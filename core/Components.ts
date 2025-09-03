@@ -1,0 +1,124 @@
+import { createHash } from 'crypto';
+import "reflect-metadata";
+import { logger as MainLogger } from "./Logger";
+import ComponentRegistry from "./ComponentRegistry";
+import { uuidv7 } from 'utils/uuid';
+const logger = MainLogger.child({ scope: "Components" });
+
+export function generateTypeId(name: string): string {
+  return createHash('sha256').update(name).digest('hex');
+}
+
+export function CompData(options?: { indexed?: boolean }) {
+    return Reflect.metadata("compData", { isData: true, indexed: options?.indexed ?? false });
+}
+
+// Type helper to extract only data properties (excludes methods and private properties)
+export type ComponentDataType<T extends BaseComponent> = {
+    [K in keyof T as T[K] extends Function ? never : 
+                    K extends `_${string}` ? never : 
+                    K extends 'id' | 'getTypeID' | 'properties' | 'data' | 'save' | 'insert' | 'update' ? never : 
+                    K]: T[K];
+};
+
+export function Component(target: any) {
+    ComponentRegistry.define(target.name, target);
+    return target;
+}
+
+export class BaseComponent {
+    public id: string = "";
+    protected _comp_name: string = "";
+    protected _typeId: string = "";
+    protected _persisted: boolean = false;
+    protected _dirty: boolean = false;
+
+    constructor() {
+        this._comp_name = this.constructor.name;
+        this._typeId = ComponentRegistry.getComponentId(this._comp_name) || generateTypeId(this._comp_name);
+        this._dirty = false;
+    }
+
+    getTypeID(): string {
+        return this._typeId;
+    }
+
+    properties(): string[] {
+        return Object.keys(this).filter(prop => {
+            const meta = Reflect.getMetadata("compData", this, prop);
+            return meta && meta.isData;
+        });
+    }
+
+    /**
+     * Get data for this component
+     * @returns Object containing only properties marked with @CompData decorator
+     */
+    data<T extends this>(): ComponentDataType<T> {
+        const data: Record<string, any> = {};
+        this.properties().forEach((prop: string) => {
+            data[prop] = (this as any)[prop];
+        });
+        return data as ComponentDataType<T>;
+    }
+
+    async save(trx: Bun.SQL, entity_id: string) {
+        logger.trace(`Saving component ${this._comp_name} for entity ${entity_id}`);
+        logger.trace(`Checking is Component can be saved (is registered)`);
+        await new Promise(resolve => {
+            if(ComponentRegistry.isComponentReady(this._comp_name)) {
+                resolve(true);
+            } else {
+                const interval = setInterval(() => {
+                    if (ComponentRegistry.isComponentReady(this._comp_name)) {
+                        clearInterval(interval);
+                        resolve(true);
+                    }
+                }, 100);
+            }
+        });
+        logger.trace(`Component Registered`);
+        if(this._persisted) {
+            await this.update(trx);
+        } else {
+            await this.insert(trx, entity_id);
+            this._persisted = true;
+        }
+    }
+
+    async insert(trx: Bun.SQL, entity_id: string) {
+        if(this.id === "") {
+            this.id = uuidv7();
+        }
+        await trx`INSERT INTO components 
+        (id, entity_id, name, type_id, data)
+        VALUES (${this.id}, ${entity_id}, ${this._comp_name}, ${this._typeId}, ${this.data()})`
+        await trx`INSERT INTO entity_components (entity_id, type_id) VALUES (${entity_id}, ${this._typeId}) ON CONFLICT DO NOTHING`
+    }
+
+    async update(trx: Bun.SQL) {
+        if(this.id === "") {
+            throw new Error("Component must have an ID to be updated");
+        }
+        await trx`UPDATE components SET data = ${this.data()} WHERE id = ${this.id}`
+    }
+
+    public setPersisted(persisted: boolean) {
+        this._persisted = persisted;
+    }
+
+    public setDirty(dirty: boolean) {
+        this._dirty = dirty;
+    }
+
+    indexedProperties(): string[] {
+        return Object.keys(this).filter(prop => {
+            const meta = Reflect.getMetadata("compData", this, prop);
+            return meta && meta.isData && meta.indexed;
+        });
+    }
+}
+
+export type ComponentGetter<T extends BaseComponent> = Pick<T, "properties" | "id"> & {
+    data(): ComponentDataType<T>;
+};
