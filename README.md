@@ -25,7 +25,7 @@
 Requires Bun and PostgreSQL.
 
 ```cmd
-bun install @yaaruu/bunsane
+bun install bunsane
 ```
 
 Ensure your tsconfig enables decorators in your app:

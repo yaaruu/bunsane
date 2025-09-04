@@ -45,7 +45,7 @@ export class BaseComponent {
 
     properties(): string[] {
         return Object.keys(this).filter(prop => {
-            const meta = Reflect.getMetadata("compData", this, prop);
+            const meta = Reflect.getMetadata("compData", Object.getPrototypeOf(this), prop);
             return meta && meta.isData;
         });
     }
@@ -113,7 +113,7 @@ export class BaseComponent {
 
     indexedProperties(): string[] {
         return Object.keys(this).filter(prop => {
-            const meta = Reflect.getMetadata("compData", this, prop);
+            const meta = Reflect.getMetadata("compData", Object.getPrototypeOf(this), prop);
             return meta && meta.isData && meta.indexed;
         });
     }

@@ -24,7 +24,16 @@ class EntityManager {
                 resolve(entity.doSave());
             }
         })
-        
+    }
+
+    public deleteEntity(entity: Entity, force: boolean = false) {
+        return new Promise<boolean>(async resolve => {
+            if(!this.dbReady) {
+                return resolve(false);
+            } else {
+                resolve(entity.doDelete(force));
+            }
+        })
     }
 
     private async savePendingEntities() {

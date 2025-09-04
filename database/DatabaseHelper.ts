@@ -38,7 +38,8 @@ export const CreateEntityTable = async () => {
         await db`CREATE TABLE IF NOT EXISTS entities (
             id UUID PRIMARY KEY,
             created_at TIMESTAMP DEFAULT NOW(),
-            updated_at TIMESTAMP DEFAULT NOW()
+            updated_at TIMESTAMP DEFAULT NOW(),
+            deleted_at TIMESTAMP
         );`;
         return resolve(true);
     });
@@ -54,6 +55,7 @@ export const CreateComponentTable = () => {
             data jsonb,
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW(),
+            deleted_at TIMESTAMP,
             PRIMARY KEY (id, type_id, entity_id)
         ) PARTITION BY LIST (type_id);`;
         await db`CREATE INDEX IF NOT EXISTS idx_components_entity_id ON components (entity_id);`
@@ -61,6 +63,46 @@ export const CreateComponentTable = () => {
         await db`CREATE INDEX IF NOT EXISTS idx_components_data_gin ON components USING GIN (data);`
         return resolve(true);
     });
+}
+
+export const UpdateComponentIndexes = async (table_name: string, indexedProperties: string[]) => {
+    try {
+
+        const indexes_list = await db`
+            SELECT indexname 
+            FROM pg_indexes 
+            WHERE tablename = ${table_name}
+        `;
+        const existingIndexes = indexes_list.map((row: any) => row.indexname);
+
+        // Check and create indexes for any new indexed properties
+        if (indexedProperties && indexedProperties.length > 0) {
+            for (const prop of indexedProperties) {
+                const indexName = `idx_${table_name}_${prop}_gin`;
+                if (!existingIndexes.includes(indexName)) {
+                    await db.unsafe(`CREATE INDEX IF NOT EXISTS ${indexName} ON ${table_name} USING GIN ((data->'${prop}'))`);
+                    logger.info(`Created missing index ${indexName} for property ${prop}`);
+                } else {
+                    logger.trace(`Index ${indexName} for property ${prop} already exists`);
+                }
+            }
+        }
+
+        // Remove indexes for properties that are no longer indexed
+        for (const index of existingIndexes) {
+            const match = index.match(/^idx_.*_(.*)_gin$/);
+            if (match) {
+                const prop = match[1];
+                if (!indexedProperties.includes(prop)) {
+                    await db.unsafe(`DROP INDEX IF EXISTS ${index}`);
+                    logger.info(`Dropped obsolete index ${index} for property ${prop}`);
+                }
+            }
+        }
+    } catch (error) {
+        logger.error(`Failed to update component indexes for ${table_name}: ${error}`);
+        throw error;
+    }
 }
 
 
@@ -78,6 +120,8 @@ export const CreateComponentPartitionTable = async (comp_name: string, type_id: 
 
         if (existingPartition.length > 0) {
             logger.info(`Partition table ${table_name} already exists`);
+
+            
             return;
         }
         logger.trace(`Creating partition table: ${table_name}`);
@@ -130,6 +174,7 @@ export const CreateEntityComponentTable = async () => {
     await db`CREATE TABLE IF NOT EXISTS entity_components (
         entity_id UUID REFERENCES entities(id),
         type_id VARCHAR(64) NOT NULL,
+        deleted_at TIMESTAMP,
         UNIQUE(entity_id, type_id)
     );`;
     await db`CREATE INDEX IF NOT EXISTS idx_entity_components_entity_id ON entity_components (entity_id);`

@@ -82,7 +82,7 @@ export class Entity {
             const temp = new ctor();
             const typeId = temp.getTypeID();
             try {
-                const rows = await db`SELECT id, data FROM components WHERE entity_id = ${this.id} AND type_id = ${typeId}`;
+                const rows = await db`SELECT id, data FROM components WHERE entity_id = ${this.id} AND type_id = ${typeId} AND deleted_at IS NULL`;
                 if (rows.length > 0) {
                     const row = rows[0];
                     const comp = new ctor();
@@ -105,6 +105,8 @@ export class Entity {
     public save() {
         return EntityManager.saveEntity(this);
     }
+
+    
 
     public doSave() {
         return new Promise<boolean>(async resolve => {
@@ -135,6 +137,30 @@ export class Entity {
         
     }
 
+    public delete(force: boolean = false) {
+        return EntityManager.deleteEntity(this, force);
+    }
+
+    public doDelete(force: boolean = false) {
+        return new Promise<boolean>(async resolve => {
+            if(!this._persisted) {
+                console.log("Entity is not persisted, cannot delete.");
+                return resolve(false); 
+            }
+            await db.transaction(async (trx) => {
+                if(force) {
+                    await trx`DELETE FROM entity_components WHERE entity_id = ${this.id}`;
+                    await trx`DELETE FROM components WHERE entity_id = ${this.id}`;
+                    await trx`DELETE FROM entities WHERE id = ${this.id}`;
+                } else {
+                    await trx`UPDATE entities SET deleted_at = CURRENT_TIMESTAMP WHERE id = ${this.id} AND deleted_at IS NULL`;
+                    await trx`UPDATE entity_components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`;
+                    await trx`UPDATE components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`;
+                }
+            });
+        })
+    }
+
     public setPersisted(persisted: boolean) {
         this._persisted = persisted;
     }
@@ -149,7 +175,7 @@ export class Entity {
         const components = await db`
             SELECT c.id, c.entity_id, c.type_id, c.data
             FROM components c
-            WHERE c.entity_id IN ${sql(ids)}
+            WHERE c.entity_id IN ${sql(ids)} AND c.deleted_at IS NULL
         `;
 
         const entitiesMap = new Map<string, Entity>();

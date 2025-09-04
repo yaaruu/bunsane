@@ -20,9 +20,9 @@
     "reflect-metadata": "^0.2.2",
     "zod": "^4.1.5"
   },
-  "graphql": {
-    "schema": "https://localhost:3001/graphql",
-    "documents": "**/*.{graphql,js,ts,jsx,tsx}"
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yaaruu/bunsane.git"
   },
   "license": "MIT"
 }

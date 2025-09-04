@@ -1,6 +1,6 @@
 import { generateTypeId, type BaseComponent } from "./Components";
 import ApplicationLifecycle, { ApplicationPhase } from "./ApplicationLifecycle";
-import { CreateComponentPartitionTable } from "database/DatabaseHelper";
+import { CreateComponentPartitionTable, UpdateComponentIndexes } from "database/DatabaseHelper";
 import { GetSchema } from "database/DatabaseHelper";
 import { logger as MainLogger } from "./Logger";
 const logger = MainLogger.child({ scope: "ComponentRegistry" });
@@ -94,13 +94,14 @@ class ComponentRegistry {
         return new Promise<boolean>(async resolve => {
             const partitionTableName = `components_${this.sluggifyName(name)}`;
             await this.populateCurrentTables();
+            const instance = new ctor();
+            const indexedProps = instance.indexedProperties();
             if (!this.currentTables.includes(partitionTableName)) {
                 logger.trace(`Partition table ${partitionTableName} does not exist. Creating... name: ${name}, typeId: ${typeid}`);
-                const instance = new ctor();
-                const indexedProps = instance.indexedProperties();
                 await CreateComponentPartitionTable(name, typeid, indexedProps);
                 await this.populateCurrentTables();
             }
+            await UpdateComponentIndexes(partitionTableName, indexedProps);
             this.componentsMap.set(name, typeid);
             this.typeIdToCtor.set(typeid, ctor);
             resolve(true);

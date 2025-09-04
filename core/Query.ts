@@ -20,6 +20,11 @@ export type QueryFilterOptions = {
 function wrapLog(str: string) {
     // console.log(str);
 }
+
+function escapeSqlString(str: string): string {
+    return str.replace(/'/g, "''");
+}
+
 class Query {
     private requiredComponents: Set<string> = new Set<string>();
     private excludedComponents: Set<string> = new Set<string>();
@@ -62,6 +67,7 @@ class Query {
 
     private buildFilterCondition(filter: QueryFilter): string {
         const { field, operator, value } = filter;
+        const escapedField = field.replace(/'/g, "''");
         switch (operator) {
             case "=":
             case ">":
@@ -70,22 +76,24 @@ class Query {
             case "<=":
             case "!=":
                 if (typeof value === "string") {
-                    return `data->>'${field}' ${operator} '${value}'`;
+                    const escapedValue = value.replace(/'/g, "''");
+                    return `data->>'${escapedField}' ${operator} '${escapedValue}'`;
                 } else {
-                    return `(data->>'${field}')::numeric ${operator} ${value}`;
+                    return `(data->>'${escapedField}')::numeric ${operator} ${value}`;
                 }
             case "LIKE":
-                return `data->>'${field}' LIKE '${value}'`;
+                const escapedValue = value.replace(/'/g, "''");
+                return `data->>'${escapedField}' LIKE '${escapedValue}'`;
             case "IN":
                 if (Array.isArray(value)) {
-                    const valueList = value.map(v => typeof v === "string" ? `'${v}'` : v).join(", ");
-                    return `data->>'${field}' IN (${valueList})`;
+                    const valueList = value.map(v => typeof v === "string" ? `'${v.replace(/'/g, "''")}'` : v).join(", ");
+                    return `data->>'${escapedField}' IN (${valueList})`;
                 }
                 throw new Error("IN operator requires an array of values");
             case "NOT IN":
                 if (Array.isArray(value)) {
-                    const valueList = value.map(v => typeof v === "string" ? `'${v}'` : v).join(", ");
-                    return `data->>'${field}' NOT IN (${valueList})`;
+                    const valueList = value.map(v => typeof v === "string" ? `'${v.replace(/'/g, "''")}'` : v).join(", ");
+                    return `data->>'${escapedField}' NOT IN (${valueList})`;
                 }
                 throw new Error("NOT IN operator requires an array of values");
             default:
@@ -131,23 +139,23 @@ class Query {
             case !hasRequired && !hasExcluded && !hasWithId:
                 return [];
             case !hasRequired && !hasExcluded && hasWithId:
-                const result = await db`SELECT id FROM entities WHERE id = ${this.withId!}`;
+                const result = await db`SELECT id FROM entities WHERE id = ${this.withId!} AND deleted_at IS NULL`;
                 ids = result.map((row: any) => row.id);
                 break;
             case hasRequired && hasExcluded && hasFilters:
                 ids = await this.getIdsWithFiltersAndExclusions(componentIds, excludedIds, componentCount);
                 break;
             case hasRequired && hasExcluded:
-                const componentIdsString = componentIds.map(id => `'${id}'`).join(', ');
-                const excludedIdsString = excludedIds.map(id => `'${id}'`).join(', ');
+                const componentIdsString = componentIds.map(id => `'${escapeSqlString(id)}'`).join(', ');
+                const excludedIdsString = excludedIds.map(id => `'${escapeSqlString(id)}'`).join(', ');
                 const excludedQuery = `
                     SELECT ec.entity_id as id
                     FROM entity_components ec
-                    WHERE ec.type_id IN (${componentIdsString})
-                    ${this.withId ? `AND ec.entity_id = '${this.withId}'` : ''}
+                    WHERE ec.type_id IN (${componentIdsString}) AND ec.deleted_at IS NULL
+                    ${this.withId ? `AND ec.entity_id = '${escapeSqlString(this.withId)}'` : ''}
                     AND NOT EXISTS (
                         SELECT 1 FROM entity_components ec_ex 
-                        WHERE ec_ex.entity_id = ec.entity_id AND ec_ex.type_id IN (${excludedIdsString})
+                        WHERE ec_ex.entity_id = ec.entity_id AND ec_ex.type_id IN (${excludedIdsString}) AND ec_ex.deleted_at IS NULL
                     )
                     GROUP BY ec.entity_id
                     HAVING COUNT(DISTINCT ec.type_id) = ${componentCount}
@@ -164,15 +172,15 @@ class Query {
                 let requiredOnlyQueryResult: any;
                 if (componentCount === 1) {
                     // Optimize for single component: no need for GROUP BY, HAVING, or DISTINCT
-                    queryStr = `SELECT entity_id as id FROM entity_components WHERE type_id = '${componentIds[0]}' ${this.withId ? `AND entity_id = '${this.withId}'` : ''}`;
+                    queryStr = `SELECT entity_id as id FROM entity_components WHERE type_id = '${escapeSqlString(componentIds[0]!)}' ${this.withId ? `AND entity_id = '${escapeSqlString(this.withId)}'` : ''} AND deleted_at IS NULL`;
                     wrapLog(`Executing optimized query: ${queryStr}`);
                     requiredOnlyQueryResult = await db.unsafe(queryStr);
                 } else {
-                    queryStr = `SELECT DISTINCT entity_id as id FROM entity_components WHERE type_id IN (${componentIds.map(id => `'${id}'`).join(', ')}) ${this.withId ? `AND entity_id = '${this.withId}'` : ''} GROUP BY entity_id HAVING COUNT(DISTINCT type_id) = ${componentCount}`;
+                    queryStr = `SELECT DISTINCT entity_id as id FROM entity_components WHERE type_id IN (${componentIds.map(id => `'${escapeSqlString(id)}'`).join(', ')}) ${this.withId ? `AND entity_id = '${escapeSqlString(this.withId)}'` : ''} AND deleted_at IS NULL GROUP BY entity_id HAVING COUNT(DISTINCT type_id) = ${componentCount}`;
                     wrapLog(`Executing query: ${queryStr}`);
                     requiredOnlyQueryResult = await db`
                         SELECT DISTINCT entity_id as id FROM entity_components
-                        WHERE type_id IN ${sql(componentIds)}
+                        WHERE type_id IN ${sql(componentIds)} AND deleted_at IS NULL
                         ${this.withId ? sql`AND entity_id = ${this.withId}` : sql``}
                         GROUP BY entity_id
                         HAVING COUNT(DISTINCT type_id) = ${componentCount}
@@ -181,14 +189,15 @@ class Query {
                 ids = requiredOnlyQueryResult.map((row: any) => row.id);
                 break;
             case hasExcluded:
-                const onlyExcludedIdsString = excludedIds.map(id => `'${id}'`).join(', ');
+                const onlyExcludedIdsString = excludedIds.map(id => `'${escapeSqlString(id)}'`).join(', ');
                 const onlyExcludedQuery = `
                     SELECT DISTINCT ec.entity_id as id
-                    FROM entity_components ec
-                    WHERE ${this.withId ? `ec.entity_id = '${this.withId}' AND ` : ''} NOT EXISTS (
+                    FROM entity_components ec 
+                    WHERE ${this.withId ? `ec.entity_id = '${escapeSqlString(this.withId)}' AND ` : ''} NOT EXISTS (
                         SELECT 1 FROM entity_components ec_ex 
-                        WHERE ec_ex.entity_id = ec.entity_id AND ec_ex.type_id IN (${onlyExcludedIdsString})
+                        WHERE ec_ex.entity_id = ec.entity_id AND ec_ex.type_id IN (${onlyExcludedIdsString}) AND ec_ex.deleted_at IS NULL
                     )
+                    AND ec.deleted_at IS NULL
                 `;
                 wrapLog(`Executing query: ${onlyExcludedQuery}`);
                 const onlyExcludedQueryResult = await db.unsafe(onlyExcludedQuery);
@@ -240,16 +249,16 @@ class Query {
         `;
         
         const joins: string[] = [];
-        const whereConditions: string[] = [`ec.type_id IN (${componentIds.map(id => `'${id}'`).join(', ')})`];
+        const whereConditions: string[] = [`ec.type_id IN (${componentIds.map(id => `'${escapeSqlString(id)}'`).join(', ')})`, `ec.deleted_at IS NULL`];
         if (this.withId) {
-            whereConditions.push(`ec.entity_id = '${this.withId}'`);
+            whereConditions.push(`ec.entity_id = '${escapeSqlString(this.withId)}'`);
         }
         
         let joinIndex = 0;
         for (const [typeId, filters] of this.componentFilters.entries()) {
             if (componentIds.includes(typeId)) {
                 const alias = `c${joinIndex}`;
-                joins.push(`JOIN components ${alias} ON ec.entity_id = ${alias}.entity_id AND ${alias}.type_id = '${typeId}'`);
+                joins.push(`JOIN components ${alias} ON ec.entity_id = ${alias}.entity_id AND ${alias}.type_id = '${escapeSqlString(typeId)}' AND ${alias}.deleted_at IS NULL`);
                 
                 const filterCondition = this.buildFilterWhereClause(typeId, filters);
                 if (filterCondition) {
@@ -275,8 +284,8 @@ class Query {
             return [];
         }
         
-        const idsString = entityIds.map(id => `'${id}'`).join(', ');
-        const excludedString = excludedIds.map(id => `'${id}'`).join(', ');
+        const idsString = entityIds.map(id => `'${escapeSqlString(id)}'`).join(', ');
+        const excludedString = excludedIds.map(id => `'${escapeSqlString(id)}'`).join(', ');
         const query = `
             WITH entity_list AS (
                 SELECT unnest(ARRAY[${idsString}]) as id
@@ -285,7 +294,7 @@ class Query {
             FROM entity_list el
             WHERE NOT EXISTS (
                 SELECT 1 FROM entity_components ec 
-                WHERE ec.entity_id = el.id AND ec.type_id IN (${excludedString})
+                WHERE ec.entity_id = el.id AND ec.type_id IN (${excludedString}) AND ec.deleted_at IS NULL
             )
         `;
         const exclusionResult = await db.unsafe(query);
