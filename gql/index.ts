@@ -1,12 +1,32 @@
 import {createSchema, createYoga} from 'graphql-yoga';
 import { GraphQLSchema, GraphQLError } from 'graphql';
-import { GraphQLType, GraphQLField, GraphQLOperation } from './Generator';
-import {GraphQLTypes} from "./types"
-export {
+import { GraphQLObjectType, GraphQLField, GraphQLOperation } from './Generator';
+import {GraphQLFieldTypes} from "./types"
+import {
+    isValidGraphQLType,
+    createOperationMeta,
+    createObjectTypeMeta,
+    createFieldMeta
+} from "./helpers";
+import type {
     GraphQLType,
+    TypeFromGraphQL,
+    ResolverInput
+} from "./helpers";
+export {
+    GraphQLObjectType,
     GraphQLField,
     GraphQLOperation,
-    GraphQLTypes
+    GraphQLFieldTypes,
+    isValidGraphQLType,
+    createOperationMeta,
+    createObjectTypeMeta,
+    createFieldMeta
+}
+export type {
+    GraphQLType,
+    TypeFromGraphQL,
+    ResolverInput
 }
 interface Entity {
     id: string;

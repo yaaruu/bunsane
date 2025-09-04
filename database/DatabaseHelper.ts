@@ -67,21 +67,23 @@ export const CreateComponentTable = () => {
 
 export const UpdateComponentIndexes = async (table_name: string, indexedProperties: string[]) => {
     try {
-
+        logger.trace(`Updating indexes for component table: ${table_name}`);
         const indexes_list = await db`
             SELECT indexname 
             FROM pg_indexes 
             WHERE tablename = ${table_name}
         `;
         const existingIndexes = indexes_list.map((row: any) => row.indexname);
+        const addedIndexes = new Set<string>();
 
         // Check and create indexes for any new indexed properties
         if (indexedProperties && indexedProperties.length > 0) {
             for (const prop of indexedProperties) {
                 const indexName = `idx_${table_name}_${prop}_gin`;
                 if (!existingIndexes.includes(indexName)) {
+                    logger.trace(`Creating missing index ${indexName} for property ${prop}`);
                     await db.unsafe(`CREATE INDEX IF NOT EXISTS ${indexName} ON ${table_name} USING GIN ((data->'${prop}'))`);
-                    logger.info(`Created missing index ${indexName} for property ${prop}`);
+                    addedIndexes.add(indexName);
                 } else {
                     logger.trace(`Index ${indexName} for property ${prop} already exists`);
                 }
@@ -90,10 +92,10 @@ export const UpdateComponentIndexes = async (table_name: string, indexedProperti
 
         // Remove indexes for properties that are no longer indexed
         for (const index of existingIndexes) {
-            const match = index.match(/^idx_.*_(.*)_gin$/);
+            const match = index.match(new RegExp(`^idx_${table_name}_(.*)_gin$`));
             if (match) {
                 const prop = match[1];
-                if (!indexedProperties.includes(prop)) {
+                if (!indexedProperties.includes(prop) && !addedIndexes.has(index)) {
                     await db.unsafe(`DROP INDEX IF EXISTS ${index}`);
                     logger.info(`Dropped obsolete index ${index} for property ${prop}`);
                 }
@@ -120,8 +122,6 @@ export const CreateComponentPartitionTable = async (comp_name: string, type_id: 
 
         if (existingPartition.length > 0) {
             logger.info(`Partition table ${table_name} already exists`);
-
-            
             return;
         }
         logger.trace(`Creating partition table: ${table_name}`);
@@ -129,15 +129,6 @@ export const CreateComponentPartitionTable = async (comp_name: string, type_id: 
         await db.unsafe(`CREATE TABLE IF NOT EXISTS ${table_name}
                 PARTITION OF components
                 FOR VALUES IN ('${type_id}');`);
-        
-        if (indexedProperties && indexedProperties.length > 0) {
-            for (const prop of indexedProperties) {
-                const indexName = `idx_${table_name}_${prop}`;
-                await db.unsafe(`CREATE INDEX IF NOT EXISTS ${indexName} ON ${table_name} USING GIN ((data->'${prop}'))`);
-                logger.trace(`Created index ${indexName} for property ${prop}`);
-            }
-        }
-        
         logger.trace(`Successfully created partition table: ${table_name}`);
         
     } catch (error) {

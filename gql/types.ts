@@ -7,7 +7,7 @@ export enum GraphQLScalar {
     Date = "Date",
 }
 
-export enum GraphQLTypes {
+export enum GraphQLFieldTypes {
     ID_REQUIRED = "ID!",
     ID_OPTIONAL = "ID",
     STRING_REQUIRED = "String!",

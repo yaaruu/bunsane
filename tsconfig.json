@@ -14,6 +14,8 @@
     "verbatimModuleSyntax": true,
     "noEmit": true,
 
+    // Path mappings for internal modules
+    "baseUrl": ".",
     // Best practices
     "strict": true,
     "skipLibCheck": true,
@@ -26,7 +28,6 @@
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false,
 
-    "baseUrl": ".",
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,
     "typeRoots": ["./types", "./node_modules/@types"]

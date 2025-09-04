@@ -1,46 +1,47 @@
 import { GraphQLSchema, GraphQLError } from "graphql";
 import {makeExecutableSchema} from "@graphql-tools/schema";
 import { logger as MainLogger } from "core/Logger";
+import type { GraphQLType } from "./helpers";
 const logger = MainLogger.child({ scope: "GraphQLGenerator" });
-export interface GraphQLTypeMeta {
+export interface GraphQLObjectTypeMeta {
     name: string;
-    fields: Record<string, string>;
+    fields: Record<string, GraphQLType>;
 }
 
 export interface GraphQLOperationMeta {
     type: "Query" | "Mutation";
     name?: string;
-    input?: Record<string, string>;
-    output: Record<string, string> | string;
+    input?: Record<string, GraphQLType>;
+    output: GraphQLType | Record<string, GraphQLType>;
 }
 
 export interface GraphQLFieldMeta {
-    type: string;
+    type: GraphQLType;
     field: string;
 }
 
-export function GraphQLType(meta: GraphQLTypeMeta) {
+export function GraphQLObjectType(meta: GraphQLObjectTypeMeta) {
     return (target: any) => {
-        target.__graphqlType = meta;
+        target.__graphqlObjectType = meta;
     }
 }
 
 export function GraphQLOperation(meta: GraphQLOperationMeta) {
-    return function (target: any, context: ClassMethodDecoratorContext) {
+    return function (target: any, propertyKey: string, descriptor: PropertyDescriptor) {
         if (!target.__graphqlOperations) target.__graphqlOperations = [];
-        const operationName = meta.name ?? context;
+        const operationName = meta.name ?? propertyKey;
         if (!operationName) {
-            throw new Error("GraphQLOperation: Operation name is required (either meta.name or context.name must be defined)");
+            throw new Error("GraphQLOperation: Operation name is required (either meta.name or propertyKey must be defined)");
         }
-        const operationMeta = { ...meta, name: operationName, propertyKey: context};
+        const operationMeta = { ...meta, name: operationName, propertyKey };
         target.__graphqlOperations.push(operationMeta);
     };
 }
 
 export function GraphQLField(meta: GraphQLFieldMeta) {
-    return function (target: any, context: ClassMethodDecoratorContext) {
+    return function (target: any, propertyKey: string, descriptor: PropertyDescriptor) {
         if (!target.__graphqlFields) target.__graphqlFields = [];
-        target.__graphqlFields.push({ ...meta, propertyKey: context });
+        target.__graphqlFields.push({ ...meta, propertyKey });
     };
 }
 
@@ -52,8 +53,8 @@ export function generateGraphQLSchema(systems: any[]): { schema: GraphQLSchema |
 
     systems.forEach(system => {
         logger.trace(`Processing system: ${system.constructor.name}`);
-        if (system.constructor.__graphqlType) {
-            const { name, fields } = system.constructor.__graphqlType;
+        if (system.constructor.__graphqlObjectType) {
+            const { name, fields } = system.constructor.__graphqlObjectType;
             typeDefs += `type ${name} {\n${Object.entries(fields).map(([k, v]) => `  ${k}: ${v}`).join('\n')}\n}\n`;
         }
         if (system.__graphqlOperations) {
