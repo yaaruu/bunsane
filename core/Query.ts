@@ -123,7 +123,7 @@ class Query {
         return this;
     }
 
-    @timed
+    @timed("Query.exec")
     public async exec(): Promise<Entity[]> {
         const componentIds = Array.from(this.requiredComponents);
         const excludedIds = Array.from(this.excludedComponents);

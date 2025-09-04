@@ -4,7 +4,7 @@ import { logger } from "core/Logger";
 const db = new SQL({
     url: `postgres://${process.env.POSTGRES_USER}:${process.env.POSTGRES_PASSWORD}@${process.env.POSTGRES_HOST}:5432/${process.env.POSTGRES_DB}`,
     // Connection pool settings
-    max: 10, // Maximum connections in pool
+    max: parseInt(process.env.POSTGRES_MAX_CONNECTIONS ?? '10', 10), // Maximum connections in pool
     idleTimeout: 0, // Close idle connections after 30s
     maxLifetime: 0, // Connection lifetime in seconds (0 = forever)
     connectionTimeout: 30, // Timeout when establishing new connections

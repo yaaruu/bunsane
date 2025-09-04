@@ -26,6 +26,22 @@ export const PrepareDatabase = async () => {
     await CreateEntityComponentTable();
 }
 
+export const GetDatabaseDataSize = async () => {
+    const result = await db`SELECT
+        relname AS table_name,
+        pg_size_pretty(pg_total_relation_size(oid)) AS total_size_pretty,
+        ROUND(pg_total_relation_size(oid) / (1024.0 * 1024.0), 2) AS total_size_mb
+    FROM
+        pg_class
+    WHERE
+        relkind = 'r' -- 'r' for regular table, 'p' for partitioned table
+        AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public') -- Or your specific schema
+    ORDER BY
+        pg_total_relation_size(oid) DESC;`;
+    return result;
+}
+
+
 export const SetupDatabaseExtensions = async () => {
     return new Promise(async resolve => {
         // await db`CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`;

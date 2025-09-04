@@ -6,6 +6,7 @@ import ComponentRegistry from "./ComponentRegistry";
 import { uuidv7 } from "utils/uuid";
 import { sql } from "bun";
 import Query from "./Query";
+import { timed } from "./Decorators";
 
 
 export class Entity {
@@ -102,6 +103,7 @@ export class Entity {
         }
     }
 
+    @timed("Entity.save")
     public save() {
         return EntityManager.saveEntity(this);
     }
@@ -124,11 +126,9 @@ export class Entity {
                     return;
                 }
                 const waitable = [];
-                    
                 for(const comp of this.components.values()) {
                     waitable.push(comp.save(trx, this.id));
                 }
-
                 await Promise.all(waitable);
             });
             this._dirty = false;
