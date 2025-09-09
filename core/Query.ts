@@ -31,6 +31,8 @@ class Query {
     private componentFilters: Map<string, QueryFilter[]> = new Map();
     private populateComponents: boolean = false;
     private withId: string | null = null;
+    private limit: number | null = null;
+    private offsetValue: number = 0;
 
     public findById(id: string) {
         this.withId = id;
@@ -123,6 +125,16 @@ class Query {
         return this;
     }
 
+    public take(limit: number): this {
+        this.limit = limit;
+        return this;
+    }
+
+    public offset(offset: number): this {
+        this.offsetValue = offset;
+        return this;
+    }
+
     @timed("Query.exec")
     public async exec(): Promise<Entity[]> {
         const componentIds = Array.from(this.requiredComponents);
@@ -139,16 +151,23 @@ class Query {
             case !hasRequired && !hasExcluded && !hasWithId:
                 return [];
             case !hasRequired && !hasExcluded && hasWithId:
-                const result = await db`SELECT id FROM entities WHERE id = ${this.withId!} AND deleted_at IS NULL`;
+                let withIdQuery = `SELECT id FROM entities WHERE id = '${escapeSqlString(this.withId!)}' AND deleted_at IS NULL ORDER BY id`;
+                if (this.limit !== null) {
+                    withIdQuery += ` LIMIT ${this.limit}`;
+                }
+                if (this.offsetValue > 0) {
+                    withIdQuery += ` OFFSET ${this.offsetValue}`;
+                }
+                const result = await db.unsafe(withIdQuery);
                 ids = result.map((row: any) => row.id);
                 break;
             case hasRequired && hasExcluded && hasFilters:
-                ids = await this.getIdsWithFiltersAndExclusions(componentIds, excludedIds, componentCount);
+                ids = await this.getIdsWithFiltersAndExclusions(componentIds, excludedIds, componentCount, this.limit, this.offsetValue);
                 break;
             case hasRequired && hasExcluded:
                 const componentIdsString = componentIds.map(id => `'${escapeSqlString(id)}'`).join(', ');
                 const excludedIdsString = excludedIds.map(id => `'${escapeSqlString(id)}'`).join(', ');
-                const excludedQuery = `
+                let excludedQuery = `
                     SELECT ec.entity_id as id
                     FROM entity_components ec
                     WHERE ec.type_id IN (${componentIdsString}) AND ec.deleted_at IS NULL
@@ -159,38 +178,51 @@ class Query {
                     )
                     GROUP BY ec.entity_id
                     HAVING COUNT(DISTINCT ec.type_id) = ${componentCount}
+                    ORDER BY ec.entity_id
                 `;
+                if (this.limit !== null) {
+                    excludedQuery += ` LIMIT ${this.limit}`;
+                }
+                if (this.offsetValue > 0) {
+                    excludedQuery += ` OFFSET ${this.offsetValue}`;
+                }
                 wrapLog(`Executing query: ${excludedQuery}`);
                 const excludedQueryResult = await db.unsafe(excludedQuery);
                 ids = excludedQueryResult.map((row: any) => row.id);
                 break;
             case hasRequired && hasFilters:
-                ids = await this.getIdsWithFilters(componentIds, componentCount);
+                ids = await this.getIdsWithFilters(componentIds, componentCount, this.limit, this.offsetValue);
                 break;
             case hasRequired:
                 let queryStr: string;
                 let requiredOnlyQueryResult: any;
                 if (componentCount === 1) {
                     // Optimize for single component: no need for GROUP BY, HAVING, or DISTINCT
-                    queryStr = `SELECT entity_id as id FROM entity_components WHERE type_id = '${escapeSqlString(componentIds[0]!)}' ${this.withId ? `AND entity_id = '${escapeSqlString(this.withId)}'` : ''} AND deleted_at IS NULL`;
+                    queryStr = `SELECT entity_id as id FROM entity_components WHERE type_id = '${escapeSqlString(componentIds[0]!)}' ${this.withId ? `AND entity_id = '${escapeSqlString(this.withId)}'` : ''} AND deleted_at IS NULL ORDER BY entity_id`;
+                    if (this.limit !== null) {
+                        queryStr += ` LIMIT ${this.limit}`;
+                    }
+                    if (this.offsetValue > 0) {
+                        queryStr += ` OFFSET ${this.offsetValue}`;
+                    }
                     wrapLog(`Executing optimized query: ${queryStr}`);
                     requiredOnlyQueryResult = await db.unsafe(queryStr);
                 } else {
-                    queryStr = `SELECT DISTINCT entity_id as id FROM entity_components WHERE type_id IN (${componentIds.map(id => `'${escapeSqlString(id)}'`).join(', ')}) ${this.withId ? `AND entity_id = '${escapeSqlString(this.withId)}'` : ''} AND deleted_at IS NULL GROUP BY entity_id HAVING COUNT(DISTINCT type_id) = ${componentCount}`;
+                    queryStr = `SELECT DISTINCT entity_id as id FROM entity_components WHERE type_id IN (${componentIds.map(id => `'${escapeSqlString(id)}'`).join(', ')}) ${this.withId ? `AND entity_id = '${escapeSqlString(this.withId)}'` : ''} AND deleted_at IS NULL GROUP BY entity_id HAVING COUNT(DISTINCT type_id) = ${componentCount} ORDER BY entity_id`;
+                    if (this.limit !== null) {
+                        queryStr += ` LIMIT ${this.limit}`;
+                    }
+                    if (this.offsetValue > 0) {
+                        queryStr += ` OFFSET ${this.offsetValue}`;
+                    }
                     wrapLog(`Executing query: ${queryStr}`);
-                    requiredOnlyQueryResult = await db`
-                        SELECT DISTINCT entity_id as id FROM entity_components
-                        WHERE type_id IN ${sql(componentIds)} AND deleted_at IS NULL
-                        ${this.withId ? sql`AND entity_id = ${this.withId}` : sql``}
-                        GROUP BY entity_id
-                        HAVING COUNT(DISTINCT type_id) = ${componentCount}
-                    `;
+                    requiredOnlyQueryResult = await db.unsafe(queryStr);
                 }
                 ids = requiredOnlyQueryResult.map((row: any) => row.id);
                 break;
             case hasExcluded:
                 const onlyExcludedIdsString = excludedIds.map(id => `'${escapeSqlString(id)}'`).join(', ');
-                const onlyExcludedQuery = `
+                let onlyExcludedQuery = `
                     SELECT DISTINCT ec.entity_id as id
                     FROM entity_components ec 
                     WHERE ${this.withId ? `ec.entity_id = '${escapeSqlString(this.withId)}' AND ` : ''} NOT EXISTS (
@@ -198,7 +230,14 @@ class Query {
                         WHERE ec_ex.entity_id = ec.entity_id AND ec_ex.type_id IN (${onlyExcludedIdsString}) AND ec_ex.deleted_at IS NULL
                     )
                     AND ec.deleted_at IS NULL
+                    ORDER BY ec.entity_id
                 `;
+                if (this.limit !== null) {
+                    onlyExcludedQuery += ` LIMIT ${this.limit}`;
+                }
+                if (this.offsetValue > 0) {
+                    onlyExcludedQuery += ` OFFSET ${this.offsetValue}`;
+                }
                 wrapLog(`Executing query: ${onlyExcludedQuery}`);
                 const onlyExcludedQueryResult = await db.unsafe(onlyExcludedQuery);
                 ids = onlyExcludedQueryResult.map((row: any) => row.id);
@@ -242,7 +281,7 @@ class Query {
         }
     }
 
-    private async getIdsWithFilters(componentIds: string[], componentCount: number): Promise<string[]> {
+    private async getIdsWithFilters(componentIds: string[], componentCount: number, limit?: number | null, offset?: number): Promise<string[]> {
         let query = `
             SELECT DISTINCT ec.entity_id as id 
             FROM entity_components ec
@@ -271,13 +310,20 @@ class Query {
         query += joins.join(' ');
         query += ` WHERE ${whereConditions.join(' AND ')}`;
         query += ` GROUP BY ec.entity_id HAVING COUNT(DISTINCT ec.type_id) = ${componentCount}`;
+        query += ` ORDER BY ec.entity_id`;
+        if (limit !== null && limit !== undefined) {
+            query += ` LIMIT ${limit}`;
+        }
+        if (offset && offset > 0) {
+            query += ` OFFSET ${offset}`;
+        }
         
         wrapLog(`Executing filtered query: ${query}`);
         const filteredResult = await db.unsafe(query);
         return filteredResult.map((row: any) => row.id);
     }
 
-    private async getIdsWithFiltersAndExclusions(componentIds: string[], excludedIds: string[], componentCount: number): Promise<string[]> {
+    private async getIdsWithFiltersAndExclusions(componentIds: string[], excludedIds: string[], componentCount: number, limit?: number | null, offset?: number): Promise<string[]> {
         const entityIds = await this.getIdsWithFilters(componentIds, componentCount);
         
         if (entityIds.length === 0) {
@@ -286,7 +332,7 @@ class Query {
         
         const idsString = entityIds.map(id => `'${escapeSqlString(id)}'`).join(', ');
         const excludedString = excludedIds.map(id => `'${escapeSqlString(id)}'`).join(', ');
-        const query = `
+        let query = `
             WITH entity_list AS (
                 SELECT unnest(ARRAY[${idsString}]) as id
             )
@@ -296,7 +342,14 @@ class Query {
                 SELECT 1 FROM entity_components ec 
                 WHERE ec.entity_id = el.id AND ec.type_id IN (${excludedString}) AND ec.deleted_at IS NULL
             )
+            ORDER BY el.id
         `;
+        if (limit !== null && limit !== undefined) {
+            query += ` LIMIT ${limit}`;
+        }
+        if (offset && offset > 0) {
+            query += ` OFFSET ${offset}`;
+        }
         const exclusionResult = await db.unsafe(query);
         return exclusionResult.map((row: any) => row.id);
     }

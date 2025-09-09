@@ -1,3 +1,7 @@
-// TODO: Add index when component was registered but changed
-// TODO: Middleware
-// TODO: Uploads
+TODO: Middleware/Plugin [(X) JWT ]
+TODO: Uploads
+TODO: HTTP Rest Controller
+TODO: Query Ordering
+TODO: Field Constraint
+
+TODO: Hooks

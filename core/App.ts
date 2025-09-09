@@ -4,9 +4,11 @@ import ComponentRegistry from "core/ComponentRegistry";
 import { logger } from "core/Logger";
 import { createYogaInstance } from "gql";
 import ServiceRegistry from "service/ServiceRegistry";
+import type { Plugin } from "graphql-yoga";
 
 export default class App {
     private yoga: any;
+    private yogaPlugins: Plugin[] = [];
 
     constructor() {
         this.init();
@@ -39,9 +41,9 @@ export default class App {
                     try {
                         const schema = ServiceRegistry.getSchema();
                         if (schema) {
-                            this.yoga = createYogaInstance(schema);
+                            this.yoga = createYogaInstance(schema, this.yogaPlugins);
                         } else {
-                            this.yoga = createYogaInstance();
+                            this.yoga = createYogaInstance(undefined, this.yogaPlugins);
                         }
                         ApplicationLifecycle.setPhase(ApplicationPhase.APPLICATION_READY);
                     } catch (error) {
@@ -71,10 +73,14 @@ export default class App {
         });
     }
 
+    public addYogaPlugin(plugin: Plugin) {
+        this.yogaPlugins.push(plugin);
+    }
+
     async start() {
         logger.info("Application Started");
         const server = Bun.serve({
-            fetch: this.yoga
+            fetch: this.yoga,
         });
         logger.info(`Server is running on ${new URL(this.yoga.graphqlEndpoint, `http://${server.hostname}:${server.port}`)}`)
     }

@@ -22,7 +22,8 @@ export interface GraphQLFieldMeta {
 
 export function GraphQLObjectType(meta: GraphQLObjectTypeMeta) {
     return (target: any) => {
-        target.__graphqlObjectType = meta;
+        if (!target.__graphqlObjectType) target.__graphqlObjectType = [];
+        target.__graphqlObjectType.push(meta);
     }
 }
 
@@ -45,20 +46,22 @@ export function GraphQLField(meta: GraphQLFieldMeta) {
     };
 }
 
-export function generateGraphQLSchema(systems: any[]): { schema: GraphQLSchema | null; resolvers: any } {
+export function generateGraphQLSchema(services: any[]): { schema: GraphQLSchema | null; resolvers: any } {
     let typeDefs = "";
     const resolvers: any = { Query: {}, Mutation: {} };
     const queryFields: string[] = [];
     const mutationFields: string[] = [];
 
-    systems.forEach(system => {
-        logger.trace(`Processing system: ${system.constructor.name}`);
-        if (system.constructor.__graphqlObjectType) {
-            const { name, fields } = system.constructor.__graphqlObjectType;
-            typeDefs += `type ${name} {\n${Object.entries(fields).map(([k, v]) => `  ${k}: ${v}`).join('\n')}\n}\n`;
+    services.forEach(service => {
+        logger.trace(`Processing service: ${service.constructor.name}`);
+        if (service.constructor.__graphqlObjectType) {
+            for (const meta of service.constructor.__graphqlObjectType) {
+                const { name, fields } = meta;
+                typeDefs += `type ${name} {\n${Object.entries(fields).map(([k, v]) => `  ${k}: ${v}`).join('\n')}\n}\n`;
+            }
         }
-        if (system.__graphqlOperations) {
-            system.__graphqlOperations.forEach((op: any) => {
+        if (service.__graphqlOperations) {
+            service.__graphqlOperations.forEach((op: any) => {
                 const { type, name, input, output, propertyKey } = op;
                 let fieldDef = `${name}`;
                 if (input) {
@@ -67,7 +70,7 @@ export function generateGraphQLSchema(systems: any[]): { schema: GraphQLSchema |
                     fieldDef += `(input: ${inputName}!)`;
                     resolvers[type][name] = async (_: any, args: any, context: any) => {
                         try {
-                            return await system[propertyKey](args.input || args, context);
+                            return await service[propertyKey](args.input || args, context);
                         } catch (error) {
                             logger.error(`Error in ${type}.${name}:`);
                             logger.error(error);
@@ -85,7 +88,7 @@ export function generateGraphQLSchema(systems: any[]): { schema: GraphQLSchema |
                 } else {
                     resolvers[type][name] = async (_: any, args: any, context: any) => {
                         try {
-                            return await system[propertyKey]({}, context);
+                            return await service[propertyKey]({}, context);
                         } catch (error) {
                             logger.error(`Error in ${type}.${name}:`);
                             logger.error(error);
@@ -118,14 +121,14 @@ export function generateGraphQLSchema(systems: any[]): { schema: GraphQLSchema |
     });
 
     // Process field resolvers
-    systems.forEach(system => {
-        if (system.__graphqlFields) {
-            system.__graphqlFields.forEach((fieldMeta: any) => {
+    services.forEach(service => {
+        if (service.__graphqlFields) {
+            service.__graphqlFields.forEach((fieldMeta: any) => {
                 const { type, field, propertyKey } = fieldMeta;
                 if (!resolvers[type]) resolvers[type] = {};
                 resolvers[type][field] = async (parent: any, args: any, context: any) => {
                     try {
-                        return await system[propertyKey](parent, args, context);
+                        return await service[propertyKey](parent, args, context);
                     } catch (error) {
                         logger.error(`Error in ${type}.${field}:`);
                         logger.error(error);

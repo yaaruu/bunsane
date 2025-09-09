@@ -1,12 +1,9 @@
-import {createSchema, createYoga} from 'graphql-yoga';
+import {createSchema, createYoga, type Plugin} from 'graphql-yoga';
 import { GraphQLSchema, GraphQLError } from 'graphql';
 import { GraphQLObjectType, GraphQLField, GraphQLOperation } from './Generator';
 import {GraphQLFieldTypes} from "./types"
 import {
     isValidGraphQLType,
-    createOperationMeta,
-    createObjectTypeMeta,
-    createFieldMeta
 } from "./helpers";
 import type {
     GraphQLType,
@@ -19,9 +16,6 @@ export {
     GraphQLOperation,
     GraphQLFieldTypes,
     isValidGraphQLType,
-    createOperationMeta,
-    createObjectTypeMeta,
-    createFieldMeta
 }
 export type {
     GraphQLType,
@@ -69,7 +63,7 @@ const staticResolvers = {
     }
 };
 
-export function createYogaInstance(schema?: GraphQLSchema) {
+export function createYogaInstance(schema?: GraphQLSchema, plugins: Plugin[] = []) {
     if (schema) {
         return createYoga({
             schema,

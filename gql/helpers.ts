@@ -30,25 +30,3 @@ export type ResolverInput<T extends Record<string, GraphQLType>> = {
   [K in keyof T]: TypeFromGraphQL<T[K]>;
 };
 
-export function createOperationMeta(
-  type: "Query" | "Mutation",
-  name: string,
-  input?: Record<string, GraphQLType>,
-  output: GraphQLType | Record<string, GraphQLType> = "String"
-) {
-  return { type, name, input, output };
-}
-
-export function createObjectTypeMeta(
-  name: string,
-  fields: Record<string, GraphQLType>
-) {
-  return { name, fields };
-}
-
-export function createFieldMeta(
-  type: GraphQLType,
-  field: string
-) {
-  return { type, field };
-}
