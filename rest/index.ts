@@ -17,6 +17,6 @@ export function httpEndpoint(options: HTTPEndpointOptions) {
     }
 }
 
-export class RestController {
-    static httpEndpoints: Array<{ method: HTTPMethod; path: string; handler: Function }> = [];
+export interface RestController {
+    httpEndpoints: Array<{ method: HTTPMethod; path: string; handler: Function }>;
 }

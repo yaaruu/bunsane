@@ -67,11 +67,22 @@ export function createYogaInstance(schema?: GraphQLSchema, plugins: Plugin[] = [
     if (schema) {
         return createYoga({
             schema,
+            plugins,
             // Configure error handling to preserve error messages for clients
             maskedErrors: {
                 // In development, show full error details
                 // In production, you might want to mask sensitive information
                 maskError: (error: any, message: string): GraphQLError => {
+                    // Handle JWT authentication errors specifically
+                    if (error.extensions?.code === 'DOWNSTREAM_SERVICE_ERROR' && error.extensions?.http?.status === 401) {
+                        return new GraphQLError('Error: Unauthorized', {
+                            extensions: {
+                                code: 'UNAUTHORIZED',
+                                http: { status: 401 }
+                            }
+                        });
+                    }
+                    
                     if (process.env.NODE_ENV === 'production') {
                         // Mask sensitive error details in production
                         return new GraphQLError('Internal server error', {
@@ -91,8 +102,19 @@ export function createYogaInstance(schema?: GraphQLSchema, plugins: Plugin[] = [
                 typeDefs: staticTypeDefs,
                 resolvers: staticResolvers,
             }),
+            plugins,
             maskedErrors: {
                 maskError: (error: any, message: string): GraphQLError => {
+                    // Handle JWT authentication errors specifically
+                    if (error.extensions?.code === 'DOWNSTREAM_SERVICE_ERROR' && error.extensions?.http?.status === 401) {
+                        return new GraphQLError('Error: Unauthorized', {
+                            extensions: {
+                                code: 'UNAUTHORIZED',
+                                http: { status: 401 }
+                            }
+                        });
+                    }
+                    
                     if (process.env.NODE_ENV === 'production') {
                         return new GraphQLError('Internal server error', {
                             extensions: {

@@ -6,7 +6,7 @@ import { GraphQLSchema } from "graphql";
 class ServiceRegistry {
     static #instance: ServiceRegistry;
 
-    private systems: Map<string, BaseService> = new Map();
+    private services: Map<string, BaseService> = new Map();
     private schema: GraphQLSchema | null = null;
 
 
@@ -18,8 +18,8 @@ class ServiceRegistry {
         ApplicationLifecycle.addPhaseListener((event) => {
             switch(event.detail) {
                 case ApplicationPhase.SYSTEM_REGISTERING: {
-                    const systemsArray = Array.from(this.systems.values());
-                    const { schema } = generateGraphQLSchema(systemsArray);
+                    const servicesArray = Array.from(this.services.values());
+                    const { schema } = generateGraphQLSchema(servicesArray);
                     this.schema = schema;
                     ApplicationLifecycle.setPhase(ApplicationPhase.SYSTEM_READY);
                     break;
@@ -37,10 +37,14 @@ class ServiceRegistry {
         return ServiceRegistry.#instance;
     }
 
-    public registerService(system: BaseService) {
-        if(!this.systems.has(system.constructor.name)) {
-            this.systems.set(system.constructor.name, system);
+    public registerService(service: BaseService) {
+        if(!this.services.has(service.constructor.name)) {
+            this.services.set(service.constructor.name, service);
         }
+    }
+
+    public getServices(): BaseService[] {
+        return Array.from(this.services.values());
     }
 
     public getSchema(): GraphQLSchema | null {

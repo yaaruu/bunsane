@@ -7,6 +7,7 @@ import ArcheType from "./core/ArcheType";
 import Query from "./core/Query";
 import {logger} from "./core/Logger";
 import { handleGraphQLError, responseError } from "./core/ErrorHandler";
+import { type Plugin } from "graphql-yoga";
 export { 
     App, 
     ArcheType,
@@ -18,6 +19,8 @@ export {
     Entity,
     Query,
     logger,
+
+    type Plugin,
 
     responseError,
     handleGraphQLError

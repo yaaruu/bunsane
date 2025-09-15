@@ -9,6 +9,7 @@ import type { Plugin } from "graphql-yoga";
 export default class App {
     private yoga: any;
     private yogaPlugins: Plugin[] = [];
+    private restEndpoints: Array<{ method: string; path: string; handler: Function; service: any }> = [];
 
     constructor() {
         this.init();
@@ -45,6 +46,23 @@ export default class App {
                         } else {
                             this.yoga = createYogaInstance(undefined, this.yogaPlugins);
                         }
+                        
+                        // Collect REST endpoints from all services
+                        const services = ServiceRegistry.getServices();
+                        for (const service of services) {
+                            const endpoints = (service.constructor as any).httpEndpoints;
+                            if (endpoints) {
+                                for (const endpoint of endpoints) {
+                                    this.restEndpoints.push({
+                                        method: endpoint.method,
+                                        path: endpoint.path,
+                                        handler: endpoint.handler.bind(service),
+                                        service: service
+                                    });
+                                }
+                            }
+                        }
+                        
                         ApplicationLifecycle.setPhase(ApplicationPhase.APPLICATION_READY);
                     } catch (error) {
                         logger.error("Error during SYSTEM_READY phase:");
@@ -77,11 +95,46 @@ export default class App {
         this.yogaPlugins.push(plugin);
     }
 
+    private async handleRequest(req: Request): Promise<Response> {
+        const url = new URL(req.url);
+        const method = req.method;
+
+        // Check for REST endpoints
+        for (const endpoint of this.restEndpoints) {
+            if (endpoint.method === method && endpoint.path === url.pathname) {
+                try {
+                    const result = await endpoint.handler(req);
+                    if (result instanceof Response) {
+                        return result;
+                    } else {
+                        // If handler doesn't return Response, assume it's JSON
+                        return new Response(JSON.stringify(result), {
+                            headers: { 'Content-Type': 'application/json' }
+                        });
+                    }
+                } catch (error) {
+                    logger.error(`Error in REST endpoint ${method} ${endpoint.path}`, error as any);
+                    return new Response(JSON.stringify({ error: 'Internal server error' }), {
+                        status: 500,
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                }
+            }
+        }
+
+        // Fallback to GraphQL
+        if (this.yoga) {
+            return this.yoga(req);
+        }
+
+        return new Response('Not Found', { status: 404 });
+    }
+
     async start() {
         logger.info("Application Started");
         const server = Bun.serve({
-            fetch: this.yoga,
+            fetch: this.handleRequest.bind(this),
         });
-        logger.info(`Server is running on ${new URL(this.yoga.graphqlEndpoint, `http://${server.hostname}:${server.port}`)}`)
+        logger.info(`Server is running on ${new URL(this.yoga?.graphqlEndpoint || '/graphql', `http://${server.hostname}:${server.port}`)}`)
     }
 }
