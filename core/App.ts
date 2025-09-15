@@ -98,8 +98,8 @@ export default class App {
     private async handleRequest(req: Request): Promise<Response> {
         const url = new URL(req.url);
         const method = req.method;
-
-        // Check for REST endpoints
+      
+        // TODO: Optimize the lookup with a map if there are many endpoints
         for (const endpoint of this.restEndpoints) {
             if (endpoint.method === method && endpoint.path === url.pathname) {
                 try {
@@ -107,7 +107,6 @@ export default class App {
                     if (result instanceof Response) {
                         return result;
                     } else {
-                        // If handler doesn't return Response, assume it's JSON
                         return new Response(JSON.stringify(result), {
                             headers: { 'Content-Type': 'application/json' }
                         });
@@ -122,7 +121,6 @@ export default class App {
             }
         }
 
-        // Fallback to GraphQL
         if (this.yoga) {
             return this.yoga(req);
         }

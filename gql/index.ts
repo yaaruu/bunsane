@@ -2,6 +2,10 @@ import {createSchema, createYoga, type Plugin} from 'graphql-yoga';
 import { GraphQLSchema, GraphQLError } from 'graphql';
 import { GraphQLObjectType, GraphQLField, GraphQLOperation } from './Generator';
 import {GraphQLFieldTypes} from "./types"
+import {logger as MainLogger} from "core/Logger"
+
+const logger = MainLogger.child({scope: "GQL"});
+
 import {
     isValidGraphQLType,
 } from "./helpers";
@@ -63,37 +67,39 @@ const staticResolvers = {
     }
 };
 
+const maskError = (error: any, message: string): GraphQLError => {
+    console.log("MASKED ERROR:", message);
+    console.log(JSON.stringify(error.extensions));
+    // Handle JWT authentication errors specifically
+    if (error.extensions?.code === 'DOWNSTREAM_SERVICE_ERROR' && error.extensions?.http?.status === 401) {
+        return new GraphQLError('Error: Unauthorized', {
+            extensions: {
+                code: 'UNAUTHORIZED',
+                http: { status: 401 }
+            }
+        });
+    }
+    
+    if (process.env.NODE_ENV === 'production') {
+        logger.error("GraphQL Error:", error);
+        // Mask sensitive error details in production
+        return new GraphQLError('Internal server error', {
+            extensions: {
+                code: 'INTERNAL_SERVER_ERROR',
+            },
+        });
+    }
+    // In development, return the original error
+    return error instanceof GraphQLError ? error : new GraphQLError(message, { originalError: error });
+};
+
 export function createYogaInstance(schema?: GraphQLSchema, plugins: Plugin[] = []) {
     if (schema) {
         return createYoga({
             schema,
             plugins,
-            // Configure error handling to preserve error messages for clients
             maskedErrors: {
-                // In development, show full error details
-                // In production, you might want to mask sensitive information
-                maskError: (error: any, message: string): GraphQLError => {
-                    // Handle JWT authentication errors specifically
-                    if (error.extensions?.code === 'DOWNSTREAM_SERVICE_ERROR' && error.extensions?.http?.status === 401) {
-                        return new GraphQLError('Error: Unauthorized', {
-                            extensions: {
-                                code: 'UNAUTHORIZED',
-                                http: { status: 401 }
-                            }
-                        });
-                    }
-                    
-                    if (process.env.NODE_ENV === 'production') {
-                        // Mask sensitive error details in production
-                        return new GraphQLError('Internal server error', {
-                            extensions: {
-                                code: 'INTERNAL_SERVER_ERROR',
-                            },
-                        });
-                    }
-                    // In development, return the original error
-                    return error instanceof GraphQLError ? error : new GraphQLError(message, { originalError: error });
-                },
+                maskError,
             },
         });
     } else {
@@ -104,26 +110,7 @@ export function createYogaInstance(schema?: GraphQLSchema, plugins: Plugin[] = [
             }),
             plugins,
             maskedErrors: {
-                maskError: (error: any, message: string): GraphQLError => {
-                    // Handle JWT authentication errors specifically
-                    if (error.extensions?.code === 'DOWNSTREAM_SERVICE_ERROR' && error.extensions?.http?.status === 401) {
-                        return new GraphQLError('Error: Unauthorized', {
-                            extensions: {
-                                code: 'UNAUTHORIZED',
-                                http: { status: 401 }
-                            }
-                        });
-                    }
-                    
-                    if (process.env.NODE_ENV === 'production') {
-                        return new GraphQLError('Internal server error', {
-                            extensions: {
-                                code: 'INTERNAL_SERVER_ERROR',
-                            },
-                        });
-                    }
-                    return error instanceof GraphQLError ? error : new GraphQLError(message, { originalError: error });
-                },
+                maskError,
             },
         });
     }
