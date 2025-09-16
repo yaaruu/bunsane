@@ -11,15 +11,13 @@ function compNameToFieldName(compName: string): string {
  * 
  * Example usage:
  * ```typescript
- * class UserArcheType extends ArcheType {
- *   constructor(name: string, email: string) {
- *     super();
- *     this.addComponent(NameComponent, { value: name });
- *     this.addComponent(EmailComponent, { value: email });
- *   }
- * }
+ * const UserArcheType = new ArcheType([NameComponent, EmailComponent, PasswordComponent]);
+ *
  * 
- * const entity = new UserArcheType("John", "john@example.com").createEntity();
+ * // FROM Request or other source 
+ * const userInput = { name: "John Doe", email: "john@example.com", password: "securepassword" };
+ * const entity = UserArcheType.fill(userInput).createEntity();
+ * await entity.save();
  * ```
  */
 
@@ -98,6 +96,24 @@ class ArcheType {
         const entity = this.createEntity();
         await entity.save();
         return entity;
+    }
+
+    /**
+     * Unwraps an entity into a plain object containing the component data.
+     * @param entity The entity to unwrap
+     * @param exclude An optional array of field names to exclude from the result (e.g., sensitive data like passwords)
+     * @returns A promise that resolves to an object with component data
+     */
+    public async Unwrap(entity: Entity, exclude: string[] = []): Promise<Record<string, any>> {
+        const result: any = { id: entity.id };
+        for (const [field, ctor] of Object.entries(this.componentMap)) {
+            if (exclude.includes(field)) continue;
+            const comp = await entity.get(ctor as any);
+            if (comp) {
+                result[field] = (comp as any).value;
+            }
+        }
+        return result;
     }
 }
 
