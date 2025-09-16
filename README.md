@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="./BunSane.jpg" alt="BunSane" width="520" />
+<img src="https://raw.githubusercontent.com/yaaruu/bunsane/refs/heads/main/BunSane.jpg" alt="BunSane" width="520" />
 
 # BunSane — Batteries‑included TypeScript API framework for Bun
 
