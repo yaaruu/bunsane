@@ -31,11 +31,7 @@ export type QueryFilterOptions = {
 };
 
 function wrapLog(str: string) {
-    // console.log(str);
-}
-
-function escapeSqlString(str: string): string {
-    return str.replace(/'/g, "''");
+    console.log(str);
 }
 
 class Query {
@@ -106,9 +102,8 @@ class Query {
         return { filters };
     }
 
-    private buildFilterCondition(filter: QueryFilter): string {
+    private buildFilterCondition(filter: QueryFilter, alias: string, paramIndex: number): { sql: string, params: any[], newParamIndex: number } {
         const { field, operator, value } = filter;
-        const escapedField = field.replace(/'/g, "''");
         switch (operator) {
             case "=":
             case ">":
@@ -117,24 +112,22 @@ class Query {
             case "<=":
             case "!=":
                 if (typeof value === "string") {
-                    const escapedValue = value.replace(/'/g, "''");
-                    return `data->>'${escapedField}' ${operator} '${escapedValue}'`;
+                    return { sql: `${alias}.data->>'${field}' ${operator} $${paramIndex}`, params: [value], newParamIndex: paramIndex + 1 };
                 } else {
-                    return `(data->>'${escapedField}')::numeric ${operator} ${value}`;
+                    return { sql: `(${alias}.data->>'${field}')::numeric ${operator} $${paramIndex}`, params: [value], newParamIndex: paramIndex + 1 };
                 }
             case "LIKE":
-                const escapedValue = value.replace(/'/g, "''");
-                return `data->>'${escapedField}' LIKE '${escapedValue}'`;
+                return { sql: `${alias}.data->>'${field}' LIKE $${paramIndex}`, params: [value], newParamIndex: paramIndex + 1 };
             case "IN":
                 if (Array.isArray(value)) {
-                    const valueList = value.map(v => typeof v === "string" ? `'${v.replace(/'/g, "''")}'` : v).join(", ");
-                    return `data->>'${escapedField}' IN (${valueList})`;
+                    const placeholders = Array.from({length: value.length}, (_, i) => `$${paramIndex + i}`).join(', ');
+                    return { sql: `${alias}.data->>'${field}' IN (${placeholders})`, params: value, newParamIndex: paramIndex + value.length };
                 }
                 throw new Error("IN operator requires an array of values");
             case "NOT IN":
                 if (Array.isArray(value)) {
-                    const valueList = value.map(v => typeof v === "string" ? `'${v.replace(/'/g, "''")}'` : v).join(", ");
-                    return `data->>'${escapedField}' NOT IN (${valueList})`;
+                    const placeholders = Array.from({length: value.length}, (_, i) => `$${paramIndex + i}`).join(', ');
+                    return { sql: `${alias}.data->>'${field}' NOT IN (${placeholders})`, params: value, newParamIndex: paramIndex + value.length };
                 }
                 throw new Error("NOT IN operator requires an array of values");
             default:
@@ -142,11 +135,20 @@ class Query {
         }
     }
 
-    private buildFilterWhereClause(typeId: string, filters: QueryFilter[]): string {
-        if (filters.length === 0) return "";
+    private buildFilterWhereClause(typeId: string, filters: QueryFilter[], alias: string, paramIndex: number): { sql: string, params: any[], newParamIndex: number } {
+        if (filters.length === 0) return { sql: '', params: [], newParamIndex: paramIndex };
         
-        const conditions = filters.map(filter => this.buildFilterCondition(filter));
-        return conditions.join(" AND ");
+        const conditions: string[] = [];
+        const allParams: any[] = [];
+        let currentIndex = paramIndex;
+        for (const filter of filters) {
+            const { sql, params, newParamIndex } = this.buildFilterCondition(filter, alias, currentIndex);
+            conditions.push(sql);
+            allParams.push(...params);
+            currentIndex = newParamIndex;
+        }
+        const sql = conditions.join(' AND ');
+        return { sql, params: allParams, newParamIndex: currentIndex };
     }
 
 
@@ -204,16 +206,16 @@ class Query {
                 ids = await this.getIdsWithFiltersAndExclusions(componentIds, excludedIds, componentCount, this.limit, this.offsetValue);
                 break;
             case hasRequired && hasExcluded:
-                const componentIdsString = inList(componentIds);
-                const excludedIdsString = inList(excludedIds);
+                const componentIdsString = inList(componentIds, 1);
+                const excludedIdsString = inList(excludedIds, componentIdsString.newParamIndex);
                 let excludedQuery = db`
                     SELECT ec.entity_id as id
                     FROM entity_components ec
-                    WHERE ec.type_id IN ${componentIdsString} AND ec.deleted_at IS NULL
+                    WHERE ec.type_id IN ${db.unsafe(componentIdsString.sql, componentIdsString.params)} AND ec.deleted_at IS NULL
                     ${this.withId ? db`AND ec.entity_id = ${this.withId}` : db``}
                     AND NOT EXISTS (
                         SELECT 1 FROM entity_components ec_ex 
-                        WHERE ec_ex.entity_id = ec.entity_id AND ec_ex.type_id IN ${excludedIdsString} AND ec_ex.deleted_at IS NULL
+                        WHERE ec_ex.entity_id = ec.entity_id AND ec_ex.type_id IN ${db.unsafe(excludedIdsString.sql, excludedIdsString.params)} AND ec_ex.deleted_at IS NULL
                     )
                     GROUP BY ec.entity_id
                     HAVING COUNT(DISTINCT ec.type_id) = ${componentCount}
@@ -225,7 +227,7 @@ class Query {
                 if (this.offsetValue > 0) {
                     excludedQuery = db`${excludedQuery} OFFSET ${this.offsetValue}`;
                 }
-                wrapLog(`Executing query: ${excludedQuery}`);
+                wrapLog('Executing excluded query');
                 const excludedQueryResult = await excludedQuery;
                 ids = excludedQueryResult.map((row: any) => row.id);
                 break;
@@ -244,30 +246,30 @@ class Query {
                     if (this.offsetValue > 0) {
                         queryStr = db`${queryStr} OFFSET ${this.offsetValue}`;
                     }
-                    wrapLog(`Executing optimized query: ${queryStr}`);
+                    wrapLog('Executing optimized query');
                     requiredOnlyQueryResult = await queryStr;
                 } else {
-                    const compIds = inList(componentIds);
-                    queryStr = db`SELECT DISTINCT entity_id as id FROM entity_components WHERE type_id IN ${compIds} ${this.withId ? db`AND entity_id = ${this.withId}` : db``} AND deleted_at IS NULL GROUP BY entity_id HAVING COUNT(DISTINCT type_id) = ${componentCount} ORDER BY entity_id`;
+                    const compIds = inList(componentIds, 1);
+                    queryStr = db`SELECT DISTINCT entity_id as id FROM entity_components WHERE type_id IN ${db.unsafe(compIds.sql, compIds.params)} ${this.withId ? db`AND entity_id = ${this.withId}` : db``} AND deleted_at IS NULL GROUP BY entity_id HAVING COUNT(DISTINCT type_id) = ${componentCount} ORDER BY entity_id`;
                     if (this.limit !== null) {
                         queryStr = db`${queryStr} LIMIT ${this.limit}`;
                     }
                     if (this.offsetValue > 0) {
                         queryStr = db`${queryStr} OFFSET ${this.offsetValue}`;
                     }
-                    wrapLog(`Executing query: ${queryStr}`);
+                    wrapLog('Executing query');
                     requiredOnlyQueryResult = await queryStr;
                 }
                 ids = requiredOnlyQueryResult.map((row: any) => row.id);
                 break;
             case hasExcluded:
-                const onlyExcludedIdsString = inList(excludedIds);
+                const onlyExcludedIdsString = inList(excludedIds, 1);
                 let onlyExcludedQuery = db`
                     SELECT DISTINCT ec.entity_id as id
                     FROM entity_components ec 
                     WHERE ${this.withId ? db`ec.entity_id = ${this.withId} AND ` : db``} NOT EXISTS (
                         SELECT 1 FROM entity_components ec_ex 
-                        WHERE ec_ex.entity_id = ec.entity_id AND ec_ex.type_id IN ${onlyExcludedIdsString} AND ec_ex.deleted_at IS NULL
+                        WHERE ec_ex.entity_id = ec.entity_id AND ec_ex.type_id IN ${db.unsafe(onlyExcludedIdsString.sql, onlyExcludedIdsString.params)} AND ec_ex.deleted_at IS NULL
                     )
                     AND ec.deleted_at IS NULL
                     ORDER BY ec.entity_id
@@ -278,7 +280,7 @@ class Query {
                 if (this.offsetValue > 0) {
                     onlyExcludedQuery = db`${onlyExcludedQuery} OFFSET ${this.offsetValue}`;
                 }
-                wrapLog(`Executing query: ${onlyExcludedQuery}`);
+                wrapLog('Executing only excluded query');
                 const onlyExcludedQueryResult = await onlyExcludedQuery;
                 ids = onlyExcludedQueryResult.map((row: any) => row.id);
                 break;
@@ -325,53 +327,63 @@ class Query {
     }
 
     private async getIdsWithFilters(componentIds: string[], componentCount: number, limit?: number | null, offset?: number): Promise<string[]> {
-        const compIds = inList(componentIds);
-        let query = db`
-            SELECT DISTINCT ec.entity_id as id 
-            FROM entity_components ec
-        `;
+        let params: any[] = [];
+        let paramIndex = 1;
+        const compIds = inList(componentIds, paramIndex);
+        params.push(...compIds.params);
+        paramIndex = compIds.newParamIndex;
         
-        const joins: any[] = [];
-        const whereConditions: any[] = [db`ec.type_id IN ${compIds}`, db`ec.deleted_at IS NULL`];
-        if (this.withId) {
-            whereConditions.push(db`ec.entity_id = ${this.withId}`);
-        }
-        
+        const joins: string[] = [];
         let joinIndex = 0;
         for (const [typeId, filters] of this.componentFilters.entries()) {
             if (componentIds.includes(typeId)) {
                 const alias = `c${joinIndex}`;
-                joins.push(db`JOIN components ${sql(alias)} ON ec.entity_id = ${sql(alias)}.entity_id AND ${sql(alias)}.type_id = ${typeId} AND ${sql(alias)}.deleted_at IS NULL`);
-                
-                const filterCondition = this.buildFilterWhereClause(typeId, filters);
-                if (filterCondition) {
-                    // Note: filterCondition still uses string, but since it's parameterized in buildFilterCondition, it's ok for now
-                    // To fully parameterize, need to refactor buildFilterCondition
-                    whereConditions.push(sql(filterCondition.replace(/data->/g, `${alias}.data->`)));
+                joins.push(`JOIN components ${alias} ON ec.entity_id = ${alias}.entity_id AND ${alias}.type_id = $${paramIndex} AND ${alias}.deleted_at IS NULL`);
+                params.push(typeId);
+                paramIndex++;
+                joinIndex++;
+            }
+        }
+        
+        let sql = `SELECT DISTINCT ec.entity_id as id FROM entity_components ec ${joins.join(' ')} WHERE ec.type_id IN ${compIds.sql} AND ec.deleted_at IS NULL`;
+        
+        if (this.withId) {
+            sql += ` AND ec.entity_id = $${paramIndex}`;
+            params.push(this.withId);
+            paramIndex++;
+        }
+        
+        joinIndex = 0;
+        for (const [typeId, filters] of this.componentFilters.entries()) {
+            if (componentIds.includes(typeId)) {
+                const alias = `c${joinIndex}`;
+                const filterConditions = this.buildFilterWhereClause(typeId, filters, alias, paramIndex);
+                if (filterConditions.sql) {
+                    sql += ` AND ${filterConditions.sql}`;
+                    params.push(...filterConditions.params);
+                    paramIndex = filterConditions.newParamIndex;
                 }
                 joinIndex++;
             }
         }
         
-        for (const join of joins) {
-            query = db`${query} ${join}`;
-        }
-        query = db`${query} WHERE`;
-        for (let i = 0; i < whereConditions.length; i++) {
-            if (i > 0) query = db`${query} AND`;
-            query = db`${query} ${whereConditions[i]}`;
-        }
-        query = db`${query} GROUP BY ec.entity_id HAVING COUNT(DISTINCT ec.type_id) = ${componentCount}`;
-        query = db`${query} ORDER BY ec.entity_id`;
+        sql += ` GROUP BY ec.entity_id HAVING COUNT(DISTINCT ec.type_id) = $${paramIndex}`;
+        params.push(componentCount);
+        paramIndex++;
+        sql += ` ORDER BY ec.entity_id`;
         if (limit !== null && limit !== undefined) {
-            query = db`${query} LIMIT ${limit}`;
+            sql += ` LIMIT $${paramIndex}`;
+            params.push(limit);
+            paramIndex++;
         }
         if (offset && offset > 0) {
-            query = db`${query} OFFSET ${offset}`;
+            sql += ` OFFSET $${paramIndex}`;
+            params.push(offset);
+            paramIndex++;
         }
         
-        wrapLog(`Executing filtered query: ${query}`);
-        const filteredResult = await query;
+        wrapLog(`Executing filtered query: ${sql}`);
+        const filteredResult = await db.unsafe(sql, params);
         return filteredResult.map((row: any) => row.id);
     }
 
@@ -382,8 +394,8 @@ class Query {
             return [];
         }
         
-        const idsList = inList(entityIds);
-        const excludedList = inList(excludedIds);
+        const idsList = sql(entityIds);
+        const excludedList = inList(excludedIds, 1);
         let query = db`
             WITH entity_list AS (
                 SELECT unnest(${idsList}) as id
@@ -392,7 +404,7 @@ class Query {
             FROM entity_list el
             WHERE NOT EXISTS (
                 SELECT 1 FROM entity_components ec 
-                WHERE ec.entity_id = el.id AND ec.type_id IN ${excludedList} AND ec.deleted_at IS NULL
+                WHERE ec.entity_id = el.id AND ec.type_id IN ${db.unsafe(excludedList.sql, excludedList.params)} AND ec.deleted_at IS NULL
             )
             ORDER BY el.id
         `;
