@@ -39,7 +39,7 @@ class MassiveComponent extends BaseComponent {
 }
 
 describe('Insert Entity Tests', () => {
-    test('Creating 100000 entities', async () => {
+    test('Creating 10000 entities', async () => {
         const entities = [];
         for(let i = 0; i < 10000; i++) {
             const entity = Entity.Create()

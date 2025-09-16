@@ -35,3 +35,33 @@ export function isFieldRequested(info: any, fieldName: string): boolean {
         selection.name.value === fieldName
     );
 }
+
+export function isFieldRequestedSafe(info: any, ...path: string[]): boolean {
+    if (!info || !info.fieldNodes || info.fieldNodes.length === 0) return false;
+    const fieldNode = info.fieldNodes[0];
+    if (!fieldNode.selectionSet) return false;
+    return isPathSelected(fieldNode.selectionSet, path);
+}
+
+function isPathSelected(selectionSet: any, path: string[]): boolean {
+    if (path.length === 0) return true;
+    const [current, ...rest] = path;
+    for (const selection of selectionSet.selections) {
+        if (selection.kind === 'Field') {
+            if (selection.name.value === current) {
+                if (rest.length === 0) return true;
+                if (selection.selectionSet) {
+                    return isPathSelected(selection.selectionSet, rest);
+                }
+                return false;
+            }
+        } else if (selection.kind === 'InlineFragment' || selection.kind === 'FragmentSpread') {
+            // For simplicity, assume fragments are expanded; in practice, they should be resolved
+            // Here, we can check if the fragment has the field
+            if (selection.selectionSet) {
+                if (isPathSelected(selection.selectionSet, path)) return true;
+            }
+        }
+    }
+    return false;
+}

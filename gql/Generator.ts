@@ -173,7 +173,8 @@ export function generateGraphQLSchema(services: any[]): { schema: GraphQLSchema 
 
     logger.trace(`System Type Defs: ${typeDefs}`);
     let schema : GraphQLSchema | null = null;
-    if(typeDefs !== "")  {
+    // Check if typeDefs contains actual schema definitions, not just whitespace
+    if(typeDefs.trim() !== "" && (queryFields.length > 0 || mutationFields.length > 0 || scalarTypes.size > 0))  {
         schema = createSchema({ typeDefs, resolvers });
     }
     return { schema, resolvers };

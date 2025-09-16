@@ -9,6 +9,8 @@ import {logger} from "./core/Logger";
 import { handleGraphQLError, responseError } from "./core/ErrorHandler";
 import { type Plugin } from "graphql-yoga";
 import { BatchLoader } from "core/BatchLoader";
+import { createRequestContextPlugin } from "./core/RequestContext";
+import type { RequestLoaders } from "./core/RequestLoaders";
 export { 
     App, 
     ArcheType,
@@ -27,5 +29,8 @@ export {
     type Plugin,
 
     responseError,
-    handleGraphQLError
+    handleGraphQLError,
+
+    createRequestContextPlugin,
+    type RequestLoaders
 };

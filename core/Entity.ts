@@ -146,18 +146,23 @@ export class Entity {
                 console.log("Entity is not persisted, cannot delete.");
                 return resolve(false); 
             }
-            await db.transaction(async (trx) => {
-                if(force) {
-                    await trx`DELETE FROM entity_components WHERE entity_id = ${this.id}`;
-                    await trx`DELETE FROM components WHERE entity_id = ${this.id}`;
-                    await trx`DELETE FROM entities WHERE id = ${this.id}`;
-                } else {
-                    await trx`UPDATE entities SET deleted_at = CURRENT_TIMESTAMP WHERE id = ${this.id} AND deleted_at IS NULL`;
-                    await trx`UPDATE entity_components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`;
-                    await trx`UPDATE components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`;
-                }
-            });
-            resolve(true);
+            try {
+                await db.transaction(async (trx) => {
+                    if(force) {
+                        await trx`DELETE FROM entity_components WHERE entity_id = ${this.id}`;
+                        await trx`DELETE FROM components WHERE entity_id = ${this.id}`;
+                        await trx`DELETE FROM entities WHERE id = ${this.id}`;
+                    } else {
+                        await trx`UPDATE entities SET deleted_at = CURRENT_TIMESTAMP WHERE id = ${this.id} AND deleted_at IS NULL`;
+                        await trx`UPDATE entity_components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`;
+                        await trx`UPDATE components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`;
+                    }
+                });
+                resolve(true);
+            } catch (error) {
+                logger.error(`Failed to delete entity: ${error}`);
+                resolve(false);
+            }
         })
     }
 

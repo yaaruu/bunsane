@@ -2,6 +2,8 @@ import db from "database";
 import { logger as MainLogger } from "core/Logger";
 const logger = MainLogger.child({ scope: "DatabaseHelper" });
 
+const BUNSANE_RELATION_TYPED_COLUMN = process.env.BUNSANE_RELATION_TYPED_COLUMN === 'true' || false;
+
 export const GetSchema = async () => {
     const dbSchema = await db`SELECT table_name 
         FROM information_schema.tables 
@@ -146,6 +148,13 @@ export const CreateComponentPartitionTable = async (comp_name: string, type_id: 
                 PARTITION OF components
                 FOR VALUES IN ('${type_id}');`);
         logger.trace(`Successfully created partition table: ${table_name}`);
+
+        if (BUNSANE_RELATION_TYPED_COLUMN && indexedProperties?.includes('value')) {
+            logger.trace(`Adding typed FK column for ${table_name}`);
+            await db.unsafe(`ALTER TABLE ${table_name} ADD COLUMN IF NOT EXISTS fk_id UUID GENERATED ALWAYS AS ((data->>'value')::UUID) STORED;`);
+            await db.unsafe(`CREATE INDEX IF NOT EXISTS idx_${table_name}_fk_id ON ${table_name} (fk_id);`);
+            logger.trace(`Added fk_id column and index for ${table_name}`);
+        }
         
     } catch (error) {
         logger.error(`Failed to create component partition table for ${comp_name}: ${error}`);
