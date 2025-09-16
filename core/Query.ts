@@ -30,10 +30,6 @@ export type QueryFilterOptions = {
     filters?: QueryFilter[];
 };
 
-function wrapLog(str: string) {
-    console.log(str);
-}
-
 class Query {
     private requiredComponents: Set<string> = new Set<string>();
     private excludedComponents: Set<string> = new Set<string>();
@@ -227,7 +223,6 @@ class Query {
                 if (this.offsetValue > 0) {
                     excludedQuery = db`${excludedQuery} OFFSET ${this.offsetValue}`;
                 }
-                wrapLog('Executing excluded query');
                 const excludedQueryResult = await excludedQuery;
                 ids = excludedQueryResult.map((row: any) => row.id);
                 break;
@@ -246,7 +241,6 @@ class Query {
                     if (this.offsetValue > 0) {
                         queryStr = db`${queryStr} OFFSET ${this.offsetValue}`;
                     }
-                    wrapLog('Executing optimized query');
                     requiredOnlyQueryResult = await queryStr;
                 } else {
                     const compIds = inList(componentIds, 1);
@@ -257,7 +251,6 @@ class Query {
                     if (this.offsetValue > 0) {
                         queryStr = db`${queryStr} OFFSET ${this.offsetValue}`;
                     }
-                    wrapLog('Executing query');
                     requiredOnlyQueryResult = await queryStr;
                 }
                 ids = requiredOnlyQueryResult.map((row: any) => row.id);
@@ -280,7 +273,6 @@ class Query {
                 if (this.offsetValue > 0) {
                     onlyExcludedQuery = db`${onlyExcludedQuery} OFFSET ${this.offsetValue}`;
                 }
-                wrapLog('Executing only excluded query');
                 const onlyExcludedQueryResult = await onlyExcludedQuery;
                 ids = onlyExcludedQueryResult.map((row: any) => row.id);
                 break;
@@ -382,7 +374,6 @@ class Query {
             paramIndex++;
         }
         
-        wrapLog(`Executing filtered query: ${sql}`);
         const filteredResult = await db.unsafe(sql, params);
         return filteredResult.map((row: any) => row.id);
     }

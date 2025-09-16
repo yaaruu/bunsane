@@ -11,6 +11,7 @@ export default class App {
     private yoga: any;
     private yogaPlugins: Plugin[] = [];
     private restEndpoints: Array<{ method: string; path: string; handler: Function; service: any }> = [];
+    private restEndpointMap: Map<string, { method: string; path: string; handler: Function; service: any }> = new Map();
     private staticAssets: Map<string, string> = new Map();
 
     constructor() {
@@ -55,12 +56,14 @@ export default class App {
                             const endpoints = (service.constructor as any).httpEndpoints;
                             if (endpoints) {
                                 for (const endpoint of endpoints) {
-                                    this.restEndpoints.push({
+                                    const endpointInfo = {
                                         method: endpoint.method,
                                         path: endpoint.path,
                                         handler: endpoint.handler.bind(service),
                                         service: service
-                                    });
+                                    };
+                                    this.restEndpoints.push(endpointInfo);
+                                    this.restEndpointMap.set(`${endpoint.method}:${endpoint.path}`, endpointInfo);
                                 }
                             }
                         }
@@ -123,25 +126,25 @@ export default class App {
             }
         }
 
-        // TODO: Optimize the lookup with a map if there are many endpoints
-        for (const endpoint of this.restEndpoints) {
-            if (endpoint.method === method && endpoint.path === url.pathname) {
-                try {
-                    const result = await endpoint.handler(req);
-                    if (result instanceof Response) {
-                        return result;
-                    } else {
-                        return new Response(JSON.stringify(result), {
-                            headers: { 'Content-Type': 'application/json' }
-                        });
-                    }
-                } catch (error) {
-                    logger.error(`Error in REST endpoint ${method} ${endpoint.path}`, error as any);
-                    return new Response(JSON.stringify({ error: 'Internal server error' }), {
-                        status: 500,
+        // Lookup REST endpoint using map for O(1) performance
+        const endpointKey = `${method}:${url.pathname}`;
+        const endpoint = this.restEndpointMap.get(endpointKey);
+        if (endpoint) {
+            try {
+                const result = await endpoint.handler(req);
+                if (result instanceof Response) {
+                    return result;
+                } else {
+                    return new Response(JSON.stringify(result), {
                         headers: { 'Content-Type': 'application/json' }
                     });
                 }
+            } catch (error) {
+                logger.error(`Error in REST endpoint ${method} ${endpoint.path}`, error as any);
+                return new Response(JSON.stringify({ error: 'Internal server error' }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json' }
+                });
             }
         }
 

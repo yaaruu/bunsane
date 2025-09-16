@@ -71,8 +71,6 @@ const staticResolvers = {
 };
 
 const maskError = (error: any, message: string): GraphQLError => {
-    console.log("MASKED ERROR:", message);
-    console.log(JSON.stringify(error.extensions));
     // Handle JWT authentication errors specifically
     if (error.extensions?.code === 'DOWNSTREAM_SERVICE_ERROR' && error.extensions?.http?.status === 401) {
         return new GraphQLError('Error: Unauthorized', {
