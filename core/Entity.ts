@@ -23,7 +23,7 @@ export class Entity {
         return new Entity();
     }
 
-    private addComponent(component: BaseComponent): Entity {
+    protected addComponent(component: BaseComponent): Entity {
         this.components.set(component.getTypeID(), component);
         return this;
     }
@@ -73,7 +73,6 @@ export class Entity {
      * @param Component
      * @returns `Component | null` *if entity doesn't have the component
      */
-    @timed("Entity.get")
     public async get<T extends BaseComponent>(ctor: new (...args: any[]) => T): Promise<ComponentDataType<T> | null> {
         const comp = Array.from(this.components.values()).find(comp => comp instanceof ctor) as ComponentGetter<T> | undefined;
         if(typeof comp !== "undefined") {
@@ -158,6 +157,7 @@ export class Entity {
                     await trx`UPDATE components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`;
                 }
             });
+            resolve(true);
         })
     }
 
@@ -204,6 +204,34 @@ export class Entity {
         }
 
         return Array.from(entitiesMap.values());
+    }
+
+    public static async LoadComponents(entities: Entity[], componentIds: string[]): Promise<void> {
+        if (entities.length === 0 || componentIds.length === 0) return;
+
+        const entityIds = entities.map(e => e.id);
+
+        const components = await db`
+            SELECT c.id, c.entity_id, c.type_id, c.data
+            FROM components c
+            WHERE c.entity_id IN ${sql(entityIds)} AND c.type_id IN ${sql(componentIds)} AND c.deleted_at IS NULL
+        `;
+
+        for (const row of components) {
+            const { id, entity_id, type_id, data } = row;
+            const entity = entities.find(e => e.id === entity_id);
+            if (entity) {
+                const ctor = ComponentRegistry.getConstructor(type_id);
+                if (ctor) {
+                    const comp = new ctor();
+                    Object.assign(comp, data);
+                    comp.id = id;
+                    comp.setPersisted(true);
+                    comp.setDirty(false);
+                    entity.addComponent(comp);
+                }
+            }
+        }
     }
 
     public static async FindById(id: string): Promise<Entity | null> {

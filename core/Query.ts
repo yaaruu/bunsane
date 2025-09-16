@@ -45,6 +45,7 @@ class Query {
     private withId: string | null = null;
     private limit: number | null = null;
     private offsetValue: number = 0;
+    private eagerComponents: Set<string> = new Set<string>();
 
     static filterOp = FilterOp;
 
@@ -72,7 +73,17 @@ class Query {
         return this;
     }
 
-    
+    public eagerLoad<T extends BaseComponent>(ctors: (new (...args: any[]) => T)[]): this {
+        for (const ctor of ctors) {
+            const type_id = ComponentRegistry.getComponentId(ctor.name);
+            if (!type_id) {
+                throw new Error(`Component ${ctor.name} is not registered.`);
+            }
+            this.eagerComponents.add(type_id);
+        }
+        return this;
+    }
+
     public static filter(field: string, operator: FilterOperator, value: any): QueryFilter {
         return { field, operator, value };
     }
@@ -292,6 +303,9 @@ class Query {
                     entity.setDirty(false);
                     entities[i + 3] = entity;
                 }
+            }
+            if (this.eagerComponents.size > 0) {
+                await Entity.LoadComponents(entities, Array.from(this.eagerComponents));
             }
             return entities;
         }
