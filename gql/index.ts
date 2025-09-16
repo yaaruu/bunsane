@@ -1,8 +1,9 @@
 import {createSchema, createYoga, type Plugin} from 'graphql-yoga';
 import { GraphQLSchema, GraphQLError } from 'graphql';
-import { GraphQLObjectType, GraphQLField, GraphQLOperation } from './Generator';
+import { GraphQLObjectType, GraphQLField, GraphQLOperation, GraphQLScalarType } from './Generator';
 import {GraphQLFieldTypes} from "./types"
 import {logger as MainLogger} from "core/Logger"
+import { isFieldRequested } from './helpers';
 
 const logger = MainLogger.child({scope: "GQL"});
 
@@ -20,6 +21,8 @@ export {
     GraphQLOperation,
     GraphQLFieldTypes,
     isValidGraphQLType,
+    GraphQLScalarType,
+    isFieldRequested
 }
 export type {
     GraphQLType,

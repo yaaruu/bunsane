@@ -5,11 +5,13 @@ import { logger } from "core/Logger";
 import { createYogaInstance } from "gql";
 import ServiceRegistry from "service/ServiceRegistry";
 import type { Plugin } from "graphql-yoga";
+import * as path from "path";
 
 export default class App {
     private yoga: any;
     private yogaPlugins: Plugin[] = [];
     private restEndpoints: Array<{ method: string; path: string; handler: Function; service: any }> = [];
+    private staticAssets: Map<string, string> = new Map();
 
     constructor() {
         this.init();
@@ -95,10 +97,32 @@ export default class App {
         this.yogaPlugins.push(plugin);
     }
 
+    public addStaticAssets(route: string, folder: string) {
+        // Resolve the folder path relative to the current working directory
+        const resolvedFolder = path.resolve(folder);
+        this.staticAssets.set(route, resolvedFolder);
+    }
+
     private async handleRequest(req: Request): Promise<Response> {
         const url = new URL(req.url);
         const method = req.method;
       
+        // Check for static assets
+        for (const [route, folder] of this.staticAssets) {
+            if (url.pathname.startsWith(route)) {
+                const relativePath = url.pathname.slice(route.length);
+                const filePath = path.join(folder, relativePath);
+                try {
+                    const file = Bun.file(filePath);
+                    if (await file.exists()) {
+                        return new Response(file);
+                    }
+                } catch (error) {
+                    logger.error(`Error serving static file ${filePath}:`, error as any);
+                }
+            }
+        }
+
         // TODO: Optimize the lookup with a map if there are many endpoints
         for (const endpoint of this.restEndpoints) {
             if (endpoint.method === method && endpoint.path === url.pathname) {

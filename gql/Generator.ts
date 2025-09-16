@@ -1,5 +1,5 @@
 import { GraphQLSchema, GraphQLError } from "graphql";
-import {makeExecutableSchema} from "@graphql-tools/schema";
+import { createSchema } from "graphql-yoga";
 import { logger as MainLogger } from "core/Logger";
 import type { GraphQLType } from "./helpers";
 const logger = MainLogger.child({ scope: "GraphQLGenerator" });
@@ -27,6 +27,13 @@ export function GraphQLObjectType(meta: GraphQLObjectTypeMeta) {
     }
 }
 
+export function GraphQLScalarType(name: string) {
+    return (target: any) => {
+        if (!target.__graphqlScalarTypes) target.__graphqlScalarTypes = [];
+        target.__graphqlScalarTypes.push(name);
+    }
+}
+
 export function GraphQLOperation(meta: GraphQLOperationMeta) {
     return function (target: any, propertyKey: string, descriptor: PropertyDescriptor) {
         if (!target.__graphqlOperations) target.__graphqlOperations = [];
@@ -47,13 +54,23 @@ export function GraphQLField(meta: GraphQLFieldMeta) {
 }
 
 export function generateGraphQLSchema(services: any[]): { schema: GraphQLSchema | null; resolvers: any } {
-    let typeDefs = "";
+    let typeDefs = `
+    `;
+    const scalarTypes: Set<string> = new Set();
     const resolvers: any = { Query: {}, Mutation: {} };
     const queryFields: string[] = [];
     const mutationFields: string[] = [];
 
     services.forEach(service => {
         logger.trace(`Processing service: ${service.constructor.name}`);
+        if(service.constructor.__graphqlScalarTypes) {
+            for (const scalarName of service.constructor.__graphqlScalarTypes) {
+                if (!scalarTypes.has(scalarName)) {
+                    scalarTypes.add(scalarName);
+                    typeDefs += `scalar ${scalarName}\n`;
+                }
+            }
+        }
         if (service.constructor.__graphqlObjectType) {
             for (const meta of service.constructor.__graphqlObjectType) {
                 const { name, fields } = meta;
@@ -68,9 +85,9 @@ export function generateGraphQLSchema(services: any[]): { schema: GraphQLSchema 
                     const inputName = `${name}Input`;
                     typeDefs += `input ${inputName} {\n${Object.entries(input).map(([k, v]) => `  ${k}: ${v}`).join('\n')}\n}\n`;
                     fieldDef += `(input: ${inputName}!)`;
-                    resolvers[type][name] = async (_: any, args: any, context: any) => {
+                    resolvers[type][name] = async (_: any, args: any, context: any, info: any) => {
                         try {
-                            return await service[propertyKey](args.input || args, context);
+                            return await service[propertyKey](args.input || args, context, info);
                         } catch (error) {
                             logger.error(`Error in ${type}.${name}:`);
                             logger.error(error);
@@ -86,9 +103,9 @@ export function generateGraphQLSchema(services: any[]): { schema: GraphQLSchema 
                         }
                     };
                 } else {
-                    resolvers[type][name] = async (_: any, args: any, context: any) => {
+                    resolvers[type][name] = async (_: any, args: any, context: any, info: any) => {
                         try {
-                            return await service[propertyKey]({}, context);
+                            return await service[propertyKey]({}, context, info);
                         } catch (error) {
                             logger.error(`Error in ${type}.${name}:`);
                             logger.error(error);
@@ -126,9 +143,9 @@ export function generateGraphQLSchema(services: any[]): { schema: GraphQLSchema 
             service.__graphqlFields.forEach((fieldMeta: any) => {
                 const { type, field, propertyKey } = fieldMeta;
                 if (!resolvers[type]) resolvers[type] = {};
-                resolvers[type][field] = async (parent: any, args: any, context: any) => {
+                resolvers[type][field] = async (parent: any, args: any, context: any, info: any) => {
                     try {
-                        return await service[propertyKey](parent, args, context);
+                        return await service[propertyKey](parent, args, context, info);
                     } catch (error) {
                         logger.error(`Error in ${type}.${field}:`);
                         logger.error(error);
@@ -157,7 +174,7 @@ export function generateGraphQLSchema(services: any[]): { schema: GraphQLSchema 
     logger.trace(`System Type Defs: ${typeDefs}`);
     let schema : GraphQLSchema | null = null;
     if(typeDefs !== "")  {
-        schema = makeExecutableSchema({ typeDefs, resolvers });
+        schema = createSchema({ typeDefs, resolvers });
     }
     return { schema, resolvers };
 }

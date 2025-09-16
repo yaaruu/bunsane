@@ -40,14 +40,16 @@ class ArcheType {
 
 
     // TODO: Can we make this type-safe?
-    public fill(input: object): this {
+    public fill(input: object, strict: boolean = false): this {
         for (const [key, value] of Object.entries(input)) {
             if (value !== undefined) {
                 const compCtor = this.componentMap[key];
                 if (compCtor) {
                     this.addComponent(compCtor, { value });
                 } else {
-                    throw new Error(`Component for field '${key}' not found in archetype.`);
+                    if (strict) {
+                        throw new Error(`Component for field '${key}' not found in archetype.`);
+                    }
                 }
             }
         }

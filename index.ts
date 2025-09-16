@@ -8,6 +8,7 @@ import Query from "./core/Query";
 import {logger} from "./core/Logger";
 import { handleGraphQLError, responseError } from "./core/ErrorHandler";
 import { type Plugin } from "graphql-yoga";
+import { BatchLoader } from "core/BatchLoader";
 export { 
     App, 
     ArcheType,
@@ -17,7 +18,10 @@ export {
     Component,
     CompData,
     Entity,
+    BatchLoader,
+
     Query,
+
     logger,
 
     type Plugin,

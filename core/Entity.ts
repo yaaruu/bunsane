@@ -8,7 +8,6 @@ import { sql } from "bun";
 import Query from "./Query";
 import { timed } from "./Decorators";
 
-
 export class Entity {
     id: string;
     public _persisted: boolean = false;
@@ -74,6 +73,7 @@ export class Entity {
      * @param Component
      * @returns `Component | null` *if entity doesn't have the component
      */
+    @timed("Entity.get")
     public async get<T extends BaseComponent>(ctor: new (...args: any[]) => T): Promise<ComponentDataType<T> | null> {
         const comp = Array.from(this.components.values()).find(comp => comp instanceof ctor) as ComponentGetter<T> | undefined;
         if(typeof comp !== "undefined") {
@@ -169,6 +169,8 @@ export class Entity {
         this._dirty = dirty;
     }
 
+
+    @timed("Entity.LoadMultiple")
     public static async LoadMultiple(ids: string[]): Promise<Entity[]> {
         if (ids.length === 0) return [];
 

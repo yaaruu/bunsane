@@ -7,6 +7,18 @@ import db from "database";
 import { timed } from "./Decorators";
 
 export type FilterOperator = "=" | ">" | "<" | ">=" | "<=" | "!=" | "LIKE" | "IN" | "NOT IN";
+
+export const FilterOp = {
+    EQ: "=" as FilterOperator,
+    GT: ">" as FilterOperator,
+    LT: "<" as FilterOperator,
+    GTE: ">=" as FilterOperator,
+    LTE: "<=" as FilterOperator,
+    NEQ: "!=" as FilterOperator,
+    LIKE: "LIKE" as FilterOperator,
+    IN: "IN" as FilterOperator,
+    NOT_IN: "NOT IN" as FilterOperator
+}
 export interface QueryFilter {
     field: string;
     operator: FilterOperator;
@@ -33,6 +45,8 @@ class Query {
     private withId: string | null = null;
     private limit: number | null = null;
     private offsetValue: number = 0;
+
+    static filterOp = FilterOp;
 
     public findById(id: string) {
         this.withId = id;
@@ -62,6 +76,8 @@ class Query {
     public static filter(field: string, operator: FilterOperator, value: any): QueryFilter {
         return { field, operator, value };
     }
+
+    
 
     public static filters(...filters: QueryFilter[]): QueryFilterOptions {
         return { filters };

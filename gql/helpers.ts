@@ -30,3 +30,8 @@ export type ResolverInput<T extends Record<string, GraphQLType>> = {
   [K in keyof T]: TypeFromGraphQL<T[K]>;
 };
 
+export function isFieldRequested(info: any, fieldName: string): boolean {
+    return info.fieldNodes[0].selectionSet.selections.some((selection: any) => 
+        selection.name.value === fieldName
+    );
+}
