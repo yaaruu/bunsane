@@ -21,7 +21,8 @@ class EntityManager {
                 this.entityQueue.push(entity);
                 return resolve(true);
             } else {
-                resolve(entity.doSave());
+                const result = await entity.doSave();
+                resolve(result);
             }
         })
     }

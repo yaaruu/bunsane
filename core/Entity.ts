@@ -7,6 +7,8 @@ import { uuidv7 } from "utils/uuid";
 import { sql } from "bun";
 import Query from "./Query";
 import { timed } from "./Decorators";
+import EntityHookManager from "./EntityHookManager";
+import { EntityCreatedEvent, EntityUpdatedEvent, EntityDeletedEvent, ComponentAddedEvent, ComponentUpdatedEvent, ComponentRemovedEvent } from "./events/EntityLifecycleEvents";
 
 export class Entity {
     id: string;
@@ -40,6 +42,15 @@ export class Entity {
         const instance = new ctor();
         Object.assign(instance, data);
         this.addComponent(instance);
+        
+        // Fire component added event
+        try {
+            EntityHookManager.executeHooks(new ComponentAddedEvent(this, instance));
+        } catch (error) {
+            logger.error(`Error firing component added hook for ${instance.getTypeID()}: ${error}`);
+            // Don't fail the add operation if hooks fail
+        }
+        
         return this;
     }
 
@@ -54,18 +65,53 @@ export class Entity {
         
         const component = Array.from(this.components.values()).find(comp => comp instanceof ctor) as T;
         if (component) {
-            console.log("Updating Existing Component", component.getTypeID())
+            // Store old data for the update event
+            const oldData = { ...component };
+            
             // Update existing component
             Object.assign(component, data);
             component.setDirty(true);
             this._dirty = true;
+            
+            // Fire component updated event
+            try {
+                EntityHookManager.executeHooks(new ComponentUpdatedEvent(this, component, oldData, component));
+            } catch (error) {
+                logger.error(`Error firing component updated hook for ${component.getTypeID()}: ${error}`);
+                // Don't fail the set operation if hooks fail
+            }
         } else {
             // Add new component
-            console.log("Adding New Component")
             this.add(ctor, data);
-            this._dirty = true;
+            // Note: add() already fires ComponentAddedEvent, so we don't need to fire it again
         }
         return this;
+    }
+
+    /**
+     * Removes a component from the entity.
+     * Use like: entity.remove(Component)
+     */
+    public remove<T extends BaseComponent>(ctor: new (...args: any[]) => T): boolean {
+        const component = Array.from(this.components.values()).find(comp => comp instanceof ctor) as T;
+        
+        if (component) {
+            // Remove the component from the map
+            this.components.delete(component.getTypeID());
+            this._dirty = true;
+            
+            // Fire component removed event
+            try {
+                EntityHookManager.executeHooks(new ComponentRemovedEvent(this, component));
+            } catch (error) {
+                logger.error(`Error firing component removed hook for ${component.getTypeID()}: ${error}`);
+                // Don't fail the remove operation if hooks fail
+            }
+            
+            return true;
+        }
+        
+        return false;
     }
     /**
      * Get component from entities. If entity is populated in query the component will get within the entitiy
@@ -115,6 +161,10 @@ export class Entity {
                 console.log("Entity is not dirty, no need to save.");
                 return resolve(true); 
             }
+
+            const wasNew = !this._persisted;
+            const changedComponents = this.getDirtyComponents();
+
             await db.transaction(async (trx) => {
                 if(!this._persisted) {
                     await trx`INSERT INTO entities (id) VALUES (${this.id}) ON CONFLICT DO NOTHING`;
@@ -130,7 +180,21 @@ export class Entity {
                 }
                 await Promise.all(waitable);
             });
+
             this._dirty = false;
+
+            // Fire lifecycle events after successful save
+            try {
+                if (wasNew) {
+                    await EntityHookManager.executeHooks(new EntityCreatedEvent(this));
+                } else if (changedComponents.length > 0) {
+                    await EntityHookManager.executeHooks(new EntityUpdatedEvent(this, changedComponents));
+                }
+            } catch (error) {
+                logger.error(`Error firing lifecycle hooks for entity ${this.id}: ${error}`);
+                // Don't fail the save operation if hooks fail
+            }
+
             resolve(true);
         })
         
@@ -158,6 +222,15 @@ export class Entity {
                         await trx`UPDATE components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`;
                     }
                 });
+
+                // Fire lifecycle event after successful deletion
+                try {
+                    await EntityHookManager.executeHooks(new EntityDeletedEvent(this, !force));
+                } catch (error) {
+                    logger.error(`Error firing delete lifecycle hook for entity ${this.id}: ${error}`);
+                    // Don't fail the delete operation if hooks fail
+                }
+
                 resolve(true);
             } catch (error) {
                 logger.error(`Failed to delete entity: ${error}`);
@@ -172,6 +245,19 @@ export class Entity {
 
     public setDirty(dirty: boolean) {
         this._dirty = dirty;
+    }
+
+    /**
+     * Get list of component type IDs that are dirty
+     */
+    private getDirtyComponents(): string[] {
+        const dirtyComponents: string[] = [];
+        for (const component of this.components.values()) {
+            if ((component as any)._dirty) {
+                dirtyComponents.push(component.getTypeID());
+            }
+        }
+        return dirtyComponents;
     }
 
 
