@@ -68,7 +68,7 @@ export class BatchLoader {
     }
 
     @timed("BatchLoader.loadRelatedEntitiesBatched")
-    static async loadRelatedEntitiesBatched<C extends BaseComponent & { value: string }>(
+    static async loadRelatedEntitiesBatched<C extends BaseComponent>(
         entities: Entity[],
         component: new () => C,
         loader: (ids: string[]) => Promise<Entity[]>

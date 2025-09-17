@@ -102,7 +102,14 @@ class Query {
         return { field, operator, value };
     }
 
-    
+    public static typedFilter<T extends BaseComponent>(
+        componentCtor: new (...args: any[]) => T,
+        field: keyof ComponentDataType<T>,
+        operator: FilterOperator,
+        value: any
+    ): QueryFilter {
+        return { field: field as string, operator, value };
+    }
 
     public static filters(...filters: QueryFilter[]): QueryFilterOptions {
         return { filters };

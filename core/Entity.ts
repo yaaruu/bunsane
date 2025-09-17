@@ -36,7 +36,7 @@ export class Entity {
      * Adds a new component to the entity.
      * Use like: entity.add(Component, { value: "Test" })
      */
-    public add<T extends BaseComponent>(ctor: new (...args: any[]) => T, data: ComponentDataType<T>): this {
+    public add<T extends BaseComponent>(ctor: new (...args: any[]) => T, data: Partial<ComponentDataType<T>>): this {
         const instance = new ctor();
         Object.assign(instance, data);
         this.addComponent(instance);
@@ -49,7 +49,7 @@ export class Entity {
      * If it doesn't exist, it adds a new component.
      * Use like: entity.set(Component, { value: "Test" })
      */
-    public async set<T extends BaseComponent>(ctor: new (...args: any[]) => T, data: Record<string, any>): Promise<this> {
+    public async set<T extends BaseComponent>(ctor: new (...args: any[]) => T, data: Partial<ComponentDataType<T>>): Promise<this> {
         await this.get(ctor);
         
         const component = Array.from(this.components.values()).find(comp => comp instanceof ctor) as T;
@@ -62,7 +62,7 @@ export class Entity {
         } else {
             // Add new component
             console.log("Adding New Component")
-            this.add(ctor, data as any);
+            this.add(ctor, data);
             this._dirty = true;
         }
         return this;
