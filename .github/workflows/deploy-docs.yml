@@ -42,7 +42,6 @@ jobs:
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}
         publish_dir: ./docs
-        cname: bunsane.dev  # Optional: Add custom domain
 
   validate-links:
     runs-on: ubuntu-latest
