@@ -7,6 +7,8 @@ import ServiceRegistry from "service/ServiceRegistry";
 import type { Plugin } from "graphql-yoga";
 import * as path from "path";
 import { registerDecoratedHooks } from "core/decorators/EntityHooks";
+import { SchedulerManager } from "core/SchedulerManager";
+import { registerScheduledTasks } from "core/decorators/ScheduledTask";
 
 export default class App {
     private yoga: any;
@@ -62,9 +64,25 @@ export default class App {
                         } else {
                             this.yoga = createYogaInstance(undefined, this.yogaPlugins);
                         }
-                        
-                        // Collect REST endpoints from all services
+
+                        // Get all services for processing
                         const services = ServiceRegistry.getServices();
+
+                        // Initialize Scheduler
+                        const scheduler = SchedulerManager.getInstance();
+
+                        // Register scheduled tasks for all services
+                        for (const service of services) {
+                            try {
+                                registerScheduledTasks(service);
+                            } catch (error) {
+                                logger.warn(`Failed to register scheduled tasks for service ${service.constructor.name}`);
+                                logger.warn(error);
+                            }
+                        }
+                        logger.info(`Registered scheduled tasks for ${services.length} services`);
+
+                        // Collect REST endpoints from all services
                         for (const service of services) {
                             const endpoints = (service.constructor as any).httpEndpoints;
                             if (endpoints) {
@@ -80,7 +98,7 @@ export default class App {
                                 }
                             }
                         }
-                        
+
                         ApplicationLifecycle.setPhase(ApplicationPhase.APPLICATION_READY);
                     } catch (error) {
                         logger.error("Error during SYSTEM_READY phase:");

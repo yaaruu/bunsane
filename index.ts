@@ -37,6 +37,9 @@ import type {
     ComponentUpdatedEvent,
     ComponentRemovedEvent
 } from "./core/events/EntityLifecycleEvents";
+import { ScheduledTask } from "core/decorators/ScheduledTask";
+import { ScheduleInterval } from "types/scheduler.types";
+
 export { 
     App, 
     ArcheType,
@@ -49,6 +52,10 @@ export {
     BatchLoader,
 
     Query,
+
+    // Scheduler exports
+    ScheduleInterval,
+    ScheduledTask,
 
     logger,
 
