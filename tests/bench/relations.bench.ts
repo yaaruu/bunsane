@@ -14,6 +14,7 @@ beforeAll(async () => {
 
 beforeEach(async () => {
     await db`TRUNCATE TABLE entities CASCADE;`;
+    Bun.sleep(1000);
 });
 
 @Component
