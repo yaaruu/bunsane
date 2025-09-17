@@ -15,6 +15,9 @@ import type {
 import Query from "./Query";
 import { Entity } from "./Entity";
 import { CronParser } from "../utils/cronParser";
+import type { ComponentTargetConfig } from "./EntityHookManager";
+import ArcheType from "./ArcheType";
+import { BaseComponent } from "./Components";
 
 const loggerInstance = logger.child({ scope: "SchedulerManager" });
 
@@ -75,8 +78,8 @@ export class SchedulerManager {
         }
 
         // Validate task info
-        if (!taskInfo.id || !taskInfo.name || !taskInfo.componentTarget || !taskInfo.interval) {
-            const error = new Error(`Invalid task info: missing required fields`);
+        if (!taskInfo.id || !taskInfo.name || (!taskInfo.componentTarget && !taskInfo.options?.componentTarget) || !taskInfo.interval) {
+            const error = new Error(`Invalid task info: missing required fields (id, name, componentTarget/componentTarget config, interval)`);
             loggerInstance.error(`Failed to register task: ${error.message}`);
             throw error;
         }
@@ -237,8 +240,19 @@ export class SchedulerManager {
         const timeout = taskInfo.options?.timeout || this.config.defaultTimeout;
 
         try {
-            // Create query with component targeting and filters
-            const query = new Query().with(taskInfo.componentTarget);
+            // Create query based on component targeting configuration
+            let query: Query;
+
+            if (taskInfo.options?.componentTarget) {
+                // Use new component targeting configuration
+                const componentTarget = taskInfo.options.componentTarget;
+                query = this.buildQueryFromComponentTarget(componentTarget);
+            } else if (taskInfo.componentTarget) {
+                // Use legacy single component targeting
+                query = new Query().with(taskInfo.componentTarget);
+            } else {
+                throw new Error('No component target specified');
+            }
 
             // Apply component filters if specified
             if (taskInfo.options?.componentFilters && taskInfo.options.componentFilters.length > 0) {
@@ -248,16 +262,25 @@ export class SchedulerManager {
                 for (const filter of taskInfo.options.componentFilters) {
                     // For now, we'll assume filters are for the main component
                     // In a more advanced implementation, we could support filters for different components
-                    if (!filtersByComponent.has(taskInfo.componentTarget.name)) {
-                        filtersByComponent.set(taskInfo.componentTarget.name, []);
+                    const mainComponent = taskInfo.componentTarget || taskInfo.options?.componentTarget?.includeComponents?.[0];
+                    if (mainComponent) {
+                        const componentName = typeof mainComponent === 'function' ? mainComponent.name : 'unknown';
+                        if (!filtersByComponent.has(componentName)) {
+                            filtersByComponent.set(componentName, []);
+                        }
+                        filtersByComponent.get(componentName)!.push(filter);
                     }
-                    filtersByComponent.get(taskInfo.componentTarget.name)!.push(filter);
                 }
 
-                // Apply filters to the main component
-                const mainFilters = filtersByComponent.get(taskInfo.componentTarget.name) || [];
-                if (mainFilters.length > 0) {
-                    query.with(taskInfo.componentTarget, Query.filters(...mainFilters));
+                // Apply filters to components
+                for (const [componentName, filters] of filtersByComponent.entries()) {
+                    // This is a simplified implementation - in practice, you'd need to map component names to actual component classes
+                    if (filters.length > 0) {
+                        // For legacy compatibility, apply to the main component
+                        if (taskInfo.componentTarget) {
+                            query.with(taskInfo.componentTarget, Query.filters(...filters));
+                        }
+                    }
                 }
             }
 
@@ -612,5 +635,76 @@ export class SchedulerManager {
 
         await this.executeTask(taskId);
         return true;
+    }
+
+    /**
+     * Build a Query object from ComponentTargetConfig
+     * @param componentTarget The component targeting configuration
+     * @returns A Query object configured with the component targeting
+     */
+    private buildQueryFromComponentTarget(componentTarget: ComponentTargetConfig): Query {
+        let query = new Query();
+
+        // Handle archetype matching first (most specific)
+        if (componentTarget.archetype) {
+            // For archetype matching, we need to include all components from the archetype
+            const archetypeComponents = this.getArchetypeComponents(componentTarget.archetype);
+            for (const component of archetypeComponents) {
+                query = query.with(component);
+            }
+        } else if (componentTarget.archetypes && componentTarget.archetypes.length > 0) {
+            // Handle multiple archetypes - for simplicity, we'll use the first valid one
+            // In a more advanced implementation, you might want to handle OR logic
+            const firstArchetype = componentTarget.archetypes.find(archetype => archetype !== undefined);
+            if (firstArchetype) {
+                const archetypeComponents = this.getArchetypeComponents(firstArchetype);
+                for (const component of archetypeComponents) {
+                    query = query.with(component);
+                }
+            }
+        }
+
+        // Handle included components
+        if (componentTarget.includeComponents && componentTarget.includeComponents.length > 0) {
+            const requireAll = componentTarget.requireAllIncluded ?? true;
+            if (requireAll) {
+                // ALL included components must be present (AND logic)
+                for (const component of componentTarget.includeComponents) {
+                    query = query.with(component);
+                }
+            } else {
+                // ANY included component must be present (OR logic)
+                // For OR logic with Query API, we need to use a different approach
+                // This is a simplified implementation - in practice, you might need custom query logic
+                for (const component of componentTarget.includeComponents) {
+                    query = query.with(component);
+                    break; // Just use the first one for simplicity
+                }
+            }
+        }
+
+        // Handle excluded components
+        if (componentTarget.excludeComponents && componentTarget.excludeComponents.length > 0) {
+            // Note: The current Query API might not directly support exclusion
+            // This would require extending the Query API or using post-filtering
+            // For now, we'll log a warning and continue
+            loggerInstance.warn('excludeComponents is not fully supported in scheduled tasks yet. Consider using post-query filtering.');
+        }
+
+        return query;
+    }
+
+    /**
+     * Extract component classes from an ArcheType
+     * @param archetype The archetype to extract components from
+     * @returns Array of component classes
+     */
+    private getArchetypeComponents(archetype: ArcheType): (new () => BaseComponent)[] {
+        // Access the private componentMap from ArcheType
+        const componentMap = (archetype as any).componentMap as Record<string, new () => BaseComponent>;
+        if (!componentMap) {
+            return [];
+        }
+        return Object.values(componentMap);
     }
 }

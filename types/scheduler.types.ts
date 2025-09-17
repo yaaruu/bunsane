@@ -4,6 +4,7 @@
  */
 
 import type { QueryFilter } from "../core/Query";
+import type { ComponentTargetConfig } from "../core/EntityHookManager";
 
 export enum ScheduleInterval {
     MINUTE = "minute",
@@ -39,6 +40,8 @@ export interface ScheduledTaskOptions {
     maxEntitiesPerExecution?: number;
     /** Whether to enable task metrics collection */
     enableMetrics?: boolean;
+    /** Component targeting configuration for fine-grained entity selection */
+    componentTarget?: ComponentTargetConfig;
 }
 
 export interface ScheduledTaskInfo {
@@ -46,8 +49,8 @@ export interface ScheduledTaskInfo {
     id: string;
     /** Task name */
     name: string;
-    /** Target component class */
-    componentTarget: new (...args: any[]) => any;
+    /** Target component class (legacy - use options.componentTarget instead) */
+    componentTarget?: new (...args: any[]) => any;
     /** Schedule interval */
     interval: ScheduleInterval;
     /** Cron expression (when interval is CRON) */

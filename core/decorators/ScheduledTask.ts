@@ -12,7 +12,7 @@ const loggerInstance = logger.child({ scope: "ScheduledTaskDecorator" });
 export function ScheduledTask(
     options: ScheduledTaskOptions & { 
         interval: ScheduleInterval; 
-        componentTarget: new (...args: any[]) => any 
+        componentTarget?: new (...args: any[]) => any 
     }
 ) {
     return function (target: any, propertyKey: string, descriptor: PropertyDescriptor) {
@@ -29,7 +29,7 @@ export function ScheduledTask(
         const taskInfo = {
             id: taskId,
             name: options.name || `${target.constructor.name}.${propertyKey}`,
-            componentTarget: options.componentTarget,
+            componentTarget: options.componentTarget, // Legacy support
             interval: options.interval,
             options: {
                 runOnStart: options.runOnStart ?? false,
