@@ -17,13 +17,15 @@ import {
     EntityHook,
     ComponentHook,
     LifecycleHook,
+    ComponentTargetHook,
     registerDecoratedHooks
 } from "./core/decorators/EntityHooks";
 import type {
     EntityHookCallback,
     ComponentHookCallback,
     LifecycleHookCallback,
-    HookOptions
+    HookOptions,
+    ComponentTargetConfig
 } from "./core/EntityHookManager";
 import type {
     EntityLifecycleEvent,
@@ -63,11 +65,13 @@ export {
     EntityHook,
     ComponentHook,
     LifecycleHook,
+    ComponentTargetHook,
     registerDecoratedHooks,
     type EntityHookCallback,
     type ComponentHookCallback,
     type LifecycleHookCallback,
     type HookOptions,
+    type ComponentTargetConfig,
     type EntityLifecycleEvent,
     type EntityCreatedEvent,
     type EntityUpdatedEvent,

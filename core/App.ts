@@ -6,6 +6,7 @@ import { createYogaInstance } from "gql";
 import ServiceRegistry from "service/ServiceRegistry";
 import type { Plugin } from "graphql-yoga";
 import * as path from "path";
+import { registerDecoratedHooks } from "core/decorators/EntityHooks";
 
 export default class App {
     private yoga: any;
@@ -38,6 +39,18 @@ export default class App {
                     break;
                 }
                 case ApplicationPhase.COMPONENTS_READY: {
+                    // Automatically register decorated hooks for all services
+                    const services = ServiceRegistry.getServices();
+                    for (const service of services) {
+                        try {
+                            registerDecoratedHooks(service);
+                        } catch (error) {
+                            logger.warn(`Failed to register hooks for service ${service.constructor.name}`);
+                            logger.warn(error);
+                        }
+                    }
+                    logger.info(`Registered hooks for ${services.length} services`);
+                    
                     ApplicationLifecycle.setPhase(ApplicationPhase.SYSTEM_REGISTERING);
                     break;
                 }
