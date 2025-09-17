@@ -214,7 +214,7 @@ export const CreateComponentPartitionTable = async (comp_name: string, type_id: 
                 await db`ALTER TABLE ${table_name} ADD COLUMN IF NOT EXISTS fk_id UUID GENERATED ALWAYS AS ((data->>'value')::UUID) STORED;`;
             });
             await retryWithBackoff(async () => {
-                await db`CREATE INDEX IF NOT EXISTS idx_${table_name}_fk_id ON ${table_name} (fk_id);`;
+                await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${table_name}_fk_id ON ${table_name} (fk_id);`;
             });
             logger.trace(`Added fk_id column and index for ${table_name}`);
         }
