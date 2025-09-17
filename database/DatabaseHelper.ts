@@ -79,6 +79,12 @@ export const CreateComponentTable = () => {
         await db`CREATE INDEX IF NOT EXISTS idx_components_entity_id ON components (entity_id);`
         await db`CREATE INDEX IF NOT EXISTS idx_components_type_id ON components (type_id);`
         await db`CREATE INDEX IF NOT EXISTS idx_components_data_gin ON components USING GIN (data);`
+
+        // Phase 2A: Add composite indexes for sorting optimization
+        await db`CREATE INDEX IF NOT EXISTS idx_components_entity_type_deleted ON components (entity_id, type_id, deleted_at);`
+        await db`CREATE INDEX IF NOT EXISTS idx_components_type_deleted ON components (type_id, deleted_at) WHERE deleted_at IS NULL;`
+        await db`CREATE INDEX IF NOT EXISTS idx_components_deleted_entity ON components (deleted_at, entity_id) WHERE deleted_at IS NULL;`
+
         return resolve(true);
     });
 }
@@ -196,4 +202,8 @@ export const CreateEntityComponentTable = async () => {
     await db`CREATE INDEX IF NOT EXISTS idx_entity_components_entity_id ON entity_components (entity_id);`
     await db`CREATE INDEX IF NOT EXISTS idx_entity_components_type_id ON entity_components (type_id);`
     await db`CREATE INDEX IF NOT EXISTS idx_entity_components_type_entity ON entity_components (type_id, entity_id);`
+
+    // Phase 2A: Add composite indexes for sorting optimization
+    await db`CREATE INDEX IF NOT EXISTS idx_entity_components_type_entity_deleted ON entity_components (type_id, entity_id, deleted_at);`
+    await db`CREATE INDEX IF NOT EXISTS idx_entity_components_deleted_type ON entity_components (deleted_at, type_id) WHERE deleted_at IS NULL;`
 }

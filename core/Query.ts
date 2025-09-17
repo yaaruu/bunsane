@@ -1,4 +1,4 @@
-import type { BaseComponent } from "./Components";
+import type { BaseComponent, ComponentDataType } from "./Components";
 import { Entity } from "./Entity";
 import ComponentRegistry from "./ComponentRegistry";
 import { logger } from "./Logger";
@@ -26,9 +26,18 @@ export interface QueryFilter {
     value: any;
 }
 
-export type QueryFilterOptions = {
-    filters?: QueryFilter[];
-};
+export interface QueryFilterOptions {
+    filters: QueryFilter[];
+}
+
+export type SortDirection = "ASC" | "DESC";
+
+export interface SortOrder {
+    component: string;
+    property: string;
+    direction: SortDirection;
+    nullsFirst?: boolean;
+}
 
 class Query {
     private requiredComponents: Set<string> = new Set<string>();
@@ -39,6 +48,7 @@ class Query {
     private limit: number | null = null;
     private offsetValue: number = 0;
     private eagerComponents: Set<string> = new Set<string>();
+    private sortOrders: SortOrder[] = [];
 
     static filterOp = FilterOp;
 
@@ -172,6 +182,50 @@ class Query {
         return this;
     }
 
+    public sortBy<T extends BaseComponent>(
+        componentCtor: new (...args: any[]) => T,
+        property: keyof ComponentDataType<T>,
+        direction: SortDirection = "ASC",
+        nullsFirst: boolean = false
+    ): this {
+        const componentName = componentCtor.name;
+        const typeId = ComponentRegistry.getComponentId(componentName);
+        
+        if (!typeId) {
+            throw new Error(`Component ${componentName} is not registered.`);
+        }
+
+        // Validate that the component is required in this query
+        if (!this.requiredComponents.has(typeId)) {
+            throw new Error(`Cannot sort by component ${componentName} that is not included in the query. Use .with(${componentName}) first.`);
+        }
+
+        this.sortOrders.push({
+            component: componentName,
+            property: property as string,
+            direction,
+            nullsFirst
+        });
+
+        return this;
+    }
+
+    public orderBy(orders: SortOrder[]): this {
+        // Validate each sort order
+        for (const order of orders) {
+            const typeId = ComponentRegistry.getComponentId(order.component);
+            if (!typeId) {
+                throw new Error(`Component ${order.component} is not registered.`);
+            }
+            if (!this.requiredComponents.has(typeId)) {
+                throw new Error(`Cannot sort by component ${order.component} that is not included in the query. Use .with(${order.component}) first.`);
+            }
+        }
+
+        this.sortOrders = orders;
+        return this;
+    }
+
     @timed("Query.exec")
     public async exec(): Promise<Entity[]> {
         const componentIds = Array.from(this.requiredComponents);
@@ -233,8 +287,14 @@ class Query {
                 let queryStr: any;
                 let requiredOnlyQueryResult: any;
                 if (componentCount === 1) {
-                    // Optimize for single component: no need for GROUP BY, HAVING, or DISTINCT
-                    queryStr = db`SELECT entity_id as id FROM entity_components WHERE type_id = ${componentIds[0]} ${this.withId ? db`AND entity_id = ${this.withId}` : db``} AND deleted_at IS NULL ORDER BY entity_id`;
+                    // Phase 2A: Optimize single component sorting with JOIN
+                    if (this.sortOrders.length > 0) {
+                        const typeId = componentIds[0]!;
+                        const sortExpression = this.buildSortExpressionForSingleComponent(typeId, "c");
+                        queryStr = db`SELECT DISTINCT ec.entity_id as id ${db.unsafe(sortExpression.select)} FROM entity_components ec JOIN components c ON ec.entity_id = c.entity_id AND c.type_id = ${typeId} AND c.deleted_at IS NULL WHERE ec.type_id = ${typeId} ${this.withId ? db`AND ec.entity_id = ${this.withId}` : db``} AND ec.deleted_at IS NULL ${db.unsafe(sortExpression.orderBy)}`;
+                    } else {
+                        queryStr = db`SELECT entity_id as id FROM entity_components WHERE type_id = ${componentIds[0]} ${this.withId ? db`AND entity_id = ${this.withId}` : db``} AND deleted_at IS NULL ORDER BY entity_id`;
+                    }
                     if (this.limit !== null) {
                         queryStr = db`${queryStr} LIMIT ${this.limit}`;
                     }
@@ -243,8 +303,30 @@ class Query {
                     }
                     requiredOnlyQueryResult = await queryStr;
                 } else {
-                    const compIds = inList(componentIds, 1);
-                    queryStr = db`SELECT DISTINCT entity_id as id FROM entity_components WHERE type_id IN ${db.unsafe(compIds.sql, compIds.params)} ${this.withId ? db`AND entity_id = ${this.withId}` : db``} AND deleted_at IS NULL GROUP BY entity_id HAVING COUNT(DISTINCT type_id) = ${componentCount} ORDER BY entity_id`;
+                    // Phase 2A: Optimize multi-component sorting with JOINs instead of subqueries
+                    if (this.sortOrders.length > 0) {
+                        const compIds = inList(componentIds, 1);
+                        let orderByClause = "ORDER BY ";
+                        const orderClauses: string[] = [];
+
+                        for (const order of this.sortOrders) {
+                            const typeId = ComponentRegistry.getComponentId(order.component);
+                            if (typeId && componentIds.includes(typeId)) {
+                                const direction = order.direction.toUpperCase();
+                                const nullsClause = order.nullsFirst ? "NULLS FIRST" : "NULLS LAST";
+                                // Use JOIN-based sorting instead of subquery
+                                const subquery = `(SELECT (c.data->>'${order.property}')::numeric FROM components c WHERE c.entity_id = base_query.id AND c.type_id = '${typeId}' AND c.deleted_at IS NULL LIMIT 1)`;
+                                orderClauses.push(`${subquery} ${direction} ${nullsClause}`);
+                            }
+                        }
+                        orderClauses.push("base_query.id ASC");
+                        orderByClause += orderClauses.join(", ");
+
+                        queryStr = db`SELECT * FROM (SELECT DISTINCT entity_id as id FROM entity_components WHERE type_id IN ${db.unsafe(compIds.sql, compIds.params)} ${this.withId ? db`AND entity_id = ${this.withId}` : db``} AND deleted_at IS NULL GROUP BY entity_id HAVING COUNT(DISTINCT type_id) = ${componentCount}) base_query ${db.unsafe(orderByClause)}`;
+                    } else {
+                        const compIds = inList(componentIds, 1);
+                        queryStr = db`SELECT DISTINCT entity_id as id FROM entity_components WHERE type_id IN ${db.unsafe(compIds.sql, compIds.params)} ${this.withId ? db`AND entity_id = ${this.withId}` : db``} AND deleted_at IS NULL GROUP BY entity_id HAVING COUNT(DISTINCT type_id) = ${componentCount} ORDER BY entity_id`;
+                    }
                     if (this.limit !== null) {
                         queryStr = db`${queryStr} LIMIT ${this.limit}`;
                     }
@@ -318,13 +400,87 @@ class Query {
         }
     }
 
+    private buildOrderByClause(): string {
+        if (this.sortOrders.length === 0) {
+            return 'ORDER BY ec.entity_id';
+        }
+
+        const orderClauses: string[] = [];
+        for (const order of this.sortOrders) {
+            const typeId = ComponentRegistry.getComponentId(order.component);
+            if (!typeId) continue;
+
+            // For now, assume we have a component alias. In practice, we'd need to map component types to aliases
+            // This is a simplified implementation - in a full implementation, we'd need to track aliases per component
+            const componentAlias = `c_${typeId}`;
+            const direction = order.direction.toUpperCase();
+            const nulls = order.nullsFirst ? 'NULLS FIRST' : 'NULLS LAST';
+            orderClauses.push(`(${componentAlias}.data->>'${order.property}')::text ${direction} ${nulls}`);
+        }
+
+        // Always include entity_id as final tiebreaker for consistent ordering
+        orderClauses.push('ec.entity_id ASC');
+
+        return `ORDER BY ${orderClauses.join(', ')}`;
+    }
+
+    private buildOrderByClauseWithJoinData(componentIds: string[], joinCount: number): string {
+        if (this.sortOrders.length === 0) {
+            return `ORDER BY id`;
+        }
+
+        const orderClauses: string[] = [];
+
+        for (let i = 0; i < this.sortOrders.length; i++) {
+            const order = this.sortOrders[i];
+            if (!order) continue;
+
+            const typeId = ComponentRegistry.getComponentId(order.component);
+            if (!typeId || !componentIds.includes(typeId)) {
+                continue; // Skip if component not in query
+            }
+
+            const direction = order.direction.toUpperCase();
+            const nullsClause = order.nullsFirst ? "NULLS FIRST" : "NULLS LAST";
+
+            // For subquery approach, use correlated subquery for sorting
+            const sortExpression = `(SELECT (c.data->>'${order.property}')::numeric FROM components c WHERE c.entity_id = filtered_entities.id AND c.type_id = '${typeId}' AND c.deleted_at IS NULL LIMIT 1)`;
+
+            orderClauses.push(`${sortExpression} ${direction} ${nullsClause}`);
+        }
+
+        // Always include entity_id as final tiebreaker for consistent ordering
+        orderClauses.push(`id ASC`);
+
+        return `ORDER BY ${orderClauses.join(", ")}`;
+    }
+
+    private buildSortExpressionForSingleComponent(typeId: string, alias: string): { select: string, orderBy: string } {
+        if (this.sortOrders.length === 0) {
+            return { select: "", orderBy: "ORDER BY ec.entity_id" };
+        }
+
+        const order = this.sortOrders[0]; // For single component, we only support single sort
+        if (!order) {
+            return { select: "", orderBy: "ORDER BY ec.entity_id" };
+        }
+
+        const direction = order.direction.toUpperCase();
+        const nullsClause = order.nullsFirst ? "NULLS FIRST" : "NULLS LAST";
+
+        const selectExpr = `, (${alias}.data->>'${order.property}')::numeric as sort_val`;
+        const orderByExpr = `ORDER BY sort_val ${direction} ${nullsClause}, ec.entity_id ASC`;
+
+        return { select: selectExpr, orderBy: orderByExpr };
+    }
+
     private async getIdsWithFilters(componentIds: string[], componentCount: number, limit?: number | null, offset?: number): Promise<string[]> {
         let params: any[] = [];
         let paramIndex = 1;
         const compIds = inList(componentIds, paramIndex);
         params.push(...compIds.params);
         paramIndex = compIds.newParamIndex;
-        
+
         const joins: string[] = [];
         let joinIndex = 0;
         for (const [typeId, filters] of this.componentFilters.entries()) {
@@ -336,33 +492,123 @@ class Query {
                 joinIndex++;
             }
         }
-        
-        let sql = `SELECT DISTINCT ec.entity_id as id FROM entity_components ec ${joins.join(' ')} WHERE ec.type_id IN ${compIds.sql} AND ec.deleted_at IS NULL`;
-        
-        if (this.withId) {
-            sql += ` AND ec.entity_id = $${paramIndex}`;
-            params.push(this.withId);
-            paramIndex++;
-        }
-        
-        joinIndex = 0;
-        for (const [typeId, filters] of this.componentFilters.entries()) {
-            if (componentIds.includes(typeId)) {
-                const alias = `c${joinIndex}`;
-                const filterConditions = this.buildFilterWhereClause(typeId, filters, alias, paramIndex);
-                if (filterConditions.sql) {
-                    sql += ` AND ${filterConditions.sql}`;
-                    params.push(...filterConditions.params);
-                    paramIndex = filterConditions.newParamIndex;
+
+        let sql: string;
+
+        // For sorting, use a CTE approach to avoid GROUP BY conflicts
+        if (this.sortOrders.length > 0) {
+            let selectColumns = `ec.entity_id as id`;
+
+            // Add sort columns using window functions
+            const sortColumns: string[] = [];
+            for (let i = 0; i < this.sortOrders.length; i++) {
+                const order = this.sortOrders[i];
+                if (!order) continue;
+
+                const typeId = ComponentRegistry.getComponentId(order.component);
+                if (!typeId || !componentIds.includes(typeId)) {
+                    continue; // Skip if component not in query
                 }
-                joinIndex++;
+
+                // Find the join alias for this component
+                let sortAlias = '';
+                let aliasIndex = 0;
+                for (const [filterTypeId, filters] of Array.from(this.componentFilters.entries())) {
+                    if (componentIds.includes(filterTypeId) && filterTypeId === typeId) {
+                        sortAlias = `c${aliasIndex}`;
+                        break;
+                    }
+                    if (componentIds.includes(filterTypeId)) {
+                        aliasIndex++;
+                    }
+                }
+
+                if (sortAlias) {
+                    sortColumns.push(`FIRST_VALUE((${sortAlias}.data->>'${order.property}')::numeric) OVER (PARTITION BY ec.entity_id ORDER BY ${sortAlias}.created_at DESC) as sort_val_${i}`);
+                }
             }
+            if (sortColumns.length > 0) {
+                selectColumns += `, ${sortColumns.join(', ')}`;
+            }
+
+            // Use CTE to get filtered entities with sort values
+            sql = `WITH filtered_entities AS (
+                SELECT ${selectColumns}
+                FROM entity_components ec ${joins.join(' ')}
+                WHERE ec.type_id IN ${compIds.sql} AND ec.deleted_at IS NULL`;
+
+            if (this.withId) {
+                sql += ` AND ec.entity_id = $${paramIndex}`;
+                params.push(this.withId);
+                paramIndex++;
+            }
+
+            joinIndex = 0;
+            for (const [typeId, filters] of this.componentFilters.entries()) {
+                if (componentIds.includes(typeId)) {
+                    const alias = `c${joinIndex}`;
+                    const filterConditions = this.buildFilterWhereClause(typeId, filters, alias, paramIndex);
+                    if (filterConditions.sql) {
+                        sql += ` AND ${filterConditions.sql}`;
+                        params.push(...filterConditions.params);
+                        paramIndex = filterConditions.newParamIndex;
+                    }
+                    joinIndex++;
+                }
+            }
+
+            sql += `
+            )
+            SELECT DISTINCT fe.id, ${sortColumns.length > 0 ? sortColumns.map((_, i) => `fe.sort_val_${i}`).join(', ') : ''}
+            FROM filtered_entities fe
+            WHERE (SELECT COUNT(DISTINCT ec.type_id) FROM entity_components ec WHERE ec.entity_id = fe.id AND ec.deleted_at IS NULL) = $${paramIndex}`;
+
+            params.push(componentCount);
+            paramIndex++;
+
+            // Build ORDER BY clause using the selected sort values
+            const orderClauses: string[] = [];
+            for (let i = 0; i < this.sortOrders.length; i++) {
+                const order = this.sortOrders[i];
+                if (!order) continue;
+
+                const direction = order.direction.toUpperCase();
+                const nullsClause = order.nullsFirst ? "NULLS FIRST" : "NULLS LAST";
+                orderClauses.push(`sort_val_${i} ${direction} ${nullsClause}`);
+            }
+            // Always include entity_id as final tiebreaker for consistent ordering
+            orderClauses.push(`id ASC`);
+            sql += ` ORDER BY ${orderClauses.join(", ")}`;
+        } else {
+            // No sorting - use simpler approach
+            sql = `SELECT DISTINCT ec.entity_id as id FROM entity_components ec ${joins.join(' ')} WHERE ec.type_id IN ${compIds.sql} AND ec.deleted_at IS NULL`;
+
+            if (this.withId) {
+                sql += ` AND ec.entity_id = $${paramIndex}`;
+                params.push(this.withId);
+                paramIndex++;
+            }
+
+            joinIndex = 0;
+            for (const [typeId, filters] of this.componentFilters.entries()) {
+                if (componentIds.includes(typeId)) {
+                    const alias = `c${joinIndex}`;
+                    const filterConditions = this.buildFilterWhereClause(typeId, filters, alias, paramIndex);
+                    if (filterConditions.sql) {
+                        sql += ` AND ${filterConditions.sql}`;
+                        params.push(...filterConditions.params);
+                        paramIndex = filterConditions.newParamIndex;
+                    }
+                    joinIndex++;
+                }
+            }
+
+            sql += ` GROUP BY ec.entity_id HAVING COUNT(DISTINCT ec.type_id) = $${paramIndex}`;
+            params.push(componentCount);
+            paramIndex++;
+            sql += ` ORDER BY ec.entity_id`;
         }
-        
-        sql += ` GROUP BY ec.entity_id HAVING COUNT(DISTINCT ec.type_id) = $${paramIndex}`;
-        params.push(componentCount);
-        paramIndex++;
-        sql += ` ORDER BY ec.entity_id`;
+
         if (limit !== null && limit !== undefined) {
             sql += ` LIMIT $${paramIndex}`;
             params.push(limit);
@@ -373,12 +619,10 @@ class Query {
             params.push(offset);
             paramIndex++;
         }
-        
+
         const filteredResult = await db.unsafe(sql, params);
         return filteredResult.map((row: any) => row.id);
-    }
-
-    private async getIdsWithFiltersAndExclusions(componentIds: string[], excludedIds: string[], componentCount: number, limit?: number | null, offset?: number): Promise<string[]> {
+    }    private async getIdsWithFiltersAndExclusions(componentIds: string[], excludedIds: string[], componentCount: number, limit?: number | null, offset?: number): Promise<string[]> {
         const entityIds = await this.getIdsWithFilters(componentIds, componentCount);
         
         if (entityIds.length === 0) {

@@ -3,7 +3,48 @@ import { BaseComponent } from "core/Components";
 import { timed } from "./Decorators";
 import db from "../database";
 import { sql } from "bun";
+
+// Phase 2A: Memory Pooling for Entity Objects
+class EntityPool {
+    private static instance: EntityPool;
+    private pool: Map<string, Entity[]> = new Map();
+    private maxPoolSize = 1000;
+
+    static getInstance(): EntityPool {
+        if (!EntityPool.instance) {
+            EntityPool.instance = new EntityPool();
+        }
+        return EntityPool.instance;
+    }
+
+    get(entityId: string): Entity | null {
+        const entities = this.pool.get(entityId);
+        if (entities && entities.length > 0) {
+            return entities.pop()!;
+        }
+        return null;
+    }
+
+    put(entity: Entity): void {
+        const entityId = entity.id;
+        let entities = this.pool.get(entityId);
+        if (!entities) {
+            entities = [];
+            this.pool.set(entityId, entities);
+        }
+        if (entities.length < this.maxPoolSize) {
+            entities.push(entity);
+        }
+    }
+
+    clear(): void {
+        this.pool.clear();
+    }
+}
+
 export class BatchLoader {
+    private static entityPool = EntityPool.getInstance();
+
     @timed("BatchLoader.loadRelatedEntities")
     static async loadRelatedEntities<C extends BaseComponent & { value: string }>(
         entities: Entity[],
