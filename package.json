@@ -1,9 +1,17 @@
 {
   "name": "bunsane",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": {
     "name": "yaaruu"
   },
+  "keywords": [
+    "bun",
+    "framework",
+    "entity-component-system",
+    "ecs",
+    "graphql",
+    "typescript"
+  ],
   "module": "index.ts",
   "type": "module",
   "devDependencies": {
