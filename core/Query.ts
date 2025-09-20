@@ -117,6 +117,10 @@ class Query {
 
     private buildFilterCondition(filter: QueryFilter, alias: string, paramIndex: number): { sql: string, params: any[], newParamIndex: number } {
         const { field, operator, value } = filter;
+
+        // Build JSON path for nested properties (e.g., "parent.child" -> data->'parent'->>'child')
+        const jsonPath = this.buildJsonPath(field, alias);
+
         switch (operator) {
             case "=":
             case ">":
@@ -125,26 +129,47 @@ class Query {
             case "<=":
             case "!=":
                 if (typeof value === "string") {
-                    return { sql: `${alias}.data->>'${field}' ${operator} $${paramIndex}`, params: [value], newParamIndex: paramIndex + 1 };
+                    return { sql: `${jsonPath} ${operator} $${paramIndex}`, params: [value], newParamIndex: paramIndex + 1 };
                 } else {
-                    return { sql: `(${alias}.data->>'${field}')::numeric ${operator} $${paramIndex}`, params: [value], newParamIndex: paramIndex + 1 };
+                    return { sql: `(${jsonPath})::numeric ${operator} $${paramIndex}`, params: [value], newParamIndex: paramIndex + 1 };
                 }
             case "LIKE":
-                return { sql: `${alias}.data->>'${field}' LIKE $${paramIndex}`, params: [value], newParamIndex: paramIndex + 1 };
+                return { sql: `${jsonPath} LIKE $${paramIndex}`, params: [value], newParamIndex: paramIndex + 1 };
             case "IN":
                 if (Array.isArray(value)) {
                     const placeholders = Array.from({length: value.length}, (_, i) => `$${paramIndex + i}`).join(', ');
-                    return { sql: `${alias}.data->>'${field}' IN (${placeholders})`, params: value, newParamIndex: paramIndex + value.length };
+                    return { sql: `${jsonPath} IN (${placeholders})`, params: value, newParamIndex: paramIndex + value.length };
                 }
                 throw new Error("IN operator requires an array of values");
             case "NOT IN":
                 if (Array.isArray(value)) {
                     const placeholders = Array.from({length: value.length}, (_, i) => `$${paramIndex + i}`).join(', ');
-                    return { sql: `${alias}.data->>'${field}' NOT IN (${placeholders})`, params: value, newParamIndex: paramIndex + value.length };
+                    return { sql: `${jsonPath} NOT IN (${placeholders})`, params: value, newParamIndex: paramIndex + value.length };
                 }
                 throw new Error("NOT IN operator requires an array of values");
             default:
                 throw new Error(`Unsupported operator: ${operator}`);
+        }
+    }
+
+    /**
+     * Build PostgreSQL JSON path expression for nested properties
+     * @param field Field path (e.g., "parent.child.grandchild")
+     * @param alias Table alias for the components table
+     * @returns PostgreSQL JSON path expression
+     */
+    private buildJsonPath(field: string, alias: string): string {
+        const parts = field.split('.');
+
+        if (parts.length === 1) {
+            // Single level: data->>'field'
+            return `${alias}.data->>'${field}'`;
+        } else {
+            // Nested levels: data->'parent'->'child'->>'grandchild'
+            const pathParts = parts.slice(0, -1).map(part => `'${part}'`);
+            const lastPart = parts[parts.length - 1];
+
+            return `${alias}.data->${pathParts.join('->')}->>'${lastPart}'`;
         }
     }
 
@@ -442,7 +467,10 @@ class Query {
             const componentAlias = `c_${typeId}`;
             const direction = order.direction.toUpperCase();
             const nulls = order.nullsFirst ? 'NULLS FIRST' : 'NULLS LAST';
-            orderClauses.push(`(${componentAlias}.data->>'${order.property}')::text ${direction} ${nulls}`);
+
+            // Use buildJsonPath for nested property support
+            const jsonPath = this.buildJsonPath(order.property, componentAlias);
+            orderClauses.push(`(${jsonPath})::text ${direction} ${nulls}`);
         }
 
         // Always include entity_id as final tiebreaker for consistent ordering
@@ -495,7 +523,9 @@ class Query {
         const direction = order.direction.toUpperCase();
         const nullsClause = order.nullsFirst ? "NULLS FIRST" : "NULLS LAST";
 
-        const selectExpr = `, (${alias}.data->>'${order.property}')::numeric as sort_val`;
+        // Use buildJsonPath for nested property support
+        const jsonPath = this.buildJsonPath(order.property, alias);
+        const selectExpr = `, (${jsonPath})::numeric as sort_val`;
         const orderByExpr = `ORDER BY sort_val ${direction} ${nullsClause}, ec.entity_id ASC`;
 
         return { select: selectExpr, orderBy: orderByExpr };
