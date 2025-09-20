@@ -14,6 +14,7 @@ export class Entity {
     id: string;
     public _persisted: boolean = false;
     private components: Map<string, BaseComponent> = new Map<string, BaseComponent>();
+    private removedComponents: Set<string> = new Set<string>();
     protected _dirty: boolean = false;
 
     constructor(id?: string) {
@@ -91,11 +92,17 @@ export class Entity {
     /**
      * Removes a component from the entity.
      * Use like: entity.remove(Component)
+     * WARNING: This will delete the component from the database upon saving the entity.
+     * If you want to keep the component in the database but just remove it from the entity instance,
+     * consider implementing a different method.
      */
     public remove<T extends BaseComponent>(ctor: new (...args: any[]) => T): boolean {
         const component = Array.from(this.components.values()).find(comp => comp instanceof ctor) as T;
         
         if (component) {
+            // Track the component type for database deletion
+            this.removedComponents.add(component.getTypeID());
+            
             // Remove the component from the map
             this.components.delete(component.getTypeID());
             this._dirty = true;
@@ -186,6 +193,15 @@ export class Entity {
                     await trx`INSERT INTO entities (id) VALUES (${this.id}) ON CONFLICT DO NOTHING`;
                     this._persisted = true;
                 }
+                
+                // Delete removed components from database
+                if (this.removedComponents.size > 0) {
+                    const typeIds = Array.from(this.removedComponents);
+                    await trx`DELETE FROM components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`;
+                    await trx`DELETE FROM entity_components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`;
+                    this.removedComponents.clear();
+                }
+                
                 if(this.components.size === 0) {
                     logger.trace(`No components to save for entity ${this.id}`);
                     return;

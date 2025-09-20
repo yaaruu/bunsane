@@ -4,6 +4,7 @@ import type { ComponentDataType } from "../core/Components";
 import { Entity } from "../core/Entity";
 import App from "../core/App";
 import ComponentRegistry from "../core/ComponentRegistry";
+import db from "../database";
 
 // Test component with 'value' attribute (standard assumption)
 @Component
@@ -49,6 +50,13 @@ class BooleanComponent extends BaseComponent {
     @CompData()
     enabled: boolean = false;
 }
+
+let app: App;
+
+beforeAll(async () => {
+    app = new App();
+    await app.waitForAppReady();
+});
 
 describe("Component Edge Cases and Attribute Handling", () => {
     describe("Component with standard 'value' attribute", () => {
@@ -201,5 +209,130 @@ describe("Component Edge Cases and Attribute Handling", () => {
             const data = comp.data();
             expect(data.value).toBe(""); // Default value
         });
+    });
+});
+
+describe("Component Removal from Entities", () => {
+    test("should successfully remove an existing component from an entity", () => {
+        const entity = Entity.Create();
+        entity.add(ValueComponent, { value: "test" });
+
+        // Verify component is added
+        expect(entity.componentList()).toHaveLength(1);
+        expect(entity.componentList()[0]).toBeInstanceOf(ValueComponent);
+
+        // Remove the component
+        const removed = entity.remove(ValueComponent);
+        expect(removed).toBe(true);
+
+        // Verify component is removed
+        expect(entity.componentList()).toHaveLength(0);
+    });
+
+    test("should return false when trying to remove a non-existent component", () => {
+        const entity = Entity.Create();
+
+        // Try to remove a component that was never added
+        const removed = entity.remove(ValueComponent);
+        expect(removed).toBe(false);
+
+        // Entity should still have no components
+        expect(entity.componentList()).toHaveLength(0);
+    });
+
+    test("should remove only the specified component type, leaving others intact", () => {
+        const entity = Entity.Create();
+        entity.add(ValueComponent, { value: "value comp" });
+        entity.add(CustomAttributeComponent, { customData: "custom comp" });
+
+        // Verify both components are added
+        expect(entity.componentList()).toHaveLength(2);
+
+        // Remove only the ValueComponent
+        const removed = entity.remove(ValueComponent);
+        expect(removed).toBe(true);
+
+        // Verify only CustomAttributeComponent remains
+        expect(entity.componentList()).toHaveLength(1);
+        expect(entity.componentList()[0]).toBeInstanceOf(CustomAttributeComponent);
+    });
+
+    test("should mark entity as dirty after component removal", () => {
+        const entity = Entity.Create();
+        entity.add(ValueComponent, { value: "test" });
+
+        // Entity should be dirty after adding
+        expect((entity as any)._dirty).toBe(true);
+
+        // Save to make it clean
+        // Note: We can't actually save without database, but we can set it manually for test
+        entity.setDirty(false);
+        expect((entity as any)._dirty).toBe(false);
+
+        // Remove component
+        entity.remove(ValueComponent);
+
+        // Entity should be dirty again
+        expect((entity as any)._dirty).toBe(true);
+    });
+
+    test("should persist component addition and removal to database", async () => {
+        const entity = Entity.Create();
+        entity.add(ValueComponent, { value: "test value" });
+
+        // Save to database
+        const saveResult = await entity.save();
+        expect(saveResult).toBe(true);
+
+        // Verify component exists in database
+        const componentsAfterAdd = await db`SELECT id, data FROM components WHERE entity_id = ${entity.id} AND deleted_at IS NULL`;
+        expect(componentsAfterAdd.length).toBe(1);
+        expect(componentsAfterAdd[0].data.value).toBe("test value");
+
+        // Remove the component
+        const removed = entity.remove(ValueComponent);
+        expect(removed).toBe(true);
+
+        // Save again to persist removal
+        const saveResult2 = await entity.save();
+        expect(saveResult2).toBe(true);
+
+        // Verify component is removed from database
+        const componentsAfterRemove = await db`SELECT id, data FROM components WHERE entity_id = ${entity.id} AND deleted_at IS NULL`;
+        expect(componentsAfterRemove.length).toBe(0);
+    });
+
+    test("should handle multiple component additions and removals in database", async () => {
+        const entity = Entity.Create();
+        entity.add(ValueComponent, { value: "value comp" });
+        entity.add(CustomAttributeComponent, { customData: "custom comp" });
+
+        // Save to database
+        await entity.save();
+
+        // Verify both components exist
+        const componentsAfterAdd = await db`SELECT type_id, data FROM components WHERE entity_id = ${entity.id} AND deleted_at IS NULL ORDER BY type_id`;
+        expect(componentsAfterAdd.length).toBe(2);
+        const valueComp = componentsAfterAdd.find((c: any) => c.data.value === "value comp");
+        const customComp = componentsAfterAdd.find((c: any) => c.data.customData === "custom comp");
+        expect(valueComp).toBeDefined();
+        expect(customComp).toBeDefined();
+
+        // Remove one component
+        entity.remove(ValueComponent);
+        await entity.save();
+
+        // Verify only custom component remains
+        const componentsAfterRemove = await db`SELECT type_id, data FROM components WHERE entity_id = ${entity.id} AND deleted_at IS NULL`;
+        expect(componentsAfterRemove.length).toBe(1);
+        expect(componentsAfterRemove[0].data.customData).toBe("custom comp");
+
+        // Remove the last component
+        entity.remove(CustomAttributeComponent);
+        await entity.save();
+
+        // Verify no components remain
+        const componentsAfterRemoveAll = await db`SELECT id FROM components WHERE entity_id = ${entity.id} AND deleted_at IS NULL`;
+        expect(componentsAfterRemoveAll.length).toBe(0);
     });
 });
