@@ -71,9 +71,19 @@ const staticResolvers = {
 };
 
 const maskError = (error: any, message: string): GraphQLError => {
+    // Handle authentication errors
+    if (error.message === 'Unauthenticated' || error.extensions?.http?.status === 401 || error.extensions?.code === 'UNAUTHENTICATED') {
+        return new GraphQLError('Unauthorized', {
+            extensions: {
+                code: 'UNAUTHORIZED',
+                http: { status: 401 }
+            }
+        });
+    }
+    
     // Handle JWT authentication errors specifically
     if (error.extensions?.code === 'DOWNSTREAM_SERVICE_ERROR' && error.extensions?.http?.status === 401) {
-        return new GraphQLError('Error: Unauthorized', {
+        return new GraphQLError('Unauthorized', {
             extensions: {
                 code: 'UNAUTHORIZED',
                 http: { status: 401 }
