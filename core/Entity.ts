@@ -150,7 +150,23 @@ export class Entity {
 
     @timed("Entity.save")
     public save() {
-        return EntityManager.saveEntity(this);
+        return new Promise<boolean>((resolve, reject) => {
+            // Add timeout to prevent hanging
+            const timeout = setTimeout(() => {
+                logger.error(`Entity save timeout for entity ${this.id}`);
+                reject(new Error(`Entity save timeout for entity ${this.id}`));
+            }, 30000); // 30 second timeout
+
+            this.doSave()
+                .then(result => {
+                    clearTimeout(timeout);
+                    resolve(result);
+                })
+                .catch(error => {
+                    clearTimeout(timeout);
+                    reject(error);
+                });
+        });
     }
 
     

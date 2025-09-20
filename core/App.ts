@@ -140,50 +140,98 @@ export default class App {
     private async handleRequest(req: Request): Promise<Response> {
         const url = new URL(req.url);
         const method = req.method;
+        const startTime = Date.now();
       
-        // Check for static assets
-        for (const [route, folder] of this.staticAssets) {
-            if (url.pathname.startsWith(route)) {
-                const relativePath = url.pathname.slice(route.length);
-                const filePath = path.join(folder, relativePath);
-                try {
-                    const file = Bun.file(filePath);
-                    if (await file.exists()) {
-                        return new Response(file);
-                    }
-                } catch (error) {
-                    logger.error(`Error serving static file ${filePath}:`, error as any);
-                }
-            }
-        }
+        // Add request timeout
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => {
+            controller.abort();
+            logger.warn(`Request timeout: ${method} ${url.pathname}`);
+        }, 30000); // 30 second timeout
 
-        // Lookup REST endpoint using map for O(1) performance
-        const endpointKey = `${method}:${url.pathname}`;
-        const endpoint = this.restEndpointMap.get(endpointKey);
-        if (endpoint) {
-            try {
-                const result = await endpoint.handler(req);
-                if (result instanceof Response) {
-                    return result;
-                } else {
-                    return new Response(JSON.stringify(result), {
-                        headers: { 'Content-Type': 'application/json' }
-                    });
-                }
-            } catch (error) {
-                logger.error(`Error in REST endpoint ${method} ${endpoint.path}`, error as any);
-                return new Response(JSON.stringify({ error: 'Internal server error' }), {
-                    status: 500,
+        try {
+            // Health check endpoint
+            if (url.pathname === '/health') {
+                clearTimeout(timeoutId);
+                return new Response(JSON.stringify({ 
+                    status: 'ok', 
+                    timestamp: new Date().toISOString(),
+                    uptime: process.uptime()
+                }), {
                     headers: { 'Content-Type': 'application/json' }
                 });
             }
-        }
+            for (const [route, folder] of this.staticAssets) {
+                if (url.pathname.startsWith(route)) {
+                    const relativePath = url.pathname.slice(route.length);
+                    const filePath = path.join(folder, relativePath);
+                    try {
+                        const file = Bun.file(filePath);
+                        if (await file.exists()) {
+                            clearTimeout(timeoutId);
+                            return new Response(file);
+                        }
+                    } catch (error) {
+                        logger.error(`Error serving static file ${filePath}:`, error as any);
+                    }
+                }
+            }
 
-        if (this.yoga) {
-            return this.yoga(req);
-        }
+            // Lookup REST endpoint using map for O(1) performance
+            const endpointKey = `${method}:${url.pathname}`;
+            const endpoint = this.restEndpointMap.get(endpointKey);
+            if (endpoint) {
+                try {
+                    const result = await endpoint.handler(req);
+                    const duration = Date.now() - startTime;
+                    logger.trace(`REST ${method} ${url.pathname} completed in ${duration}ms`);
+                    
+                    clearTimeout(timeoutId);
+                    if (result instanceof Response) {
+                        return result;
+                    } else {
+                        return new Response(JSON.stringify(result), {
+                            headers: { 'Content-Type': 'application/json' }
+                        });
+                    }
+                } catch (error) {
+                    const duration = Date.now() - startTime;
+                    logger.error(`Error in REST endpoint ${method} ${endpoint.path} after ${duration}ms`, error as any);
+                    clearTimeout(timeoutId);
+                    return new Response(JSON.stringify({ error: 'Internal server error' }), {
+                        status: 500,
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                }
+            }
 
-        return new Response('Not Found', { status: 404 });
+            if (this.yoga) {
+                const response = await this.yoga(req);
+                const duration = Date.now() - startTime;
+                logger.trace(`GraphQL request completed in ${duration}ms`);
+                clearTimeout(timeoutId);
+                return response;
+            }
+
+            clearTimeout(timeoutId);
+            return new Response('Not Found', { status: 404 });
+        } catch (error) {
+            const duration = Date.now() - startTime;
+            logger.error(`Request failed after ${duration}ms: ${method} ${url.pathname}`, error as any);
+            clearTimeout(timeoutId);
+            
+            if ((error as Error).name === 'AbortError') {
+                return new Response(JSON.stringify({ error: 'Request timeout' }), {
+                    status: 408,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
+            
+            return new Response(JSON.stringify({ error: 'Internal server error' }), {
+                status: 500,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
     }
 
     async start() {

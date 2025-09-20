@@ -3,10 +3,10 @@ import { logger } from "core/Logger";
 
 const db = new SQL({
     url: `postgres://${process.env.POSTGRES_USER}:${process.env.POSTGRES_PASSWORD}@${process.env.POSTGRES_HOST}:${process.env.POSTGRES_PORT ?? "5432"}/${process.env.POSTGRES_DB}`,
-    // Connection pool settings
-    max: parseInt(process.env.POSTGRES_MAX_CONNECTIONS ?? '10', 10), // Maximum connections in pool
-    idleTimeout: 0, // Close idle connections after 30s
-    maxLifetime: 0, // Connection lifetime in seconds (0 = forever)
+    // Connection pool settings - FIXED
+    max: parseInt(process.env.POSTGRES_MAX_CONNECTIONS ?? '20', 10), // Increased max connections
+    idleTimeout: 30000, // Close idle connections after 30s (was 0)
+    maxLifetime: 600000, // Connection lifetime 10 minutes (was 0 = forever)
     connectionTimeout: 30, // Timeout when establishing new connections
     onclose: (err) => {
         if (err) {

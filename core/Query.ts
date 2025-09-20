@@ -235,6 +235,26 @@ class Query {
 
     @timed("Query.exec")
     public async exec(): Promise<Entity[]> {
+        return new Promise<Entity[]>((resolve, reject) => {
+            // Add timeout to prevent hanging queries
+            const timeout = setTimeout(() => {
+                logger.error(`Query execution timeout`);
+                reject(new Error(`Query execution timeout after 30 seconds`));
+            }, 30000); // 30 second timeout
+
+            this.doExec()
+                .then(result => {
+                    clearTimeout(timeout);
+                    resolve(result);
+                })
+                .catch(error => {
+                    clearTimeout(timeout);
+                    reject(error);
+                });
+        });
+    }
+
+    private async doExec(): Promise<Entity[]> {
         const componentIds = Array.from(this.requiredComponents);
         const excludedIds = Array.from(this.excludedComponents);
         const componentCount = componentIds.length;
