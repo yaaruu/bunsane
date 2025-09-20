@@ -189,6 +189,7 @@ export default class App {
     async start() {
         logger.info("Application Started");
         const server = Bun.serve({
+            port: parseInt(process.env.PORT || "3000"),
             fetch: this.handleRequest.bind(this),
         });
         logger.info(`Server is running on ${new URL(this.yoga?.graphqlEndpoint || '/graphql', `http://${server.hostname}:${server.port}`)}`)

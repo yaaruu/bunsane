@@ -2,7 +2,7 @@ import {SQL} from "bun";
 import { logger } from "core/Logger";
 
 const db = new SQL({
-    url: `postgres://${process.env.POSTGRES_USER}:${process.env.POSTGRES_PASSWORD}@${process.env.POSTGRES_HOST}:5432/${process.env.POSTGRES_DB}`,
+    url: `postgres://${process.env.POSTGRES_USER}:${process.env.POSTGRES_PASSWORD}@${process.env.POSTGRES_HOST}:${process.env.POSTGRES_PORT ?? "5432"}/${process.env.POSTGRES_DB}`,
     // Connection pool settings
     max: parseInt(process.env.POSTGRES_MAX_CONNECTIONS ?? '10', 10), // Maximum connections in pool
     idleTimeout: 0, // Close idle connections after 30s

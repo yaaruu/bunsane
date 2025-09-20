@@ -158,7 +158,7 @@ export class Entity {
     public doSave() {
         return new Promise<boolean>(async resolve => {
             if(!this._dirty) {
-                console.log("Entity is not dirty, no need to save.");
+                logger.trace("Entity is not dirty, no need to save.");
                 return resolve(true); 
             }
 

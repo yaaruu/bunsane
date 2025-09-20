@@ -57,7 +57,7 @@ export function generateGraphQLSchema(services: any[]): { schema: GraphQLSchema 
     let typeDefs = `
     `;
     const scalarTypes: Set<string> = new Set();
-    const resolvers: any = { Query: {}, Mutation: {} };
+    const resolvers: any = {};
     const queryFields: string[] = [];
     const mutationFields: string[] = [];
 
@@ -80,6 +80,7 @@ export function generateGraphQLSchema(services: any[]): { schema: GraphQLSchema 
         if (service.__graphqlOperations) {
             service.__graphqlOperations.forEach((op: any) => {
                 const { type, name, input, output, propertyKey } = op;
+                if (!resolvers[type]) resolvers[type] = {};
                 let fieldDef = `${name}`;
                 if (input) {
                     const inputName = `${name}Input`;
