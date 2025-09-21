@@ -41,6 +41,7 @@ class ServiceRegistry {
         if(!this.services.has(service.constructor.name)) {
             this.services.set(service.constructor.name, service);
         }
+        return service;
     }
 
     public getServices(): BaseService[] {

@@ -1,5 +1,6 @@
 import type { SwaggerEndpointMetadata } from "./decorators";
-
+import {logger as MainLogger}  from "core/Logger";
+const logger = MainLogger.child({ scope: "OpenAPISpecGenerator" });
 export interface OpenAPISpec {
     openapi: string;
     info: {
@@ -38,7 +39,7 @@ export class OpenAPISpecGenerator {
 
     addEndpoint(metadata: SwaggerEndpointMetadata) {
         const { method, path, operation } = metadata;
-
+        logger.trace(`Adding endpoint to OpenAPI spec: [${method}] ${path}`);
         if (!this.spec.paths[path]) {
             this.spec.paths[path] = {};
         }

@@ -103,6 +103,7 @@ export default class App {
                                         handler: endpoint.handler.bind(service),
                                         service: service
                                     };
+                                    logger.trace(`Registered REST endpoint: [${endpoint.method}] ${endpoint.path} for service ${service.constructor.name}`);
                                     this.restEndpoints.push(endpointInfo);
                                     this.restEndpointMap.set(`${endpoint.method}:${endpoint.path}`, endpointInfo);
 
@@ -112,22 +113,26 @@ export default class App {
                                         const classTags = (service.constructor as any).swaggerClassTags || [];
                                         const methodTags = (service.constructor as any).swaggerMethodTags?.[endpoint.handler.name] || [];
                                         const allTags = [...classTags, ...methodTags];
+
+                                        logger.trace(`Generating OpenAPI spec for endpoint: [${endpoint.method}] ${endpoint.path} with tags: ${allTags.join(", ")}`);
                                         
                                         // Merge tags into the operation
                                         const operation = { ...(endpoint.handler as any).swaggerOperation };
                                         if (allTags.length > 0) {
                                             operation.tags = [...(operation.tags || []), ...allTags];
-                                        }
+                                        }   
                                         
                                         this.openAPISpecGenerator!.addEndpoint({
                                             method: endpoint.method,
                                             path: endpoint.path,
                                             operation
                                         });
+                                        logger.trace(`Registered OpenAPI spec for endpoint: [${endpoint.method}] ${endpoint.path}`);
                                     }
                                 }
                             }
                         }
+
 
                         ApplicationLifecycle.setPhase(ApplicationPhase.APPLICATION_READY);
                     } catch (error) {
@@ -160,10 +165,15 @@ export default class App {
     public addOpenAPISchema(name: string, schema: any) {
         this.openAPISpecGenerator!.addSchema(name, schema);
     }
+    public addOpenAPIServer(url: string, description?: string) {
+        this.openAPISpecGenerator!.addServer(url, description);
+    }
 
     public addYogaPlugin(plugin: Plugin) {
         this.yogaPlugins.push(plugin);
     }
+
+    
 
     public addStaticAssets(route: string, folder: string) {
         // Resolve the folder path relative to the current working directory
