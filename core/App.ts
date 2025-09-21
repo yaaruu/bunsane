@@ -21,6 +21,8 @@ export default class App {
     private staticAssets: Map<string, string> = new Map();
     private openAPISpecGenerator: OpenAPISpecGenerator | null = null;
 
+    private appReadyCallbacks: Array<() => void> = [];
+
     constructor(appName?: string, appVersion?: string) {
         if (appName) this.name = appName;
         if (appVersion) this.version = appVersion;
@@ -347,6 +349,10 @@ export default class App {
         this.version = version;
     }
 
+    public subscribeAppReady(callback: () => void) {
+        this.appReadyCallbacks.push(callback);
+    }
+
     async start() {
         logger.info("Application Started");
         const port = parseInt(process.env.PORT || "3000");
@@ -359,5 +365,7 @@ export default class App {
         this.openAPISpecGenerator!.addServer(`http://localhost:${port}`, "Development server");
         
         logger.info(`Server is running on ${new URL(this.yoga?.graphqlEndpoint || '/graphql', `http://${server.hostname}:${server.port}`)}`)
+
+        this.appReadyCallbacks.forEach(cb => cb());
     }
 }
