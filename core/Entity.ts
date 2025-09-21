@@ -39,9 +39,13 @@ export class Entity {
      * Adds a new component to the entity.
      * Use like: entity.add(Component, { value: "Test" })
      */
-    public add<T extends BaseComponent>(ctor: new (...args: any[]) => T, data: Partial<ComponentDataType<T>>): this {
+    public add<T extends BaseComponent>(ctor: new (...args: any[]) => T, data?: Partial<ComponentDataType<T>>): this {
         const instance = new ctor();
-        Object.assign(instance, data);
+        if (data) {
+            Object.assign(instance, data);
+        } else {
+            Object.assign(instance, {});
+        }
         this.addComponent(instance);
         
         // Fire component added event

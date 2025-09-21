@@ -40,7 +40,7 @@ import type {
 import { ScheduledTask } from "core/decorators/ScheduledTask";
 import { ScheduleInterval } from "types/scheduler.types";
 // Swagger exports
-import { ApiOperation, ApiTags } from "./swagger";
+import { ApiDocs, ApiTags } from "./swagger";
 
 export { 
     App, 
@@ -60,7 +60,7 @@ export {
     ScheduledTask,
 
     // Swagger exports
-    ApiOperation,
+    ApiDocs,
     ApiTags,
 
     logger,

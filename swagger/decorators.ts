@@ -42,7 +42,7 @@ export interface SwaggerEndpointMetadata {
  *
 */
 
-export function ApiOperation(operation: OpenAPIOperation) {
+export function ApiDocs(operation: OpenAPIOperation) {
     return function (target: any, propertyKey: string, descriptor: PropertyDescriptor) {
         // Store the operation on the function itself
         (descriptor.value as any).swaggerOperation = operation;

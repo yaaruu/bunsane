@@ -128,6 +128,17 @@ export default class App {
                                             operation
                                         });
                                         logger.trace(`Registered OpenAPI spec for endpoint: [${endpoint.method}] ${endpoint.path}`);
+                                    } else {
+                                        logger.warn(`No swagger operation found for endpoint: [${endpoint.method}] ${endpoint.path} in service ${service.constructor.name}`);
+                                        this.openAPISpecGenerator!.addEndpoint({
+                                            method: endpoint.method,
+                                            path: endpoint.path,
+                                            operation: {
+                                                summary: `No description for ${endpoint.path}. Don't use this endpoint until it's properly documented!`,
+                                                requestBody: {content: {"application/json": {schema: {}}}},
+                                                responses: { "200": { description: "Success" } }
+                                            }
+                                        });
                                     }
                                 }
                             }
