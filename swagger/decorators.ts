@@ -35,6 +35,13 @@ export interface SwaggerEndpointMetadata {
     operation: OpenAPIOperation;
 }
 
+/** 
+ * Annotations for OpenAPI/Swagger documentation 
+ * - @ApiOperation: Describes an API operation (endpoint)
+ * - @ApiTags: Assigns tags to group operations in the documentation
+ *
+*/
+
 export function ApiOperation(operation: OpenAPIOperation) {
     return function (target: any, propertyKey: string, descriptor: PropertyDescriptor) {
         // Store the operation on the function itself

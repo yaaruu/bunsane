@@ -108,10 +108,21 @@ export default class App {
 
                                     // Check if this endpoint has a swagger operation
                                     if ((endpoint.handler as any).swaggerOperation) {
+                                        // Collect tags from class and method decorators
+                                        const classTags = (service.constructor as any).swaggerClassTags || [];
+                                        const methodTags = (service.constructor as any).swaggerMethodTags?.[endpoint.handler.name] || [];
+                                        const allTags = [...classTags, ...methodTags];
+                                        
+                                        // Merge tags into the operation
+                                        const operation = { ...(endpoint.handler as any).swaggerOperation };
+                                        if (allTags.length > 0) {
+                                            operation.tags = [...(operation.tags || []), ...allTags];
+                                        }
+                                        
                                         this.openAPISpecGenerator!.addEndpoint({
                                             method: endpoint.method,
                                             path: endpoint.path,
-                                            operation: (endpoint.handler as any).swaggerOperation
+                                            operation
                                         });
                                     }
                                 }
