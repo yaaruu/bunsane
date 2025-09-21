@@ -9,20 +9,30 @@ import * as path from "path";
 import { registerDecoratedHooks } from "core/decorators/EntityHooks";
 import { SchedulerManager } from "core/SchedulerManager";
 import { registerScheduledTasks } from "core/decorators/ScheduledTask";
+import { OpenAPISpecGenerator, type SwaggerEndpointMetadata } from "swagger";
 
 export default class App {
+    private name: string = "BunSane Application";
+    private version: string = "1.0.0";
     private yoga: any;
     private yogaPlugins: Plugin[] = [];
     private restEndpoints: Array<{ method: string; path: string; handler: Function; service: any }> = [];
     private restEndpointMap: Map<string, { method: string; path: string; handler: Function; service: any }> = new Map();
     private staticAssets: Map<string, string> = new Map();
+    private openAPISpecGenerator: OpenAPISpecGenerator | null = null;
 
-    constructor() {
+    constructor(appName?: string, appVersion?: string) {
+        if (appName) this.name = appName;
+        if (appVersion) this.version = appVersion;
         this.init();
     }
 
     async init() {
         logger.trace(`Initializing App`);
+        this.openAPISpecGenerator = new OpenAPISpecGenerator(
+            this.name,
+            this.version,
+        );
         ComponentRegistry.init();
         ServiceRegistry.init();
         if(ApplicationLifecycle.getCurrentPhase() === ApplicationPhase.DATABASE_INITIALIZING) {
@@ -95,6 +105,15 @@ export default class App {
                                     };
                                     this.restEndpoints.push(endpointInfo);
                                     this.restEndpointMap.set(`${endpoint.method}:${endpoint.path}`, endpointInfo);
+
+                                    // Check if this endpoint has a swagger operation
+                                    if ((endpoint.handler as any).swaggerOperation) {
+                                        this.openAPISpecGenerator!.addEndpoint({
+                                            method: endpoint.method,
+                                            path: endpoint.path,
+                                            operation: (endpoint.handler as any).swaggerOperation
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -125,6 +144,10 @@ export default class App {
                 }
             }, 100);
         });
+    }
+
+    public addOpenAPISchema(name: string, schema: any) {
+        this.openAPISpecGenerator!.addSchema(name, schema);
     }
 
     public addYogaPlugin(plugin: Plugin) {
@@ -159,6 +182,56 @@ export default class App {
                     uptime: process.uptime()
                 }), {
                     headers: { 'Content-Type': 'application/json' }
+                });
+            }
+
+            // OpenAPI spec endpoint
+            if (url.pathname === '/openapi.json') {
+                clearTimeout(timeoutId);
+                return new Response(this.openAPISpecGenerator!.toJSON(), {
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
+
+            // Swagger UI endpoint
+            if (url.pathname === '/docs') {
+                clearTimeout(timeoutId);
+                const swaggerUIHTML = `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>${this.name} Documentation</title>
+    <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.10.3/swagger-ui.css" />
+    <style>
+        html { box-sizing: border-box; overflow: -moz-scrollbars-vertical; overflow-y: scroll; }
+        *, *:before, *:after { box-sizing: inherit; }
+        body { margin: 0; background: #fafafa; }
+    </style>
+</head>
+<body>
+    <div id="swagger-ui"></div>
+    <script src="https://unpkg.com/swagger-ui-dist@5.10.3/swagger-ui-bundle.js"></script>
+    <script>
+        window.onload = function() {
+            const ui = SwaggerUIBundle({
+                url: '/openapi.json',
+                dom_id: '#swagger-ui',
+                deepLinking: true,
+                presets: [
+                    SwaggerUIBundle.presets.apis,
+                    SwaggerUIBundle.presets.standalone
+                ],
+                plugins: [
+                    SwaggerUIBundle.plugins.DownloadUrl
+                ],
+                layout: "BaseLayout"
+            });
+        };
+    </script>
+</body>
+</html>`;
+                return new Response(swaggerUIHTML, {
+                    headers: { 'Content-Type': 'text/html' }
                 });
             }
             for (const [route, folder] of this.staticAssets) {
@@ -234,12 +307,25 @@ export default class App {
         }
     }
 
+    public setName(name: string) {
+        this.name = name;
+    }
+
+    public setVersion(version: string) {
+        this.version = version;
+    }
+
     async start() {
         logger.info("Application Started");
+        const port = parseInt(process.env.PORT || "3000");
         const server = Bun.serve({
-            port: parseInt(process.env.PORT || "3000"),
+            port: port,
             fetch: this.handleRequest.bind(this),
         });
+        
+        // Update the OpenAPI spec with the actual server URL
+        this.openAPISpecGenerator!.addServer(`http://localhost:${port}`, "Development server");
+        
         logger.info(`Server is running on ${new URL(this.yoga?.graphqlEndpoint || '/graphql', `http://${server.hostname}:${server.port}`)}`)
     }
 }

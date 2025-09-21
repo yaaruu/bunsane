@@ -39,6 +39,8 @@ import type {
 } from "./core/events/EntityLifecycleEvents";
 import { ScheduledTask } from "core/decorators/ScheduledTask";
 import { ScheduleInterval } from "types/scheduler.types";
+// Swagger exports
+import { ApiOperation, ApiTags } from "./swagger";
 
 export { 
     App, 
@@ -56,6 +58,10 @@ export {
     // Scheduler exports
     ScheduleInterval,
     ScheduledTask,
+
+    // Swagger exports
+    ApiOperation,
+    ApiTags,
 
     logger,
 
