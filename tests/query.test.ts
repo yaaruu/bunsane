@@ -6,6 +6,7 @@ import { Entity } from "core/Entity";
 let app;
 beforeAll(async () => {
     app = new App();
+    app.init();
     await app.waitForAppReady();
 });
 

@@ -63,6 +63,13 @@ export default class App {
                 }
                 case ApplicationPhase.COMPONENTS_READY: {
                     const components = ComponentRegistry.getComponents();
+                    for(const plugin of this.plugins) {
+                        if(plugin.onComponentRegistered) {
+                            for(const {name, ctor} of components) {
+                                plugin.onComponentRegistered(name, ctor, this);
+                            }
+                        }
+                    }
                     for(const {name, ctor} of components) {
                         const instance = new ctor();
                         if(instance.indexedProperties().length > 0) {

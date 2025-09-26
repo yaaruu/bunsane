@@ -7,6 +7,7 @@ import db from "database";
 let app;
 beforeAll(async () => {
     app = new App();
+    app.init();
     await app.waitForAppReady();
 });
 

@@ -7,7 +7,7 @@ import db from "database";
 import { timed } from "./Decorators";
 import { inList } from "../database/sqlHelpers";
 
-export type FilterOperator = "=" | ">" | "<" | ">=" | "<=" | "!=" | "LIKE" | "IN" | "NOT IN";
+export type FilterOperator = "=" | ">" | "<" | ">=" | "<=" | "!=" | "LIKE" | "IN" | "NOT IN" | string;
 
 export const FilterOp = {
     EQ: "=" as FilterOperator,
@@ -49,6 +49,12 @@ class Query {
     private offsetValue: number = 0;
     private eagerComponents: Set<string> = new Set<string>();
     private sortOrders: SortOrder[] = [];
+
+    private static customFilterBuilders: Map<string, (filter: QueryFilter, alias: string, paramIndex: number) => { sql: string, params: any[], newParamIndex: number }> = new Map();
+
+    public static registerFilterBuilder(operator: string, builder: (filter: QueryFilter, alias: string, paramIndex: number) => { sql: string, params: any[], newParamIndex: number }) {
+        this.customFilterBuilders.set(operator, builder);
+    }
 
     static filterOp = FilterOp;
 
@@ -117,6 +123,11 @@ class Query {
 
     private buildFilterCondition(filter: QueryFilter, alias: string, paramIndex: number): { sql: string, params: any[], newParamIndex: number } {
         const { field, operator, value } = filter;
+
+        // Check for custom filter builders first
+        if (Query.customFilterBuilders.has(operator)) {
+            return Query.customFilterBuilders.get(operator)!(filter, alias, paramIndex);
+        }
 
         // Build JSON path for nested properties (e.g., "parent.child" -> data->'parent'->>'child')
         const jsonPath = this.buildJsonPath(field, alias);
@@ -339,7 +350,6 @@ class Query {
                 let queryStr: any;
                 let requiredOnlyQueryResult: any;
                 if (componentCount === 1) {
-                    // Phase 2A: Optimize single component sorting with JOIN
                     if (this.sortOrders.length > 0) {
                         const typeId = componentIds[0]!;
                         const sortExpression = this.buildSortExpressionForSingleComponent(typeId, "c");

@@ -9,6 +9,7 @@ let app: App;
 
 beforeAll(async () => {
     app = new App();
+    app.init();
     await app.waitForAppReady();
 });
 

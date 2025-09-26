@@ -61,6 +61,7 @@ const PostArchetype = new ArcheType([PostTag]);
 
 beforeAll(async () => {
     app = new App();
+    app.init();
     await app.waitForAppReady();
 });
 

@@ -6,7 +6,8 @@ abstract class BasePlugin {
     version!: string;
 
     abstract init?(app: App): Promise<void> | void;
-    abstract onPhaseChange(phase: ApplicationPhase, app: App): Promise<void> | void;
+    onPhaseChange?(phase: ApplicationPhase, app: App): Promise<void> | void;
+    onComponentRegistered?(componentName: string, componentCtor: new () => any, app: App): void;
 }
 
 export default BasePlugin;
