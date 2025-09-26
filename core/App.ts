@@ -20,6 +20,7 @@ export default class App {
     private restEndpointMap: Map<string, { method: string; path: string; handler: Function; service: any }> = new Map();
     private staticAssets: Map<string, string> = new Map();
     private openAPISpecGenerator: OpenAPISpecGenerator | null = null;
+    private enforceDocs: boolean = false;
 
     private appReadyCallbacks: Array<() => void> = [];
 
@@ -131,16 +132,18 @@ export default class App {
                                         });
                                         logger.trace(`Registered OpenAPI spec for endpoint: [${endpoint.method}] ${endpoint.path}`);
                                     } else {
-                                        logger.warn(`No swagger operation found for endpoint: [${endpoint.method}] ${endpoint.path} in service ${service.constructor.name}`);
-                                        this.openAPISpecGenerator!.addEndpoint({
-                                            method: endpoint.method,
-                                            path: endpoint.path,
-                                            operation: {
-                                                summary: `No description for ${endpoint.path}. Don't use this endpoint until it's properly documented!`,
-                                                requestBody: {content: {"application/json": {schema: {}}}},
-                                                responses: { "200": { description: "Success" } }
-                                            }
-                                        });
+                                        if(this.enforceDocs) {
+                                            logger.warn(`No swagger operation found for endpoint: [${endpoint.method}] ${endpoint.path} in service ${service.constructor.name}`);
+                                            this.openAPISpecGenerator!.addEndpoint({
+                                                method: endpoint.method,
+                                                path: endpoint.path,
+                                                operation: {
+                                                    summary: `No description for ${endpoint.path}. Don't use this endpoint until it's properly documented!`,
+                                                    requestBody: {content: {"application/json": {schema: {}}}},
+                                                    responses: { "200": { description: "Success" } }
+                                                }
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -351,6 +354,10 @@ export default class App {
 
     public subscribeAppReady(callback: () => void) {
         this.appReadyCallbacks.push(callback);
+    }
+
+    public enforceSwaggerDocs(value: boolean) {
+        this.enforceDocs = value;
     }
 
     async start() {

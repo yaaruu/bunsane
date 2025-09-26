@@ -13,6 +13,21 @@ export function CompData(options?: { indexed?: boolean }) {
     return Reflect.metadata("compData", { isData: true, indexed: options?.indexed ?? false });
 }
 
+export enum CompCastingType {
+    STRING = "string",
+    NUMBER = "number",
+    BOOLEAN = "boolean",
+    DATE = "date",
+}
+/**
+ * Cast property to specific type when loading from database
+ * @param type Casting type for the property
+ * @returns 
+ */
+export function Cast(type: CompCastingType) {
+    return Reflect.metadata("compCast", { type });
+}
+
 // Type helper to extract only data properties (excludes methods and private properties)
 export type ComponentDataType<T extends BaseComponent> = {
     [K in keyof T as T[K] extends Function ? never : 

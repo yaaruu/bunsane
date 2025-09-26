@@ -47,7 +47,7 @@ export class Entity {
             Object.assign(instance, {});
         }
         this.addComponent(instance);
-        
+        this._dirty = true; 
         // Fire component added event
         try {
             EntityHookManager.executeHooks(new ComponentAddedEvent(this, instance));
@@ -88,6 +88,7 @@ export class Entity {
         } else {
             // Add new component
             this.add(ctor, data);
+            this._dirty = true;
             // Note: add() already fires ComponentAddedEvent, so we don't need to fire it again
         }
         return this;
@@ -149,6 +150,40 @@ export class Entity {
                     comp.setDirty(false);
                     this.addComponent(comp);
                     return comp.data();
+                } else {
+                    return null;
+                }
+            } catch (error) {
+                logger.error(`Failed to fetch component: ${error}`);
+                return null;
+            }
+        }
+    }
+
+    /**
+     * Get a component from the entity.
+     * @param ctor Constructor of the component to fetch
+     * @returns Component instance or null if not found
+     */
+    public async getComponent<T extends BaseComponent>(ctor: new (...args: any[]) => T): Promise<T | null> {
+        const comp = Array.from(this.components.values()).find(comp => comp instanceof ctor) as T | undefined;
+        if(typeof comp !== "undefined") {
+            return comp;
+        } else {
+            // fetch from db
+            const temp = new ctor();
+            const typeId = temp.getTypeID();
+            try {
+                const rows = await db`SELECT id, data FROM components WHERE entity_id = ${this.id} AND type_id = ${typeId} AND deleted_at IS NULL`;
+                if (rows.length > 0) {
+                    const row = rows[0];
+                    const comp = new ctor();
+                    Object.assign(comp, row.data);
+                    comp.id = row.id;
+                    comp.setPersisted(true);
+                    comp.setDirty(false);
+                    this.addComponent(comp);
+                    return comp;
                 } else {
                     return null;
                 }
@@ -361,6 +396,11 @@ export class Entity {
         }
     }
 
+    /**
+     * Find an entity by its ID. Returning populated with all components. Or null if not found.
+     * @param id Entity ID
+     * @returns Entity | null
+     */
     public static async FindById(id: string): Promise<Entity | null> {
         const entities = await new Query().findById(id).populate().exec()
         if(entities.length === 1) {
