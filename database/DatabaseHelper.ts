@@ -91,7 +91,6 @@ export const GetDatabaseDataSize = async () => {
 
 
 export const SetupDatabaseExtensions = async () => {
-    // await db`CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`;
 }
 
 export const CreateEntityTable = async () => {

@@ -14,8 +14,6 @@ export { LocalStorageProvider } from "../core/storage/LocalStorageProvider";
 // Components
 export { UploadComponent, ImageMetadataComponent } from "../core/components/UploadComponent";
 
-// Processors
-export { ImageProcessor } from "../core/processors/ImageProcessor";
 
 // Utilities
 export { UploadHelper } from "../utils/UploadHelper";
