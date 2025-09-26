@@ -172,16 +172,17 @@ export const UpdateComponentIndexes = async (table_name: string, indexedProperti
     }
 }
 
-
-export const CreateComponentPartitionTable = async (comp_name: string, type_id: string, indexedProperties?: string[]) => {
+//TODO: Cleanup and optimize
+export const CreateComponentPartitionTable = async (comp_name: string, type_id: string) => {
     try {
         comp_name = validateIdentifier(comp_name);
-        // type_id is a value, not identifier, so no validation
-        if (indexedProperties) {
-            indexedProperties = indexedProperties.map(prop => validateIdentifier(prop));
-        }
+        // // type_id is a value, not identifier, so no validation
+        // if (indexedProperties) {
+        //     indexedProperties = indexedProperties.map(prop => validateIdentifier(prop));
+        // }
         logger.trace(`Attempt adding partition table for component: ${comp_name}`);
-        const table_name = `components_${comp_name.toLowerCase().replace(/\s+/g, '_')}`;
+        // const table_name = `components_${comp_name.toLowerCase().replace(/\s+/g, '_')}`;
+        const table_name = GenerateTableName(comp_name);
         logger.trace(`Checking for existing partition table: ${table_name}`);
         const existingPartition = await db.unsafe(`SELECT 1 FROM information_schema.tables 
             WHERE table_name = '${table_name}' 
@@ -201,16 +202,17 @@ export const CreateComponentPartitionTable = async (comp_name: string, type_id: 
         });
         logger.trace(`Successfully created partition table: ${table_name}`);
 
-        if (BUNSANE_RELATION_TYPED_COLUMN && indexedProperties?.includes('value')) {
-            logger.trace(`Adding typed FK column for ${table_name}`);
-            await retryWithBackoff(async () => {
-                await db.unsafe(`ALTER TABLE ${table_name} ADD COLUMN IF NOT EXISTS fk_id UUID GENERATED ALWAYS AS ((data->>'value')::UUID) STORED`);
-            });
-            await retryWithBackoff(async () => {
-                await db.unsafe(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${table_name}_fk_id ON ${table_name} (fk_id)`);
-            });
-            logger.trace(`Added fk_id column and index for ${table_name}`);
-        }
+        // TODO: Not sure if this is needed here or should be handled separately
+        // if (BUNSANE_RELATION_TYPED_COLUMN && indexedProperties?.includes('value')) {
+        //     logger.trace(`Adding typed FK column for ${table_name}`);
+        //     await retryWithBackoff(async () => {
+        //         await db.unsafe(`ALTER TABLE ${table_name} ADD COLUMN IF NOT EXISTS fk_id UUID GENERATED ALWAYS AS ((data->>'value')::UUID) STORED`);
+        //     });
+        //     await retryWithBackoff(async () => {
+        //         await db.unsafe(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${table_name}_fk_id ON ${table_name} (fk_id)`);
+        //     });
+        //     logger.trace(`Added fk_id column and index for ${table_name}`);
+        // }
         
     } catch (error) {
         logger.error(`Failed to create component partition table for ${comp_name}: ${error}`);
@@ -256,7 +258,8 @@ export const CreateEntityComponentTable = async () => {
     await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_type_id ON entity_components (type_id);`
     await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_type_entity ON entity_components (type_id, entity_id);`
 
-    // Phase 2A: Add composite indexes for sorting optimization
     await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_type_entity_deleted ON entity_components (type_id, entity_id, deleted_at);`
     await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_deleted_type ON entity_components (deleted_at, type_id) WHERE deleted_at IS NULL;`
 }
+
+export const GenerateTableName = (name: string) => `components_${name.toLowerCase().replace(/\s+/g, '_')}`;

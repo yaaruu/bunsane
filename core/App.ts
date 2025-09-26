@@ -1,5 +1,5 @@
 import ApplicationLifecycle, {ApplicationPhase} from "core/ApplicationLifecycle";
-import { HasValidBaseTable, PrepareDatabase } from "database/DatabaseHelper";
+import { GenerateTableName, HasValidBaseTable, PrepareDatabase, UpdateComponentIndexes } from "database/DatabaseHelper";
 import ComponentRegistry from "core/ComponentRegistry";
 import { logger } from "core/Logger";
 import { createYogaInstance } from "gql";
@@ -10,6 +10,7 @@ import { registerDecoratedHooks } from "core/decorators/EntityHooks";
 import { SchedulerManager } from "core/SchedulerManager";
 import { registerScheduledTasks } from "core/decorators/ScheduledTask";
 import { OpenAPISpecGenerator, type SwaggerEndpointMetadata } from "swagger";
+import type BasePlugin from "plugins";
 
 export default class App {
     private name: string = "BunSane Application";
@@ -24,36 +25,53 @@ export default class App {
 
     private appReadyCallbacks: Array<() => void> = [];
 
+    private plugins: BasePlugin[] = [];
+
     constructor(appName?: string, appVersion?: string) {
         if (appName) this.name = appName;
         if (appVersion) this.version = appVersion;
-        this.init();
-    }
-
-    async init() {
-        logger.trace(`Initializing App`);
         this.openAPISpecGenerator = new OpenAPISpecGenerator(
             this.name,
             this.version,
         );
+        return this;
+    }
+
+    async init() {
+        logger.trace(`Initializing App`);
         ComponentRegistry.init();
         ServiceRegistry.init();
-        if(ApplicationLifecycle.getCurrentPhase() === ApplicationPhase.DATABASE_INITIALIZING) {
-            if(!await HasValidBaseTable()) {
-                await PrepareDatabase();
+        // Plugin initialization
+        for(const plugin of this.plugins) {
+            if(plugin.init) {
+                await plugin.init(this);
             }
-            logger.trace(`Database prepared...`);
-            ApplicationLifecycle.setPhase(ApplicationPhase.DATABASE_READY);
         }
 
-        ApplicationLifecycle.addPhaseListener((event) => {
+        ApplicationLifecycle.addPhaseListener(async (event) => {
             const phase = event.detail;
             logger.info(`Application phase changed to: ${phase}`);
+            // Notify plugins of phase change
+            for(const plugin of this.plugins) {
+                if(plugin.onPhaseChange) {
+                    await plugin.onPhaseChange(phase, this);
+                }
+            }
             switch(phase) {
                 case ApplicationPhase.DATABASE_READY: {
                     break;
                 }
                 case ApplicationPhase.COMPONENTS_READY: {
+                    const components = ComponentRegistry.getComponents();
+                    for(const {name, ctor} of components) {
+                        const instance = new ctor();
+                        if(instance.indexedProperties().length > 0) {
+                            const table_name = GenerateTableName(name);
+                            UpdateComponentIndexes(table_name, instance.indexedProperties());
+                            // Register indexed component
+                        }
+                    }
+
                     // Automatically register decorated hooks for all services
                     const services = ServiceRegistry.getServices();
                     for (const service of services) {
@@ -165,6 +183,16 @@ export default class App {
                 }
             }
         });
+
+        if(ApplicationLifecycle.getCurrentPhase() === ApplicationPhase.DATABASE_INITIALIZING) {
+            if(!await HasValidBaseTable()) {
+                await PrepareDatabase();
+            }
+            logger.trace(`Database prepared...`);
+            ApplicationLifecycle.setPhase(ApplicationPhase.DATABASE_READY);
+        }
+
+        
     }
 
     waitForAppReady(): Promise<void> {
@@ -189,7 +217,9 @@ export default class App {
         this.yogaPlugins.push(plugin);
     }
 
-    
+    public addPlugin(plugin: BasePlugin) {
+        this.plugins.push(plugin);
+    }   
 
     public addStaticAssets(route: string, folder: string) {
         // Resolve the folder path relative to the current working directory

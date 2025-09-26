@@ -11,6 +11,7 @@ import { type Plugin } from "graphql-yoga";
 import { BatchLoader } from "core/BatchLoader";
 import { createRequestContextPlugin } from "./core/RequestContext";
 import type { RequestLoaders } from "./core/RequestLoaders";
+import BasePlugin from "./plugins";
 // Hook system exports
 import EntityHookManager from "./core/EntityHookManager";
 import {
@@ -65,6 +66,7 @@ export {
 
     logger,
 
+    BasePlugin,
     type Plugin,
 
     responseError,
