@@ -269,6 +269,10 @@ class Query {
         return this;
     }
 
+    public count(): Promise<number> {
+        return this.doCount();
+    }
+
     @timed("Query.exec")
     public async exec(): Promise<Entity[]> {
         return new Promise<Entity[]>((resolve, reject) => {
@@ -689,7 +693,9 @@ class Query {
 
         const filteredResult = await db.unsafe(sql, params);
         return filteredResult.map((row: any) => row.id);
-    }    private async getIdsWithFiltersAndExclusions(componentIds: string[], excludedIds: string[], componentCount: number, limit?: number | null, offset?: number): Promise<string[]> {
+    }
+
+    private async getIdsWithFiltersAndExclusions(componentIds: string[], excludedIds: string[], componentCount: number, limit?: number | null, offset?: number): Promise<string[]> {
         const entityIds = await this.getIdsWithFilters(componentIds, componentCount);
         
         if (entityIds.length === 0) {
@@ -718,6 +724,156 @@ class Query {
         }
         const exclusionResult = await query;
         return exclusionResult.map((row: any) => row.id);
+    }
+
+    private async doCount(): Promise<number> {
+        const componentIds = Array.from(this.requiredComponents);
+        const excludedIds = Array.from(this.excludedComponents);
+        const componentCount = componentIds.length;
+        const hasRequired = componentCount > 0;
+        const hasExcluded = excludedIds.length > 0;
+        const hasFilters = this.componentFilters.size > 0;
+        const hasWithId = this.withId !== null;
+        
+        switch (true) {
+            case !hasRequired && !hasExcluded && !hasWithId:
+                return 0;
+            case !hasRequired && !hasExcluded && hasWithId:
+                const result = await db`SELECT COUNT(*) as count FROM entities WHERE id = ${this.withId} AND deleted_at IS NULL`;
+                return parseInt(result[0].count);
+            case hasRequired && hasExcluded && hasFilters:
+                return await this.getCountWithFiltersAndExclusions(componentIds, excludedIds, componentCount);
+            case hasRequired && hasExcluded:
+                const componentIdsString = inList(componentIds, 1);
+                const excludedIdsString = inList(excludedIds, componentIdsString.newParamIndex);
+                const excludedQuery = db`
+                    SELECT COUNT(*) as count FROM (
+                        SELECT ec.entity_id
+                        FROM entity_components ec
+                        WHERE ec.type_id IN ${db.unsafe(componentIdsString.sql, componentIdsString.params)} AND ec.deleted_at IS NULL
+                        ${this.withId ? db`AND ec.entity_id = ${this.withId}` : db``}
+                        AND NOT EXISTS (
+                            SELECT 1 FROM entity_components ec_ex 
+                            WHERE ec_ex.entity_id = ec.entity_id AND ec_ex.type_id IN ${db.unsafe(excludedIdsString.sql, excludedIdsString.params)} AND ec_ex.deleted_at IS NULL
+                        )
+                        GROUP BY ec.entity_id
+                        HAVING COUNT(DISTINCT ec.type_id) = ${componentCount}
+                    ) as subquery
+                `;
+                const excludedResult = await excludedQuery;
+                return parseInt(excludedResult[0].count);
+            case hasRequired && hasFilters:
+                return await this.getCountWithFilters(componentIds, componentCount);
+            case hasRequired:
+                if (componentCount === 1) {
+                    const countQuery = db`SELECT COUNT(*) as count FROM entity_components WHERE type_id = ${componentIds[0]} ${this.withId ? db`AND entity_id = ${this.withId}` : db``} AND deleted_at IS NULL`;
+                    const countResult = await countQuery;
+                    return parseInt(countResult[0].count);
+                } else {
+                    const compIds = inList(componentIds, 1);
+                    const multiComponentQuery = db`
+                        SELECT COUNT(*) as count FROM (
+                            SELECT entity_id FROM entity_components 
+                            WHERE type_id IN ${db.unsafe(compIds.sql, compIds.params)} ${this.withId ? db`AND entity_id = ${this.withId}` : db``} AND deleted_at IS NULL 
+                            GROUP BY entity_id 
+                            HAVING COUNT(DISTINCT type_id) = ${componentCount}
+                        ) as subquery
+                    `;
+                    const multiComponentResult = await multiComponentQuery;
+                    return parseInt(multiComponentResult[0].count);
+                }
+            case hasExcluded:
+                const onlyExcludedIdsString = inList(excludedIds, 1);
+                const onlyExcludedQuery = db`
+                    SELECT COUNT(*) as count FROM (
+                        SELECT DISTINCT ec.entity_id
+                        FROM entity_components ec 
+                        WHERE ${this.withId ? db`ec.entity_id = ${this.withId} AND ` : db``} NOT EXISTS (
+                            SELECT 1 FROM entity_components ec_ex 
+                            WHERE ec_ex.entity_id = ec.entity_id AND ec_ex.type_id IN ${db.unsafe(onlyExcludedIdsString.sql, onlyExcludedIdsString.params)} AND ec_ex.deleted_at IS NULL
+                        )
+                        AND ec.deleted_at IS NULL
+                    ) as subquery
+                `;
+                const onlyExcludedResult = await onlyExcludedQuery;
+                return parseInt(onlyExcludedResult[0].count);
+            default:
+                return 0;
+        }
+    }
+
+    private async getCountWithFilters(componentIds: string[], componentCount: number): Promise<number> {
+        let params: any[] = [];
+        let paramIndex = 1;
+        const compIds = inList(componentIds, paramIndex);
+        params.push(...compIds.params);
+        paramIndex = compIds.newParamIndex;
+
+        const joins: string[] = [];
+        let joinIndex = 0;
+        for (const [typeId, filters] of this.componentFilters.entries()) {
+            if (componentIds.includes(typeId)) {
+                const alias = `c${joinIndex}`;
+                joins.push(`JOIN components ${alias} ON ec.entity_id = ${alias}.entity_id AND ${alias}.type_id = $${paramIndex} AND ${alias}.deleted_at IS NULL`);
+                params.push(typeId);
+                paramIndex++;
+                joinIndex++;
+            }
+        }
+
+        let sql: string = `SELECT COUNT(*) as count FROM (SELECT DISTINCT ec.entity_id FROM entity_components ec ${joins.join(' ')} WHERE ec.type_id IN ${compIds.sql} AND ec.deleted_at IS NULL`;
+
+        if (this.withId) {
+            sql += ` AND ec.entity_id = $${paramIndex}`;
+            params.push(this.withId);
+            paramIndex++;
+        }
+
+        joinIndex = 0;
+        for (const [typeId, filters] of this.componentFilters.entries()) {
+            if (componentIds.includes(typeId)) {
+                const alias = `c${joinIndex}`;
+                const filterConditions = this.buildFilterWhereClause(typeId, filters, alias, paramIndex);
+                if (filterConditions.sql) {
+                    sql += ` AND ${filterConditions.sql}`;
+                    params.push(...filterConditions.params);
+                    paramIndex = filterConditions.newParamIndex;
+                }
+                joinIndex++;
+            }
+        }
+
+        sql += ` GROUP BY ec.entity_id HAVING COUNT(DISTINCT ec.type_id) = $${paramIndex}) as subquery`;
+        params.push(componentCount);
+
+        const filteredResult = await db.unsafe(sql, params);
+        return parseInt(filteredResult[0].count);
+    }
+
+    private async getCountWithFiltersAndExclusions(componentIds: string[], excludedIds: string[], componentCount: number): Promise<number> {
+        const entityIds = await this.getIdsWithFilters(componentIds, componentCount);
+        
+        if (entityIds.length === 0) {
+            return 0;
+        }
+        
+        const idsList = sql(entityIds);
+        const excludedList = inList(excludedIds, 1);
+        const query = db`
+            SELECT COUNT(*) as count FROM (
+                WITH entity_list AS (
+                    SELECT unnest(${idsList}) as id
+                )
+                SELECT el.id
+                FROM entity_list el
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM entity_components ec 
+                    WHERE ec.entity_id = el.id AND ec.type_id IN ${db.unsafe(excludedList.sql, excludedList.params)} AND ec.deleted_at IS NULL
+                )
+            ) as subquery
+        `;
+        const exclusionResult = await query;
+        return parseInt(exclusionResult[0].count);
     }
 }
 
