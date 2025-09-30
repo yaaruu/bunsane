@@ -5,6 +5,21 @@ function compNameToFieldName(compName: string): string {
     return compName.charAt(0).toLowerCase() + compName.slice(1).replace(/Component$/, '');
 }
 
+export type ArcheTypeResolver = {
+    resolver?: string;
+    component?: new (...args: any[]) => BaseComponent;
+    field?: string;
+    filter?: {[key: string]: any};
+}
+
+export type ArcheTypeCreateInfo = {
+    name: string;
+    components: Array<new (...args: any[]) => BaseComponent>;
+    graphql?: {
+        fields: Record<string, ArcheTypeResolver>;
+    }
+};
+
 /**
  * ArcheType provides a layer of abstraction for creating entities with predefined sets of components.
  * This makes entity creation more elegant and reduces code repetition.
@@ -20,16 +35,23 @@ function compNameToFieldName(compName: string): string {
  * await entity.save();
  * ```
  */
-
-
 class ArcheType {
     protected components: Set<{ ctor: new (...args: any[]) => BaseComponent, data: any }> = new Set();
     protected componentMap: Record<string, typeof BaseComponent> = {}; 
+    public graphql?: {
+        fields: Record<string, ArcheTypeResolver>;
+    };
 
     constructor(components: Array<new (...args: any[]) => BaseComponent>) {
         for (const ctor of components) {
             this.componentMap[compNameToFieldName(ctor.name)] = ctor;
         }
+    }
+
+    static Create(info: ArcheTypeCreateInfo): ArcheType {
+        const archetype = new ArcheType(info.components);
+        archetype.graphql = info.graphql;
+        return archetype;
     }
    
     

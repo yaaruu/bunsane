@@ -6,7 +6,6 @@ import { createYogaInstance } from "gql";
 import ServiceRegistry from "service/ServiceRegistry";
 import type { Plugin } from "graphql-yoga";
 import * as path from "path";
-import { registerDecoratedHooks } from "core/decorators/EntityHooks";
 import { SchedulerManager } from "core/SchedulerManager";
 import { registerScheduledTasks } from "core/decorators/ScheduledTask";
 import { OpenAPISpecGenerator, type SwaggerEndpointMetadata } from "swagger";
@@ -59,39 +58,6 @@ export default class App {
             }
             switch(phase) {
                 case ApplicationPhase.DATABASE_READY: {
-                    break;
-                }
-                case ApplicationPhase.COMPONENTS_READY: {
-                    const components = ComponentRegistry.getComponents();
-                    for(const plugin of this.plugins) {
-                        if(plugin.onComponentRegistered) {
-                            for(const {name, ctor} of components) {
-                                plugin.onComponentRegistered(name, ctor, this);
-                            }
-                        }
-                    }
-                    for(const {name, ctor} of components) {
-                        const instance = new ctor();
-                        if(instance.indexedProperties().length > 0) {
-                            const table_name = GenerateTableName(name);
-                            UpdateComponentIndexes(table_name, instance.indexedProperties());
-                            // Register indexed component
-                        }
-                    }
-
-                    // Automatically register decorated hooks for all services
-                    const services = ServiceRegistry.getServices();
-                    for (const service of services) {
-                        try {
-                            registerDecoratedHooks(service);
-                        } catch (error) {
-                            logger.warn(`Failed to register hooks for service ${service.constructor.name}`);
-                            logger.warn(error);
-                        }
-                    }
-                    logger.info(`Registered hooks for ${services.length} services`);
-                    
-                    ApplicationLifecycle.setPhase(ApplicationPhase.SYSTEM_REGISTERING);
                     break;
                 }
                 case ApplicationPhase.SYSTEM_READY: {
@@ -205,7 +171,7 @@ export default class App {
     waitForAppReady(): Promise<void> {
         return new Promise(resolve => {
             const interval = setInterval(() => {
-                if (ApplicationLifecycle.getCurrentPhase() === ApplicationPhase.APPLICATION_READY) {
+                if (ApplicationLifecycle.getCurrentPhase() >= ApplicationPhase.COMPONENTS_READY) {
                     clearInterval(interval);
                     resolve();
                 }
