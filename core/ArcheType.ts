@@ -1,8 +1,59 @@
 import type { BaseComponent, ComponentDataType } from "./Components";
 import { Entity } from "./Entity";
+import { getMetadataStorage } from "./metadata";
 
 function compNameToFieldName(compName: string): string {
     return compName.charAt(0).toLowerCase() + compName.slice(1).replace(/Component$/, '');
+}
+
+export type ArcheTypeOptions = {
+    name?: string;
+    graphql?: {
+        fields: Record<string, ArcheTypeResolver>;
+    }
+};
+// TODO: Implement archetype with GraphQL support
+export function ArcheType<T extends new () => BaseArcheType>(nameOrOptions?: string | ArcheTypeOptions) {
+    console.log("ArcheType decorator applied with:", nameOrOptions);
+    return function(target: T): T {
+        const storage = getMetadataStorage();
+        const typeId = storage.getComponentId(target.name);
+        
+        let archetype_name = target.name;
+        let graphql: { fields: Record<string, ArcheTypeResolver> } | undefined;
+        
+        if (typeof nameOrOptions === 'string') {
+            archetype_name = nameOrOptions;
+        } else if (nameOrOptions) {
+            archetype_name = nameOrOptions.name || target.name;
+            graphql = nameOrOptions.graphql;
+        }
+        
+        storage.collectArcheTypeMetadata({
+            name: archetype_name,
+            typeId: typeId,
+            target: target,        
+        });
+
+        const fieldNames = Object.getOwnPropertyNames(target.prototype);
+        for (const fieldName of fieldNames) {
+            const fieldMeta = Reflect.getMetadata("archetypeField", target.prototype, fieldName);
+            if (fieldMeta) {
+                storage.collectArchetypeField(archetype_name, fieldName);
+            }
+        }
+        
+        // Set GraphQL configuration on the prototype if provided
+        if (graphql) {
+            (target.prototype as any).graphql = graphql;
+        }
+        
+        return target;
+    };
+}
+
+export function ArcheTypeField() {
+    return Reflect.metadata("archetypeField", {});
 }
 
 export type ArcheTypeResolver = {
@@ -35,21 +86,30 @@ export type ArcheTypeCreateInfo = {
  * await entity.save();
  * ```
  */
-class ArcheType {
+class BaseArcheType {
     protected components: Set<{ ctor: new (...args: any[]) => BaseComponent, data: any }> = new Set();
     protected componentMap: Record<string, typeof BaseComponent> = {}; 
     public graphql?: {
         fields: Record<string, ArcheTypeResolver>;
     };
 
-    constructor(components: Array<new (...args: any[]) => BaseComponent>) {
-        for (const ctor of components) {
-            this.componentMap[compNameToFieldName(ctor.name)] = ctor;
-        }
+    // constructor(components: Array<new (...args: any[]) => BaseComponent>) {
+    //     for (const ctor of components) {
+    //         this.componentMap[compNameToFieldName(ctor.name)] = ctor;
+    //     }
+    // }
+
+    static ResolveField<T extends BaseComponent>(component: new (...args: any[]) => T, field: keyof T): ArcheTypeResolver {
+        return { component, field: field as string };
     }
 
-    static Create(info: ArcheTypeCreateInfo): ArcheType {
-        const archetype = new ArcheType(info.components);
+
+    static Create(info: ArcheTypeCreateInfo): BaseArcheType {
+        const archetype = new BaseArcheType();
+        archetype.components = new Set();
+        for (const ctor of info.components) {
+            archetype.componentMap[compNameToFieldName(ctor.name)] = ctor;
+        }
         archetype.graphql = info.graphql;
         return archetype;
     }
@@ -141,4 +201,4 @@ class ArcheType {
     }
 }
 
-export default ArcheType;
+export default BaseArcheType;

@@ -10,14 +10,36 @@ export function generateTypeId(name: string): string {
   return createHash('sha256').update(name).digest('hex');
 }
 
+const primitiveTypes = [String, Number, Boolean, Symbol, BigInt];
+
+//TODO: Continue here
 export function CompData(options?: { indexed?: boolean }) {
     return (target: any, propertyKey: string) => {
         const storage = getMetadataStorage();
         const typeId = storage.getComponentId(target.constructor.name);
+        const propType = Reflect.getMetadata("design:type", target, propertyKey);
+        const isEnum = Reflect.getMetadata("isEnum", propType) ?? false;
+        console.log(`Property ${propertyKey} type:`, propType?.name);
+        console.log(`Is Enum:`, isEnum);
+        let enumObj: any = null;
+        if(isEnum) {
+            if (typeof propType === 'function') {
+                enumObj = Object.keys(propType).length > 0 ? propType : propType.prototype;
+            } else {
+                enumObj = propType;
+            }
+            // console.log(`Enum Object:`, enumObj);
+            // console.log(`Enum Keys:`, Object.keys(enumObj));
+            // console.log(`Enum Values:`, Object.keys(enumObj).filter(key => !isNaN(Number(key))).map(key => enumObj[key]));
+        }
         storage.collectComponentPropertyMetadata({
             component_id: typeId,
             propertyKey: propertyKey,
-            indexed: options?.indexed ?? false
+            propertyType: propType,
+            indexed: options?.indexed ?? false,
+            isPrimitive: primitiveTypes.includes(propType),
+            isEnum: isEnum,
+            enumValues:  isEnum ? Object.keys(enumObj).filter(key => !isNaN(Number(key))).map(key => enumObj[key]) : undefined
         })
         // Reflect.metadata("compData", { isData: true, indexed: options?.indexed ?? false })(target, propertyKey);
     };
@@ -50,6 +72,8 @@ export type ComponentDataType<T extends BaseComponent> = {
 export function Component<T extends new () => BaseComponent>(target: T): T {
     const storage = getMetadataStorage();
     const typeId = storage.getComponentId(target.name);
+    const properties = storage.getComponentProperties(typeId);
+    console.log(`Component decorator applied to ${target.name} with typeId ${typeId} and properties:`, properties);
     storage.collectComponentMetadata({
         name: target.name,
         typeId: typeId,

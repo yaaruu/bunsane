@@ -6,6 +6,10 @@ export interface ComponentMetadata {
 
 export interface ComponentPropertyMetadata {
     propertyKey: string;
+    propertyType?: any;
     component_id: string;
     indexed: boolean;
+    isPrimitive: boolean;
+    isEnum: boolean;
+    enumValues?: string[];
 }

@@ -1,7 +1,8 @@
 import ApplicationLifecycle, {ApplicationPhase} from "core/ApplicationLifecycle";
 import { GenerateTableName, HasValidBaseTable, PrepareDatabase, UpdateComponentIndexes } from "database/DatabaseHelper";
 import ComponentRegistry from "core/ComponentRegistry";
-import { logger } from "core/Logger";
+import { logger as MainLogger } from "core/Logger";
+const logger = MainLogger.child({ scope: "App" });
 import { createYogaInstance } from "gql";
 import ServiceRegistry from "service/ServiceRegistry";
 import type { Plugin } from "graphql-yoga";
@@ -163,6 +164,8 @@ export default class App {
             }
             logger.trace(`Database prepared...`);
             ApplicationLifecycle.setPhase(ApplicationPhase.DATABASE_READY);
+            await ComponentRegistry.registerAllComponents();
+            ApplicationLifecycle.setPhase(ApplicationPhase.SYSTEM_REGISTERING);
         }
 
         

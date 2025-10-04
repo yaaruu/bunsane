@@ -28,13 +28,7 @@ class ComponentRegistry {
     }
 
     public init() {
-        ApplicationLifecycle.addPhaseListener(async (event) => {
-            if(event.detail === ApplicationPhase.DATABASE_READY && !this.componentsRegistered) {
-                logger.trace("Registering Components...");
-                ApplicationLifecycle.setPhase(ApplicationPhase.COMPONENTS_REGISTERING);
-                await this.registerAllComponents();
-            }
-        });
+        // Listener removed to make component registration sequential
     }
 
     public static get instance(): ComponentRegistry {
@@ -143,6 +137,9 @@ class ComponentRegistry {
         if (this.componentsRegistered) {
             return; // Already registered
         }
+        
+        logger.trace("Registering Components...");
+        ApplicationLifecycle.setPhase(ApplicationPhase.COMPONENTS_REGISTERING);
         
         await this.populateCurrentTables();
         const storage = getMetadataStorage();
@@ -257,8 +254,6 @@ class ComponentRegistry {
             }
         }
         logger.info(`Registered hooks for ${services.length} services`);
-        
-        ApplicationLifecycle.setPhase(ApplicationPhase.SYSTEM_REGISTERING);
     }
 }
 
