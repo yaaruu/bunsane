@@ -5,9 +5,15 @@ import { Entity } from "./Entity";
 import { getMetadataStorage } from "./metadata";
 import { z, ZodObject, type ZodTypeAny } from "zod";
 import {weave} from "@gqloom/core";
-import { ZodWeaver } from "@gqloom/zod";
+import { ZodWeaver, asEnumType } from "@gqloom/zod";
 import { printSchema } from "graphql";
 import "reflect-metadata";
+
+const customTypeRegistry = new Map<any, z.ZodTypeAny>();
+
+export function registerCustomZodType(type: any, schema: z.ZodTypeAny) {
+    customTypeRegistry.set(type, schema);
+}
 
 function compNameToFieldName(compName: string): string {
     return compName.charAt(0).toLowerCase() + compName.slice(1).replace(/Component$/, '');
@@ -274,8 +280,21 @@ class BaseArcheType {
                             default:
                                 zodFields[prop.propertyKey] = z.any();
                         }
-                    } else if (prop.isEnum && prop.enumValues) {
-                        zodFields[prop.propertyKey] = z.enum(prop.enumValues!);
+                    } else if (prop.isEnum && prop.enumValues && prop.enumKeys) {
+                        const enumObj: Record<string, string> = {};
+                        prop.enumKeys.forEach((key, idx) => {
+                            enumObj[key] = prop.enumValues![idx];
+                        });
+                        const enumTypeName = prop.propertyType?.name || `${ctor.name}_${prop.propertyKey}_Enum`;
+                        zodFields[prop.propertyKey] = z.enum(prop.enumValues as any).register(asEnumType, {
+                            name: enumTypeName,
+                            valuesConfig: prop.enumKeys.reduce((acc: Record<string, { description: string }>, key, idx) => { 
+                                acc[key] = { description: prop.enumValues![idx] }; 
+                                return acc; 
+                            }, {})
+                        });
+                    } else if (customTypeRegistry.has(prop.propertyType)) {
+                        zodFields[prop.propertyKey] = customTypeRegistry.get(prop.propertyType)!;
                     } else {
                         zodFields[prop.propertyKey] = z.any();
                     }

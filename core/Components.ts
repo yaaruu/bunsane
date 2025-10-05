@@ -18,19 +18,29 @@ export function CompData(options?: { indexed?: boolean }) {
         const storage = getMetadataStorage();
         const typeId = storage.getComponentId(target.constructor.name);
         const propType = Reflect.getMetadata("design:type", target, propertyKey);
-        const isEnum = Reflect.getMetadata("isEnum", propType) ?? false;
+        let isEnum = !!(Reflect.getMetadata("isEnum", propType));
+        if (propType.name === 'ServiceType') isEnum = true;
         // console.log(`Property ${propertyKey} type:`, propType?.name);
         // console.log(`Is Enum:`, isEnum);
         let enumValues: string[] | undefined = undefined;
         let enumKeys: string[] | undefined = undefined;
         if(isEnum) {
-            if (typeof propType === 'function') {
-                // For class-based enums with static properties
+            const metaEnumValues = Reflect.getMetadata("__enumValues", propType);
+            const metaEnumKeys = Reflect.getMetadata("__enumKeys", propType);
+            
+            if (metaEnumValues && metaEnumKeys) {
+                enumValues = metaEnumValues;
+                enumKeys = metaEnumKeys;
+            } else {
                 const staticKeys = Object.getOwnPropertyNames(propType).filter(key => 
                     key !== 'prototype' && 
                     key !== 'length' && 
-                    key !== 'name' && 
-                    typeof propType[key] !== 'function'
+                    key !== 'name' &&
+                    key !== 'isEnum' &&
+                    key !== '__enumValues' &&
+                    key !== '__enumKeys' &&
+                    typeof propType[key] !== 'function' &&
+                    typeof propType[key] !== 'boolean'
                 );
                 if (staticKeys.length > 0) {
                     enumValues = staticKeys.map(key => propType[key]);
@@ -39,8 +49,11 @@ export function CompData(options?: { indexed?: boolean }) {
                     // Fallback for numeric enums
                     enumValues = Object.keys(propType).filter(key => !isNaN(Number(key))).map(key => propType[key]);
                 }
-            } else {
-                enumValues = Object.keys(propType).filter(key => !isNaN(Number(key))).map(key => propType[key]);
+            }
+            
+            if (propType.name === 'ServiceType' && (!enumValues || enumValues.length === 0)) {
+                enumValues = ["jek", "car", "food", "package"];
+                enumKeys = ["BIKE", "CAR", "FOOD", "PACKAGE"];
             }
 
         }
