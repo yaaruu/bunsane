@@ -4,15 +4,132 @@ import type { ArcheTypeFieldOptions } from "./metadata/definitions/ArcheType";
 import { Entity } from "./Entity";
 import { getMetadataStorage } from "./metadata";
 import { z, ZodObject, type ZodTypeAny } from "zod";
-import {weave} from "@gqloom/core";
+import {weave, silk, resolver} from "@gqloom/core";
 import { ZodWeaver, asEnumType } from "@gqloom/zod";
 import { printSchema } from "graphql";
 import "reflect-metadata";
 
 const customTypeRegistry = new Map<any, z.ZodTypeAny>();
+const customTypeNameRegistry = new Map<any, string>();
+const registeredCustomTypes = new Map<string, z.ZodTypeAny>();
+const customTypeSilks = new Map<string, any>(); // Store silk types for unified weaving
+const customTypeResolvers: any[] = []; // Store resolvers for custom types
 
-export function registerCustomZodType(type: any, schema: z.ZodTypeAny) {
-    customTypeRegistry.set(type, schema);
+// Component-level schema cache
+const componentSchemaCache = new Map<string, ZodObject<any>>(); // componentId -> Zod schema
+
+const archetypeSchemaCache = new Map<string, { zodSchema: ZodObject<any>, graphqlSchema: string }>();
+const allArchetypeZodObjects = new Map<string, ZodObject<any>>();
+
+export function registerCustomZodType(type: any, schema: z.ZodTypeAny, typeName?: string) {
+    // If a type name is provided and it's a ZodObject, add __typename to control GraphQL naming
+    if (typeName && schema instanceof ZodObject) {
+        // Extend the schema with __typename literal to control the GraphQL type name
+        const shape = schema.shape;
+        const namedSchema = z.object({
+            __typename: z.literal(typeName).nullish(),
+            ...shape
+        });
+        customTypeRegistry.set(type, namedSchema);
+        if (typeName) {
+            customTypeNameRegistry.set(type, typeName);
+            registeredCustomTypes.set(typeName, namedSchema);
+        }
+    } else {
+        customTypeRegistry.set(type, schema);
+        if (typeName) {
+            customTypeNameRegistry.set(type, typeName);
+            registeredCustomTypes.set(typeName, schema);
+        }
+    }
+}
+
+export function getArchetypeSchema(archetypeName: string) {
+    return archetypeSchemaCache.get(archetypeName);
+}
+
+export function getAllArchetypeSchemas() {
+    return Array.from(archetypeSchemaCache.values());
+}
+
+export function getRegisteredCustomTypes() {
+    return registeredCustomTypes;
+}
+
+export function weaveAllArchetypes() {
+    if (allArchetypeZodObjects.size === 0) {
+        return null;
+    }
+    // Weave all archetype schemas together
+    // Component schemas are already cached and reused, so @gqloom will deduplicate them
+    const schemas = Array.from(allArchetypeZodObjects.values());
+    const schema = weave(ZodWeaver, ...schemas);
+    return printSchema(schema);
+}
+
+// Generate Zod schema for a component and cache it
+function getOrCreateComponentSchema(componentCtor: new (...args: any[]) => BaseComponent, componentId: string, fieldOptions?: ArcheTypeFieldOptions): z.ZodTypeAny | null {
+    // Check cache first
+    if (componentSchemaCache.has(componentId)) {
+        return componentSchemaCache.get(componentId)!;
+    }
+    
+    const storage = getMetadataStorage();
+    const props = storage.getComponentProperties(componentId);
+    
+    // Return null if no properties - caller should skip this component
+    if (props.length === 0) {
+        return null;
+    }
+    
+    const zodFields: Record<string, any> = {
+        __typename: z.literal(compNameToFieldName(componentCtor.name))
+    };
+
+    for (const prop of props) {
+        if (prop.isPrimitive) {
+            switch (prop.propertyType) {
+                case String:
+                    zodFields[prop.propertyKey] = z.string();
+                    break;
+                case Number:
+                    zodFields[prop.propertyKey] = z.number();
+                    break;
+                case Boolean:
+                    zodFields[prop.propertyKey] = z.boolean();
+                    break;
+                case Date:
+                    zodFields[prop.propertyKey] = z.date();
+                    break;
+                default:
+                    zodFields[prop.propertyKey] = z.any();
+            }
+        } else if (prop.isEnum && prop.enumValues && prop.enumKeys) {
+            const enumTypeName = prop.propertyType?.name || `${componentCtor.name}_${prop.propertyKey}_Enum`;
+            zodFields[prop.propertyKey] = z.enum(prop.enumValues as any).register(asEnumType, {
+                name: enumTypeName,
+                valuesConfig: prop.enumKeys.reduce((acc: Record<string, { description: string }>, key, idx) => { 
+                    acc[key] = { description: prop.enumValues![idx] }; 
+                    return acc; 
+                }, {})
+            });
+        } else if (customTypeRegistry.has(prop.propertyType)) {
+            zodFields[prop.propertyKey] = customTypeRegistry.get(prop.propertyType)!;
+        } else {
+            zodFields[prop.propertyKey] = z.any();
+        }
+        
+        if (fieldOptions?.nullable) {
+            zodFields[prop.propertyKey] = zodFields[prop.propertyKey].nullish();
+        }
+    }
+    
+    const componentSchema = z.object(zodFields);
+    
+    // Cache the component schema for reuse
+    componentSchemaCache.set(componentId, componentSchema);
+    
+    return componentSchema;
 }
 
 function compNameToFieldName(compName: string): string {
@@ -257,52 +374,15 @@ class BaseArcheType {
             } else if (type === Date) {
                 zodShapes[field] = z.date();
             } else {
-                // component
+                // Use cached component schema - this enables reuse across archetypes
                 const typeId = storage.getComponentId(ctor.name);
-                const props = storage.getComponentProperties(typeId);
-                if (props.length === 0) continue;
-                const zodFields: Record<string, any> = {};
-                for (const prop of props) {
-                    if (prop.isPrimitive) {
-                        switch (prop.propertyType) {
-                            case String:
-                                zodFields[prop.propertyKey] = z.string();
-                                break;
-                            case Number:
-                                zodFields[prop.propertyKey] = z.number();
-                                break;
-                            case Boolean:
-                                zodFields[prop.propertyKey] = z.boolean();
-                                break;
-                            case Date:
-                                zodFields[prop.propertyKey] = z.date();
-                                break;
-                            default:
-                                zodFields[prop.propertyKey] = z.any();
-                        }
-                    } else if (prop.isEnum && prop.enumValues && prop.enumKeys) {
-                        const enumObj: Record<string, string> = {};
-                        prop.enumKeys.forEach((key, idx) => {
-                            enumObj[key] = prop.enumValues![idx];
-                        });
-                        const enumTypeName = prop.propertyType?.name || `${ctor.name}_${prop.propertyKey}_Enum`;
-                        zodFields[prop.propertyKey] = z.enum(prop.enumValues as any).register(asEnumType, {
-                            name: enumTypeName,
-                            valuesConfig: prop.enumKeys.reduce((acc: Record<string, { description: string }>, key, idx) => { 
-                                acc[key] = { description: prop.enumValues![idx] }; 
-                                return acc; 
-                            }, {})
-                        });
-                    } else if (customTypeRegistry.has(prop.propertyType)) {
-                        zodFields[prop.propertyKey] = customTypeRegistry.get(prop.propertyType)!;
-                    } else {
-                        zodFields[prop.propertyKey] = z.any();
-                    }
-                    if (this.fieldOptions[field]?.nullable) {
-                        zodFields[prop.propertyKey] = zodFields[prop.propertyKey].nullish();
-                    }
+                const componentSchema = getOrCreateComponentSchema(ctor, typeId, this.fieldOptions[field]);
+                if (componentSchema) {
+                    zodShapes[field] = componentSchema;
+                } else {
+                    // Skip components with no properties
+                    continue;
                 }
-                zodShapes[field] = z.object(zodFields);
             }
             if (this.fieldOptions[field]?.nullable && !(zodShapes[field] instanceof ZodObject)) {
                 zodShapes[field] = zodShapes[field].nullish();
@@ -324,7 +404,18 @@ class BaseArcheType {
         const r = z.object(shape);
         const schema_arr = [r];
         const schema = weave(ZodWeaver, ...schema_arr);
-        console.log("WeavedSchema:", printSchema(schema));
+        const graphqlSchemaString = printSchema(schema);
+        console.log("WeavedSchema:", graphqlSchemaString);
+        
+        // Cache the schema for this archetype
+        archetypeSchemaCache.set(nameFromStorage, {
+            zodSchema: r,
+            graphqlSchema: graphqlSchemaString
+        });
+        
+        // Store for unified weaving
+        allArchetypeZodObjects.set(nameFromStorage, r);
+        
         return r;
     }
 }
