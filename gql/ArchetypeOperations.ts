@@ -26,6 +26,8 @@ export function generateArchetypeOperations(config: ArchetypeOperationConfig = {
     } = config;
 
     const schemas = getAllArchetypeSchemas();
+    logger.trace(`getAllArchetypeSchemas returned ${schemas.length} schemas`);
+    
     let typeDefs = "\n# Auto-generated Archetype Types\n";
     const queryFields: string[] = [];
     const mutationFields: string[] = [];
@@ -37,7 +39,10 @@ export function generateArchetypeOperations(config: ArchetypeOperationConfig = {
     schemas.forEach(({ zodSchema, graphqlSchema }) => {
         // Extract archetype name from the schema
         const archetypeName = extractArchetypeName(graphqlSchema);
-        if (!archetypeName) return;
+        if (!archetypeName) {
+            logger.warn(`Could not extract archetype name from schema: ${graphqlSchema.substring(0, 100)}`);
+            return;
+        }
 
         logger.trace(`Generating operations for archetype: ${archetypeName}`);
 
@@ -45,10 +50,12 @@ export function generateArchetypeOperations(config: ArchetypeOperationConfig = {
         // Extract and deduplicate type definitions
         const typeDefinitions = extractTypeDefinitions(graphqlSchema);
         const deduplicatedTypes = deduplicateTypeDefinitions(typeDefinitions, definedTypes);
+        logger.trace(`Adding ${deduplicatedTypes.length} characters of type definitions for ${archetypeName}`);
         typeDefs += deduplicatedTypes;
     });
 
     typeDefs += "\n# END AUTO-GENERATED TYPES\n";
+    logger.trace(`Final typeDefs length: ${typeDefs.length}`);
 
     // Return types only, without operations
     return { typeDefs, queryFields, mutationFields, resolvers };

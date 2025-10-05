@@ -61,10 +61,15 @@ export function weaveAllArchetypes() {
     if (allArchetypeZodObjects.size === 0) {
         return null;
     }
-    // Weave all archetype schemas together
-    // Component schemas are already cached and reused, so @gqloom will deduplicate them
-    const schemas = Array.from(allArchetypeZodObjects.values());
-    const schema = weave(ZodWeaver, ...schemas);
+    // Weave all archetype schemas together along with all component schemas
+    // This ensures that nested component types are also included in the unified schema
+    const archetypeSchemas = Array.from(allArchetypeZodObjects.values());
+    const componentSchemas = Array.from(componentSchemaCache.values());
+    
+    // Combine both archetype and component schemas for weaving
+    const allSchemas = [...archetypeSchemas, ...componentSchemas];
+    
+    const schema = weave(ZodWeaver, ...allSchemas);
     let schemaString = printSchema(schema);
     
     // Post-process: Replace 'id: String' with 'id: ID' for all id fields
@@ -159,7 +164,6 @@ export type ArcheTypeOptions = {
 };
 // TODO: Implement archetype with GraphQL support
 export function ArcheType<T extends new () => BaseArcheType>(nameOrOptions?: string | ArcheTypeOptions) {
-    console.log("ArcheType decorator applied with:", nameOrOptions);
     return function(target: T): T {
         const storage = getMetadataStorage();
         const typeId = storage.getComponentId(target.name);
@@ -180,7 +184,6 @@ export function ArcheType<T extends new () => BaseArcheType>(nameOrOptions?: str
 
         const prototype = target.prototype;
         const fields = prototype[archetypeFieldsSymbol];
-        console.log("archetypeFields for", archetype_name, ":", fields);
         if (fields) {
             for (const {propertyKey, component, options} of fields) {
                 const type = Reflect.getMetadata('design:type', target.prototype, propertyKey);
@@ -239,7 +242,12 @@ class BaseArcheType {
 
     constructor() {
         const storage = getMetadataStorage();
-        const archetypeName = this.constructor.name.replace(/ArcheType$/, '');
+        const archetypeId = storage.getComponentId(this.constructor.name);
+        
+        // Look up the custom name from metadata (e.g., from @ArcheType("CustomName"))
+        const archetypeMetadata = storage.archetypes.find(a => a.typeId === archetypeId);
+        const archetypeName = archetypeMetadata?.name || this.constructor.name.replace(/ArcheType$/, '');
+        
         const fields = storage.archetypes_field_map.get(archetypeName);
         if (fields) {
             for (const {fieldName, component, options, type} of fields) {
@@ -500,8 +508,6 @@ class BaseArcheType {
      */
     public registerFieldResolvers(service: any): void {
         const resolvers = this.generateFieldResolvers();
-        console.log("Field Resolvers: ");
-        console.log(resolvers)
         
         if (!service.__graphqlFields) {
             service.__graphqlFields = [];
@@ -574,8 +580,18 @@ class BaseArcheType {
             }
         }
         const r = z.object(shape);
-        const schema_arr = [r];
-        const schema = weave(ZodWeaver, ...schema_arr);
+        
+        // Collect all component schemas used by this archetype for weaving
+        const componentSchemasToWeave: z.ZodTypeAny[] = [];
+        for (const [field, zodType] of Object.entries(zodShapes)) {
+            if (zodType instanceof ZodObject) {
+                componentSchemasToWeave.push(zodType);
+            }
+        }
+        
+        // Weave archetype schema along with its component schemas
+        const schemasToWeave = [r, ...componentSchemasToWeave];
+        const schema = weave(ZodWeaver, ...schemasToWeave);
         let graphqlSchemaString = printSchema(schema);
         
         // Post-process: Replace 'id: String' with 'id: ID' for all id fields

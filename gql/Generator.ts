@@ -121,6 +121,26 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
     const queryFields: string[] = [];
     const mutationFields: string[] = [];
 
+    // PRE-GENERATE ALL ARCHETYPE SCHEMAS
+    // Scan all services for archetype instances and generate their schemas upfront
+    logger.trace(`Pre-generating archetype schemas from service operations...`);
+    services.forEach(service => {
+        const operations = service.__graphqlOperations || service.constructor.prototype.__graphqlOperations;
+        if (operations) {
+            operations.forEach((op: any) => {
+                const { output } = op;
+                // Check if output is an archetype or array of archetypes
+                if (Array.isArray(output) && output[0] instanceof BaseArcheType) {
+                    const archetypeInstance = output[0];
+                    getArchetypeTypeName(archetypeInstance); // This will cache the schema
+                } else if (output instanceof BaseArcheType) {
+                    getArchetypeTypeName(output); // This will cache the schema
+                }
+            });
+        }
+    });
+    logger.trace(`Completed pre-generation of archetype schemas`);
+
     // Generate archetype operations if enabled
     if (options?.enableArchetypeOperations !== false) {
         try {
