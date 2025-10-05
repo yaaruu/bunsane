@@ -223,9 +223,30 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
                             typeDefs += `input ${inputName} {\n${Object.entries(input).map(([k, v]) => `  ${k}: ${v}`).join('\n')}\n}\n`;
                         }
                         fieldDef += `(input: ${inputName}!)`;
+                        
+                        // Store the Zod schema for validation if it's a Zod type
+                        const zodSchema = (input && typeof input === 'object' && '_def' in input) ? input as ZodType : null;
+                        
                         resolvers[type][name] = async (_: any, args: any, context: any, info: any) => {
                             try {
-                                return await service[propertyKey](args.input || args, context, info);
+                                const inputArgs = args.input || args;
+                                
+                                // Automatically validate with Zod schema if provided
+                                if (zodSchema) {
+                                    try {
+                                        const validated = zodSchema.parse(inputArgs);
+                                        return await service[propertyKey](validated, context, info);
+                                    } catch (error) {
+                                        if (error instanceof z.ZodError) {
+                                            // Let handleGraphQLError convert Zod errors to user-friendly messages
+                                            const { handleGraphQLError } = await import("../core/ErrorHandler");
+                                            handleGraphQLError(error);
+                                        }
+                                        throw error;
+                                    }
+                                } else {
+                                    return await service[propertyKey](inputArgs, context, info);
+                                }
                             } catch (error) {
                                 logger.error(`Error in ${type}.${name}:`);
                                 logger.error(error);

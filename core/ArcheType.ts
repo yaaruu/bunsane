@@ -287,11 +287,24 @@ class BaseArcheType {
 
     // TODO: Can we make this type-safe?
     public fill(input: object, strict: boolean = false): this {
+        const storage = getMetadataStorage();
+        
         for (const [key, value] of Object.entries(input)) {
             if (value !== undefined) {
                 const compCtor = this.componentMap[key];
                 if (compCtor) {
-                    this.addComponent(compCtor, { value });
+                    const fieldType = this.fieldTypes[key];
+                    const typeId = storage.getComponentId(compCtor.name);
+                    const componentProps = storage.getComponentProperties(typeId);
+                    
+                    // Check if this is a primitive field that should be unwrapped
+                    if (shouldUnwrapComponent(componentProps, fieldType)) {
+                        // For primitive types, wrap in { value }
+                        this.addComponent(compCtor, { value } as any);
+                    } else {
+                        // For complex types, pass data directly
+                        this.addComponent(compCtor, value as any);
+                    }
                 } else {
                     // direct property
                     (this as any)[key] = value;
@@ -309,13 +322,26 @@ class BaseArcheType {
     }
 
     async updateEntity<T>(entity: Entity, updates: Partial<T>) {
+        const storage = getMetadataStorage();
+        
         for (const key of Object.keys(updates)) {
             if(key === 'id' || key === '_id') continue;
             const value = updates[key as keyof T];
             if (value !== undefined) {
                 const compCtor = this.componentMap[key];
                 if (compCtor) {
-                    await entity.set(compCtor, { value });
+                    const fieldType = this.fieldTypes[key];
+                    const typeId = storage.getComponentId(compCtor.name);
+                    const componentProps = storage.getComponentProperties(typeId);
+                    
+                    // Check if this is a primitive field that should be unwrapped
+                    if (shouldUnwrapComponent(componentProps, fieldType)) {
+                        // For primitive types, wrap in { value }
+                        await entity.set(compCtor, { value });
+                    } else {
+                        // For complex types, pass data directly
+                        await entity.set(compCtor, value);
+                    }
                 } else {
                     // direct, set on archetype
                     (this as any)[key] = value;
