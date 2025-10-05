@@ -2,6 +2,11 @@ import { GraphQLSchema, GraphQLError } from "graphql";
 import { createSchema } from "graphql-yoga";
 import { logger as MainLogger } from "core/Logger";
 import type { GraphQLType } from "./helpers";
+import { generateArchetypeOperations } from "./ArchetypeOperations";
+import { weaveAllArchetypes, getArchetypeSchema } from "../core/ArcheType";
+import BaseArcheType from "../core/ArcheType";
+import { getMetadataStorage } from "../core/metadata";
+
 const logger = MainLogger.child({ scope: "GraphQLGenerator" });
 export interface GraphQLObjectTypeMeta {
     name: string;
@@ -53,13 +58,81 @@ export function GraphQLField(meta: GraphQLFieldMeta) {
     };
 }
 
-export function generateGraphQLSchema(services: any[]): { schema: GraphQLSchema | null; resolvers: any } {
+/**
+ * Helper function to get the registered GraphQL type name from an archetype instance.
+ * This respects the custom name set via @ArcheType("CustomName") decorator.
+ * Falls back to inferring from class name if not found in registry.
+ */
+function getArchetypeTypeName(archetypeInstance: any): string | null {
+    if (!archetypeInstance || !(archetypeInstance instanceof BaseArcheType)) {
+        return null;
+    }
+    
+    const storage = getMetadataStorage();
+    const className = archetypeInstance.constructor.name;
+    
+    // Look up the archetype metadata by class name to get the custom name
+    const archetypeMetadata = storage.archetypes.find(a => a.target?.name === className);
+    
+    if (archetypeMetadata?.name) {
+        // Use the custom name from @ArcheType("CustomName") decorator
+        logger.trace(`Found custom archetype name: ${archetypeMetadata.name} for class ${className}`);
+        
+        // Ensure schema is generated and cached
+        try {
+            if (!getArchetypeSchema(archetypeMetadata.name)) {
+                archetypeInstance.getZodObjectSchema();
+            }
+        } catch (error) {
+            logger.warn(`Failed to generate schema for archetype ${archetypeMetadata.name}:`, error);
+        }
+        
+        return archetypeMetadata.name;
+    }
+    
+    // Fallback: infer from class name
+    const inferredName = className.replace(/ArcheType$/, '');
+    logger.trace(`Using inferred archetype name: ${inferredName} for class ${className}`);
+    
+    try {
+        if (!getArchetypeSchema(inferredName)) {
+            archetypeInstance.getZodObjectSchema();
+        }
+    } catch (error) {
+        logger.warn(`Failed to generate schema for archetype ${inferredName}:`, error);
+    }
+    
+    return inferredName;
+}
+
+export function generateGraphQLSchema(services: any[], options?: { enableArchetypeOperations?: boolean }): { schema: GraphQLSchema | null; resolvers: any } {
     let typeDefs = `
     `;
     const scalarTypes: Set<string> = new Set();
     const resolvers: any = {};
     const queryFields: string[] = [];
     const mutationFields: string[] = [];
+
+    // Generate archetype operations if enabled
+    if (options?.enableArchetypeOperations !== false) {
+        try {
+            // Option 1: Use individual archetype schemas with auto-generated CRUD
+            const archetypeOps = generateArchetypeOperations();
+            typeDefs += archetypeOps.typeDefs;
+            queryFields.push(...archetypeOps.queryFields);
+            mutationFields.push(...archetypeOps.mutationFields);
+            Object.assign(resolvers, archetypeOps.resolvers);
+            logger.trace(`Added archetype operations: ${archetypeOps.queryFields.length} queries, ${archetypeOps.mutationFields.length} mutations`);
+            
+            // Option 2: Or use the unified schema from weaveAllArchetypes (no CRUD yet)
+            // const unifiedSchema = weaveAllArchetypes();
+            // if (unifiedSchema) {
+            //     typeDefs += "\n# Unified Archetype Schemas\n" + unifiedSchema;
+            // }
+        } catch (error) {
+            logger.error(`Failed to generate archetype operations: ${error}`);
+        }
+    }
 
     services.forEach(service => {
         logger.trace(`Processing service: ${service.constructor.name}`);
@@ -124,6 +197,25 @@ export function generateGraphQLSchema(services: any[]): { schema: GraphQLSchema 
                 }
                 if (typeof output === 'string') {
                     fieldDef += `: ${output}`;
+                } else if (Array.isArray(output)) {
+                    // Handle array of archetypes: [serviceAreaArcheType]
+                    const archetypeInstance = output[0];
+                    const typeName = getArchetypeTypeName(archetypeInstance);
+                    if (typeName) {
+                        fieldDef += `: [${typeName}]`;
+                    } else {
+                        logger.warn(`Invalid array output type for ${name}, expected archetype instance`);
+                        fieldDef += `: [Any]`;
+                    }
+                } else if (output instanceof BaseArcheType) {
+                    // Handle single archetype instance: serviceAreaArcheType
+                    const typeName = getArchetypeTypeName(output);
+                    if (typeName) {
+                        fieldDef += `: ${typeName}`;
+                    } else {
+                        logger.warn(`Could not determine type name for archetype in ${name}`);
+                        fieldDef += `: Any`;
+                    }
                 } else if (typeof output === 'object') {
                     const outputName = `${name}Output`;
                     typeDefs += `type ${outputName} {\n${Object.entries(output).map(([k, v]) => `  ${k}: ${v}`).join('\n')}\n}\n`;

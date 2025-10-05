@@ -17,6 +17,7 @@ export default class App {
     private version: string = "1.0.0";
     private yoga: any;
     private yogaPlugins: Plugin[] = [];
+    private contextFactory?: (request: Request) => any;
     private restEndpoints: Array<{ method: string; path: string; handler: Function; service: any }> = [];
     private restEndpointMap: Map<string, { method: string; path: string; handler: Function; service: any }> = new Map();
     private staticAssets: Map<string, string> = new Map();
@@ -65,9 +66,9 @@ export default class App {
                     try {
                         const schema = ServiceRegistry.getSchema();
                         if (schema) {
-                            this.yoga = createYogaInstance(schema, this.yogaPlugins);
+                            this.yoga = createYogaInstance(schema, this.yogaPlugins, this.contextFactory);
                         } else {
-                            this.yoga = createYogaInstance(undefined, this.yogaPlugins);
+                            this.yoga = createYogaInstance(undefined, this.yogaPlugins, this.contextFactory);
                         }
 
                         // Get all services for processing
@@ -191,6 +192,10 @@ export default class App {
 
     public addYogaPlugin(plugin: Plugin) {
         this.yogaPlugins.push(plugin);
+    }
+
+    public setGraphQLContextFactory(factory: (request: Request) => any) {
+        this.contextFactory = factory;
     }
 
     public addPlugin(plugin: BasePlugin) {

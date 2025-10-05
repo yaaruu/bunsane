@@ -104,26 +104,28 @@ const maskError = (error: any, message: string): GraphQLError => {
     return error instanceof GraphQLError ? error : new GraphQLError(message, { originalError: error });
 };
 
-export function createYogaInstance(schema?: GraphQLSchema, plugins: Plugin[] = []) {
+export function createYogaInstance(schema?: GraphQLSchema, plugins: Plugin[] = [], contextFactory?: (request: Request) => any) {
+    const yogaConfig: any = {
+        plugins,
+        maskedErrors: {
+            maskError,
+        },
+    };
+
+    // Add context factory if provided
+    if (contextFactory) {
+        yogaConfig.context = contextFactory;
+    }
+
     if (schema) {
-        return createYoga({
-            schema,
-            plugins,
-            maskedErrors: {
-                maskError,
-            },
-        });
+        yogaConfig.schema = schema;
+        return createYoga(yogaConfig);
     } else {
-        return createYoga({
-            schema: createSchema({
-                typeDefs: staticTypeDefs,
-                resolvers: staticResolvers,
-            }),
-            plugins,
-            maskedErrors: {
-                maskError,
-            },
+        yogaConfig.schema = createSchema({
+            typeDefs: staticTypeDefs,
+            resolvers: staticResolvers,
         });
+        return createYoga(yogaConfig);
     }
 }
 

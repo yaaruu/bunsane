@@ -359,6 +359,116 @@ class BaseArcheType {
         return result;
     }
 
+    /**
+     * Generates GraphQL field resolver functions for this archetype.
+     * These resolvers handle both simple fields and component-based fields with DataLoader support.
+     * 
+     * @returns An array of resolver metadata that can be registered with GraphQL
+     * 
+     * @example
+     * const resolvers = serviceAreaArcheType.generateFieldResolvers();
+     * // Returns array of: { typeName, fieldName, resolver }
+     */
+    public generateFieldResolvers(): Array<{
+        typeName: string;
+        fieldName: string;
+        resolver: (parent: any, args: any, context: any) => any;
+    }> {
+        const storage = getMetadataStorage();
+        const resolvers: Array<any> = [];
+        const archetypeId = storage.getComponentId(this.constructor.name);
+        const archetypeName = storage.archetypes.find(a => a.typeId === archetypeId)?.name || this.constructor.name;
+
+        // Generate ID resolver for the main archetype type
+        resolvers.push({
+            typeName: archetypeName,
+            fieldName: 'id',
+            resolver: (parent: any) => parent.id
+        });
+
+        // Generate resolvers for each component field
+        for (const [field, ctor] of Object.entries(this.componentMap)) {
+            const typeId = storage.getComponentId(ctor.name);
+            const typeIdHex = typeId;
+            const componentName = ctor.name;
+            
+            // Main field resolver (returns the component data or loads it)
+            resolvers.push({
+                typeName: archetypeName,
+                fieldName: field,
+                resolver: async (parent: any, args: any, context: any) => {
+                    const entity = parent._entity;
+                    if (!entity) return parent[field];
+                    
+                    // Use DataLoader if available
+                    if (context.loaders) {
+                        const componentData = await context.loaders.componentsByEntityType.load({
+                            entityId: entity.id,
+                            typeId: parseInt(typeIdHex, 16)
+                        });
+                        return componentData?.data;
+                    }
+                    
+                    // Fallback: direct query
+                    const comp = await entity.get(ctor as any);
+                    return comp;
+                }
+            });
+
+            // Generate nested field resolvers for component properties
+            const props = storage.getComponentProperties(typeId);
+            const componentTypeName = compNameToFieldName(componentName);
+            
+            for (const prop of props) {
+                resolvers.push({
+                    typeName: componentTypeName.charAt(0).toUpperCase() + componentTypeName.slice(1),
+                    fieldName: prop.propertyKey,
+                    resolver: (parent: any) => parent[prop.propertyKey]
+                });
+            }
+        }
+
+        return resolvers;
+    }
+
+    /**
+     * Registers all auto-generated field resolvers for this archetype with a service.
+     * This eliminates the need to manually write @GraphQLField decorators.
+     * 
+     * @param service The service instance to attach resolvers to
+     * 
+     * @example
+     * class AreaService extends BaseService {
+     *     constructor(app: App) {
+     *         super();
+     *         // Auto-register all field resolvers!
+     *         serviceAreaArcheType.registerFieldResolvers(this);
+     *     }
+     * }
+     */
+    public registerFieldResolvers(service: any): void {
+        const resolvers = this.generateFieldResolvers();
+        
+        if (!service.__graphqlFields) {
+            service.__graphqlFields = [];
+        }
+        
+        for (const { typeName, fieldName, resolver } of resolvers) {
+            // Create a unique method name
+            const methodName = `_autoResolver_${typeName}_${fieldName}`;
+            
+            // Attach resolver as a method
+            service[methodName] = resolver;
+            
+            // Register with GraphQL metadata
+            service.__graphqlFields.push({
+                type: typeName,
+                field: fieldName,
+                propertyKey: methodName
+            });
+        }
+    }
+
     // TODO: Here
     public getZodObjectSchema(): ZodObject<any> {
         const zodShapes: Record<string, z.ZodTypeAny> = {};
