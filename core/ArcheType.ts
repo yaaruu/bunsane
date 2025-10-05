@@ -6,6 +6,7 @@ import { getMetadataStorage } from "./metadata";
 import { z, ZodObject, type ZodTypeAny } from "zod";
 import {weave, silk, resolver} from "@gqloom/core";
 import { ZodWeaver, asEnumType } from "@gqloom/zod";
+import { GraphQLID } from "graphql";
 import { printSchema } from "graphql";
 import "reflect-metadata";
 
@@ -64,7 +65,12 @@ export function weaveAllArchetypes() {
     // Component schemas are already cached and reused, so @gqloom will deduplicate them
     const schemas = Array.from(allArchetypeZodObjects.values());
     const schema = weave(ZodWeaver, ...schemas);
-    return printSchema(schema);
+    let schemaString = printSchema(schema);
+    
+    // Post-process: Replace 'id: String' with 'id: ID' for all id fields
+    schemaString = schemaString.replace(/\bid:\s*String\b/g, 'id: ID');
+    
+    return schemaString;
 }
 
 // Generate Zod schema for a component and cache it
@@ -109,7 +115,7 @@ function getOrCreateComponentSchema(componentCtor: new (...args: any[]) => BaseC
             zodFields[prop.propertyKey] = z.enum(prop.enumValues as any).register(asEnumType, {
                 name: enumTypeName,
                 valuesConfig: prop.enumKeys.reduce((acc: Record<string, { description: string }>, key, idx) => { 
-                    acc[key] = { description: prop.enumValues![idx] }; 
+                    acc[key] = { description: prop.enumValues![idx]! }; 
                     return acc; 
                 }, {})
             });
@@ -212,7 +218,7 @@ export type ArcheTypeCreateInfo = {
  */
 class BaseArcheType {
     protected components: Set<{ ctor: new (...args: any[]) => BaseComponent, data: any }> = new Set();
-    protected componentMap: Record<string, typeof BaseComponent> = {}; 
+    public componentMap: Record<string, typeof BaseComponent> = {}; 
     protected fieldOptions: Record<string, ArcheTypeFieldOptions> = {};
     protected fieldTypes: Record<string, any> = {};
     public resolver?: {
@@ -392,6 +398,12 @@ class BaseArcheType {
             const typeIdHex = typeId;
             const componentName = ctor.name;
             
+            // Skip components with no properties (like tag components)
+            const componentProps = storage.getComponentProperties(typeId);
+            if (componentProps.length === 0) {
+                continue;
+            }
+            
             // Main field resolver (returns the component data or loads it)
             resolvers.push({
                 typeName: archetypeName,
@@ -421,7 +433,7 @@ class BaseArcheType {
             
             for (const prop of props) {
                 resolvers.push({
-                    typeName: componentTypeName.charAt(0).toUpperCase() + componentTypeName.slice(1),
+                    typeName: componentTypeName,  // Use lowercase component name
                     fieldName: prop.propertyKey,
                     resolver: (parent: any) => parent[prop.propertyKey]
                 });
@@ -448,6 +460,8 @@ class BaseArcheType {
      */
     public registerFieldResolvers(service: any): void {
         const resolvers = this.generateFieldResolvers();
+        console.log("Field Resolvers: ");
+        console.log(resolvers)
         
         if (!service.__graphqlFields) {
             service.__graphqlFields = [];
@@ -503,6 +517,7 @@ class BaseArcheType {
         console.log("NameFromStorage: ",nameFromStorage)
         const shape: Record<string, z.ZodTypeAny> = {
             __typename: z.literal(nameFromStorage).nullish(),
+            id: z.string().nullish(),  // Will be converted to ID in post-processing
         };
         for (const [field, zodType] of Object.entries(zodShapes)) {
             if (this.fieldOptions[field]?.nullable && zodType instanceof ZodObject) {
@@ -514,7 +529,11 @@ class BaseArcheType {
         const r = z.object(shape);
         const schema_arr = [r];
         const schema = weave(ZodWeaver, ...schema_arr);
-        const graphqlSchemaString = printSchema(schema);
+        let graphqlSchemaString = printSchema(schema);
+        
+        // Post-process: Replace 'id: String' with 'id: ID' for all id fields
+        graphqlSchemaString = graphqlSchemaString.replace(/\bid:\s*String\b/g, 'id: ID');
+        
         console.log("WeavedSchema:", graphqlSchemaString);
         
         // Cache the schema for this archetype
@@ -529,5 +548,14 @@ class BaseArcheType {
         return r;
     }
 }
+
+export type InferArcheType<T extends BaseArcheType> = {
+    [K in keyof T['componentMap']]: T['componentMap'][K] extends new (...args: any[]) => infer C ? C : never
+};
+
+// Alternative: Infer from the actual instance properties (recommended)
+export type InferArcheTypeFromInstance<T extends BaseArcheType> = {
+    [K in keyof T as T[K] extends BaseComponent ? K : never]: T[K]
+};
 
 export default BaseArcheType;

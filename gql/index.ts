@@ -104,7 +104,7 @@ const maskError = (error: any, message: string): GraphQLError => {
     return error instanceof GraphQLError ? error : new GraphQLError(message, { originalError: error });
 };
 
-export function createYogaInstance(schema?: GraphQLSchema, plugins: Plugin[] = [], contextFactory?: (request: Request) => any) {
+export function createYogaInstance(schema?: GraphQLSchema, plugins: Plugin[] = [], contextFactory?: (context: any) => any) {
     const yogaConfig: any = {
         plugins,
         maskedErrors: {

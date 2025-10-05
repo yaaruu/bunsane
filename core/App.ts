@@ -17,7 +17,7 @@ export default class App {
     private version: string = "1.0.0";
     private yoga: any;
     private yogaPlugins: Plugin[] = [];
-    private contextFactory?: (request: Request) => any;
+    private contextFactory?: (context: any) => any;
     private restEndpoints: Array<{ method: string; path: string; handler: Function; service: any }> = [];
     private restEndpointMap: Map<string, { method: string; path: string; handler: Function; service: any }> = new Map();
     private staticAssets: Map<string, string> = new Map();
@@ -65,10 +65,23 @@ export default class App {
                 case ApplicationPhase.SYSTEM_READY: {
                     try {
                         const schema = ServiceRegistry.getSchema();
+                        
+                        // Wrap user's context factory to automatically spread Yoga context
+                        const wrappedContextFactory = this.contextFactory 
+                            ? (yogaContext: any) => {
+                                const userContext = this.contextFactory!(yogaContext);
+                                // Merge Yoga's context with user's context, preserving Yoga properties
+                                return {
+                                    ...yogaContext,  // Yoga context (request, params, etc.)
+                                    ...userContext,  // User's additional context
+                                };
+                            }
+                            : undefined;
+                        
                         if (schema) {
-                            this.yoga = createYogaInstance(schema, this.yogaPlugins, this.contextFactory);
+                            this.yoga = createYogaInstance(schema, this.yogaPlugins, wrappedContextFactory);
                         } else {
-                            this.yoga = createYogaInstance(undefined, this.yogaPlugins, this.contextFactory);
+                            this.yoga = createYogaInstance(undefined, this.yogaPlugins, wrappedContextFactory);
                         }
 
                         // Get all services for processing
@@ -194,7 +207,7 @@ export default class App {
         this.yogaPlugins.push(plugin);
     }
 
-    public setGraphQLContextFactory(factory: (request: Request) => any) {
+    public setGraphQLContextFactory(factory: (context: any) => any) {
         this.contextFactory = factory;
     }
 

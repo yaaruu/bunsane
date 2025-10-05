@@ -19,7 +19,10 @@ class ServiceRegistry {
             switch(event.detail) {
                 case ApplicationPhase.SYSTEM_REGISTERING: {
                     const servicesArray = Array.from(this.services.values());
-                    const { schema } = generateGraphQLSchema(servicesArray);
+                    // Disable auto-generated archetype operations to avoid conflicts with manual operations
+                    const { schema } = generateGraphQLSchema(servicesArray, { 
+                        enableArchetypeOperations: false 
+                    });
                     this.schema = schema;
                     ApplicationLifecycle.setPhase(ApplicationPhase.SYSTEM_READY);
                     break;

@@ -84,7 +84,7 @@ function getArchetypeTypeName(archetypeInstance: any): string | null {
                 archetypeInstance.getZodObjectSchema();
             }
         } catch (error) {
-            logger.warn(`Failed to generate schema for archetype ${archetypeMetadata.name}:`, error);
+            logger.warn(`Failed to generate schema for archetype ${archetypeMetadata.name}: ${error}`);
         }
         
         return archetypeMetadata.name;
@@ -99,7 +99,7 @@ function getArchetypeTypeName(archetypeInstance: any): string | null {
             archetypeInstance.getZodObjectSchema();
         }
     } catch (error) {
-        logger.warn(`Failed to generate schema for archetype ${inferredName}:`, error);
+        logger.warn(`Failed to generate schema for archetype ${inferredName}: ${error}`);
     }
     
     return inferredName;
@@ -116,21 +116,23 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
     // Generate archetype operations if enabled
     if (options?.enableArchetypeOperations !== false) {
         try {
-            // Option 1: Use individual archetype schemas with auto-generated CRUD
             const archetypeOps = generateArchetypeOperations();
             typeDefs += archetypeOps.typeDefs;
             queryFields.push(...archetypeOps.queryFields);
             mutationFields.push(...archetypeOps.mutationFields);
             Object.assign(resolvers, archetypeOps.resolvers);
             logger.trace(`Added archetype operations: ${archetypeOps.queryFields.length} queries, ${archetypeOps.mutationFields.length} mutations`);
-            
-            // Option 2: Or use the unified schema from weaveAllArchetypes (no CRUD yet)
-            // const unifiedSchema = weaveAllArchetypes();
-            // if (unifiedSchema) {
-            //     typeDefs += "\n# Unified Archetype Schemas\n" + unifiedSchema;
-            // }
         } catch (error) {
             logger.error(`Failed to generate archetype operations: ${error}`);
+        }
+    } else {
+        // Still generate type definitions even if operations are disabled
+        try {
+            const archetypeOps = generateArchetypeOperations();
+            typeDefs += archetypeOps.typeDefs;
+            logger.trace(`Added archetype type definitions (without operations)`);
+        } catch (error) {
+            logger.error(`Failed to generate archetype type definitions: ${error}`);
         }
     }
 

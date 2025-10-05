@@ -31,6 +31,46 @@ export function generateArchetypeOperations(config: ArchetypeOperationConfig = {
     const mutationFields: string[] = [];
     const resolvers: any = { Query: {}, Mutation: {} };
 
+    // Track defined types to prevent duplicates
+    const definedTypes = new Set<string>();
+
+    schemas.forEach(({ zodSchema, graphqlSchema }) => {
+        // Extract archetype name from the schema
+        const archetypeName = extractArchetypeName(graphqlSchema);
+        if (!archetypeName) return;
+
+        logger.trace(`Generating operations for archetype: ${archetypeName}`);
+
+        // Add the archetype type definition (without Query/Mutation)
+        // Extract and deduplicate type definitions
+        const typeDefinitions = extractTypeDefinitions(graphqlSchema);
+        const deduplicatedTypes = deduplicateTypeDefinitions(typeDefinitions, definedTypes);
+        typeDefs += deduplicatedTypes;
+    });
+
+    typeDefs += "\n# END AUTO-GENERATED TYPES\n";
+
+    // Return types only, without operations
+    return { typeDefs, queryFields, mutationFields, resolvers };
+}
+
+/**
+ * WIP
+ * Generate full archetype operations including types, queries, and mutations
+ */
+//TODO: Implement this
+export function generateArchetypeOperationsWithCRUD(config: ArchetypeOperationConfig = {}) {
+    const {
+        enableQueries = { get: true, list: true },
+        enableMutations = { create: true, update: true, delete: true }
+    } = config;
+
+    const schemas = getAllArchetypeSchemas();
+    let typeDefs = "\n# Auto-generated Archetype Types\n";
+    const queryFields: string[] = [];
+    const mutationFields: string[] = [];
+    const resolvers: any = { Query: {}, Mutation: {} };
+
     schemas.forEach(({ zodSchema, graphqlSchema }) => {
         // Extract archetype name from the schema
         const archetypeName = extractArchetypeName(graphqlSchema);
@@ -83,7 +123,7 @@ export function generateArchetypeOperations(config: ArchetypeOperationConfig = {
 
 function extractArchetypeName(graphqlSchema: string): string | null {
     const match = graphqlSchema.match(/type (\w+) \{/);
-    return match ? match[1] : null;
+    return match ? match[1] ?? null : null;
 }
 
 function extractTypeDefinitions(graphqlSchema: string): string {
@@ -98,13 +138,73 @@ function extractTypeDefinitions(graphqlSchema: string): string {
     return filtered.join('\n') + '\n';
 }
 
+/**
+ * Deduplicates type definitions by tracking which types have already been defined.
+ * Parses the type definitions and only returns new ones.
+ */
+function deduplicateTypeDefinitions(typeDefinitions: string, definedTypes: Set<string>): string {
+    const lines = typeDefinitions.split('\n');
+    const result: string[] = [];
+    let currentType = '';
+    let currentTypeName = '';
+    let inTypeDefinition = false;
+
+    for (const line of lines) {
+        const trimmed = line.trim();
+        
+        // Check if this is the start of a type/enum/input definition
+        const typeMatch = trimmed.match(/^(type|enum|input)\s+(\w+)/);
+        
+        if (typeMatch) {
+            // Save previous type if we were in one
+            if (inTypeDefinition && currentTypeName && !definedTypes.has(currentTypeName)) {
+                result.push(currentType);
+                definedTypes.add(currentTypeName);
+            }
+            
+            // Start new type
+            currentTypeName = typeMatch[2] || '';
+            currentType = line + '\n';
+            inTypeDefinition = true;
+        } else if (inTypeDefinition) {
+            currentType += line + '\n';
+            
+            // Check if this is the closing brace
+            if (trimmed === '}') {
+                // End of type definition
+                if (!definedTypes.has(currentTypeName)) {
+                    result.push(currentType);
+                    definedTypes.add(currentTypeName);
+                    logger.trace(`Added type definition: ${currentTypeName}`);
+                } else {
+                    logger.trace(`Skipped duplicate type definition: ${currentTypeName}`);
+                }
+                currentType = '';
+                currentTypeName = '';
+                inTypeDefinition = false;
+            }
+        } else {
+            // Not in a type definition, just add the line (could be comments, etc.)
+            result.push(line + '\n');
+        }
+    }
+    
+    // Handle last type if file doesn't end with closing brace
+    if (inTypeDefinition && currentTypeName && !definedTypes.has(currentTypeName)) {
+        result.push(currentType);
+        definedTypes.add(currentTypeName);
+    }
+
+    return result.join('');
+}
+
 function generateFilterInput(archetypeName: string, zodSchema: any): string {
     // Generate filter input with common filter operators
+    // Add a dummy field to make the input type valid until full implementation
     return `
 input ${archetypeName}Filter {
   id: ID
-  # Add more filter fields based on archetype properties
-  # TODO: Auto-generate from zodSchema properties
+  _placeholder: String
 }
 
 `;
@@ -112,10 +212,10 @@ input ${archetypeName}Filter {
 
 function generateCreateInput(archetypeName: string, zodSchema: any): string {
     // Generate create input (all fields except id)
+    // Add a dummy field to make the input type valid until full implementation
     return `
 input Create${archetypeName}Input {
-  # Auto-generated from archetype schema
-  # TODO: Extract from zodSchema and make required fields non-nullable
+  _placeholder: String
 }
 
 `;
@@ -123,10 +223,10 @@ input Create${archetypeName}Input {
 
 function generateUpdateInput(archetypeName: string, zodSchema: any): string {
     // Generate update input (all fields optional except id)
+    // Add a dummy field to make the input type valid until full implementation
     return `
 input Update${archetypeName}Input {
-  # Auto-generated from archetype schema
-  # TODO: Extract from zodSchema and make all fields optional
+  _placeholder: String
 }
 
 `;
