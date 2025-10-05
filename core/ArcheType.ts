@@ -142,6 +142,18 @@ function compNameToFieldName(compName: string): string {
     return compName.charAt(0).toLowerCase() + compName.slice(1).replace(/Component$/, '');
 }
 
+/**
+ * Helper to determine if a component should be unwrapped to a scalar value.
+ * Returns true if the component has a single 'value' property and the field type is primitive.
+ */
+function shouldUnwrapComponent(componentProps: ComponentPropertyMetadata[], fieldType: any): boolean {
+    // If field type is a primitive, unwrap the component to that primitive
+    if (fieldType === String || fieldType === Number || fieldType === Boolean || fieldType === Date) {
+        return true;
+    }
+    return false;
+}
+
 export type ArcheTypeOptions = {
     name?: string;
 };
@@ -397,6 +409,7 @@ class BaseArcheType {
             const typeId = storage.getComponentId(ctor.name);
             const typeIdHex = typeId;
             const componentName = ctor.name;
+            const fieldType = this.fieldTypes[field];
             
             // Skip components with no properties (like tag components)
             const componentProps = storage.getComponentProperties(typeId);
@@ -404,39 +417,66 @@ class BaseArcheType {
                 continue;
             }
             
-            // Main field resolver (returns the component data or loads it)
-            resolvers.push({
-                typeName: archetypeName,
-                fieldName: field,
-                resolver: async (parent: any, args: any, context: any) => {
-                    const entity = parent._entity;
-                    if (!entity) return parent[field];
-                    
-                    // Use DataLoader if available
-                    if (context.loaders) {
-                        const componentData = await context.loaders.componentsByEntityType.load({
-                            entityId: entity.id,
-                            typeId: parseInt(typeIdHex, 16)
-                        });
-                        return componentData?.data;
-                    }
-                    
-                    // Fallback: direct query
-                    const comp = await entity.get(ctor as any);
-                    return comp;
-                }
-            });
-
-            // Generate nested field resolvers for component properties
-            const props = storage.getComponentProperties(typeId);
-            const componentTypeName = compNameToFieldName(componentName);
+            // Check if this component should be unwrapped to a scalar
+            const isUnwrapped = shouldUnwrapComponent(componentProps, fieldType);
             
-            for (const prop of props) {
+            if (isUnwrapped) {
+                // For unwrapped components, resolve directly to the 'value' property
                 resolvers.push({
-                    typeName: componentTypeName,  // Use lowercase component name
-                    fieldName: prop.propertyKey,
-                    resolver: (parent: any) => parent[prop.propertyKey]
+                    typeName: archetypeName,
+                    fieldName: field,
+                    resolver: async (parent: any, args: any, context: any) => {
+                        const entity = parent._entity;
+                        if (!entity) return parent[field];
+                        
+                        // Use DataLoader if available
+                        if (context.loaders) {
+                            const componentData = await context.loaders.componentsByEntityType.load({
+                                entityId: entity.id,
+                                typeId: typeIdHex  // Pass hex string directly
+                            });
+                            return componentData?.data?.value;
+                        }
+                        
+                        // Fallback: direct query
+                        const comp = await entity.get(ctor as unknown);
+                        return (comp as any)?.value;
+                    }
                 });
+            } else {
+                // For complex components, return the full component object
+                resolvers.push({
+                    typeName: archetypeName,
+                    fieldName: field,
+                    resolver: async (parent: any, args: any, context: any) => {
+                        const entity = parent._entity;
+                        if (!entity) return parent[field];
+                        
+                        // Use DataLoader if available
+                        if (context.loaders) {
+                            const componentData = await context.loaders.componentsByEntityType.load({
+                                entityId: entity.id,
+                                typeId: typeIdHex  // Pass hex string directly
+                            });
+                            return componentData?.data;
+                        }
+                        
+                        // Fallback: direct query
+                        const comp = await entity.get(ctor as unknown);
+                        return comp;
+                    }
+                });
+
+                // Generate nested field resolvers for component properties
+                const componentTypeName = compNameToFieldName(componentName);
+                
+                for (const prop of componentProps) {
+                    resolvers.push({
+                        typeName: componentTypeName,  // Use lowercase component name
+                        fieldName: prop.propertyKey,
+                        resolver: (parent: any) => parent[prop.propertyKey]
+                    });
+                }
             }
         }
 
@@ -489,17 +529,23 @@ class BaseArcheType {
         const storage = getMetadataStorage();
         for (const [field, ctor] of Object.entries(this.componentMap)) {
             const type = this.fieldTypes[field];
-            if (type === String) {
-                zodShapes[field] = z.string();
-            } else if (type === Number) {
-                zodShapes[field] = z.number();
-            } else if (type === Boolean) {
-                zodShapes[field] = z.boolean();
-            } else if (type === Date) {
-                zodShapes[field] = z.date();
+            const typeId = storage.getComponentId(ctor.name);
+            const componentProps = storage.getComponentProperties(typeId);
+            
+            // Check if component should be unwrapped based on field type
+            if (shouldUnwrapComponent(componentProps, type)) {
+                // Unwrap to primitive type
+                if (type === String) {
+                    zodShapes[field] = z.string();
+                } else if (type === Number) {
+                    zodShapes[field] = z.number();
+                } else if (type === Boolean) {
+                    zodShapes[field] = z.boolean();
+                } else if (type === Date) {
+                    zodShapes[field] = z.date();
+                }
             } else {
-                // Use cached component schema - this enables reuse across archetypes
-                const typeId = storage.getComponentId(ctor.name);
+                // Use component schema for complex types
                 const componentSchema = getOrCreateComponentSchema(ctor, typeId, this.fieldOptions[field]);
                 if (componentSchema) {
                     zodShapes[field] = componentSchema;
@@ -508,7 +554,8 @@ class BaseArcheType {
                     continue;
                 }
             }
-            if (this.fieldOptions[field]?.nullable && !(zodShapes[field] instanceof ZodObject)) {
+            
+            if (this.fieldOptions[field]?.nullable && zodShapes[field] && !(zodShapes[field] instanceof ZodObject)) {
                 zodShapes[field] = zodShapes[field].nullish();
             }
         }

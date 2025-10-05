@@ -4,7 +4,7 @@ import db from '../database';
 import { inList } from '../database/sqlHelpers';
 
 export type ComponentData = {
-  typeId: number;
+  typeId: string;
   data: any;
   createdAt: Date;
   updatedAt: Date;
@@ -13,7 +13,7 @@ export type ComponentData = {
 
 export type RequestLoaders = {
   entityById: DataLoader<string, Entity | null>;
-  componentsByEntityType: DataLoader<{ entityId: string; typeId: number }, ComponentData | null>;
+  componentsByEntityType: DataLoader<{ entityId: string; typeId: string }, ComponentData | null>;
 };
 
 export function createRequestLoaders(db: any): RequestLoaders {
@@ -21,12 +21,13 @@ export function createRequestLoaders(db: any): RequestLoaders {
     const startTime = Date.now();
     try {
       const uniqueIds = [...new Set(ids)];
-      const rows = await db`
+      const idList = inList(uniqueIds, 1);
+      const rows = await db.unsafe(`
         SELECT id
         FROM entities
-        WHERE id IN ${inList(uniqueIds, 1)}
+        WHERE id IN ${idList.sql}
           AND deleted_at IS NULL
-      `;
+      `, idList.params);
       const entities = rows.map((row: any) => {
         const entity = new Entity(row.id);
         entity.setPersisted(true);
@@ -47,19 +48,21 @@ export function createRequestLoaders(db: any): RequestLoaders {
     }
   });
 
-  const componentsByEntityType = new DataLoader<{ entityId: string; typeId: number }, ComponentData | null>(
-    async (keys: readonly { entityId: string; typeId: number }[]) => {
+  const componentsByEntityType = new DataLoader<{ entityId: string; typeId: string }, ComponentData | null>(
+    async (keys: readonly { entityId: string; typeId: string }[]) => {
       const startTime = Date.now();
       try {
         const entityIds = [...new Set(keys.map(k => k.entityId))];
         const typeIds = [...new Set(keys.map(k => k.typeId))];
-        const rows = await db`
+        const entityIdList = inList(entityIds, 1);
+        const typeIdList = inList(typeIds, entityIdList.newParamIndex);
+        const rows = await db.unsafe(`
           SELECT entity_id, type_id, data, created_at, updated_at, deleted_at
           FROM components
-          WHERE entity_id IN ${inList(entityIds, 1)}
-            AND type_id IN ${inList(typeIds, entityIds.length + 1)}
+          WHERE entity_id IN ${entityIdList.sql}
+            AND type_id IN ${typeIdList.sql}
             AND deleted_at IS NULL
-        `;
+        `, [...entityIdList.params, ...typeIdList.params]);
         const map = new Map<string, ComponentData>();
         rows.forEach((row: any) => {
           const key = `${row.entity_id}-${row.type_id}`;
