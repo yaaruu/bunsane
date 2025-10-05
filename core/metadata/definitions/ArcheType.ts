@@ -3,3 +3,7 @@ export interface ArcheTypeMetadata {
     target: Function;
     typeId: string;
 }
+
+export interface ArcheTypeFieldOptions {
+    nullable?: boolean;
+}

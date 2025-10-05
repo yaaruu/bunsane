@@ -1,6 +1,13 @@
 import type { BaseComponent, ComponentDataType } from "./Components";
+import type { ComponentPropertyMetadata } from "./metadata/definitions/Component";
+import type { ArcheTypeFieldOptions } from "./metadata/definitions/ArcheType";
 import { Entity } from "./Entity";
 import { getMetadataStorage } from "./metadata";
+import { z, ZodObject, type ZodTypeAny } from "zod";
+import {weave} from "@gqloom/core";
+import { ZodWeaver } from "@gqloom/zod";
+import { printSchema } from "graphql";
+import "reflect-metadata";
 
 function compNameToFieldName(compName: string): string {
     return compName.charAt(0).toLowerCase() + compName.slice(1).replace(/Component$/, '');
@@ -8,9 +15,6 @@ function compNameToFieldName(compName: string): string {
 
 export type ArcheTypeOptions = {
     name?: string;
-    graphql?: {
-        fields: Record<string, ArcheTypeResolver>;
-    }
 };
 // TODO: Implement archetype with GraphQL support
 export function ArcheType<T extends new () => BaseArcheType>(nameOrOptions?: string | ArcheTypeOptions) {
@@ -20,40 +24,40 @@ export function ArcheType<T extends new () => BaseArcheType>(nameOrOptions?: str
         const typeId = storage.getComponentId(target.name);
         
         let archetype_name = target.name;
-        let graphql: { fields: Record<string, ArcheTypeResolver> } | undefined;
         
         if (typeof nameOrOptions === 'string') {
             archetype_name = nameOrOptions;
         } else if (nameOrOptions) {
             archetype_name = nameOrOptions.name || target.name;
-            graphql = nameOrOptions.graphql;
         }
         
         storage.collectArcheTypeMetadata({
             name: archetype_name,
             typeId: typeId,
-            target: target,        
+            target: target,
         });
 
-        const fieldNames = Object.getOwnPropertyNames(target.prototype);
-        for (const fieldName of fieldNames) {
-            const fieldMeta = Reflect.getMetadata("archetypeField", target.prototype, fieldName);
-            if (fieldMeta) {
-                storage.collectArchetypeField(archetype_name, fieldName);
+        const prototype = target.prototype;
+        const fields = prototype[archetypeFieldsSymbol];
+        console.log("archetypeFields for", archetype_name, ":", fields);
+        if (fields) {
+            for (const {propertyKey, component, options} of fields) {
+                const type = Reflect.getMetadata('design:type', target.prototype, propertyKey);
+                storage.collectArchetypeField(archetype_name, propertyKey, component, options, type);
             }
         }
-        
-        // Set GraphQL configuration on the prototype if provided
-        if (graphql) {
-            (target.prototype as any).graphql = graphql;
-        }
-        
         return target;
     };
 }
 
-export function ArcheTypeField() {
-    return Reflect.metadata("archetypeField", {});
+const archetypeFieldsSymbol = Symbol("archetypeFields");
+export function ArcheTypeField<T extends BaseComponent>(component: new (...args: any[]) => T, options?: ArcheTypeFieldOptions) {
+    return function(target: any, propertyKey: string) {
+        if (!target[archetypeFieldsSymbol]) {
+            target[archetypeFieldsSymbol] = [];
+        }
+        target[archetypeFieldsSymbol].push({ propertyKey, component, options });
+    };
 }
 
 export type ArcheTypeResolver = {
@@ -66,9 +70,6 @@ export type ArcheTypeResolver = {
 export type ArcheTypeCreateInfo = {
     name: string;
     components: Array<new (...args: any[]) => BaseComponent>;
-    graphql?: {
-        fields: Record<string, ArcheTypeResolver>;
-    }
 };
 
 /**
@@ -89,9 +90,24 @@ export type ArcheTypeCreateInfo = {
 class BaseArcheType {
     protected components: Set<{ ctor: new (...args: any[]) => BaseComponent, data: any }> = new Set();
     protected componentMap: Record<string, typeof BaseComponent> = {}; 
-    public graphql?: {
+    protected fieldOptions: Record<string, ArcheTypeFieldOptions> = {};
+    protected fieldTypes: Record<string, any> = {};
+    public resolver?: {
         fields: Record<string, ArcheTypeResolver>;
     };
+
+    constructor() {
+        const storage = getMetadataStorage();
+        const archetypeName = this.constructor.name.replace(/ArcheType$/, '');
+        const fields = storage.archetypes_field_map.get(archetypeName);
+        if (fields) {
+            for (const {fieldName, component, options, type} of fields) {
+                this.componentMap[fieldName] = component;
+                if (options) this.fieldOptions[fieldName] = options;
+                if (type) this.fieldTypes[fieldName] = type;
+            }
+        }
+    }
 
     // constructor(components: Array<new (...args: any[]) => BaseComponent>) {
     //     for (const ctor of components) {
@@ -110,7 +126,6 @@ class BaseArcheType {
         for (const ctor of info.components) {
             archetype.componentMap[compNameToFieldName(ctor.name)] = ctor;
         }
-        archetype.graphql = info.graphql;
         return archetype;
     }
    
@@ -129,9 +144,8 @@ class BaseArcheType {
                 if (compCtor) {
                     this.addComponent(compCtor, { value });
                 } else {
-                    if (strict) {
-                        throw new Error(`Component for field '${key}' not found in archetype.`);
-                    }
+                    // direct property
+                    (this as any)[key] = value;
                 }
             }
         }
@@ -154,7 +168,8 @@ class BaseArcheType {
                 if (compCtor) {
                     await entity.set(compCtor, { value });
                 } else {
-                    throw new Error(`Component for field '${key}' not found in archetype.`);
+                    // direct, set on archetype
+                    (this as any)[key] = value;
                 }
             }
         }
@@ -197,7 +212,101 @@ class BaseArcheType {
                 result[field] = (comp as any).value;
             }
         }
+        // for direct fields
+        for (const field of Object.keys(this.fieldTypes)) {
+            if (exclude.includes(field)) continue;
+            if (!this.componentMap[field]) {
+                result[field] = (this as any)[field];
+            }
+        }
         return result;
+    }
+
+    /**
+     * Gets the property metadata for all components in this archetype.
+     * @returns A record mapping field names to their component property metadata arrays
+     */
+    public getComponentProperties(): Record<string, ComponentPropertyMetadata[]> {
+        const storage = getMetadataStorage();
+        const result: Record<string, ComponentPropertyMetadata[]> = {};
+        for (const [field, ctor] of Object.entries(this.componentMap)) {
+            const typeId = storage.getComponentId(ctor.name);
+            result[field] = storage.getComponentProperties(typeId);
+        }
+        return result;
+    }
+
+    // TODO: Here
+    public getZodObjectSchema(): ZodObject<any> {
+        const zodShapes: Record<string, z.ZodTypeAny> = {};
+        const storage = getMetadataStorage();
+        for (const [field, ctor] of Object.entries(this.componentMap)) {
+            const type = this.fieldTypes[field];
+            if (type === String) {
+                zodShapes[field] = z.string();
+            } else if (type === Number) {
+                zodShapes[field] = z.number();
+            } else if (type === Boolean) {
+                zodShapes[field] = z.boolean();
+            } else if (type === Date) {
+                zodShapes[field] = z.date();
+            } else {
+                // component
+                const typeId = storage.getComponentId(ctor.name);
+                const props = storage.getComponentProperties(typeId);
+                if (props.length === 0) continue;
+                const zodFields: Record<string, any> = {};
+                for (const prop of props) {
+                    if (prop.isPrimitive) {
+                        switch (prop.propertyType) {
+                            case String:
+                                zodFields[prop.propertyKey] = z.string();
+                                break;
+                            case Number:
+                                zodFields[prop.propertyKey] = z.number();
+                                break;
+                            case Boolean:
+                                zodFields[prop.propertyKey] = z.boolean();
+                                break;
+                            case Date:
+                                zodFields[prop.propertyKey] = z.date();
+                                break;
+                            default:
+                                zodFields[prop.propertyKey] = z.any();
+                        }
+                    } else if (prop.isEnum && prop.enumValues) {
+                        zodFields[prop.propertyKey] = z.enum(prop.enumValues!);
+                    } else {
+                        zodFields[prop.propertyKey] = z.any();
+                    }
+                    if (this.fieldOptions[field]?.nullable) {
+                        zodFields[prop.propertyKey] = zodFields[prop.propertyKey].nullish();
+                    }
+                }
+                zodShapes[field] = z.object(zodFields);
+            }
+            if (this.fieldOptions[field]?.nullable && !(zodShapes[field] instanceof ZodObject)) {
+                zodShapes[field] = zodShapes[field].nullish();
+            }
+        }
+        const archetypeId = storage.getComponentId(this.constructor.name);
+        const nameFromStorage = storage.archetypes.find(a => a.typeId === archetypeId)?.name || this.constructor.name;
+        console.log("NameFromStorage: ",nameFromStorage)
+        const shape: Record<string, z.ZodTypeAny> = {
+            __typename: z.literal(nameFromStorage).nullish(),
+        };
+        for (const [field, zodType] of Object.entries(zodShapes)) {
+            if (this.fieldOptions[field]?.nullable && zodType instanceof ZodObject) {
+                shape[field] = zodType.optional();
+            } else {
+                shape[field] = zodType;
+            }
+        }
+        const r = z.object(shape);
+        const schema_arr = [r];
+        const schema = weave(ZodWeaver, ...schema_arr);
+        console.log("WeavedSchema:", printSchema(schema));
+        return r;
     }
 }
 

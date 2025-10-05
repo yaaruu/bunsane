@@ -12,4 +12,5 @@ export interface ComponentPropertyMetadata {
     isPrimitive: boolean;
     isEnum: boolean;
     enumValues?: string[];
+    enumKeys?: string[];
 }

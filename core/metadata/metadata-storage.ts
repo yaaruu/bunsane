@@ -3,7 +3,7 @@ import type {
     ComponentMetadata,
     ComponentPropertyMetadata
  } from "./definitions/Component";
-import type { ArcheTypeMetadata } from './definitions/ArcheType';
+import type { ArcheTypeMetadata, ArcheTypeFieldOptions } from './definitions/ArcheType';
 
 function generateTypeId(name: string): string {
   return createHash('sha256').update(name).digest('hex');
@@ -15,7 +15,7 @@ export class MetadataStorage {
     components_map: Map<string, ComponentMetadata> = new Map();
     componentProperties: Map<string, ComponentPropertyMetadata[]> = new Map();
     archetypes: ArcheTypeMetadata[] = [];
-    archetypes_field_map: Map<string, string[]> = new Map();
+    archetypes_field_map: Map<string, {fieldName: string, component: new (...args: any[]) => any, options?: ArcheTypeFieldOptions, type?: any}[]> = new Map();
 
 
     graphql_types: Map<string, any> = new Map();
@@ -47,11 +47,11 @@ export class MetadataStorage {
         return this.componentProperties.get(component_id) || [];
     }
 
-    collectArchetypeField(archetype_id: string, fieldName: string) {
+    collectArchetypeField(archetype_id: string, fieldName: string, component: new (...args: any[]) => any, options?: ArcheTypeFieldOptions, type?: any) {
         if(!this.archetypes_field_map.has(archetype_id)) {
             this.archetypes_field_map.set(archetype_id, []);
         }
-        this.archetypes_field_map.get(archetype_id)!.push(fieldName);
+        this.archetypes_field_map.get(archetype_id)!.push({fieldName, component, options, type});
     }
 
     collectArcheTypeMetadata(metadata: ArcheTypeMetadata) {

@@ -19,18 +19,30 @@ export function CompData(options?: { indexed?: boolean }) {
         const typeId = storage.getComponentId(target.constructor.name);
         const propType = Reflect.getMetadata("design:type", target, propertyKey);
         const isEnum = Reflect.getMetadata("isEnum", propType) ?? false;
-        console.log(`Property ${propertyKey} type:`, propType?.name);
-        console.log(`Is Enum:`, isEnum);
-        let enumObj: any = null;
+        // console.log(`Property ${propertyKey} type:`, propType?.name);
+        // console.log(`Is Enum:`, isEnum);
+        let enumValues: string[] | undefined = undefined;
+        let enumKeys: string[] | undefined = undefined;
         if(isEnum) {
             if (typeof propType === 'function') {
-                enumObj = Object.keys(propType).length > 0 ? propType : propType.prototype;
+                // For class-based enums with static properties
+                const staticKeys = Object.getOwnPropertyNames(propType).filter(key => 
+                    key !== 'prototype' && 
+                    key !== 'length' && 
+                    key !== 'name' && 
+                    typeof propType[key] !== 'function'
+                );
+                if (staticKeys.length > 0) {
+                    enumValues = staticKeys.map(key => propType[key]);
+                    enumKeys = staticKeys;
+                } else {
+                    // Fallback for numeric enums
+                    enumValues = Object.keys(propType).filter(key => !isNaN(Number(key))).map(key => propType[key]);
+                }
             } else {
-                enumObj = propType;
+                enumValues = Object.keys(propType).filter(key => !isNaN(Number(key))).map(key => propType[key]);
             }
-            // console.log(`Enum Object:`, enumObj);
-            // console.log(`Enum Keys:`, Object.keys(enumObj));
-            // console.log(`Enum Values:`, Object.keys(enumObj).filter(key => !isNaN(Number(key))).map(key => enumObj[key]));
+
         }
         storage.collectComponentPropertyMetadata({
             component_id: typeId,
@@ -39,7 +51,8 @@ export function CompData(options?: { indexed?: boolean }) {
             indexed: options?.indexed ?? false,
             isPrimitive: primitiveTypes.includes(propType),
             isEnum: isEnum,
-            enumValues:  isEnum ? Object.keys(enumObj).filter(key => !isNaN(Number(key))).map(key => enumObj[key]) : undefined
+            enumValues: enumValues,
+            enumKeys: enumKeys,
         })
         // Reflect.metadata("compData", { isData: true, indexed: options?.indexed ?? false })(target, propertyKey);
     };
@@ -73,7 +86,7 @@ export function Component<T extends new () => BaseComponent>(target: T): T {
     const storage = getMetadataStorage();
     const typeId = storage.getComponentId(target.name);
     const properties = storage.getComponentProperties(typeId);
-    console.log(`Component decorator applied to ${target.name} with typeId ${typeId} and properties:`, properties);
+    // console.log(`Component decorator applied to ${target.name} with typeId ${typeId} and properties:`, properties);
     storage.collectComponentMetadata({
         name: target.name,
         typeId: typeId,
