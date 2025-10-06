@@ -435,7 +435,9 @@ class BaseArcheType {
         resolvers.push({
             typeName: archetypeName,
             fieldName: 'id',
-            resolver: (parent: any) => parent.id
+            resolver: (parent: Entity) => {
+                return parent.id;
+            }
         });
 
         // Generate resolvers for each component field
@@ -459,9 +461,8 @@ class BaseArcheType {
                 resolvers.push({
                     typeName: archetypeName,
                     fieldName: field,
-                    resolver: async (parent: any, args: any, context: any) => {
-                        const entity = parent._entity;
-                        if (!entity) return parent[field];
+                    resolver: async (parent: Entity, args: any, context: any) => {
+                        const entity = parent;
                         
                         // Use DataLoader if available
                         if (context.loaders) {
@@ -473,7 +474,7 @@ class BaseArcheType {
                         }
                         
                         // Fallback: direct query
-                        const comp = await entity.get(ctor as unknown);
+                        const comp = await entity.get(ctor);
                         return (comp as any)?.value;
                     }
                 });
@@ -482,9 +483,9 @@ class BaseArcheType {
                 resolvers.push({
                     typeName: archetypeName,
                     fieldName: field,
-                    resolver: async (parent: any, args: any, context: any) => {
-                        const entity = parent._entity;
-                        if (!entity) return parent[field];
+                    resolver: async (parent: Entity, args: any, context: any) => {
+                        const entity = parent;
+                        if (!entity || !entity.id) return parent[field];
                         
                         // Use DataLoader if available
                         if (context.loaders) {
@@ -496,7 +497,7 @@ class BaseArcheType {
                         }
                         
                         // Fallback: direct query
-                        const comp = await entity.get(ctor as unknown);
+                        const comp = await entity.get(ctor);
                         return comp;
                     }
                 });
