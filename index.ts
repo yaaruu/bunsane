@@ -3,6 +3,7 @@ import ServiceRegistry from "./service/ServiceRegistry";
 import BaseService from "./service/Service";
 import { Component, CompData, BaseComponent } from "./core/Components";
 import { Entity } from "./core/Entity";
+import type { IEntity } from "./core/EntityInterface";
 import BaseArcheType, { ArcheType} from "./core/ArcheType";
 import Query from "./core/Query";
 import {logger} from "./core/Logger";
@@ -53,6 +54,7 @@ export {
     Component,
     CompData,
     Entity,
+    type IEntity,
     BatchLoader,
 
     Query,
