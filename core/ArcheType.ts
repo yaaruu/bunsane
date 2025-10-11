@@ -293,21 +293,6 @@ export type ArcheTypeCreateInfo = {
     components: Array<new (...args: any[]) => BaseComponent>;
 };
 
-/**
- * ArcheType provides a layer of abstraction for creating entities with predefined sets of components.
- * This makes entity creation more elegant and reduces code repetition.
- * 
- * Example usage:
- * ```typescript
- * const UserArcheType = new ArcheType([NameComponent, EmailComponent, PasswordComponent]);
- *
- * 
- * // FROM Request or other source 
- * const userInput = { name: "John Doe", email: "john@example.com", password: "securepassword" };
- * const entity = UserArcheType.fill(userInput).createEntity();
- * await entity.save();
- * ```
- */
 class BaseArcheType {
     protected components: Set<{ ctor: new (...args: any[]) => BaseComponent, data: any }> = new Set();
     public componentMap: Record<string, typeof BaseComponent> = {}; 
@@ -554,17 +539,19 @@ class BaseArcheType {
                     fieldName: field,
                     resolver: async (parent: Entity, args: any, context: any) => {
                         const entity = parent;
-                        
-                        // Use DataLoader if available
+
+                        // Use DataLoader if available, but fall back when no row exists
                         if (context.loaders) {
                             const componentData = await context.loaders.componentsByEntityType.load({
                                 entityId: entity.id,
                                 typeId: typeIdHex  // Pass hex string directly
                             });
-                            return componentData?.data?.value;
+                            if (componentData?.data?.value !== undefined) {
+                                return componentData.data.value;
+                            }
                         }
-                        
-                        // Fallback: direct query
+
+                        // Fallback: direct query ensures component data is returned
                         const comp = await entity.get(ctor);
                         return (comp as any)?.value;
                     }
@@ -577,17 +564,19 @@ class BaseArcheType {
                     resolver: async (parent: Entity, args: any, context: any) => {
                         const entity = parent;
                         if (!entity || !entity.id) return (parent as any)[field];
-                        
-                        // Use DataLoader if available
+
+                        // Use DataLoader if available, but fall back when no row exists
                         if (context.loaders) {
                             const componentData = await context.loaders.componentsByEntityType.load({
                                 entityId: entity.id,
                                 typeId: typeIdHex  // Pass hex string directly
                             });
-                            return componentData?.data;
+                            if (componentData?.data) {
+                                return componentData.data;
+                            }
                         }
-                        
-                        // Fallback: direct query
+
+                        // Fallback: direct query ensures component data is returned
                         const comp = await entity.get(ctor);
                         return comp;
                     }
@@ -622,7 +611,69 @@ class BaseArcheType {
                 relatedTypeName = relatedArchetypeMetadata?.name || relatedArcheType.name.replace(/ArcheType$/, '');
             }
             
-            if (isArray) {
+            if (!isArray && relationType === 'belongsTo' && relationOptions?.foreignKey) {
+                resolvers.push({
+                    typeName: archetypeName,
+                    fieldName: field,
+                    resolver: async (parent: Entity, args: any, context: any) => {
+                        const entity = parent;
+                        if (!entity || !entity.id) {
+                            return null;
+                        }
+
+                        let foreignId: string | undefined;
+
+                        // Attempt to load the component that holds the foreign key via DataLoader
+                        if (context.loaders) {
+                            for (const [componentField, compCtor] of Object.entries(this.componentMap)) {
+                                const typeIdForComponent = storage.getComponentId(compCtor.name);
+                                const componentProps = storage.getComponentProperties(typeIdForComponent);
+                                const hasForeignKey = componentProps.some(prop => prop.propertyKey === relationOptions.foreignKey);
+                                if (!hasForeignKey) continue;
+
+                                const componentData = await context.loaders.componentsByEntityType.load({
+                                    entityId: entity.id,
+                                    typeId: typeIdForComponent
+                                });
+
+                                if (componentData?.data && componentData.data[relationOptions.foreignKey] !== undefined) {
+                                    foreignId = componentData.data[relationOptions.foreignKey];
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Fallback: pull the component from the entity directly when DataLoader misses
+                        if (!foreignId) {
+                            for (const compCtor of Object.values(this.componentMap)) {
+                                const typeIdForComponent = storage.getComponentId(compCtor.name);
+                                const componentProps = storage.getComponentProperties(typeIdForComponent);
+                                const hasForeignKey = componentProps.some(prop => prop.propertyKey === relationOptions.foreignKey);
+                                if (!hasForeignKey) continue;
+                                const componentInstance = await entity.get(compCtor as any);
+                                if (componentInstance && (componentInstance as any)[relationOptions.foreignKey] !== undefined) {
+                                    foreignId = (componentInstance as any)[relationOptions.foreignKey];
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (!foreignId) {
+                            return null;
+                        }
+
+                        // Resolve the related entity using loaders when possible, otherwise hit the database directly
+                        if (context.loaders?.entityById) {
+                            const relatedEntity = await context.loaders.entityById.load(foreignId);
+                            if (relatedEntity) {
+                                return relatedEntity;
+                            }
+                        }
+
+                        return Entity.FindById(foreignId);
+                    }
+                });
+            } else if (isArray) {
                 // Array relation resolver
                 resolvers.push({
                     typeName: archetypeName,
@@ -662,7 +713,9 @@ class BaseArcheType {
                                 relatedType: relatedTypeName,
                                 foreignKey: relationOptions?.foreignKey
                             });
-                            return results.length > 0 ? results[0] : null;
+                            if (results.length > 0) {
+                                return results[0];
+                            }
                         }
                         
                         // Fallback: return null or implement custom relation query
