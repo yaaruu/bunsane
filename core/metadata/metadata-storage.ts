@@ -4,6 +4,7 @@ import type {
     ComponentPropertyMetadata
  } from "./definitions/Component";
 import type { ArcheTypeMetadata, ArcheTypeFieldOptions } from './definitions/ArcheType';
+import type { RelationOptions } from '../ArcheType';
 
 function generateTypeId(name: string): string {
   return createHash('sha256').update(name).digest('hex');
@@ -16,6 +17,7 @@ export class MetadataStorage {
     componentProperties: Map<string, ComponentPropertyMetadata[]> = new Map();
     archetypes: ArcheTypeMetadata[] = [];
     archetypes_field_map: Map<string, {fieldName: string, component: new (...args: any[]) => any, options?: ArcheTypeFieldOptions, type?: any}[]> = new Map();
+    archetypes_relations_map: Map<string, {fieldName: string, relatedArcheType: new (...args: any[]) => any | string, relationType: 'hasMany' | 'belongsTo' | 'hasOne' | 'belongsToMany', options?: RelationOptions, type?: any}[]> = new Map();
 
 
     graphql_types: Map<string, any> = new Map();
@@ -52,6 +54,13 @@ export class MetadataStorage {
             this.archetypes_field_map.set(archetype_id, []);
         }
         this.archetypes_field_map.get(archetype_id)!.push({fieldName, component, options, type});
+    }
+
+    collectArchetypeRelation(archetype_id: string, fieldName: string, relatedArcheType: new (...args: any[]) => any | string, relationType: 'hasMany' | 'belongsTo' | 'hasOne' | 'belongsToMany', options?: RelationOptions, type?: any) {
+        if(!this.archetypes_relations_map.has(archetype_id)) {
+            this.archetypes_relations_map.set(archetype_id, []);
+        }
+        this.archetypes_relations_map.get(archetype_id)!.push({fieldName, relatedArcheType, relationType, options, type});
     }
 
     collectArcheTypeMetadata(metadata: ArcheTypeMetadata) {

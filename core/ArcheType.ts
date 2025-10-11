@@ -58,6 +58,21 @@ export function getRegisteredCustomTypes() {
 }
 
 export function weaveAllArchetypes() {
+    // First, ensure all archetype schemas are generated
+    const storage = getMetadataStorage();
+    for (const archetypeMetadata of storage.archetypes) {
+        const archetypeName = archetypeMetadata.name;
+        if (!archetypeSchemaCache.has(archetypeName)) {
+            try {
+                const ArchetypeClass = archetypeMetadata.target as any;
+                const instance = new ArchetypeClass();
+                instance.getZodObjectSchema(); // Generate and cache the schema
+            } catch (error) {
+                console.warn(`Could not generate schema for archetype ${archetypeName}:`, error);
+            }
+        }
+    }
+
     if (allArchetypeZodObjects.size === 0) {
         return null;
     }
@@ -162,6 +177,30 @@ function shouldUnwrapComponent(componentProps: ComponentPropertyMetadata[], fiel
 export type ArcheTypeOptions = {
     name?: string;
 };
+
+export interface RelationOptions {
+    nullable?: boolean;
+    foreignKey?: string;
+    through?: string;
+    cascade?: boolean;
+}
+
+export interface HasManyOptions extends RelationOptions {
+    // Additional HasMany specific options
+}
+
+export interface BelongsToOptions extends RelationOptions {
+    // Additional BelongsTo specific options
+}
+
+export interface HasOneOptions extends RelationOptions {
+    // Additional HasOne specific options
+}
+
+export interface BelongsToManyOptions extends RelationOptions {
+    through: string; // Required for many-to-many
+}
+
 // TODO: Implement archetype with GraphQL support
 export function ArcheType<T extends new () => BaseArcheType>(nameOrOptions?: string | ArcheTypeOptions) {
     return function(target: T): T {
@@ -190,6 +229,15 @@ export function ArcheType<T extends new () => BaseArcheType>(nameOrOptions?: str
                 storage.collectArchetypeField(archetype_name, propertyKey, component, options, type);
             }
         }
+
+        // Process relations
+        const relations = prototype[archetypeRelationsSymbol];
+        if (relations) {
+            for (const {propertyKey, relatedArcheType, relationType, options} of relations) {
+                const type = Reflect.getMetadata('design:type', target.prototype, propertyKey);
+                storage.collectArchetypeRelation(archetype_name, propertyKey, relatedArcheType, relationType, options, type);
+            }
+        }
         return target;
     };
 }
@@ -203,6 +251,35 @@ export function ArcheTypeField<T extends BaseComponent>(component: new (...args:
         target[archetypeFieldsSymbol].push({ propertyKey, component, options });
     };
 }
+
+const archetypeRelationsSymbol = Symbol("archetypeRelations");
+
+function createRelationDecorator(relationType: 'hasMany' | 'belongsTo' | 'hasOne' | 'belongsToMany') {
+    return function<T extends BaseArcheType>(
+        relatedArcheType: new (...args: any[]) => T | string,
+        options?: RelationOptions
+    ) {
+        return function(target: any, propertyKey: string) {
+            if (!target[archetypeRelationsSymbol]) {
+                target[archetypeRelationsSymbol] = [];
+            }
+            target[archetypeRelationsSymbol].push({
+                propertyKey,
+                relatedArcheType,
+                relationType,
+                options
+            });
+        };
+    };
+}
+
+export const HasMany = createRelationDecorator('hasMany');
+export const BelongsTo = createRelationDecorator('belongsTo');
+export const HasOne = createRelationDecorator('hasOne');
+export const BelongsToMany = createRelationDecorator('belongsToMany');
+
+// Keep ArcheTypeRelation as alias for backwards compatibility
+export const ArcheTypeRelation = HasMany;
 
 export type ArcheTypeResolver = {
     resolver?: string;
@@ -236,6 +313,10 @@ class BaseArcheType {
     public componentMap: Record<string, typeof BaseComponent> = {}; 
     protected fieldOptions: Record<string, ArcheTypeFieldOptions> = {};
     protected fieldTypes: Record<string, any> = {};
+    public relationMap: Record<string, typeof BaseArcheType | string> = {};
+    protected relationOptions: Record<string, RelationOptions> = {};
+    protected relationTypes: Record<string, 'hasMany' | 'belongsTo' | 'hasOne' | 'belongsToMany'> = {};
+
     public resolver?: {
         fields: Record<string, ArcheTypeResolver>;
     };
@@ -254,6 +335,16 @@ class BaseArcheType {
                 this.componentMap[fieldName] = component;
                 if (options) this.fieldOptions[fieldName] = options;
                 if (type) this.fieldTypes[fieldName] = type;
+            }
+        }
+
+        // Process relations
+        const relations = storage.archetypes_relations_map.get(archetypeName);
+        if (relations) {
+            for (const {fieldName, relatedArcheType, relationType, options, type} of relations) {
+                this.relationMap[fieldName] = relatedArcheType;
+                this.relationTypes[fieldName] = relationType;
+                if (options) this.relationOptions[fieldName] = options;
             }
         }
     }
@@ -340,7 +431,7 @@ class BaseArcheType {
                         await entity.set(compCtor, { value });
                     } else {
                         // For complex types, pass data directly
-                        await entity.set(compCtor, value);
+                        await entity.set(compCtor, value as any);
                     }
                 } else {
                     // direct, set on archetype
@@ -485,7 +576,7 @@ class BaseArcheType {
                     fieldName: field,
                     resolver: async (parent: Entity, args: any, context: any) => {
                         const entity = parent;
-                        if (!entity || !entity.id) return parent[field];
+                        if (!entity || !entity.id) return (parent as any)[field];
                         
                         // Use DataLoader if available
                         if (context.loaders) {
@@ -512,6 +603,73 @@ class BaseArcheType {
                         resolver: (parent: any) => parent[prop.propertyKey]
                     });
                 }
+            }
+        }
+
+        // Generate resolvers for relation fields
+        for (const [field, relatedArcheType] of Object.entries(this.relationMap)) {
+            const relationType = this.relationTypes[field];
+            const relationOptions = this.relationOptions[field];
+            const isArray = relationType === 'hasMany' || relationType === 'belongsToMany';
+            
+            // Get the related archetype name
+            let relatedTypeName: string;
+            if (typeof relatedArcheType === 'string') {
+                relatedTypeName = relatedArcheType;
+            } else {
+                const relatedArchetypeId = storage.getComponentId(relatedArcheType.name);
+                const relatedArchetypeMetadata = storage.archetypes.find(a => a.typeId === relatedArchetypeId);
+                relatedTypeName = relatedArchetypeMetadata?.name || relatedArcheType.name.replace(/ArcheType$/, '');
+            }
+            
+            if (isArray) {
+                // Array relation resolver
+                resolvers.push({
+                    typeName: archetypeName,
+                    fieldName: field,
+                    resolver: async (parent: Entity, args: any, context: any) => {
+                        const entity = parent;
+                        
+                        // Use DataLoader for relation loading if available
+                        if (context.loaders && context.loaders.relationsByEntityField) {
+                            return context.loaders.relationsByEntityField.load({
+                                entityId: entity.id,
+                                relationField: field,
+                                relatedType: relatedTypeName,
+                                foreignKey: relationOptions?.foreignKey
+                            });
+                        }
+                        
+                        // Fallback: return empty array or implement custom relation query
+                        // This should be implemented based on your relation storage strategy
+                        console.warn(`No relationsByEntityField loader found for array relation ${field} on ${archetypeName}`);
+                        return [];
+                    }
+                });
+            } else {
+                // Single relation resolver
+                resolvers.push({
+                    typeName: archetypeName,
+                    fieldName: field,
+                    resolver: async (parent: Entity, args: any, context: any) => {
+                        const entity = parent;
+                        
+                        // Use DataLoader for relation loading if available
+                        if (context.loaders && context.loaders.relationsByEntityField) {
+                            const results = await context.loaders.relationsByEntityField.load({
+                                entityId: entity.id,
+                                relationField: field,
+                                relatedType: relatedTypeName,
+                                foreignKey: relationOptions?.foreignKey
+                            });
+                            return results.length > 0 ? results[0] : null;
+                        }
+                        
+                        // Fallback: return null or implement custom relation query
+                        console.warn(`No relationsByEntityField loader found for single relation ${field} on ${archetypeName}`);
+                        return null;
+                    }
+                });
             }
         }
 
@@ -592,6 +750,37 @@ class BaseArcheType {
                 zodShapes[field] = zodShapes[field].nullish();
             }
         }
+
+        // Process relations for GraphQL schema generation
+        for (const [field, relatedArcheType] of Object.entries(this.relationMap)) {
+            const relationType = this.relationTypes[field];
+            const isArray = relationType === 'hasMany' || relationType === 'belongsToMany';
+            
+            // Get the related archetype name
+            let relatedTypeName: string;
+            if (typeof relatedArcheType === 'string') {
+                relatedTypeName = relatedArcheType;
+            } else {
+                const relatedArchetypeId = storage.getComponentId(relatedArcheType.name);
+                const relatedArchetypeMetadata = storage.archetypes.find(a => a.typeId === relatedArchetypeId);
+                relatedTypeName = relatedArchetypeMetadata?.name || relatedArcheType.name.replace(/ArcheType$/, '');
+            }
+            
+            // For GraphQL relations, we just store the type name as a string reference
+            // The GraphQL schema will use the type name directly, and the full type definition
+            // will be generated when each archetype's getZodObjectSchema() is called
+            const relatedTypeSchema = z.string().describe(`Reference to ${relatedTypeName} type`);
+            
+            if (isArray) {
+                zodShapes[field] = z.array(relatedTypeSchema);
+            } else {
+                zodShapes[field] = relatedTypeSchema;
+            }
+            
+            if (this.relationOptions[field]?.nullable) {
+                zodShapes[field] = zodShapes[field].nullish();
+            }
+        }
         const archetypeId = storage.getComponentId(this.constructor.name);
         const nameFromStorage = storage.archetypes.find(a => a.typeId === archetypeId)?.name || this.constructor.name;
         console.log("NameFromStorage: ",nameFromStorage)
@@ -623,6 +812,30 @@ class BaseArcheType {
         
         // Post-process: Replace 'id: String' with 'id: ID' for all id fields
         graphqlSchemaString = graphqlSchemaString.replace(/\bid:\s*String\b/g, 'id: ID');
+        
+        // Post-process: Replace relation field types with proper GraphQL type references
+        for (const [field, relatedArcheType] of Object.entries(this.relationMap)) {
+            const relationType = this.relationTypes[field];
+            const isArray = relationType === 'hasMany' || relationType === 'belongsToMany';
+            
+            let relatedTypeName: string;
+            if (typeof relatedArcheType === 'string') {
+                relatedTypeName = relatedArcheType;
+            } else {
+                const relatedArchetypeId = storage.getComponentId(relatedArcheType.name);
+                const relatedArchetypeMetadata = storage.archetypes.find(a => a.typeId === relatedArchetypeId);
+                relatedTypeName = relatedArchetypeMetadata?.name || relatedArcheType.name.replace(/ArcheType$/, '');
+            }
+            
+            // Replace the String field with proper GraphQL type reference
+            if (isArray) {
+                const pattern = new RegExp(`${field}:\\s*\\[String!?\\]!?`, 'g');
+                graphqlSchemaString = graphqlSchemaString.replace(pattern, `${field}: [${relatedTypeName}!]!`);
+            } else {
+                const pattern = new RegExp(`${field}:\\s*String!?`, 'g');
+                graphqlSchemaString = graphqlSchemaString.replace(pattern, `${field}: ${relatedTypeName}!`);
+            }
+        }
         
         console.log("WeavedSchema:", graphqlSchemaString);
         
