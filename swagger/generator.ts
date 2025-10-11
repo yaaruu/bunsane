@@ -33,7 +33,16 @@ export class OpenAPISpecGenerator {
                 title,
                 version
             },
-            paths: {}
+            paths: {},
+            components: {
+                securitySchemes: {
+                    BearerAuth: {
+                        type: "http",
+                        scheme: "bearer",
+                        bearerFormat: "JWT"
+                    }
+                },
+            }
         };
     }
 

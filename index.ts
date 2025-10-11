@@ -8,7 +8,7 @@ import Query from "./core/Query";
 import {logger} from "./core/Logger";
 import { handleGraphQLError, responseError } from "./core/ErrorHandler";
 import { type Plugin } from "graphql-yoga";
-import { BatchLoader } from "core/BatchLoader";
+import { BatchLoader } from "./core/BatchLoader";
 import { createRequestContextPlugin } from "./core/RequestContext";
 import type { RequestLoaders } from "./core/RequestLoaders";
 import BasePlugin from "./plugins";
@@ -38,8 +38,8 @@ import type {
     ComponentUpdatedEvent,
     ComponentRemovedEvent
 } from "./core/events/EntityLifecycleEvents";
-import { ScheduledTask } from "core/decorators/ScheduledTask";
-import { ScheduleInterval } from "types/scheduler.types";
+import { ScheduledTask } from "./core/decorators/ScheduledTask";
+import { ScheduleInterval } from "./types/scheduler.types";
 // Swagger exports
 import { ApiDocs, ApiTags } from "./swagger";
 
