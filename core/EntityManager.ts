@@ -1,10 +1,10 @@
 import ApplicationLifecycle, { ApplicationPhase } from "./ApplicationLifecycle";
-import type { Entity } from "./Entity";
+import type { IEntity } from "./EntityInterface";
 
 class EntityManager {
     static #instance: EntityManager;
     private dbReady = false;
-    private entityQueue: Entity[] = [];
+    private entityQueue: IEntity[] = [];
 
     constructor() {
         ApplicationLifecycle.addPhaseListener(async (event) => {
@@ -15,7 +15,7 @@ class EntityManager {
         });
     }
 
-    public saveEntity(entity: Entity) {
+    public saveEntity(entity: IEntity) {
         return new Promise<boolean>(async resolve => {
             if(!this.dbReady) {
                 this.entityQueue.push(entity);
@@ -27,7 +27,7 @@ class EntityManager {
         })
     }
 
-    public deleteEntity(entity: Entity, force: boolean = false) {
+    public deleteEntity(entity: IEntity, force: boolean = false) {
         return new Promise<boolean>(async resolve => {
             if(!this.dbReady) {
                 return resolve(false);

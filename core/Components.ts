@@ -3,30 +3,89 @@ import "reflect-metadata";
 import { logger as MainLogger } from "./Logger";
 import ComponentRegistry from "./ComponentRegistry";
 import { uuidv7 } from 'utils/uuid';
+import { getMetadataStorage } from './metadata';
 const logger = MainLogger.child({ scope: "Components" });
 
 export function generateTypeId(name: string): string {
   return createHash('sha256').update(name).digest('hex');
 }
 
+const primitiveTypes = [String, Number, Boolean, Symbol, BigInt];
+
+//TODO: Continue here
 export function CompData(options?: { indexed?: boolean }) {
-    return Reflect.metadata("compData", { isData: true, indexed: options?.indexed ?? false });
+    return (target: any, propertyKey: string) => {
+        const storage = getMetadataStorage();
+        const typeId = storage.getComponentId(target.constructor.name);
+        const propType = Reflect.getMetadata("design:type", target, propertyKey);
+        let isEnum = !!(Reflect.getMetadata("isEnum", propType));
+        if (propType.name === 'ServiceType') isEnum = true;
+        // console.log(`Property ${propertyKey} type:`, propType?.name);
+        // console.log(`Is Enum:`, isEnum);
+        let enumValues: string[] | undefined = undefined;
+        let enumKeys: string[] | undefined = undefined;
+        if(isEnum) {
+            const metaEnumValues = Reflect.getMetadata("__enumValues", propType);
+            const metaEnumKeys = Reflect.getMetadata("__enumKeys", propType);
+            
+            if (metaEnumValues && metaEnumKeys) {
+                enumValues = metaEnumValues;
+                enumKeys = metaEnumKeys;
+            } else {
+                const staticKeys = Object.getOwnPropertyNames(propType).filter(key => 
+                    key !== 'prototype' && 
+                    key !== 'length' && 
+                    key !== 'name' &&
+                    key !== 'isEnum' &&
+                    key !== '__enumValues' &&
+                    key !== '__enumKeys' &&
+                    typeof propType[key] !== 'function' &&
+                    typeof propType[key] !== 'boolean'
+                );
+                if (staticKeys.length > 0) {
+                    enumValues = staticKeys.map(key => propType[key]);
+                    enumKeys = staticKeys;
+                } else {
+                    // Fallback for numeric enums
+                    enumValues = Object.keys(propType).filter(key => !isNaN(Number(key))).map(key => propType[key]);
+                }
+            }
+            
+            if (propType.name === 'ServiceType' && (!enumValues || enumValues.length === 0)) {
+                enumValues = ["jek", "car", "food", "package"];
+                enumKeys = ["BIKE", "CAR", "FOOD", "PACKAGE"];
+            }
+
+        }
+        storage.collectComponentPropertyMetadata({
+            component_id: typeId,
+            propertyKey: propertyKey,
+            propertyType: propType,
+            indexed: options?.indexed ?? false,
+            isPrimitive: primitiveTypes.includes(propType),
+            isEnum: isEnum,
+            enumValues: enumValues,
+            enumKeys: enumKeys,
+        })
+        // Reflect.metadata("compData", { isData: true, indexed: options?.indexed ?? false })(target, propertyKey);
+    };
 }
 
-export enum CompCastingType {
-    STRING = "string",
-    NUMBER = "number",
-    BOOLEAN = "boolean",
-    DATE = "date",
-}
-/**
- * Cast property to specific type when loading from database
- * @param type Casting type for the property
- * @returns 
- */
-export function Cast(type: CompCastingType) {
-    return Reflect.metadata("compCast", { type });
-}
+// TODO: Component Property Casting
+// export enum CompCastingType {
+//     STRING = "string",
+//     NUMBER = "number",
+//     BOOLEAN = "boolean",
+//     DATE = "date",
+// }
+// /**
+//  * Cast property to specific type when loading from database
+//  * @param type Casting type for the property
+//  * @returns 
+//  */
+// export function Cast(type: CompCastingType) {
+//     return Reflect.metadata("compCast", { type });
+// }
 
 // Type helper to extract only data properties (excludes methods and private properties)
 export type ComponentDataType<T extends BaseComponent> = {
@@ -36,8 +95,17 @@ export type ComponentDataType<T extends BaseComponent> = {
                     K]: T[K];
 };
 
-export function Component(target: any) {
-    ComponentRegistry.define(target.name, target);
+export function Component<T extends new () => BaseComponent>(target: T): T {
+    const storage = getMetadataStorage();
+    const typeId = storage.getComponentId(target.name);
+    const properties = storage.getComponentProperties(typeId);
+    // console.log(`Component decorator applied to ${target.name} with typeId ${typeId} and properties:`, properties);
+    storage.collectComponentMetadata({
+        name: target.name,
+        typeId: typeId,
+        target: target,
+    });
+    // ComponentRegistry.define(target.name, target);
     return target;
 }
 
@@ -50,7 +118,8 @@ export class BaseComponent {
 
     constructor() {
         this._comp_name = this.constructor.name;
-        this._typeId = ComponentRegistry.getComponentId(this._comp_name) || generateTypeId(this._comp_name);
+        const storage = getMetadataStorage();
+        this._typeId = storage.getComponentId(this._comp_name);
         this._dirty = false;
     }
 
@@ -59,10 +128,15 @@ export class BaseComponent {
     }
 
     properties(): string[] {
-        return Object.keys(this).filter(prop => {
-            const meta = Reflect.getMetadata("compData", Object.getPrototypeOf(this), prop);
-            return meta && meta.isData;
-        });
+        const storage = getMetadataStorage();
+        const props = storage.componentProperties.get(this._typeId);
+        if(!props) return [];
+        return props.map(p => p.propertyKey);
+        //
+        // return Object.keys(this).filter(prop => {
+        //     const meta = Reflect.getMetadata("compData", Object.getPrototypeOf(this), prop);
+        //     return meta && meta.isData;
+        // });
     }
 
     /**
@@ -116,10 +190,10 @@ export class BaseComponent {
     }
 
     indexedProperties(): string[] {
-        return Object.keys(this).filter(prop => {
-            const meta = Reflect.getMetadata("compData", Object.getPrototypeOf(this), prop);
-            return meta && meta.isData && meta.indexed;
-        });
+        const storage = getMetadataStorage();
+        const props = storage.componentProperties.get(this._typeId);
+        if(!props) return [];
+        return props.filter(p => p.indexed).map(p => p.propertyKey);
     }
 }
 

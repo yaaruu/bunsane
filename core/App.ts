@@ -1,12 +1,12 @@
 import ApplicationLifecycle, {ApplicationPhase} from "core/ApplicationLifecycle";
 import { GenerateTableName, HasValidBaseTable, PrepareDatabase, UpdateComponentIndexes } from "database/DatabaseHelper";
 import ComponentRegistry from "core/ComponentRegistry";
-import { logger } from "core/Logger";
+import { logger as MainLogger } from "core/Logger";
+const logger = MainLogger.child({ scope: "App" });
 import { createYogaInstance } from "gql";
 import ServiceRegistry from "service/ServiceRegistry";
 import type { Plugin } from "graphql-yoga";
 import * as path from "path";
-import { registerDecoratedHooks } from "core/decorators/EntityHooks";
 import { SchedulerManager } from "core/SchedulerManager";
 import { registerScheduledTasks } from "core/decorators/ScheduledTask";
 import { OpenAPISpecGenerator, type SwaggerEndpointMetadata } from "swagger";
@@ -17,6 +17,7 @@ export default class App {
     private version: string = "1.0.0";
     private yoga: any;
     private yogaPlugins: Plugin[] = [];
+    private contextFactory?: (context: any) => any;
     private restEndpoints: Array<{ method: string; path: string; handler: Function; service: any }> = [];
     private restEndpointMap: Map<string, { method: string; path: string; handler: Function; service: any }> = new Map();
     private staticAssets: Map<string, string> = new Map();
@@ -61,46 +62,26 @@ export default class App {
                 case ApplicationPhase.DATABASE_READY: {
                     break;
                 }
-                case ApplicationPhase.COMPONENTS_READY: {
-                    const components = ComponentRegistry.getComponents();
-                    for(const plugin of this.plugins) {
-                        if(plugin.onComponentRegistered) {
-                            for(const {name, ctor} of components) {
-                                plugin.onComponentRegistered(name, ctor, this);
-                            }
-                        }
-                    }
-                    for(const {name, ctor} of components) {
-                        const instance = new ctor();
-                        if(instance.indexedProperties().length > 0) {
-                            const table_name = GenerateTableName(name);
-                            UpdateComponentIndexes(table_name, instance.indexedProperties());
-                            // Register indexed component
-                        }
-                    }
-
-                    // Automatically register decorated hooks for all services
-                    const services = ServiceRegistry.getServices();
-                    for (const service of services) {
-                        try {
-                            registerDecoratedHooks(service);
-                        } catch (error) {
-                            logger.warn(`Failed to register hooks for service ${service.constructor.name}`);
-                            logger.warn(error);
-                        }
-                    }
-                    logger.info(`Registered hooks for ${services.length} services`);
-                    
-                    ApplicationLifecycle.setPhase(ApplicationPhase.SYSTEM_REGISTERING);
-                    break;
-                }
                 case ApplicationPhase.SYSTEM_READY: {
                     try {
                         const schema = ServiceRegistry.getSchema();
+                        
+                        // Wrap user's context factory to automatically spread Yoga context
+                        const wrappedContextFactory = this.contextFactory 
+                            ? (yogaContext: any) => {
+                                const userContext = this.contextFactory!(yogaContext);
+                                // Merge Yoga's context with user's context, preserving Yoga properties
+                                return {
+                                    ...yogaContext,  // Yoga context (request, params, etc.)
+                                    ...userContext,  // User's additional context
+                                };
+                            }
+                            : undefined;
+                        
                         if (schema) {
-                            this.yoga = createYogaInstance(schema, this.yogaPlugins);
+                            this.yoga = createYogaInstance(schema, this.yogaPlugins, wrappedContextFactory);
                         } else {
-                            this.yoga = createYogaInstance(undefined, this.yogaPlugins);
+                            this.yoga = createYogaInstance(undefined, this.yogaPlugins, wrappedContextFactory);
                         }
 
                         // Get all services for processing
@@ -197,6 +178,8 @@ export default class App {
             }
             logger.trace(`Database prepared...`);
             ApplicationLifecycle.setPhase(ApplicationPhase.DATABASE_READY);
+            await ComponentRegistry.registerAllComponents();
+            ApplicationLifecycle.setPhase(ApplicationPhase.SYSTEM_REGISTERING);
         }
 
         
@@ -205,7 +188,7 @@ export default class App {
     waitForAppReady(): Promise<void> {
         return new Promise(resolve => {
             const interval = setInterval(() => {
-                if (ApplicationLifecycle.getCurrentPhase() === ApplicationPhase.APPLICATION_READY) {
+                if (ApplicationLifecycle.getCurrentPhase() >= ApplicationPhase.COMPONENTS_READY) {
                     clearInterval(interval);
                     resolve();
                 }
@@ -222,6 +205,10 @@ export default class App {
 
     public addYogaPlugin(plugin: Plugin) {
         this.yogaPlugins.push(plugin);
+    }
+
+    public setGraphQLContextFactory(factory: (context: any) => any) {
+        this.contextFactory = factory;
     }
 
     public addPlugin(plugin: BasePlugin) {

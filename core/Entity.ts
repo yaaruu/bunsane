@@ -5,12 +5,13 @@ import EntityManager from "./EntityManager";
 import ComponentRegistry from "./ComponentRegistry";
 import { uuidv7 } from "utils/uuid";
 import { sql } from "bun";
-import Query from "./Query";
+// import Query from "./Query"; // Lazy import to avoid cycle
 import { timed } from "./Decorators";
 import EntityHookManager from "./EntityHookManager";
 import { EntityCreatedEvent, EntityUpdatedEvent, EntityDeletedEvent, ComponentAddedEvent, ComponentUpdatedEvent, ComponentRemovedEvent } from "./events/EntityLifecycleEvents";
+import type { IEntity } from "./EntityInterface";
 
-export class Entity {
+export class Entity implements IEntity {
     id: string;
     public _persisted: boolean = false;
     private components: Map<string, BaseComponent> = new Map<string, BaseComponent>();
@@ -402,6 +403,7 @@ export class Entity {
      * @returns Entity | null
      */
     public static async FindById(id: string): Promise<Entity | null> {
+        const { default: Query } = await import("./Query");
         const entities = await new Query().findById(id).populate().exec()
         if(entities.length === 1) {
             return entities[0]!;
