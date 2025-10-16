@@ -3,16 +3,15 @@ import type { ComponentPropertyMetadata } from "./metadata/definitions/Component
 import type { ArcheTypeFieldOptions } from "./metadata/definitions/ArcheType";
 import { Entity } from "./Entity";
 import { getMetadataStorage } from "./metadata";
-import { z, ZodObject, type ZodTypeAny } from "zod";
-import {weave, silk, resolver} from "@gqloom/core";
+import { z, ZodObject } from "zod";
+import {weave } from "@gqloom/core";
 import { ZodWeaver, asEnumType } from "@gqloom/zod";
-import { GraphQLID } from "graphql";
 import { printSchema } from "graphql";
 import "reflect-metadata";
 
-const customTypeRegistry = new Map<any, z.ZodTypeAny>();
+const customTypeRegistry = new Map<any, any>();
 const customTypeNameRegistry = new Map<any, string>();
-const registeredCustomTypes = new Map<string, z.ZodTypeAny>();
+const registeredCustomTypes = new Map<string, any>();
 const customTypeSilks = new Map<string, any>(); // Store silk types for unified weaving
 const customTypeResolvers: any[] = []; // Store resolvers for custom types
 
@@ -22,7 +21,7 @@ const componentSchemaCache = new Map<string, ZodObject<any>>(); // componentId -
 const archetypeSchemaCache = new Map<string, { zodSchema: ZodObject<any>, graphqlSchema: string }>();
 const allArchetypeZodObjects = new Map<string, ZodObject<any>>();
 
-export function registerCustomZodType(type: any, schema: z.ZodTypeAny, typeName?: string) {
+export function registerCustomZodType(type: any, schema: any, typeName?: string) {
     // If a type name is provided and it's a ZodObject, add __typename to control GraphQL naming
     if (typeName && schema instanceof ZodObject) {
         // Extend the schema with __typename literal to control the GraphQL type name
@@ -94,7 +93,7 @@ export function weaveAllArchetypes() {
 }
 
 // Generate Zod schema for a component and cache it
-function getOrCreateComponentSchema(componentCtor: new (...args: any[]) => BaseComponent, componentId: string, fieldOptions?: ArcheTypeFieldOptions): z.ZodTypeAny | null {
+function getOrCreateComponentSchema(componentCtor: new (...args: any[]) => BaseComponent, componentId: string, fieldOptions?: ArcheTypeFieldOptions): any | null {
     // Check cache first
     if (componentSchemaCache.has(componentId)) {
         return componentSchemaCache.get(componentId)!;
@@ -769,7 +768,7 @@ class BaseArcheType {
 
     // TODO: Here
     public getZodObjectSchema(): ZodObject<any> {
-        const zodShapes: Record<string, z.ZodTypeAny> = {};
+        const zodShapes: Record<string, any> = {};
         const storage = getMetadataStorage();
         for (const [field, ctor] of Object.entries(this.componentMap)) {
             const type = this.fieldTypes[field];
@@ -837,7 +836,7 @@ class BaseArcheType {
         const archetypeId = storage.getComponentId(this.constructor.name);
         const nameFromStorage = storage.archetypes.find(a => a.typeId === archetypeId)?.name || this.constructor.name;
         console.log("NameFromStorage: ",nameFromStorage)
-        const shape: Record<string, z.ZodTypeAny> = {
+        const shape: Record<string, any> = {
             __typename: z.literal(nameFromStorage).nullish(),
             id: z.string().nullish(),  // Will be converted to ID in post-processing
         };
@@ -851,7 +850,7 @@ class BaseArcheType {
         const r = z.object(shape);
         
         // Collect all component schemas used by this archetype for weaving
-        const componentSchemasToWeave: z.ZodTypeAny[] = [];
+        const componentSchemasToWeave: any[] = [];
         for (const [field, zodType] of Object.entries(zodShapes)) {
             if (zodType instanceof ZodObject) {
                 componentSchemasToWeave.push(zodType);
