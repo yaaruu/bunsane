@@ -1012,6 +1012,11 @@ export class BaseArcheType {
                     schema: unionSchema,
                     components: unionComponentSchemas
                 });
+                
+                // Apply nullable option for union fields
+                if (this.unionOptions[fieldName]?.nullable) {
+                    zodShapes[fieldName] = zodShapes[fieldName].nullish();
+                }
             }
         }
 
@@ -1054,7 +1059,9 @@ export class BaseArcheType {
             id: z.string().nullish(),  // Will be converted to ID in post-processing
         };
         for (const [field, zodType] of Object.entries(zodShapes)) {
-            if (this.fieldOptions[field]?.nullable && zodType instanceof ZodObject) {
+            const isNullable = this.fieldOptions[field]?.nullable || this.unionOptions[field]?.nullable;
+            if (isNullable) {
+                // For nullable fields, make them optional in the GraphQL schema
                 shape[field] = zodType.optional();
             } else {
                 shape[field] = zodType;
