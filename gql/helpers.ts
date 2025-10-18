@@ -14,15 +14,15 @@ export function isValidGraphQLType(type: string): type is GraphQLType {
 }
 
 export type TypeFromGraphQL<T extends GraphQLType> =
-  T extends GraphQLFieldTypes.ID_REQUIRED | GraphQLFieldTypes.ID_OPTIONAL ? string :
+  T extends GraphQLFieldTypes.ID_REQUIRED | GraphQLFieldTypes.ID ? string :
   T extends GraphQLFieldTypes.STRING_REQUIRED ? string :
-  T extends GraphQLFieldTypes.STRING_OPTIONAL ? string | null :
+  T extends GraphQLFieldTypes.STRING ? string | null :
   T extends GraphQLFieldTypes.INT_REQUIRED ? number :
-  T extends GraphQLFieldTypes.INT_OPTIONAL ? number | null :
+  T extends GraphQLFieldTypes.INT ? number | null :
   T extends GraphQLFieldTypes.BOOLEAN_REQUIRED ? boolean :
-  T extends GraphQLFieldTypes.BOOLEAN_OPTIONAL ? boolean | null :
+  T extends GraphQLFieldTypes.BOOLEAN ? boolean | null :
   T extends GraphQLFieldTypes.FLOAT_REQUIRED ? number :
-  T extends GraphQLFieldTypes.FLOAT_OPTIONAL ? number | null :
+  T extends GraphQLFieldTypes.FLOAT ? number | null :
   T extends `[${string}]` | `[${string}]!` ? any[] :  
   any;  
 

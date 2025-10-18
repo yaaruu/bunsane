@@ -1,5 +1,5 @@
 import BaseService from "./Service";
-import { ServiceRegistry } from "index";
+import  ServiceRegistry  from "./ServiceRegistry";
 import { httpEndpoint } from "../rest";
 
 export {

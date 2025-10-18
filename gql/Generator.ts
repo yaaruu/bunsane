@@ -3,7 +3,7 @@ import { createSchema } from "graphql-yoga";
 import { logger as MainLogger } from "core/Logger";
 import type { GraphQLType } from "./helpers";
 import { generateArchetypeOperations } from "./ArchetypeOperations";
-import { weaveAllArchetypes, getArchetypeSchema } from "../core/ArcheType";
+import { getArchetypeSchema } from "../core/ArcheType";
 import BaseArcheType from "../core/ArcheType";
 import { getMetadataStorage } from "../core/metadata";
 import type { BaseService } from "service";
@@ -22,7 +22,7 @@ export interface GraphQLOperationMeta<T extends BaseArcheType | BaseArcheType[] 
     type: "Query" | "Mutation";
     propertyKey?: string;
     name?: string;
-    input?: Record<string, GraphQLType> | ZodType;
+    input?: Record<string, GraphQLType> | any;
     output: GraphQLType | Record<string, GraphQLType> | T;
 }
 

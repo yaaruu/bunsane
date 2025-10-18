@@ -254,8 +254,8 @@ export function ArcheTypeField<T extends BaseComponent>(component: new (...args:
 const archetypeRelationsSymbol = Symbol("archetypeRelations");
 
 function createRelationDecorator(relationType: 'hasMany' | 'belongsTo' | 'hasOne' | 'belongsToMany') {
-    return function<T extends BaseArcheType>(
-        relatedArcheType: new (...args: any[]) => T | string,
+    return function(
+        relatedArcheType: string,
         options?: RelationOptions
     ) {
         return function(target: any, propertyKey: string) {
@@ -292,7 +292,7 @@ export type ArcheTypeCreateInfo = {
     components: Array<new (...args: any[]) => BaseComponent>;
 };
 
-class BaseArcheType {
+export class BaseArcheType {
     protected components: Set<{ ctor: new (...args: any[]) => BaseComponent, data: any }> = new Set();
     public componentMap: Record<string, typeof BaseComponent> = {}; 
     protected fieldOptions: Record<string, ArcheTypeFieldOptions> = {};
