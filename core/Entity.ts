@@ -411,3 +411,5 @@ export class Entity implements IEntity {
         return null;
     }
 }
+
+export default Entity;
