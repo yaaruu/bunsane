@@ -386,7 +386,7 @@ export default class App {
 
     async start() {
         logger.info("Application Started");
-        const port = parseInt(process.env.PORT || "3000");
+        const port = parseInt(process.env.APP_PORT || "3000");
         const server = Bun.serve({
             port: port,
             fetch: this.handleRequest.bind(this),
