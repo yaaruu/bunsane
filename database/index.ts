@@ -1,8 +1,13 @@
 import {SQL} from "bun";
 import { logger } from "core/Logger";
 
+let connectionUrl = `postgres://${process.env.POSTGRES_USER}:${process.env.POSTGRES_PASSWORD}@${process.env.POSTGRES_HOST}:${process.env.POSTGRES_PORT ?? "5432"}/${process.env.POSTGRES_DB}`;
+if(process.env.DB_CONNECTION_URL) {
+    connectionUrl = process.env.DB_CONNECTION_URL;
+}
+logger.info(`Database connection URL: ${connectionUrl}`);
 const db = new SQL({
-    url: `postgres://${process.env.POSTGRES_USER}:${process.env.POSTGRES_PASSWORD}@${process.env.POSTGRES_HOST}:${process.env.POSTGRES_PORT ?? "5432"}/${process.env.POSTGRES_DB}`,
+    url: connectionUrl,
     // Connection pool settings - FIXED
     max: parseInt(process.env.POSTGRES_MAX_CONNECTIONS ?? '20', 10), // Increased max connections
     idleTimeout: 30000, // Close idle connections after 30s (was 0)
