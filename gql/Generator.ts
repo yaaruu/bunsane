@@ -201,17 +201,32 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
                                 const gqlInputSchema = weave(ZodWeaver, input as ZodType) as GraphQLSchema;
                                 const schemaString = printSchema(gqlInputSchema);
                                 logger.trace(`Schema string for ${name}: ${schemaString}`);
-                                // Extract the type definition and convert it to an input type
-                                // The schema will contain "type <TypeName> { ... }", we need to replace with "input <inputName> { ... }"
-                                const typeMatch = schemaString.match(/type\s+(\w+)\s*\{([^}]*)\}/s);
-                                if (typeMatch) {
-                                    const fields = typeMatch[2];
-                                    typeDefs += `input ${inputName} {${fields}}\n`;
-                                    logger.trace(`Successfully generated input type ${inputName}`);
-                                } else {
-                                    logger.warn(`Could not extract type from Zod schema for ${name}, schema: ${schemaString}`);
-                                    typeDefs += `input ${inputName} { _placeholder: String }\n`;
-                                }
+                                // Collect custom type names
+                                const typeNames: string[] = [];
+                                schemaString.replace(/type (\w+)/g, (match, name) => {
+                                    typeNames.push(name);
+                                    return match;
+                                });
+                                // Convert all type definitions to input types with Input suffix for non-Input types
+                                let inputTypeDefs = schemaString.replace(/\btype\b/g, 'input');
+                                inputTypeDefs = inputTypeDefs.replace(/input (\w+)/g, (match, name) => {
+                                    if (name.endsWith('Input')) {
+                                        return `input ${name}`;
+                                    } else {
+                                        return `input ${name}Input`;
+                                    }
+                                });
+                                // Update field types for custom types
+                                inputTypeDefs = inputTypeDefs.replace(/: (\w+)([!\[\]]*)(\s|$)/g, (match, type, suffix, end) => {
+                                    if (typeNames.includes(type)) {
+                                        return `: ${type.endsWith('Input') ? type : type + 'Input'}${suffix}${end}`;
+                                    } else {
+                                        return match;
+                                    }
+                                });
+                                typeDefs += inputTypeDefs;
+                                typeDefs += `\n`;
+                                logger.trace(`Successfully generated input types for ${name}`);
                             } catch (error) {
                                 logger.error(`Failed to weave Zod schema for ${name}: ${error}`);
                                 logger.error(`Error stack: ${error instanceof Error ? error.stack : 'No stack'}`);

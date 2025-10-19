@@ -13,4 +13,5 @@ export interface ComponentPropertyMetadata {
     isEnum: boolean;
     enumValues?: string[];
     enumKeys?: string[];
+    isOptional: boolean;
 }

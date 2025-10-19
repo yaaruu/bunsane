@@ -108,7 +108,7 @@ function getOrCreateComponentSchema(componentCtor: new (...args: any[]) => BaseC
     }
     
     const zodFields: Record<string, any> = {
-        __typename: z.literal(compNameToFieldName(componentCtor.name))
+        __typename: z.literal(compNameToFieldName(componentCtor.name)).nullish()
     };
 
     for (const prop of props) {
@@ -129,6 +129,9 @@ function getOrCreateComponentSchema(componentCtor: new (...args: any[]) => BaseC
                 default:
                     zodFields[prop.propertyKey] = z.any();
             }
+            if (prop.isOptional) {
+                zodFields[prop.propertyKey] = zodFields[prop.propertyKey].optional();
+            }
         } else if (prop.isEnum && prop.enumValues && prop.enumKeys) {
             const enumTypeName = prop.propertyType?.name || `${componentCtor.name}_${prop.propertyKey}_Enum`;
             zodFields[prop.propertyKey] = z.enum(prop.enumValues as any).register(asEnumType, {
@@ -138,10 +141,19 @@ function getOrCreateComponentSchema(componentCtor: new (...args: any[]) => BaseC
                     return acc; 
                 }, {})
             });
+            if (prop.isOptional) {
+                zodFields[prop.propertyKey] = zodFields[prop.propertyKey].optional();
+            }
         } else if (customTypeRegistry.has(prop.propertyType)) {
             zodFields[prop.propertyKey] = customTypeRegistry.get(prop.propertyType)!;
+            if (prop.isOptional) {
+                zodFields[prop.propertyKey] = zodFields[prop.propertyKey].optional();
+            }
         } else {
             zodFields[prop.propertyKey] = z.any();
+            if (prop.isOptional) {
+                zodFields[prop.propertyKey] = zodFields[prop.propertyKey].optional();
+            }
         }
         
         if (fieldOptions?.nullable) {
