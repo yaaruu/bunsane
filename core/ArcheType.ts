@@ -1053,7 +1053,6 @@ export class BaseArcheType {
 
         const archetypeId = storage.getComponentId(this.constructor.name);
         const nameFromStorage = storage.archetypes.find(a => a.typeId === archetypeId)?.name || this.constructor.name;
-        console.log("NameFromStorage: ",nameFromStorage)
         const shape: Record<string, any> = {
             __typename: z.literal(nameFromStorage).nullish(),
             id: z.string().nullish(),  // Will be converted to ID in post-processing
@@ -1114,7 +1113,7 @@ export class BaseArcheType {
             }
         }
         
-        console.log("WeavedSchema:", graphqlSchemaString);
+        // console.log("WeavedSchema:", graphqlSchemaString);
         
         // Cache the schema for this archetype
         archetypeSchemaCache.set(nameFromStorage, {

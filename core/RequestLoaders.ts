@@ -2,6 +2,8 @@ import DataLoader from 'dataloader';
 import { Entity } from './Entity';
 import db from '../database';
 import { inList } from '../database/sqlHelpers';
+import {logger as MainLogger} from './Logger';
+const logger = MainLogger.child({ module: 'RequestLoaders' });
 import { getMetadataStorage } from './metadata';
 
 export type ComponentData = {
@@ -102,8 +104,8 @@ export function createRequestLoaders(db: any): RequestLoaders {
           let relatedEntities: Entity[] = [];
           
           try {
-            console.log(`[RelationLoader] Looking for ${key.relatedType} entities with foreign key ${key.foreignKey || 'auto-detect'} pointing to ${key.entityId} for field ${key.relationField}`);
-            
+            logger.trace(`[RelationLoader] Looking for ${key.relatedType} entities with foreign key ${key.foreignKey || 'auto-detect'} pointing to ${key.entityId} for field ${key.relationField}`);
+
             let whereClause: string;
             if (key.foreignKey) {
               // Use specific foreign key from relation metadata
@@ -126,10 +128,10 @@ export function createRequestLoaders(db: any): RequestLoaders {
                 AND c.deleted_at IS NULL
                 AND ${whereClause}
             `, [key.entityId]);
-            
-            console.log(`[RelationLoader] Found ${rows.length} components with foreign keys pointing to ${key.entityId}`);
+
+            logger.trace(`[RelationLoader] Found ${rows.length} components with foreign keys pointing to ${key.entityId}`);
             rows.forEach((row: any) => {
-              console.log(`[RelationLoader] Component ${row.type_id} on entity ${row.entity_id}:`, row.data);
+              logger.trace(`[RelationLoader] Component ${row.type_id} on entity ${row.entity_id}:`, row.data);
             });
             
             // Create Entity objects for each related entity
@@ -139,11 +141,12 @@ export function createRequestLoaders(db: any): RequestLoaders {
               entity.setPersisted(true);
               return entity;
             });
-            
-            console.log(`[RelationLoader] Created ${relatedEntities.length} related entities for ${key.relationField}`);
-            
+
+            logger.trace(`[RelationLoader] Created ${relatedEntities.length} related entities for ${key.relationField}`);
+
           } catch (queryError) {
-            console.error(`Error querying relations for ${key.entityId}:`, queryError);
+            logger.error(`Error querying relations for ${key.entityId}:`);
+            logger.error(queryError);
             relatedEntities = [];
           }
           
@@ -153,17 +156,18 @@ export function createRequestLoaders(db: any): RequestLoaders {
         
         const duration = Date.now() - startTime;
         if (duration > 1000) {
-          console.warn(`Slow relationsByEntityField query: ${duration}ms for ${keys.length} keys`);
+          logger.warn(`Slow relationsByEntityField query: ${duration}ms for ${keys.length} keys`);
         }
         
         return keys.map(k => {
           const mapKey = `${k.entityId}-${k.relationField}-${k.relatedType}`;
           const result = resultMap.get(mapKey) || [];
-          console.log(`[RelationLoader] Returning ${result.length} entities for ${k.relationField} on ${k.entityId}`);
+          logger.trace(`[RelationLoader] Returning ${result.length} entities for ${k.relationField} on ${k.entityId}`);
           return result;
         });
       } catch (error) {
-        console.error(`Error in relationsByEntityField DataLoader:`, error);
+        logger.error(`Error in relationsByEntityField DataLoader:`);
+        logger.error(error);
         // Return empty arrays for all keys on error
         return keys.map(() => []);
       }

@@ -279,7 +279,7 @@ export class Entity implements IEntity {
     public doDelete(force: boolean = false) {
         return new Promise<boolean>(async resolve => {
             if(!this._persisted) {
-                console.log("Entity is not persisted, cannot delete.");
+                logger.warn("Entity is not persisted, cannot delete.");
                 return resolve(false); 
             }
             try {

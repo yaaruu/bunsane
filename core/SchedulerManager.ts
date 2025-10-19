@@ -685,10 +685,9 @@ export class SchedulerManager {
 
         // Handle excluded components
         if (componentTarget.excludeComponents && componentTarget.excludeComponents.length > 0) {
-            // Note: The current Query API might not directly support exclusion
-            // This would require extending the Query API or using post-filtering
-            // For now, we'll log a warning and continue
-            loggerInstance.warn('excludeComponents is not fully supported in scheduled tasks yet. Consider using post-query filtering.');
+            for(const component of componentTarget.excludeComponents){
+                query = query.without(component);
+            }
         }
 
         return query;
