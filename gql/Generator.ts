@@ -66,6 +66,74 @@ export function GraphQLField(meta: GraphQLFieldMeta) {
 }
 
 /**
+ * Deduplicate input type definitions by tracking which types have already been defined.
+ * @param inputTypeDefs - The input type definitions to deduplicate
+ * @param definedTypes - Set of already defined type names
+ * @returns Deduplicated input type definitions
+ */
+function deduplicateInputTypes(inputTypeDefs: string, definedTypes: Set<string>): string {
+    const lines = inputTypeDefs.split('\n');
+    const result: string[] = [];
+    let currentType = '';
+    let currentTypeName = '';
+    let inTypeDefinition = false;
+
+    for (const line of lines) {
+        const trimmed = line.trim();
+        
+        // Check if this is the start of an input/enum definition
+        const typeMatch = trimmed.match(/^(input|enum)\s+(\w+)/);
+        
+        if (typeMatch) {
+            // Save previous type if we were in one
+            if (inTypeDefinition && currentTypeName && !definedTypes.has(currentTypeName)) {
+                result.push(currentType);
+                definedTypes.add(currentTypeName);
+                logger.trace(`Added input type definition: ${currentTypeName}`);
+            } else if (inTypeDefinition && currentTypeName && definedTypes.has(currentTypeName)) {
+                logger.trace(`Skipped duplicate input type definition: ${currentTypeName}`);
+            }
+            
+            // Start new type
+            currentTypeName = typeMatch[2] || '';
+            currentType = line + '\n';
+            inTypeDefinition = true;
+        } else if (inTypeDefinition) {
+            currentType += line + '\n';
+            
+            // Check if this is the closing brace
+            if (trimmed === '}' || trimmed === '') {
+                // End of type definition (closing brace or empty line after enum)
+                if (trimmed === '}' && !definedTypes.has(currentTypeName)) {
+                    result.push(currentType);
+                    definedTypes.add(currentTypeName);
+                    logger.trace(`Added input type definition: ${currentTypeName}`);
+                } else if (trimmed === '}' && definedTypes.has(currentTypeName)) {
+                    logger.trace(`Skipped duplicate input type definition: ${currentTypeName}`);
+                }
+                currentType = '';
+                currentTypeName = '';
+                inTypeDefinition = false;
+            }
+        } else {
+            // Not in a type definition, just add the line (could be comments, etc.)
+            if (trimmed !== '') {
+                result.push(line + '\n');
+            }
+        }
+    }
+    
+    // Handle last type if file doesn't end with closing brace
+    if (inTypeDefinition && currentTypeName && !definedTypes.has(currentTypeName)) {
+        result.push(currentType);
+        definedTypes.add(currentTypeName);
+        logger.trace(`Added input type definition: ${currentTypeName}`);
+    }
+
+    return result.join('');
+}
+
+/**
  * Helper function to get the registered GraphQL type name from an archetype instance.
  * This respects the custom name set via @ArcheType("CustomName") decorator.
  * Falls back to inferring from class name if not found in registry.
@@ -120,6 +188,7 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
     const resolvers: any = {};
     const queryFields: string[] = [];
     const mutationFields: string[] = [];
+    const definedInputTypes: Set<string> = new Set(); // Track defined input types to prevent duplicates
 
     // PRE-GENERATE ALL ARCHETYPE SCHEMAS
     // Scan all services for archetype instances and generate their schemas upfront
@@ -224,7 +293,10 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
                                         return match;
                                     }
                                 });
-                                typeDefs += inputTypeDefs;
+                                
+                                // Deduplicate input types - only add if not already defined
+                                const deduplicatedInputTypeDefs = deduplicateInputTypes(inputTypeDefs, definedInputTypes);
+                                typeDefs += deduplicatedInputTypeDefs;
                                 typeDefs += `\n`;
                                 logger.trace(`Successfully generated input types for ${name}`);
                             } catch (error) {
