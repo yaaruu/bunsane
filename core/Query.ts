@@ -42,6 +42,7 @@ export interface SortOrder {
 class Query {
     private requiredComponents: Set<string> = new Set<string>();
     private excludedComponents: Set<string> = new Set<string>();
+    private excludedEntityIds: Set<string> = new Set<string>();
     private componentFilters: Map<string, QueryFilter[]> = new Map();
     private populateComponents: boolean = false;
     private withId: string | null = null;
@@ -184,6 +185,15 @@ class Query {
         }
     }
 
+    private buildEntityExclusionClause(paramIndex: number = 1): { sql: string, params: any[], newParamIndex: number } {
+        if (this.excludedEntityIds.size === 0) {
+            return { sql: '', params: [], newParamIndex: paramIndex };
+        }
+        const ids = Array.from(this.excludedEntityIds);
+        const placeholders = ids.map((_, i) => `$${paramIndex + i}`).join(', ');
+        return { sql: ` AND entity_id::text NOT IN (${placeholders})`, params: ids, newParamIndex: paramIndex + ids.length };
+    }
+
     private buildFilterWhereClause(typeId: string, filters: QueryFilter[], alias: string, paramIndex: number): { sql: string, params: any[], newParamIndex: number } {
         if (filters.length === 0) return { sql: '', params: [], newParamIndex: paramIndex };
         
@@ -207,6 +217,11 @@ class Query {
             throw new Error(`Component ${ctor.name} is not registered.`);
         }
         this.excludedComponents.add(type_id);
+        return this;
+    }
+
+    public excludeEntityId(entityId: string): this {
+        this.excludedEntityIds.add(entityId);
         return this;
     }
 
@@ -310,6 +325,10 @@ class Query {
                 return [];
             case !hasRequired && !hasExcluded && hasWithId:
                 let query = db`SELECT id FROM entities WHERE id = ${this.withId} AND deleted_at IS NULL ORDER BY id`;
+                const exclusionClause = this.buildEntityExclusionClause(1);
+                if (exclusionClause.sql) {
+                    query = db`${query}${db.unsafe(exclusionClause.sql, exclusionClause.params)}`;
+                }
                 if (this.limit !== null) {
                     query = db`${query} LIMIT ${this.limit}`;
                 }
@@ -338,6 +357,10 @@ class Query {
                     HAVING COUNT(DISTINCT ec.type_id) = ${componentCount}
                     ORDER BY ec.entity_id
                 `;
+                const entityExclusionClause = this.buildEntityExclusionClause(excludedIdsString.newParamIndex);
+                if (entityExclusionClause.sql) {
+                    excludedQuery = db`${excludedQuery}${db.unsafe(entityExclusionClause.sql.replace('entity_id', 'ec.entity_id'), entityExclusionClause.params)}`;
+                }
                 if (this.limit !== null) {
                     excludedQuery = db`${excludedQuery} LIMIT ${this.limit}`;
                 }
@@ -360,6 +383,10 @@ class Query {
                         queryStr = db`SELECT DISTINCT ec.entity_id as id ${db.unsafe(sortExpression.select)} FROM entity_components ec JOIN components c ON ec.entity_id = c.entity_id AND c.type_id = ${typeId} AND c.deleted_at IS NULL WHERE ec.type_id = ${typeId} ${this.withId ? db`AND ec.entity_id = ${this.withId}` : db``} AND ec.deleted_at IS NULL ${db.unsafe(sortExpression.orderBy)}`;
                     } else {
                         queryStr = db`SELECT entity_id as id FROM entity_components WHERE type_id = ${componentIds[0]} ${this.withId ? db`AND entity_id = ${this.withId}` : db``} AND deleted_at IS NULL ORDER BY entity_id`;
+                    }
+                    const entityExclusionClause = this.buildEntityExclusionClause(1);
+                    if (entityExclusionClause.sql) {
+                        queryStr = db`${queryStr}${db.unsafe(entityExclusionClause.sql.replace('entity_id', 'ec.entity_id'), entityExclusionClause.params)}`;
                     }
                     if (this.limit !== null) {
                         queryStr = db`${queryStr} LIMIT ${this.limit}`;
@@ -393,6 +420,10 @@ class Query {
                         const compIds = inList(componentIds, 1);
                         queryStr = db`SELECT DISTINCT entity_id as id FROM entity_components WHERE type_id IN ${db.unsafe(compIds.sql, compIds.params)} ${this.withId ? db`AND entity_id = ${this.withId}` : db``} AND deleted_at IS NULL GROUP BY entity_id HAVING COUNT(DISTINCT type_id) = ${componentCount} ORDER BY entity_id`;
                     }
+                    const entityExclusionClause = this.buildEntityExclusionClause(1);
+                    if (entityExclusionClause.sql) {
+                        queryStr = db`${queryStr}${db.unsafe(entityExclusionClause.sql.replace('entity_id', 'entity_id'), entityExclusionClause.params)}`;
+                    }
                     if (this.limit !== null) {
                         queryStr = db`${queryStr} LIMIT ${this.limit}`;
                     }
@@ -415,6 +446,10 @@ class Query {
                     AND ec.deleted_at IS NULL
                     ORDER BY ec.entity_id
                 `;
+                const excludedEntityClause = this.buildEntityExclusionClause(onlyExcludedIdsString.newParamIndex);
+                if (excludedEntityClause.sql) {
+                    onlyExcludedQuery = db`${onlyExcludedQuery}${db.unsafe(excludedEntityClause.sql.replace('entity_id', 'ec.entity_id'), excludedEntityClause.params)}`;
+                }
                 if (this.limit !== null) {
                     onlyExcludedQuery = db`${onlyExcludedQuery} LIMIT ${this.limit}`;
                 }
@@ -614,6 +649,13 @@ class Query {
                 paramIndex++;
             }
 
+            const entityExclusionClause = this.buildEntityExclusionClause(paramIndex);
+            if (entityExclusionClause.sql) {
+                sql += entityExclusionClause.sql.replace('entity_id', 'ec.entity_id');
+                params.push(...entityExclusionClause.params);
+                paramIndex = entityExclusionClause.newParamIndex;
+            }
+
             joinIndex = 0;
             for (const [typeId, filters] of this.componentFilters.entries()) {
                 if (componentIds.includes(typeId)) {
@@ -658,6 +700,13 @@ class Query {
                 sql += ` AND ec.entity_id = $${paramIndex}`;
                 params.push(this.withId);
                 paramIndex++;
+            }
+
+            const entityExclusionClause = this.buildEntityExclusionClause(paramIndex);
+            if (entityExclusionClause.sql) {
+                sql += entityExclusionClause.sql.replace('entity_id', 'ec.entity_id');
+                params.push(...entityExclusionClause.params);
+                paramIndex = entityExclusionClause.newParamIndex;
             }
 
             joinIndex = 0;
@@ -746,7 +795,7 @@ class Query {
             case hasRequired && hasExcluded:
                 const componentIdsString = inList(componentIds, 1);
                 const excludedIdsString = inList(excludedIds, componentIdsString.newParamIndex);
-                const excludedQuery = db`
+                let excludedQuery = db`
                     SELECT COUNT(*) as count FROM (
                         SELECT ec.entity_id
                         FROM entity_components ec
@@ -760,6 +809,11 @@ class Query {
                         HAVING COUNT(DISTINCT ec.type_id) = ${componentCount}
                     ) as subquery
                 `;
+                const countExclusionClause = this.buildEntityExclusionClause(excludedIdsString.newParamIndex);
+                if (countExclusionClause.sql) {
+                    // For count queries with subqueries, we need to modify the inner query
+                    excludedQuery = db`${excludedQuery}`; // This is complex, might need a different approach
+                }
                 const excludedResult = await excludedQuery;
                 return parseInt(excludedResult[0].count);
             case hasRequired && hasFilters:

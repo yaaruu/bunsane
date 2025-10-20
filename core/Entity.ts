@@ -145,7 +145,8 @@ export class Entity implements IEntity {
                 if (rows.length > 0) {
                     const row = rows[0];
                     const comp = new ctor();
-                    Object.assign(comp, row.data);
+                    const componentData = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+                    Object.assign(comp, componentData);
                     comp.id = row.id;
                     comp.setPersisted(true);
                     comp.setDirty(false);
@@ -179,7 +180,8 @@ export class Entity implements IEntity {
                 if (rows.length > 0) {
                     const row = rows[0];
                     const comp = new ctor();
-                    Object.assign(comp, row.data);
+                    const componentData = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+                    Object.assign(comp, componentData);
                     comp.id = row.id;
                     comp.setPersisted(true);
                     comp.setDirty(false);
@@ -358,7 +360,8 @@ export class Entity implements IEntity {
             const ctor = ComponentRegistry.getConstructor(type_id);
             if (ctor) {
                 const comp = new ctor();
-                Object.assign(comp, data);
+                const componentData = typeof data === 'string' ? JSON.parse(data) : data;
+                Object.assign(comp, componentData);
                 comp.id = id;
                 comp.setPersisted(true);
                 comp.setDirty(false);
@@ -387,7 +390,8 @@ export class Entity implements IEntity {
                 const ctor = ComponentRegistry.getConstructor(type_id);
                 if (ctor) {
                     const comp = new ctor();
-                    Object.assign(comp, data);
+                    const componentData = typeof data === 'string' ? JSON.parse(data) : data;
+                    Object.assign(comp, componentData);
                     comp.id = id;
                     comp.setPersisted(true);
                     comp.setDirty(false);

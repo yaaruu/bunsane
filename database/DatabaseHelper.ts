@@ -105,7 +105,7 @@ export const CreateEntityTable = async () => {
 export const CreateComponentTable = async () => {
     await db`CREATE TABLE IF NOT EXISTS components (
         id UUID,
-        entity_id UUID REFERENCES entities(id),
+        entity_id UUID REFERENCES entities(id) ON DELETE CASCADE,
         type_id varchar(64) NOT NULL,
         name varchar(128),
         data jsonb,
@@ -249,7 +249,7 @@ export const DeleteComponentPartitionTable = async (comp_name: string) => {
 
 export const CreateEntityComponentTable = async () => {
     await db`CREATE TABLE IF NOT EXISTS entity_components (
-        entity_id UUID REFERENCES entities(id),
+        entity_id UUID REFERENCES entities(id) ON DELETE CASCADE,
         type_id VARCHAR(64) NOT NULL,
         deleted_at TIMESTAMP,
         UNIQUE(entity_id, type_id)

@@ -50,12 +50,6 @@ export function CompData(options?: { indexed?: boolean; optional?: boolean }) {
                     enumValues = Object.keys(propType).filter(key => !isNaN(Number(key))).map(key => propType[key]);
                 }
             }
-            
-            if (propType.name === 'ServiceType' && (!enumValues || enumValues.length === 0)) {
-                enumValues = ["jek", "car", "food", "package"];
-                enumKeys = ["BIKE", "CAR", "FOOD", "PACKAGE"];
-            }
-
         }
         storage.collectComponentPropertyMetadata({
             component_id: typeId,
