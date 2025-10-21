@@ -42,11 +42,12 @@ export class UploadHelper {
                 });
                 
                 entity.add(UploadComponent, uploadComponent.data());
-                
+
+                // TODO: For better modularity, user might want to use plugins instead
                 // Add image metadata if it's an image
-                if (result.mimeType?.startsWith('image/')) {
-                    await this.addImageMetadata(entity, file, result);
-                }
+                // if (result.mimeType?.startsWith('image/')) {
+                //     await this.addImageMetadata(entity, file, result);
+                // }
                 
                 logger.info(`Upload component attached to entity ${entity.id}`);
             }

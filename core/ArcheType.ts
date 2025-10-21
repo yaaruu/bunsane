@@ -970,84 +970,67 @@ export class BaseArcheType {
 
                         // Attempt to load the component that holds the foreign key via DataLoader
                         if (context.loaders) {
-                            for (const [
-                                componentField,
-                                compCtor,
-                            ] of Object.entries(this.componentMap)) {
-                                const typeIdForComponent =
-                                    storage.getComponentId(compCtor.name);
-                                const componentProps =
-                                    storage.getComponentProperties(
-                                        typeIdForComponent
-                                    );
-                                const hasForeignKey = componentProps.some(
-                                    (prop) =>
-                                        prop.propertyKey ===
-                                        relationOptions.foreignKey
-                                );
-                                if (
-                                    !hasForeignKey ||
-                                    !relationOptions.foreignKey
-                                )
-                                    continue;
+                            const foreignKey = relationOptions.foreignKey;
+                            if (foreignKey && foreignKey.includes('.')) {
+                                // Handle nested foreign key like "field.property"
+                                const [fieldName, propName] = foreignKey.split('.');
+                                const compCtor = this.componentMap[fieldName!];
+                                if (compCtor) {
+                                    const typeIdForComponent = storage.getComponentId(compCtor.name);
+                                    const componentData = await context.loaders.componentsByEntityType.load({
+                                        entityId: entity.id,
+                                        typeId: typeIdForComponent,
+                                    });
+                                    if (componentData?.data && componentData.data[propName!] !== undefined) {
+                                        foreignId = componentData.data[propName!];
+                                    }
+                                }
+                            } else {
+                                // Original logic for flat foreign key
+                                for (const [componentField, compCtor] of Object.entries(this.componentMap)) {
+                                    const typeIdForComponent = storage.getComponentId(compCtor.name);
+                                    const componentProps = storage.getComponentProperties(typeIdForComponent);
+                                    const hasForeignKey = componentProps.some(prop => prop.propertyKey === foreignKey);
+                                    if (!hasForeignKey || !foreignKey) continue;
 
-                                const componentData =
-                                    await context.loaders.componentsByEntityType.load(
-                                        {
-                                            entityId: entity.id,
-                                            typeId: typeIdForComponent,
-                                        }
-                                    );
+                                    const componentData = await context.loaders.componentsByEntityType.load({
+                                        entityId: entity.id,
+                                        typeId: typeIdForComponent,
+                                    });
 
-                                if (
-                                    componentData?.data &&
-                                    componentData.data[
-                                        relationOptions.foreignKey
-                                    ] !== undefined
-                                ) {
-                                    foreignId =
-                                        componentData.data[
-                                            relationOptions.foreignKey
-                                        ];
-                                    break;
+                                    if (componentData?.data && componentData.data[foreignKey] !== undefined) {
+                                        foreignId = componentData.data[foreignKey];
+                                        break;
+                                    }
                                 }
                             }
                         }
 
                         // Fallback: pull the component from the entity directly when DataLoader misses
                         if (!foreignId) {
-                            for (const compCtor of Object.values(
-                                this.componentMap
-                            )) {
-                                const typeIdForComponent =
-                                    storage.getComponentId(compCtor.name);
-                                const componentProps =
-                                    storage.getComponentProperties(
-                                        typeIdForComponent
-                                    );
-                                const hasForeignKey = componentProps.some(
-                                    (prop) =>
-                                        prop.propertyKey ===
-                                        relationOptions.foreignKey
-                                );
-                                if (
-                                    !hasForeignKey ||
-                                    !relationOptions.foreignKey
-                                )
-                                    continue;
-                                const componentInstance = await entity.get(
-                                    compCtor as any
-                                );
-                                if (
-                                    componentInstance &&
-                                    (componentInstance as any)[
-                                        relationOptions.foreignKey
-                                    ] !== undefined
-                                ) {
-                                    foreignId = (componentInstance as any)[
-                                        relationOptions.foreignKey
-                                    ];
-                                    break;
+                            const foreignKey = relationOptions.foreignKey;
+                            if (foreignKey && foreignKey.includes('.')) {
+                                // Handle nested foreign key like "field.property"
+                                const [fieldName, propName] = foreignKey.split('.');
+                                const compCtor = this.componentMap[fieldName!];
+                                if (compCtor) {
+                                    const componentInstance = await entity.get(compCtor as any);
+                                    if (componentInstance && (componentInstance as any)[propName!] !== undefined) {
+                                        foreignId = (componentInstance as any)[propName!];
+                                    }
+                                }
+                            } else {
+                                // Original logic for flat foreign key
+                                for (const compCtor of Object.values(this.componentMap)) {
+                                    const typeIdForComponent = storage.getComponentId(compCtor.name);
+                                    const componentProps = storage.getComponentProperties(typeIdForComponent);
+                                    const hasForeignKey = componentProps.some(prop => prop.propertyKey === foreignKey);
+                                    if (!hasForeignKey || !foreignKey) continue;
+                                    const componentInstance = await entity.get(compCtor as any);
+                                    if (componentInstance && (componentInstance as any)[foreignKey] !== undefined) {
+                                        foreignId = (componentInstance as any)[foreignKey];
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -1082,25 +1065,34 @@ export class BaseArcheType {
                     ) => {
                         const entity = parent;
 
-                        // Use DataLoader for relation loading if available
-                        if (
-                            context.loaders &&
-                            context.loaders.relationsByEntityField
-                        ) {
-                            return context.loaders.relationsByEntityField.load({
-                                entityId: entity.id,
-                                relationField: field,
-                                relatedType: relatedTypeName,
-                                foreignKey: relationOptions?.foreignKey,
-                            });
-                        }
+                        // If foreignKey is specified, treat as hasMany with foreign key on this entity (unusual, but handle it)
+                        if (relationOptions?.foreignKey) {
+                            // For now, since foreign key on this entity, it's like belongsTo but array? Wait, probably not standard.
+                            // Perhaps return empty array or implement custom logic.
+                            // For simplicity, return empty array.
+                            console.warn(`Array relation ${field} with foreignKey on this entity not fully implemented`);
+                            return [];
+                        } else {
+                            // Use DataLoader for relation loading if available
+                            if (
+                                context.loaders &&
+                                context.loaders.relationsByEntityField
+                            ) {
+                                return context.loaders.relationsByEntityField.load({
+                                    entityId: entity.id,
+                                    relationField: field,
+                                    relatedType: relatedTypeName,
+                                    foreignKey: relationOptions?.foreignKey,
+                                });
+                            }
 
-                        // Fallback: return empty array or implement custom relation query
-                        // This should be implemented based on your relation storage strategy
-                        console.warn(
-                            `No relationsByEntityField loader found for array relation ${field} on ${archetypeName}`
-                        );
-                        return [];
+                            // Fallback: return empty array or implement custom relation query
+                            // This should be implemented based on your relation storage strategy
+                            console.warn(
+                                `No relationsByEntityField loader found for array relation ${field} on ${archetypeName}`
+                            );
+                            return [];
+                        }
                     },
                 });
             } else {
@@ -1115,30 +1107,120 @@ export class BaseArcheType {
                     ) => {
                         const entity = parent;
 
-                        // Use DataLoader for relation loading if available
-                        if (
-                            context.loaders &&
-                            context.loaders.relationsByEntityField
-                        ) {
-                            const results =
-                                await context.loaders.relationsByEntityField.load(
-                                    {
-                                        entityId: entity.id,
-                                        relationField: field,
-                                        relatedType: relatedTypeName,
-                                        foreignKey: relationOptions?.foreignKey,
-                                    }
-                                );
-                            if (results.length > 0) {
-                                return results[0];
+                        // If foreignKey is specified, treat as belongsTo (foreign key on this entity)
+                        if (relationOptions?.foreignKey) {
+                            if (!entity || !entity.id) {
+                                return null;
                             }
-                        }
 
-                        // Fallback: return null or implement custom relation query
-                        console.warn(
-                            `No relationsByEntityField loader found for single relation ${field} on ${archetypeName}`
-                        );
-                        return null;
+                            let foreignId: string | undefined;
+
+                            // Attempt to load the component that holds the foreign key via DataLoader
+                            if (context.loaders) {
+                                const foreignKey = relationOptions.foreignKey;
+                                if (foreignKey && foreignKey.includes('.')) {
+                                    // Handle nested foreign key like "field.property"
+                                    const [fieldName, propName] = foreignKey.split('.');
+                                    const compCtor = this.componentMap[fieldName!];
+                                    if (compCtor) {
+                                        const typeIdForComponent = storage.getComponentId(compCtor.name);
+                                        const componentData = await context.loaders.componentsByEntityType.load({
+                                            entityId: entity.id,
+                                            typeId: typeIdForComponent,
+                                        });
+                                        if (componentData?.data && componentData.data[propName!] !== undefined) {
+                                            foreignId = componentData.data[propName!];
+                                        }
+                                    }
+                                } else {
+                                    // Original logic for flat foreign key
+                                    for (const [componentField, compCtor] of Object.entries(this.componentMap)) {
+                                        const typeIdForComponent = storage.getComponentId(compCtor.name);
+                                        const componentProps = storage.getComponentProperties(typeIdForComponent);
+                                        const hasForeignKey = componentProps.some(prop => prop.propertyKey === foreignKey);
+                                        if (!hasForeignKey || !foreignKey) continue;
+
+                                        const componentData = await context.loaders.componentsByEntityType.load({
+                                            entityId: entity.id,
+                                            typeId: typeIdForComponent,
+                                        });
+
+                                        if (componentData?.data && componentData.data[foreignKey] !== undefined) {
+                                            foreignId = componentData.data[foreignKey];
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Fallback: pull the component from the entity directly when DataLoader misses
+                            if (!foreignId) {
+                                const foreignKey = relationOptions.foreignKey;
+                                if (foreignKey && foreignKey.includes('.')) {
+                                    // Handle nested foreign key like "field.property"
+                                    const [fieldName, propName] = foreignKey.split('.');
+                                    const compCtor = this.componentMap[fieldName!];
+                                    if (compCtor) {
+                                        const componentInstance = await entity.get(compCtor as any);
+                                        if (componentInstance && (componentInstance as any)[propName!] !== undefined) {
+                                            foreignId = (componentInstance as any)[propName!];
+                                        }
+                                    }
+                                } else {
+                                    // Original logic for flat foreign key
+                                    for (const compCtor of Object.values(this.componentMap)) {
+                                        const typeIdForComponent = storage.getComponentId(compCtor.name);
+                                        const componentProps = storage.getComponentProperties(typeIdForComponent);
+                                        const hasForeignKey = componentProps.some(prop => prop.propertyKey === foreignKey);
+                                        if (!hasForeignKey || !foreignKey) continue;
+                                        const componentInstance = await entity.get(compCtor as any);
+                                        if (componentInstance && (componentInstance as any)[foreignKey] !== undefined) {
+                                            foreignId = (componentInstance as any)[foreignKey];
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (!foreignId) {
+                                return null;
+                            }
+
+                            // Resolve the related entity using loaders when possible, otherwise hit the database directly
+                            if (context.loaders?.entityById) {
+                                const relatedEntity = await context.loaders.entityById.load(foreignId);
+                                if (relatedEntity) {
+                                    return relatedEntity;
+                                }
+                            }
+
+                            return Entity.FindById(foreignId);
+                        } else {
+                            // Use DataLoader for relation loading if available
+                            if (
+                                context.loaders &&
+                                context.loaders.relationsByEntityField
+                            ) {
+                                const results =
+                                    await context.loaders.relationsByEntityField.load(
+                                        {
+                                            entityId: entity.id,
+                                            relationField: field,
+                                            relatedType: relatedTypeName,
+                                            foreignKey: relationOptions?.foreignKey,
+                                        }
+                                    );
+                                if (results.length > 0) {
+                                    return results[0];
+                                }
+                            }
+
+                            // Fallback: return null or implement custom relation query
+                            console.warn(
+                                `No relationsByEntityField loader found for single relation ${field} on ${archetypeName}`
+                            );
+                            return null;
+                        }
                     },
                 });
             }
@@ -1436,19 +1518,23 @@ export class BaseArcheType {
 
             // Replace the String field with proper GraphQL type reference
             if (isArray) {
+                const isNullable = this.relationOptions[field]?.nullable;
+                const suffix = isNullable ? "" : "!";
                 const pattern = new RegExp(
                     `${field}:\\s*\\[String!?\\]!?`,
                     "g"
                 );
                 graphqlSchemaString = graphqlSchemaString.replace(
                     pattern,
-                    `${field}: [${relatedTypeName}!]!`
+                    `${field}: [${relatedTypeName}!]${suffix}`
                 );
             } else {
+                const isNullable = this.relationOptions[field]?.nullable;
+                const suffix = isNullable ? "" : "!";
                 const pattern = new RegExp(`${field}:\\s*String!?`, "g");
                 graphqlSchemaString = graphqlSchemaString.replace(
                     pattern,
-                    `${field}: ${relatedTypeName}!`
+                    `${field}: ${relatedTypeName}${suffix}`
                 );
             }
         }

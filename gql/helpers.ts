@@ -12,7 +12,7 @@ export function isValidGraphQLType(type: string): type is GraphQLType {
   return enumValues.includes(type as GraphQLFieldTypes) ||
          /^(\w+|\[\w+\])(!)?$/.test(type);  // Simple regex for custom types/lists
 }
-
+/** @deprecated */
 export type TypeFromGraphQL<T extends GraphQLType> =
   T extends GraphQLFieldTypes.ID_REQUIRED | GraphQLFieldTypes.ID ? string :
   T extends GraphQLFieldTypes.STRING_REQUIRED ? string :
@@ -26,6 +26,11 @@ export type TypeFromGraphQL<T extends GraphQLType> =
   T extends `[${string}]` | `[${string}]!` ? any[] :  
   any;  
 
+/**
+ * 
+ * @deprecated
+ * @reason Use `ArcheType.getInputSchema()` instead.
+ */
 export type ResolverInput<T extends Record<string, GraphQLType>> = {
   [K in keyof T]: TypeFromGraphQL<T[K]>;
 };

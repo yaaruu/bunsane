@@ -24,6 +24,7 @@ export interface GraphQLField {
 
 
 // TODO: Remove this when we have a better way to define GraphQL type
+// Current usage is for custom input types in Operation decorators
 export enum GraphQLFieldTypes {
     ID = "ID",
     ID_REQUIRED = "ID!",
