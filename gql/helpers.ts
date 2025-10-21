@@ -1,4 +1,5 @@
 import { GraphQLFieldTypes } from './types';
+import { z } from 'zod';
 
 export type GraphQLType =
   | GraphQLFieldTypes  // e.g., "ID!", "String"

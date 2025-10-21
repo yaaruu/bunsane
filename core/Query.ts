@@ -2,7 +2,6 @@ import type { BaseComponent, ComponentDataType } from "./Components";
 import { Entity } from "./Entity";
 import ComponentRegistry from "./ComponentRegistry";
 import { logger } from "./Logger";
-import { sql } from "bun";
 import db from "database";
 import { timed } from "./Decorators";
 import { inList } from "../database/sqlHelpers";
@@ -1249,5 +1248,7 @@ class Query {
         return parseInt(result[0].count);
     }
 }
+
+
 
 export default Query;

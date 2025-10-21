@@ -190,6 +190,8 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
     const mutationFields: string[] = [];
     const definedInputTypes: Set<string> = new Set(); // Track defined input types to prevent duplicates
 
+    // TODO: Need a way to add Custom Schema
+
     // PRE-GENERATE ALL ARCHETYPE SCHEMAS
     // Scan all services for archetype instances and generate their schemas upfront
     logger.trace(`Pre-generating archetype schemas from service operations...`);
@@ -264,8 +266,18 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
                         if (input && typeof input === 'object' && '_def' in input) {
                             // It's a Zod schema - use GQLoom's weave to generate GraphQL type
                             try {
-                                // Add __typename to input zod object
-                                input = input.extend({ __typename: z.literal(inputName).nullish() });
+                                // Add __typename to input zod object, handling optional schemas
+                                let innerInput = input;
+                                const wasOptional = input instanceof z.ZodOptional;
+                                if (wasOptional) {
+                                    innerInput = input.unwrap();
+                                }
+                                innerInput = innerInput.extend({ __typename: z.literal(inputName).nullish() });
+                                if (wasOptional) {
+                                    input = innerInput.optional();
+                                } else {
+                                    input = innerInput;
+                                }
                                 logger.trace(`Weaving Zod schema for ${name}`);
                                 const gqlInputSchema = weave(ZodWeaver, input as ZodType) as GraphQLSchema;
                                 const schemaString = printSchema(gqlInputSchema);
@@ -285,14 +297,14 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
                                         return `input ${name}Input`;
                                     }
                                 });
-                                // Update field types for custom types
-                                inputTypeDefs = inputTypeDefs.replace(/: (\w+)([!\[\]]*)(\s|$)/g, (match, type, suffix, end) => {
-                                    if (typeNames.includes(type)) {
-                                        return `: ${type.endsWith('Input') ? type : type + 'Input'}${suffix}${end}`;
-                                    } else {
-                                        return match;
-                                    }
-                                });
+                                        // Update field types for custom types
+                                        inputTypeDefs = inputTypeDefs.replace(/: (\w+)([!\[\]]*)(\s|$)/g, (match, type, suffix, end) => {
+                                            if (typeNames.includes(type)) {
+                                                return `: ${type.endsWith('Input') ? type : type + 'Input'}${suffix}${end}`;
+                                            } else {
+                                                return match;
+                                            }
+                                        });
                                 
                                 // Deduplicate input types - only add if not already defined
                                 const deduplicatedInputTypeDefs = deduplicateInputTypes(inputTypeDefs, definedInputTypes);
@@ -309,10 +321,25 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
                             // Legacy Record<string, GraphQLType> format
                             typeDefs += `input ${inputName} {\n${Object.entries(input).map(([k, v]) => `  ${k}: ${v}`).join('\n')}\n}\n`;
                         }
-                        fieldDef += `(input: ${inputName}!)`;
-                        
+
                         // Store the Zod schema for validation if it's a Zod type
                         const zodSchema = (input && typeof input === 'object' && '_def' in input) ? input as ZodType : null;
+
+                        // Determine GraphQL input nullability based on Zod schema acceptance of undefined/null
+                        // If the Zod schema accepts undefined or null (i.e. is optional/nullable), we omit the '!' for the input param.
+                        let inputNullability = '!';
+                        if (zodSchema) {
+                            try {
+                                const allowsUndefined = !!(zodSchema && typeof (zodSchema as any).safeParse === 'function' && (zodSchema as any).safeParse(undefined).success);
+                                const allowsNull = !!(zodSchema && typeof (zodSchema as any).safeParse === 'function' && (zodSchema as any).safeParse(null).success);
+                                if (allowsUndefined || allowsNull) inputNullability = '';
+                            } catch (e) {
+                                // If anything goes wrong, conservatively keep it non-nullable
+                                inputNullability = '!';
+                            }
+                        }
+
+                        fieldDef += `(input: ${inputName}${inputNullability})`;
                         
                         resolvers[type][name] = async (_: any, args: any, context: any, info: any) => {
                             try {

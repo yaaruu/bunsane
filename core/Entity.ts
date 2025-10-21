@@ -218,8 +218,6 @@ export class Entity implements IEntity {
         });
     }
 
-    
-
     public doSave() {
         return new Promise<boolean>(async resolve => {
             if(!this._dirty) {
@@ -291,6 +289,23 @@ export class Entity implements IEntity {
                 if(componentsToInsert.length > 0) {
                     await trx`INSERT INTO components ${sql(componentsToInsert, 'id', 'entity_id', 'name', 'type_id', 'data')}`;
                     await trx`INSERT INTO entity_components ${sql(entityComponentsToInsert, 'entity_id', 'type_id', 'component_id')} ON CONFLICT DO NOTHING`;
+                }
+                
+                // Insert entity_components for existing components if entity is new
+                if(!this._persisted) {
+                    const existingEntityComponents = [];
+                    for(const comp of this.components.values()) {
+                        if((comp as any)._persisted) {
+                            existingEntityComponents.push({
+                                entity_id: this.id,
+                                type_id: comp.getTypeID(),
+                                component_id: comp.id
+                            });
+                        }
+                    }
+                    if(existingEntityComponents.length > 0) {
+                        await trx`INSERT INTO entity_components ${sql(existingEntityComponents, 'entity_id', 'type_id', 'component_id')} ON CONFLICT DO NOTHING`;
+                    }
                 }
                 
                 // Perform batch updates
@@ -460,6 +475,36 @@ export class Entity implements IEntity {
         }
         return null;
     }
+
+    public static Clone(entity: Entity): Entity {
+        const clone = new Entity();
+        clone._dirty = true;
+        clone._persisted = false;
+        for (const comp of entity.components.values()) {
+            const newComp = new (comp.constructor as any)();
+            Object.assign(newComp, comp.data());
+            newComp.id = uuidv7();
+            newComp.setDirty(true);
+            newComp.setPersisted(false);
+            clone.addComponent(newComp);
+        }
+        return clone;
+    }
+
+    public static MakeRef(entity: Entity): Entity {
+        const ref = new Entity();
+        ref._dirty = true;
+        ref._persisted = false;
+        for (const comp of entity.components.values()) {
+            const refComp = comp;
+            refComp.setDirty(false);
+            refComp.setPersisted(true);
+            ref.addComponent(refComp);
+        }
+        return ref;
+    }
+
+
 }
 
 export default Entity;

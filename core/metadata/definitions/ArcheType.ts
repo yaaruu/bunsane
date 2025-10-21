@@ -6,4 +6,5 @@ export interface ArcheTypeMetadata {
 
 export interface ArcheTypeFieldOptions {
     nullable?: boolean;
+    filterable?: boolean;
 }

@@ -1304,7 +1304,6 @@ export class BaseArcheType {
         }
     }
 
-    // TODO: Here
     public getZodObjectSchema(options?: { excludeRelations?: boolean }): ZodObject<any> {
         const excludeRelations = options?.excludeRelations ?? false;
         const zodShapes: Record<string, any> = {};
@@ -1596,19 +1595,27 @@ export class BaseArcheType {
     public getInputSchema(): ZodObject<any> {
         return this.getZodObjectSchema({ excludeRelations: true });
     }
+
+    public getFilterSchema(): ZodObject<any> {
+        const baseSchema = this.getZodObjectSchema({ excludeRelations: true });
+        const filterShape: Record<string, any> = {};
+        for (const key of Object.keys(baseSchema.shape)) {
+            // Only include fields that are explicitly set to filterable: true
+            const isFilterable = this.fieldOptions[key]?.filterable === true || this.unionOptions[key]?.filterable === true;
+            if (isFilterable) {
+                filterShape[key] = z.object({
+                    field: z.string().default(key),
+                    op: z.string().default("eq"),
+                    value: z.string(),
+                }).optional();
+            }
+        }
+        return z.object(filterShape);
+    }
 }
 
-export type InferArcheType<T extends BaseArcheType> = {
-    [K in keyof T["componentMap"]]: T["componentMap"][K] extends new (
-        ...args: any[]
-    ) => infer C
-        ? C
-        : never;
-};
 
-// Alternative: Infer from the actual instance properties (recommended)
-export type InferArcheTypeFromInstance<T extends BaseArcheType> = {
-    [K in keyof T as T[K] extends BaseComponent ? K : never]: T[K];
-};
+
+
 
 export default BaseArcheType;
