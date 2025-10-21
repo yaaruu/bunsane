@@ -90,6 +90,21 @@ const maskError = (error: any, message: string): GraphQLError => {
             }
         });
     }
+
+    // Handle GraphQL validation errors for missing required fields
+    if (error.message.includes('was not provided')) {
+        const match = error.message.match(/Field "([^"]+)" of required type "([^"]+)" was not provided/);
+        if (match) {
+            const fieldName = match[1];
+            return new GraphQLError(`Missing required field: ${fieldName}`, {
+                extensions: {
+                    code: 'VALIDATION_ERROR',
+                    field: fieldName,
+                    originalMessage: error.message
+                }
+            });
+        }
+    }
     
     if (process.env.NODE_ENV === 'production') {
         logger.error("GraphQL Error:", error);

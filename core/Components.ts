@@ -166,7 +166,7 @@ export class BaseComponent {
         await trx`INSERT INTO components 
         (id, entity_id, name, type_id, data)
         VALUES (${this.id}, ${entity_id}, ${this._comp_name}, ${this._typeId}, ${this.data()})`
-        await trx`INSERT INTO entity_components (entity_id, type_id) VALUES (${entity_id}, ${this._typeId}) ON CONFLICT DO NOTHING`
+        await trx`INSERT INTO entity_components (entity_id, type_id, component_id) VALUES (${entity_id}, ${this._typeId}, ${this.id}) ON CONFLICT DO NOTHING`
     }
 
     async update(trx: Bun.SQL) {
