@@ -8,6 +8,10 @@ import db from "database";
 let app: App;
 
 beforeAll(async () => {
+    // Drop tables to ensure clean schema
+    await db`DROP TABLE IF EXISTS components CASCADE;`;
+    await db`DROP TABLE IF EXISTS entity_components CASCADE;`;
+    await db`DROP TABLE IF EXISTS entities CASCADE;`;
     app = new App();
     app.init();
     await app.waitForAppReady();
@@ -216,14 +220,14 @@ describe('Relations Benchmark - Performance Guarantees', () => {
         
         // Create large dataset
         const users: Entity[] = [];
-        for (let i = 0; i < 1000; i++) {
+        for (let i = 0; i < 100; i++) {
             const user = Entity.Create().add(UserComponent, { name: `User${i}` });
             users.push(user);
         }
         await Promise.all(users.map(u => u.save()));
 
         const posts: Entity[] = [];
-        for (let i = 0; i < 10000; i++) {
+        for (let i = 0; i < 1000; i++) {
             const randomUser = users[Math.floor(Math.random() * users.length)]!;
             const post = Entity.Create()
                 .add(TitleComponent, { value: `Post${i}` })

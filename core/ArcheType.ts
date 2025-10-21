@@ -8,6 +8,7 @@ import { weave } from "@gqloom/core";
 import { ZodWeaver, asEnumType, asUnionType } from "@gqloom/zod";
 import { printSchema } from "graphql";
 import "reflect-metadata";
+import Query from "./Query";
 
 const customTypeRegistry = new Map<any, any>();
 const customTypeNameRegistry = new Map<any, string>();
@@ -1065,13 +1066,49 @@ export class BaseArcheType {
                     ) => {
                         const entity = parent;
 
-                        // If foreignKey is specified, treat as hasMany with foreign key on this entity (unusual, but handle it)
+                        // If foreignKey is specified, for hasMany, the foreign key is on the related entity
                         if (relationOptions?.foreignKey) {
-                            // For now, since foreign key on this entity, it's like belongsTo but array? Wait, probably not standard.
-                            // Perhaps return empty array or implement custom logic.
-                            // For simplicity, return empty array.
-                            console.warn(`Array relation ${field} with foreignKey on this entity not fully implemented`);
-                            return [];
+                            // Find the component that has the foreign key (may be nested like "field.property")
+                            let componentCtor: any = null;
+                            let foreignKeyField: string = relationOptions.foreignKey;
+                            let relatedArchetypeInstance: any = null;
+                            
+                            if (typeof relatedArcheType === "function") {
+                                relatedArchetypeInstance = new (relatedArcheType as any)();
+                            } else if (typeof relatedArcheType === "string") {
+                                // Find the archetype class by name
+                                const relatedArchetypeMetadata = storage.archetypes.find((a) => a.name === relatedArcheType);
+                                if (relatedArchetypeMetadata) {
+                                    relatedArchetypeInstance = new (relatedArchetypeMetadata.target as any)();
+                                }
+                            }
+                            
+                            if (relatedArchetypeInstance) {
+                                if (relationOptions.foreignKey.includes('.')) {
+                                    const [fieldName, propName] = relationOptions.foreignKey.split('.');
+                                    componentCtor = relatedArchetypeInstance.componentMap[fieldName!];
+                                    foreignKeyField = propName!;
+                                } else {
+                                    // Flat foreign key
+                                    for (const comp of Object.values(relatedArchetypeInstance.componentMap) as any[]) {
+                                        const typeId = storage.getComponentId(comp.name);
+                                        const props = storage.getComponentProperties(typeId);
+                                        if (props.some(p => p.propertyKey === relationOptions.foreignKey)) {
+                                            componentCtor = comp;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            if (componentCtor) {
+                                const query = new Query();
+                                query.with(componentCtor, Query.filters(Query.filter(foreignKeyField, Query.filterOp.EQ, entity.id)));
+                                return await query.exec();
+                            } else {
+                                console.warn(`No component found with foreign key ${relationOptions.foreignKey} in ${relatedTypeName}`);
+                                return [];
+                            }
                         } else {
                             // Use DataLoader for relation loading if available
                             if (

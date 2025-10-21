@@ -188,7 +188,7 @@ export default class App {
     waitForAppReady(): Promise<void> {
         return new Promise(resolve => {
             const interval = setInterval(() => {
-                if (ApplicationLifecycle.getCurrentPhase() >= ApplicationPhase.COMPONENTS_READY) {
+                if (ApplicationLifecycle.getCurrentPhase() >= ApplicationPhase.APPLICATION_READY) {
                     clearInterval(interval);
                     resolve();
                 }

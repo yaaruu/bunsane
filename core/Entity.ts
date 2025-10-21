@@ -248,11 +248,57 @@ export class Entity implements IEntity {
                     logger.trace(`No components to save for entity ${this.id}`);
                     return;
                 }
-                const waitable = [];
+                
+                // Batch inserts and updates for better performance
+                const componentsToInsert = [];
+                const entityComponentsToInsert = [];
+                const componentsToUpdate = [];
+                
                 for(const comp of this.components.values()) {
-                    waitable.push(comp.save(trx, this.id));
+                    const compName = comp.constructor.name;
+                    if (!ComponentRegistry.isComponentReady(compName)) {
+                        await ComponentRegistry.getReadyPromise(compName);
+                    }
+                    
+                    if(!(comp as any)._persisted) {
+                        if(comp.id === "") {
+                            comp.id = uuidv7();
+                        }
+                        componentsToInsert.push({
+                            id: comp.id,
+                            entity_id: this.id,
+                            name: compName,
+                            type_id: comp.getTypeID(),
+                            data: comp.data()
+                        });
+                        entityComponentsToInsert.push({
+                            entity_id: this.id,
+                            type_id: comp.getTypeID(),
+                            component_id: comp.id
+                        });
+                        (comp as any).setPersisted(true);
+                        (comp as any).setDirty(false);
+                    } else if((comp as any)._dirty) {
+                        componentsToUpdate.push({
+                            id: comp.id,
+                            data: comp.data()
+                        });
+                        (comp as any).setDirty(false);
+                    }
                 }
-                await Promise.all(waitable);
+                
+                // Perform batch inserts
+                if(componentsToInsert.length > 0) {
+                    await trx`INSERT INTO components ${sql(componentsToInsert, 'id', 'entity_id', 'name', 'type_id', 'data')}`;
+                    await trx`INSERT INTO entity_components ${sql(entityComponentsToInsert, 'entity_id', 'type_id', 'component_id')} ON CONFLICT DO NOTHING`;
+                }
+                
+                // Perform batch updates
+                if(componentsToUpdate.length > 0) {
+                    for(const comp of componentsToUpdate) {
+                        await trx`UPDATE components SET data = ${comp.data} WHERE id = ${comp.id}`;
+                    }
+                }
             });
 
             this._dirty = false;

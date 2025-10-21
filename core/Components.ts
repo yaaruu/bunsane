@@ -148,9 +148,13 @@ export class BaseComponent {
 
     async save(trx: Bun.SQL, entity_id: string) {
         logger.trace(`Saving component ${this._comp_name} for entity ${entity_id}`);
-        logger.trace(`Checking is Component can be saved (is registered)`);
-        await ComponentRegistry.getReadyPromise(this._comp_name);
-        logger.trace(`Component Registered`);
+        // Only check readiness if component is not yet registered
+        // This optimization avoids 40,000+ unnecessary async calls for bulk operations
+        if(!ComponentRegistry.isComponentReady(this._comp_name)) {
+            logger.trace(`Checking is Component can be saved (is registered)`);
+            await ComponentRegistry.getReadyPromise(this._comp_name);
+            logger.trace(`Component Registered`);
+        }
         if(this._persisted) {
             await this.update(trx);
         } else {
