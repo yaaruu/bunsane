@@ -4,7 +4,6 @@ import { timed } from "./Decorators";
 import db from "../database";
 import { sql } from "bun";
 
-// Phase 2A: Memory Pooling for Entity Objects
 class EntityPool {
     private static instance: EntityPool;
     private pool: Map<string, Entity[]> = new Map();

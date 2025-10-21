@@ -112,18 +112,18 @@ export const CreateComponentTable = async () => {
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW(),
         deleted_at TIMESTAMP,
-        PRIMARY KEY (id, type_id, entity_id)
+        PRIMARY KEY (id, type_id),
+        UNIQUE(entity_id, type_id)
     ) PARTITION BY LIST (type_id);`;
-    await db`
-CREATE INDEX IF NOT EXISTS idx_components_entity_id ON components (entity_id);
-CREATE INDEX IF NOT EXISTS idx_components_type_id ON components (type_id);
-CREATE INDEX IF NOT EXISTS idx_components_data_gin ON components USING GIN (data);
-
-CREATE INDEX IF NOT EXISTS idx_components_entity_type_deleted ON components (entity_id, type_id, deleted_at);
-CREATE INDEX IF NOT EXISTS idx_components_type_deleted ON components (type_id, deleted_at) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_components_deleted_entity ON components (deleted_at, entity_id) WHERE deleted_at IS NULL;
-`}
-
+    await db`CREATE INDEX IF NOT EXISTS idx_components_entity_id ON components (entity_id)`;
+    await db`CREATE INDEX IF NOT EXISTS idx_components_type_id ON components (type_id)`;
+    await db`CREATE INDEX IF NOT EXISTS idx_components_data_gin ON components USING GIN (data)`;
+    await db`CREATE INDEX IF NOT EXISTS idx_components_entity_type_deleted ON components (entity_id, type_id, deleted_at)`;
+    await db`CREATE INDEX IF NOT EXISTS idx_components_type_deleted ON components (type_id, deleted_at) WHERE deleted_at IS NULL`;
+    await db`CREATE INDEX IF NOT EXISTS idx_components_deleted_entity ON components (deleted_at, entity_id) WHERE deleted_at IS NULL`;
+    await db`CREATE INDEX IF NOT EXISTS idx_components_entity_created_desc ON components (entity_id, created_at DESC)`;
+    await db`CREATE INDEX IF NOT EXISTS idx_components_type_entity_created ON components (type_id, entity_id, created_at DESC)`;
+}
 export const UpdateComponentIndexes = async (table_name: string, indexedProperties: string[]) => {
     try {
         table_name = validateIdentifier(table_name);
@@ -247,22 +247,18 @@ export const CreateEntityComponentTable = async () => {
     await db`CREATE TABLE IF NOT EXISTS entity_components (
         entity_id UUID REFERENCES entities(id) ON DELETE CASCADE,
         type_id VARCHAR(64) NOT NULL,
-        component_id UUID REFERENCES components(id) ON DELETE CASCADE,
+        component_id UUID,
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW(),
         deleted_at TIMESTAMP,
         UNIQUE(entity_id, type_id)
     );`;
-    await db`
-    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_entity_id ON entity_components (entity_id);
-    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_type_id ON entity_components (type_id);
-    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_type_entity ON entity_components (type_id, entity_id);
-
-    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_type_entity_deleted ON entity_components (type_id, entity_id, deleted_at);
-    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_deleted_type ON entity_components (deleted_at, type_id) WHERE deleted_at IS NULL;
-
-    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_component_id ON entity_components (component_id);
-    `
+    await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_entity_id ON entity_components (entity_id)`;
+    await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_type_id ON entity_components (type_id)`;
+    await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_type_entity ON entity_components (type_id, entity_id)`;
+    await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_type_entity_deleted ON entity_components (type_id, entity_id, deleted_at)`;
+    await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_deleted_type ON entity_components (deleted_at, type_id) WHERE deleted_at IS NULL`;
+    await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_component_id ON entity_components (component_id)`;
 }
 
 export const GenerateTableName = (name: string) => `components_${name.toLowerCase().replace(/\s+/g, '_')}`;

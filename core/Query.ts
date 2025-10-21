@@ -122,7 +122,7 @@ class Query {
         return { filters };
     }
 
-    private buildFilterCondition(filter: QueryFilter, alias: string, paramIndex: number): { sql: string, params: any[], newParamIndex: number } {
+    private buildFilterCondition(filter: QueryFilter, alias: string, paramIndex: number, interpolate: boolean = false): { sql: string, params: any[], newParamIndex: number } {
         const { field, operator, value } = filter;
 
         // Check for custom filter builders first
@@ -140,23 +140,45 @@ class Query {
             case ">=":
             case "<=":
             case "!=":
-                if (typeof value === "string") {
-                    return { sql: `${jsonPath} ${operator} $${paramIndex}`, params: [value], newParamIndex: paramIndex + 1 };
+                if (interpolate) {
+                    if (typeof value === "string") {
+                        return { sql: `${jsonPath} ${operator} '${value.replace(/'/g, "''")}'`, params: [], newParamIndex: paramIndex };
+                    } else {
+                        return { sql: `(${jsonPath})::numeric ${operator} ${value}`, params: [], newParamIndex: paramIndex };
+                    }
                 } else {
-                    return { sql: `(${jsonPath})::numeric ${operator} $${paramIndex}`, params: [value], newParamIndex: paramIndex + 1 };
+                    if (typeof value === "string") {
+                        return { sql: `${jsonPath} ${operator} $${paramIndex}`, params: [value], newParamIndex: paramIndex + 1 };
+                    } else {
+                        return { sql: `(${jsonPath})::numeric ${operator} $${paramIndex}`, params: [value], newParamIndex: paramIndex + 1 };
+                    }
                 }
             case "LIKE":
-                return { sql: `${jsonPath} LIKE $${paramIndex}`, params: [value], newParamIndex: paramIndex + 1 };
+                if (interpolate) {
+                    return { sql: `${jsonPath} LIKE '${value.replace(/'/g, "''")}'`, params: [], newParamIndex: paramIndex };
+                } else {
+                    return { sql: `${jsonPath} LIKE $${paramIndex}`, params: [value], newParamIndex: paramIndex + 1 };
+                }
             case "IN":
                 if (Array.isArray(value)) {
-                    const placeholders = Array.from({length: value.length}, (_, i) => `$${paramIndex + i}`).join(', ');
-                    return { sql: `${jsonPath} IN (${placeholders})`, params: value, newParamIndex: paramIndex + value.length };
+                    if (interpolate) {
+                        const placeholders = value.map(v => typeof v === 'string' ? `'${v.replace(/'/g, "''")}'` : v).join(', ');
+                        return { sql: `${jsonPath} IN (${placeholders})`, params: [], newParamIndex: paramIndex };
+                    } else {
+                        const placeholders = Array.from({length: value.length}, (_, i) => `$${paramIndex + i}`).join(', ');
+                        return { sql: `${jsonPath} IN (${placeholders})`, params: value, newParamIndex: paramIndex + value.length };
+                    }
                 }
                 throw new Error("IN operator requires an array of values");
             case "NOT IN":
                 if (Array.isArray(value)) {
-                    const placeholders = Array.from({length: value.length}, (_, i) => `$${paramIndex + i}`).join(', ');
-                    return { sql: `${jsonPath} NOT IN (${placeholders})`, params: value, newParamIndex: paramIndex + value.length };
+                    if (interpolate) {
+                        const placeholders = value.map(v => typeof v === 'string' ? `'${v.replace(/'/g, "''")}'` : v).join(', ');
+                        return { sql: `${jsonPath} NOT IN (${placeholders})`, params: [], newParamIndex: paramIndex };
+                    } else {
+                        const placeholders = Array.from({length: value.length}, (_, i) => `$${paramIndex + i}`).join(', ');
+                        return { sql: `${jsonPath} NOT IN (${placeholders})`, params: value, newParamIndex: paramIndex + value.length };
+                    }
                 }
                 throw new Error("NOT IN operator requires an array of values");
             default:
@@ -185,23 +207,29 @@ class Query {
         }
     }
 
-    private buildEntityExclusionClause(paramIndex: number = 1): { sql: string, params: any[], newParamIndex: number } {
+    private buildEntityExclusionClause(paramIndex: number = 1, interpolate: boolean = false): { sql: string, params: any[], newParamIndex: number } {
         if (this.excludedEntityIds.size === 0) {
             return { sql: '', params: [], newParamIndex: paramIndex };
         }
-        const ids = Array.from(this.excludedEntityIds);
-        const placeholders = ids.map((_, i) => `$${paramIndex + i}`).join(', ');
-        return { sql: ` AND entity_id::text NOT IN (${placeholders})`, params: ids, newParamIndex: paramIndex + ids.length };
+        if (interpolate) {
+            const ids = Array.from(this.excludedEntityIds);
+            const placeholders = ids.map(id => `'${id.replace(/'/g, "''")}'`).join(', ');
+            return { sql: ` AND entity_id::text NOT IN (${placeholders})`, params: [], newParamIndex: paramIndex };
+        } else {
+            const ids = Array.from(this.excludedEntityIds);
+            const placeholders = ids.map((_, i) => `$${paramIndex + i}`).join(', ');
+            return { sql: ` AND entity_id::text NOT IN (${placeholders})`, params: ids, newParamIndex: paramIndex + ids.length };
+        }
     }
 
-    private buildFilterWhereClause(typeId: string, filters: QueryFilter[], alias: string, paramIndex: number): { sql: string, params: any[], newParamIndex: number } {
+    private buildFilterWhereClause(typeId: string, filters: QueryFilter[], alias: string, paramIndex: number, interpolate: boolean = false): { sql: string, params: any[], newParamIndex: number } {
         if (filters.length === 0) return { sql: '', params: [], newParamIndex: paramIndex };
         
         const conditions: string[] = [];
         const allParams: any[] = [];
         let currentIndex = paramIndex;
         for (const filter of filters) {
-            const { sql, params, newParamIndex } = this.buildFilterCondition(filter, alias, currentIndex);
+            const { sql, params, newParamIndex } = this.buildFilterCondition(filter, alias, currentIndex, interpolate);
             conditions.push(sql);
             allParams.push(...params);
             currentIndex = newParamIndex;
@@ -399,23 +427,60 @@ class Query {
                     // Phase 2A: Optimize multi-component sorting with JOINs instead of subqueries
                     if (this.sortOrders.length > 0) {
                         const compIds = inList(componentIds, 1);
-                        let orderByClause = "ORDER BY ";
-                        const orderClauses: string[] = [];
-
+                        let paramIndex = compIds.newParamIndex;
+                        let params = [...compIds.params];
+                        if (this.withId) {
+                            params.push(this.withId);
+                            paramIndex++;
+                        }
+                        const entityExclusionClause = this.buildEntityExclusionClause(paramIndex);
+                        if (entityExclusionClause.sql) {
+                            params.push(...entityExclusionClause.params);
+                            paramIndex = entityExclusionClause.newParamIndex;
+                        }
+                        const sortCtes: string[] = [];
+                        const sortJoins: string[] = [];
+                        const sortOrderClauses: string[] = [];
+                        let sortIndex = 0;
                         for (const order of this.sortOrders) {
                             const typeId = ComponentRegistry.getComponentId(order.component);
                             if (typeId && componentIds.includes(typeId)) {
                                 const direction = order.direction.toUpperCase();
                                 const nullsClause = order.nullsFirst ? "NULLS FIRST" : "NULLS LAST";
-                                // Use JOIN-based sorting instead of subquery
-                                const subquery = `(SELECT (c.data->>'${order.property}')::numeric FROM components c WHERE c.entity_id = base_query.id AND c.type_id = '${typeId}' AND c.deleted_at IS NULL LIMIT 1)`;
-                                orderClauses.push(`${subquery} ${direction} ${nullsClause}`);
+                                sortCtes.push(`${order.component}_sort AS (
+                                    SELECT entity_id,
+                                        FIRST_VALUE((data->>'${order.property}')::numeric) OVER (PARTITION BY entity_id ORDER BY created_at DESC) as sort_val
+                                    FROM components
+                                    WHERE type_id = '${typeId}' AND deleted_at IS NULL
+                                )`);
+                                sortJoins.push(`JOIN ${order.component}_sort esv${sortIndex} ON fe.id = esv${sortIndex}.entity_id`);
+                                sortOrderClauses.push(`esv${sortIndex}.sort_val ${direction} ${nullsClause}`);
+                                sortIndex++;
                             }
                         }
-                        orderClauses.push("base_query.id ASC");
-                        orderByClause += orderClauses.join(", ");
-
-                        queryStr = db`SELECT * FROM (SELECT DISTINCT entity_id as id FROM entity_components WHERE type_id IN ${db.unsafe(compIds.sql, compIds.params)} ${this.withId ? db`AND entity_id = ${this.withId}` : db``} AND deleted_at IS NULL GROUP BY entity_id HAVING COUNT(DISTINCT type_id) = ${componentCount}) base_query ${db.unsafe(orderByClause)}`;
+                        sortOrderClauses.push("fe.id ASC");
+                        let sql = `WITH ${sortCtes.join(', ')}, filtered_entities AS (
+                            SELECT DISTINCT entity_id as id
+                            FROM entity_components
+                            WHERE type_id IN ${compIds.sql} ${this.withId ? `AND entity_id = $${compIds.newParamIndex}` : ''} AND deleted_at IS NULL ${entityExclusionClause.sql ? entityExclusionClause.sql.replace('entity_id', 'entity_id') : ''}
+                            GROUP BY entity_id
+                            HAVING COUNT(DISTINCT type_id) = ${componentCount}
+                        )
+                        SELECT fe.id
+                        FROM filtered_entities fe
+                        ${sortJoins.join(' ')}
+                        ORDER BY ${sortOrderClauses.join(', ')}`;
+                        if (this.limit !== null) {
+                            sql += ` LIMIT $${paramIndex}`;
+                            params.push(this.limit);
+                            paramIndex++;
+                        }
+                        if (this.offsetValue > 0) {
+                            sql += ` OFFSET $${paramIndex}`;
+                            params.push(this.offsetValue);
+                            paramIndex++;
+                        }
+                        queryStr = db.unsafe(sql, params);
                     } else {
                         const compIds = inList(componentIds, 1);
                         queryStr = db`SELECT DISTINCT entity_id as id FROM entity_components WHERE type_id IN ${db.unsafe(compIds.sql, compIds.params)} ${this.withId ? db`AND entity_id = ${this.withId}` : db``} AND deleted_at IS NULL GROUP BY entity_id HAVING COUNT(DISTINCT type_id) = ${componentCount} ORDER BY entity_id`;
@@ -745,34 +810,182 @@ class Query {
     }
 
     private async getIdsWithFiltersAndExclusions(componentIds: string[], excludedIds: string[], componentCount: number, limit?: number | null, offset?: number): Promise<string[]> {
-        const entityIds = await this.getIdsWithFilters(componentIds, componentCount);
-        
-        if (entityIds.length === 0) {
-            return [];
+        let params: any[] = [];
+        let paramIndex = 1;
+        const compIds = inList(componentIds, paramIndex);
+        params.push(...compIds.params);
+        paramIndex = compIds.newParamIndex;
+        const excludedList = inList(excludedIds, paramIndex);
+        params.push(...excludedList.params);
+        paramIndex = excludedList.newParamIndex;
+
+        const joins: string[] = [];
+        let joinIndex = 0;
+        for (const [typeId, filters] of this.componentFilters.entries()) {
+            if (componentIds.includes(typeId)) {
+                const alias = `c${joinIndex}`;
+                joins.push(`JOIN components ${alias} ON ec.entity_id = ${alias}.entity_id AND ${alias}.type_id = $${paramIndex} AND ${alias}.deleted_at IS NULL`);
+                params.push(typeId);
+                paramIndex++;
+                joinIndex++;
+            }
         }
-        
-        const idsList = sql(entityIds);
-        const excludedList = inList(excludedIds, 1);
-        let query = db`
-            WITH entity_list AS (
-                SELECT unnest(${idsList}) as id
+
+        let sql: string;
+
+        // For sorting, use a CTE approach
+        if (this.sortOrders.length > 0) {
+            let selectColumns = `ec.entity_id as id`;
+
+            // Add sort columns using window functions
+            const sortColumns: string[] = [];
+            for (let i = 0; i < this.sortOrders.length; i++) {
+                const order = this.sortOrders[i];
+                if (!order) continue;
+
+                const typeId = ComponentRegistry.getComponentId(order.component);
+                if (!typeId || !componentIds.includes(typeId)) {
+                    continue; // Skip if component not in query
+                }
+
+                // Find the join alias for this component
+                let sortAlias = '';
+                let aliasIndex = 0;
+                for (const [filterTypeId, filters] of Array.from(this.componentFilters.entries())) {
+                    if (componentIds.includes(filterTypeId) && filterTypeId === typeId) {
+                        sortAlias = `c${aliasIndex}`;
+                        break;
+                    }
+                    if (componentIds.includes(filterTypeId)) {
+                        aliasIndex++;
+                    }
+                }
+
+                if (sortAlias) {
+                    sortColumns.push(`FIRST_VALUE((${sortAlias}.data->>'${order.property}')::numeric) OVER (PARTITION BY ec.entity_id ORDER BY ${sortAlias}.created_at DESC) as sort_val_${i}`);
+                }
+            }
+            if (sortColumns.length > 0) {
+                selectColumns += `, ${sortColumns.join(', ')}`;
+            }
+
+            // Use CTE to get filtered entities with sort values
+            sql = `WITH filtered_entities AS (
+                SELECT ${selectColumns}
+                FROM entity_components ec ${joins.join(' ')}
+                WHERE ec.type_id IN ${compIds.sql} AND ec.deleted_at IS NULL`;
+
+            if (this.withId) {
+                sql += ` AND ec.entity_id = $${paramIndex}`;
+                params.push(this.withId);
+                paramIndex++;
+            }
+
+            const entityExclusionClause = this.buildEntityExclusionClause(paramIndex);
+            if (entityExclusionClause.sql) {
+                sql += entityExclusionClause.sql.replace('entity_id', 'ec.entity_id');
+                params.push(...entityExclusionClause.params);
+                paramIndex = entityExclusionClause.newParamIndex;
+            }
+
+            // Add exclusion for excluded components
+            sql += ` AND NOT EXISTS (
+                SELECT 1 FROM entity_components ec_ex 
+                WHERE ec_ex.entity_id = ec.entity_id AND ec_ex.type_id IN ${excludedList.sql} AND ec_ex.deleted_at IS NULL
+            )`;
+
+            joinIndex = 0;
+            for (const [typeId, filters] of this.componentFilters.entries()) {
+                if (componentIds.includes(typeId)) {
+                    const alias = `c${joinIndex}`;
+                    const filterConditions = this.buildFilterWhereClause(typeId, filters, alias, paramIndex);
+                    if (filterConditions.sql) {
+                        sql += ` AND ${filterConditions.sql}`;
+                        params.push(...filterConditions.params);
+                        paramIndex = filterConditions.newParamIndex;
+                    }
+                    joinIndex++;
+                }
+            }
+
+            sql += `
             )
-            SELECT el.id
-            FROM entity_list el
-            WHERE NOT EXISTS (
-                SELECT 1 FROM entity_components ec 
-                WHERE ec.entity_id = el.id AND ec.type_id IN ${db.unsafe(excludedList.sql, excludedList.params)} AND ec.deleted_at IS NULL
-            )
-            ORDER BY el.id
-        `;
+            SELECT DISTINCT fe.id, ${sortColumns.length > 0 ? sortColumns.map((_, i) => `fe.sort_val_${i}`).join(', ') : ''}
+            FROM filtered_entities fe
+            WHERE (SELECT COUNT(DISTINCT ec.type_id) FROM entity_components ec WHERE ec.entity_id = fe.id AND ec.deleted_at IS NULL) = $${paramIndex}`;
+
+            params.push(componentCount);
+            paramIndex++;
+
+            // Build ORDER BY clause using the selected sort values
+            const orderClauses: string[] = [];
+            for (let i = 0; i < this.sortOrders.length; i++) {
+                const order = this.sortOrders[i];
+                if (!order) continue;
+
+                const direction = order.direction.toUpperCase();
+                const nullsClause = order.nullsFirst ? "NULLS FIRST" : "NULLS LAST";
+                orderClauses.push(`sort_val_${i} ${direction} ${nullsClause}`);
+            }
+            // Always include entity_id as final tiebreaker for consistent ordering
+            orderClauses.push(`id ASC`);
+            sql += ` ORDER BY ${orderClauses.join(", ")}`;
+        } else {
+            // No sorting - use simpler approach
+            sql = `SELECT DISTINCT ec.entity_id as id FROM entity_components ec ${joins.join(' ')} WHERE ec.type_id IN ${compIds.sql} AND ec.deleted_at IS NULL`;
+
+            if (this.withId) {
+                sql += ` AND ec.entity_id = $${paramIndex}`;
+                params.push(this.withId);
+                paramIndex++;
+            }
+
+            const entityExclusionClause = this.buildEntityExclusionClause(paramIndex);
+            if (entityExclusionClause.sql) {
+                sql += entityExclusionClause.sql.replace('entity_id', 'ec.entity_id');
+                params.push(...entityExclusionClause.params);
+                paramIndex = entityExclusionClause.newParamIndex;
+            }
+
+            // Add exclusion
+            sql += ` AND NOT EXISTS (
+                SELECT 1 FROM entity_components ec_ex 
+                WHERE ec_ex.entity_id = ec.entity_id AND ec_ex.type_id IN ${excludedList.sql} AND ec_ex.deleted_at IS NULL
+            )`;
+
+            joinIndex = 0;
+            for (const [typeId, filters] of this.componentFilters.entries()) {
+                if (componentIds.includes(typeId)) {
+                    const alias = `c${joinIndex}`;
+                    const filterConditions = this.buildFilterWhereClause(typeId, filters, alias, paramIndex);
+                    if (filterConditions.sql) {
+                        sql += ` AND ${filterConditions.sql}`;
+                        params.push(...filterConditions.params);
+                        paramIndex = filterConditions.newParamIndex;
+                    }
+                    joinIndex++;
+                }
+            }
+
+            sql += ` GROUP BY ec.entity_id HAVING COUNT(DISTINCT ec.type_id) = $${paramIndex}`;
+            params.push(componentCount);
+            paramIndex++;
+            sql += ` ORDER BY ec.entity_id`;
+        }
+
         if (limit !== null && limit !== undefined) {
-            query = db`${query} LIMIT ${limit}`;
+            sql += ` LIMIT $${paramIndex}`;
+            params.push(limit);
+            paramIndex++;
         }
         if (offset && offset > 0) {
-            query = db`${query} OFFSET ${offset}`;
+            sql += ` OFFSET $${paramIndex}`;
+            params.push(offset);
+            paramIndex++;
         }
-        const exclusionResult = await query;
-        return exclusionResult.map((row: any) => row.id);
+
+        const filteredResult = await db.unsafe(sql, params);
+        return filteredResult.map((row: any) => row.id);
     }
 
     private async doCount(): Promise<number> {
@@ -905,29 +1118,135 @@ class Query {
     }
 
     private async getCountWithFiltersAndExclusions(componentIds: string[], excludedIds: string[], componentCount: number): Promise<number> {
-        const entityIds = await this.getIdsWithFilters(componentIds, componentCount);
-        
-        if (entityIds.length === 0) {
-            return 0;
+        const compIdsStr = componentIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ');
+        const excludedListStr = excludedIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ');
+
+        const joins: string[] = [];
+        let joinIndex = 0;
+        for (const [typeId, filters] of this.componentFilters.entries()) {
+            if (componentIds.includes(typeId)) {
+                const alias = `c${joinIndex}`;
+                joins.push(`JOIN components ${alias} ON ec.entity_id = ${alias}.entity_id AND ${alias}.type_id = '${typeId.replace(/'/g, "''")}' AND ${alias}.deleted_at IS NULL`);
+                joinIndex++;
+            }
         }
-        
-        const idsList = sql(entityIds);
-        const excludedList = inList(excludedIds, 1);
-        const query = db`
+
+        let sql: string;
+
+        // For sorting, use a CTE approach
+        if (this.sortOrders.length > 0) {
+            let selectColumns = `ec.entity_id as id`;
+
+            // Add sort columns using window functions
+            const sortColumns: string[] = [];
+            for (let i = 0; i < this.sortOrders.length; i++) {
+                const order = this.sortOrders[i];
+                if (!order) continue;
+
+                const typeId = ComponentRegistry.getComponentId(order.component);
+                if (!typeId || !componentIds.includes(typeId)) {
+                    continue; // Skip if component not in query
+                }
+
+                // Find the join alias for this component
+                let sortAlias = '';
+                let aliasIndex = 0;
+                for (const [filterTypeId, filters] of Array.from(this.componentFilters.entries())) {
+                    if (componentIds.includes(filterTypeId) && filterTypeId === typeId) {
+                        sortAlias = `c${aliasIndex}`;
+                        break;
+                    }
+                    if (componentIds.includes(filterTypeId)) {
+                        aliasIndex++;
+                    }
+                }
+
+                if (sortAlias) {
+                    sortColumns.push(`FIRST_VALUE((${sortAlias}.data->>'${order.property}')::numeric) OVER (PARTITION BY ec.entity_id ORDER BY ${sortAlias}.created_at DESC) as sort_val_${i}`);
+                }
+            }
+            if (sortColumns.length > 0) {
+                selectColumns += `, ${sortColumns.join(', ')}`;
+            }
+
+            // Use CTE to get filtered entities with sort values
+            sql = `WITH filtered_entities AS (
+                SELECT ${selectColumns}
+                FROM entity_components ec ${joins.join(' ')}
+                WHERE ec.type_id IN (${compIdsStr}) AND ec.deleted_at IS NULL`;
+
+            if (this.withId) {
+                sql += ` AND ec.entity_id = '${this.withId.replace(/'/g, "''")}'`;
+            }
+
+            const entityExclusionClause = this.buildEntityExclusionClause(1, true);
+            if (entityExclusionClause.sql) {
+                sql += entityExclusionClause.sql.replace('entity_id', 'ec.entity_id');
+            }
+
+            // Add exclusion for excluded components
+            sql += ` AND NOT EXISTS (
+                SELECT 1 FROM entity_components ec_ex 
+                WHERE ec_ex.entity_id = ec.entity_id AND ec_ex.type_id IN (${excludedListStr}) AND ec_ex.deleted_at IS NULL
+            )`;
+
+            joinIndex = 0;
+            for (const [typeId, filters] of this.componentFilters.entries()) {
+                if (componentIds.includes(typeId)) {
+                    const alias = `c${joinIndex}`;
+                    const filterConditions = this.buildFilterWhereClause(typeId, filters, alias, 1, true);
+                    if (filterConditions.sql) {
+                        sql += ` AND ${filterConditions.sql}`;
+                    }
+                    joinIndex++;
+                }
+            }
+
+            sql += `
+            )
             SELECT COUNT(*) as count FROM (
-                WITH entity_list AS (
-                    SELECT unnest(${idsList}) as id
-                )
-                SELECT el.id
-                FROM entity_list el
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM entity_components ec 
-                    WHERE ec.entity_id = el.id AND ec.type_id IN ${db.unsafe(excludedList.sql, excludedList.params)} AND ec.deleted_at IS NULL
-                )
-            ) as subquery
-        `;
-        const exclusionResult = await query;
-        return parseInt(exclusionResult[0].count);
+                SELECT DISTINCT fe.id
+                FROM filtered_entities fe
+                WHERE (SELECT COUNT(DISTINCT ec.type_id) FROM entity_components ec WHERE ec.entity_id = fe.id AND ec.deleted_at IS NULL) = ${componentCount}
+            ) as subquery`;
+        } else {
+            // No sorting - use simpler approach
+            sql = `SELECT COUNT(*) as count FROM (
+                SELECT DISTINCT ec.entity_id FROM entity_components ec ${joins.join(' ')} WHERE ec.type_id IN (${compIdsStr}) AND ec.deleted_at IS NULL`;
+
+            if (this.withId) {
+                sql += ` AND ec.entity_id = '${this.withId.replace(/'/g, "''")}'`;
+            }
+
+            const entityExclusionClause = this.buildEntityExclusionClause(1, true);
+            if (entityExclusionClause.sql) {
+                sql += entityExclusionClause.sql.replace('entity_id', 'ec.entity_id');
+            }
+
+            // Add exclusion
+            sql += ` AND NOT EXISTS (
+                SELECT 1 FROM entity_components ec_ex 
+                WHERE ec_ex.entity_id = ec.entity_id AND ec_ex.type_id IN (${excludedListStr}) AND ec_ex.deleted_at IS NULL
+            )`;
+
+            joinIndex = 0;
+            for (const [typeId, filters] of this.componentFilters.entries()) {
+                if (componentIds.includes(typeId)) {
+                    const alias = `c${joinIndex}`;
+                    const filterConditions = this.buildFilterWhereClause(typeId, filters, alias, 1, true);
+                    if (filterConditions.sql) {
+                        sql += ` AND ${filterConditions.sql}`;
+                    }
+                    joinIndex++;
+                }
+            }
+
+            sql += ` GROUP BY ec.entity_id HAVING COUNT(DISTINCT ec.type_id) = ${componentCount}
+            ) as subquery`;
+        }
+
+        const result = await db.unsafe(sql);
+        return parseInt(result[0].count);
     }
 }
 
