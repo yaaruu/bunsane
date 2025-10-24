@@ -183,8 +183,5 @@ export function registerDecoratedHooks(serviceInstance: any): void {
  * @param serviceInstance The service instance to unregister hooks for
  */
 export function unregisterDecoratedHooks(serviceInstance: any): void {
-    // Note: This is a simplified implementation
-    // In a production system, you'd want to track hook IDs during registration
-    // and use them for targeted removal here
     console.warn('unregisterDecoratedHooks is not fully implemented. Use EntityHookManager.removeHook() for individual hook removal.');
 }

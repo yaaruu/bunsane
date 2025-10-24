@@ -5,52 +5,52 @@ import { logger } from "../Logger";
 
 const loggerInstance = logger.child({ scope: "ScheduledTaskDecorator" });
 
-/**
- * Decorator for registering scheduled tasks
- * @param options Task configuration options including interval and component target
- */
-export function ScheduledTask(
-    options: ScheduledTaskOptions & { 
-        interval: ScheduleInterval; 
-        componentTarget?: new (...args: any[]) => any 
-    }
-) {
-    return function (target: any, propertyKey: string, descriptor: PropertyDescriptor) {
-        const originalMethod = descriptor.value;
+// /**
+//  * Decorator for registering scheduled tasks
+//  * @param options Task configuration options including interval and component target
+//  */
+// export function ScheduledTask(
+//     options: ScheduledTaskOptions & { 
+//         interval: ScheduleInterval; 
+//         componentTarget?: new (...args: any[]) => any 
+//     }
+// ) {
+//     return function (target: any, propertyKey: string, descriptor: PropertyDescriptor) {
+//         const originalMethod = descriptor.value;
 
-        // Generate task ID if not provided
-        const taskId = options.id || `${target.constructor.name}.${propertyKey}`;
+//         // Generate task ID if not provided
+//         const taskId = options.id || `${target.constructor.name}.${propertyKey}`;
 
-        // Store task info for later registration
-        if (!target.constructor.__scheduledTasks) {
-            target.constructor.__scheduledTasks = [];
-        }
+//         // Store task info for later registration
+//         if (!target.constructor.__scheduledTasks) {
+//             target.constructor.__scheduledTasks = [];
+//         }
 
-        const taskInfo = {
-            id: taskId,
-            name: options.name || `${target.constructor.name}.${propertyKey}`,
-            componentTarget: options.componentTarget, // Legacy support
-            interval: options.interval,
-            options: {
-                runOnStart: options.runOnStart ?? false,
-                timeout: options.timeout ?? 30000,
-                enableLogging: options.enableLogging ?? true,
-                ...options
-            },
-            service: null, // Will be set when service is instantiated
-            methodName: propertyKey,
-            nextExecution: new Date(),
-            executionCount: 0,
-            isRunning: false,
-            enabled: true
-        };
+//         const taskInfo = {
+//             id: taskId,
+//             name: options.name || `${target.constructor.name}.${propertyKey}`,
+//             componentTarget: options.componentTarget, // Legacy support
+//             interval: options.interval,
+//             options: {
+//                 runOnStart: options.runOnStart ?? false,
+//                 timeout: options.timeout ?? 30000,
+//                 enableLogging: options.enableLogging ?? true,
+//                 ...options
+//             },
+//             service: null, // Will be set when service is instantiated
+//             methodName: propertyKey,
+//             nextExecution: new Date(),
+//             executionCount: 0,
+//             isRunning: false,
+//             enabled: true
+//         };
 
-        target.constructor.__scheduledTasks.push(taskInfo);
+//         target.constructor.__scheduledTasks.push(taskInfo);
 
-        // Return the original descriptor to maintain method functionality
-        return descriptor;
-    };
-}
+//         // Return the original descriptor to maintain method functionality
+//         return descriptor;
+//     };
+// }
 
 /**
  * Function to manually register decorated tasks for a service instance
