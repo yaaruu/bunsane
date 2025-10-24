@@ -5,10 +5,16 @@ import { Entity } from "./Entity";
 import { getMetadataStorage } from "./metadata";
 import { z, ZodObject } from "zod";
 import { weave } from "@gqloom/core";
-import { ZodWeaver, asEnumType, asUnionType } from "@gqloom/zod";
+import { ZodWeaver, asEnumType, asUnionType, asObjectType } from "@gqloom/zod";
 import { printSchema } from "graphql";
 import "reflect-metadata";
 import Query from "./Query";
+
+const InputFilterSchema = z.object({
+    field: z.string(),
+    op: z.string().default("eq"),
+    value: z.string(),
+}).register(asObjectType, { name: "InputFilter" });
 
 const customTypeRegistry = new Map<any, any>();
 const customTypeNameRegistry = new Map<any, string>();
@@ -1603,14 +1609,11 @@ export class BaseArcheType {
             // Only include fields that are explicitly set to filterable: true
             const isFilterable = this.fieldOptions[key]?.filterable === true || this.unionOptions[key]?.filterable === true;
             if (isFilterable) {
-                filterShape[key] = z.object({
-                    field: z.string().default(key),
-                    op: z.string().default("eq"),
-                    value: z.string(),
-                }).optional();
+                filterShape[key] = InputFilterSchema.optional();
             }
         }
-        return z.object(filterShape);
+        const filterSchema = z.object(filterShape);
+        return filterSchema;
     }
 }
 

@@ -37,7 +37,9 @@ export interface SortOrder {
     direction: SortDirection;
     nullsFirst?: boolean;
 }
-
+/**
+ * @deprecated Use the new Query class in bunsane/query instead
+ */
 class Query {
     private requiredComponents: Set<string> = new Set<string>();
     private excludedComponents: Set<string> = new Set<string>();
