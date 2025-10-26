@@ -1336,8 +1336,9 @@ export class BaseArcheType {
         }
     }
 
-    public getZodObjectSchema(options?: { excludeRelations?: boolean }): ZodObject<any> {
+    public getZodObjectSchema(options?: { excludeRelations?: boolean; excludeFunctions?: boolean }): ZodObject<any> {
         const excludeRelations = options?.excludeRelations ?? false;
+        const excludeFunctions = options?.excludeFunctions ?? false;
         const zodShapes: Record<string, any> = {};
         const storage = getMetadataStorage();
         const unionSchemas: Array<{
@@ -1512,27 +1513,29 @@ export class BaseArcheType {
         }
 
         // Process archetype functions
-        for (const { propertyKey, options } of this.functions) {
-            let zodType;
-            if (options?.returnType === 'number') {
-                zodType = z.number();
-            } else if (options?.returnType === 'string') {
-                zodType = z.string();
-            } else if (options?.returnType === 'boolean') {
-                zodType = z.boolean();
-            } else {
-                const returnType = Reflect.getMetadata("design:returntype", this.constructor.prototype, propertyKey);
-                if (returnType === String) {
-                    zodType = z.string();
-                } else if (returnType === Number) {
+        if (!excludeFunctions) {
+            for (const { propertyKey, options } of this.functions) {
+                let zodType;
+                if (options?.returnType === 'number') {
                     zodType = z.number();
-                } else if (returnType === Boolean) {
+                } else if (options?.returnType === 'string') {
+                    zodType = z.string();
+                } else if (options?.returnType === 'boolean') {
                     zodType = z.boolean();
                 } else {
-                    zodType = z.any();
+                    const returnType = Reflect.getMetadata("design:returntype", this.constructor.prototype, propertyKey);
+                    if (returnType === String) {
+                        zodType = z.string();
+                    } else if (returnType === Number) {
+                        zodType = z.number();
+                    } else if (returnType === Boolean) {
+                        zodType = z.boolean();
+                    } else {
+                        zodType = z.any();
+                    }
                 }
+                zodShapes[propertyKey] = zodType.optional();
             }
-            zodShapes[propertyKey] = zodType;
         }
 
         const archetypeId = storage.getComponentId(this.constructor.name);
@@ -1646,14 +1649,14 @@ export class BaseArcheType {
     }
 
     /**
-     * Get a Zod schema suitable for GraphQL input types (excludes relations)
+     * Get a Zod schema suitable for GraphQL input types (excludes relations and functions)
      */
     public getInputSchema(): ZodObject<any> {
-        return this.getZodObjectSchema({ excludeRelations: true });
+        return this.getZodObjectSchema({ excludeRelations: true, excludeFunctions: true });
     }
 
     public getFilterSchema(): ZodObject<any> {
-        const baseSchema = this.getZodObjectSchema({ excludeRelations: true });
+        const baseSchema = this.getZodObjectSchema({ excludeRelations: true, excludeFunctions: true });
         const filterShape: Record<string, any> = {};
         for (const key of Object.keys(baseSchema.shape)) {
             // Only include fields that are explicitly set to filterable: true

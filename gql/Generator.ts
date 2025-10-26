@@ -297,16 +297,14 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
                                         return `input ${name}Input`;
                                     }
                                 });
-                                        // Update field types for custom types
-                                        inputTypeDefs = inputTypeDefs.replace(/: (\w+)([!\[\]]*)(\s|$)/g, (match, type, suffix, end) => {
-                                            if (typeNames.includes(type)) {
-                                                return `: ${type.endsWith('Input') ? type : type + 'Input'}${suffix}${end}`;
-                                            } else {
-                                                return match;
-                                            }
-                                        });
-                                
-                                // Deduplicate input types - only add if not already defined
+                                // Update field types for custom types
+                                inputTypeDefs = inputTypeDefs.replace(/: (\[?)(\w+)([!\[\]]*)(\s|$)/g, (match, bracketStart, type, suffix, end) => {
+                                    if (typeNames.includes(type)) {
+                                        return `: ${bracketStart}${type.endsWith('Input') ? type : type + 'Input'}${suffix}${end}`;
+                                    } else {
+                                        return match;
+                                    }
+                                });                                // Deduplicate input types - only add if not already defined
                                 const deduplicatedInputTypeDefs = deduplicateInputTypes(inputTypeDefs, definedInputTypes);
                                 typeDefs += deduplicatedInputTypeDefs;
                                 typeDefs += `\n`;
