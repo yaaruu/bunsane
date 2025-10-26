@@ -1655,6 +1655,75 @@ export class BaseArcheType {
         return this.getZodObjectSchema({ excludeRelations: true, excludeFunctions: true });
     }
 
+    /**
+     * Apply validations to specific fields in the input schema
+     * @param validations - Object mapping field paths to Zod schemas or refinement functions
+     * @returns Modified Zod schema with validations applied
+     * 
+     * @example
+     * archetype.withValidation({
+     *   name: z.string().min(3),
+     *   'info.label': z.string().min(3)
+     * })
+     */
+    public withValidation(validations: Record<string, any>): ZodObject<any> {
+        const baseSchema = this.getInputSchema();
+        const shape = { ...baseSchema.shape };
+
+        for (const [path, validation] of Object.entries(validations)) {
+            if (path.includes('.')) {
+                // Handle nested fields like 'info.label'
+                const [field, ...nestedPath] = path.split('.');
+                
+                if (shape[field!]) {
+                    const currentField = shape[field!];
+                    
+                    // Check if it's an optional field and unwrap it
+                    const isOptional = currentField._def?.typeName === 'ZodOptional';
+                    const innerSchema = isOptional ? currentField.unwrap() : currentField;
+                    
+                    // Check if it's a ZodObject - handle both typeName and type property
+                    const isZodObject = innerSchema._def?.typeName === 'ZodObject' || 
+                                       innerSchema._def?.type === 'object' || 
+                                       innerSchema.type === 'object';
+                    
+                    if (isZodObject && innerSchema.shape) {
+                        // Deep clone the nested shape to avoid mutations
+                        const nestedShape = { ...innerSchema.shape };
+                        
+                        // Apply validation to the nested field
+                        if (nestedPath.length === 1 && nestedShape[nestedPath[0]!]) {
+                            nestedShape[nestedPath[0]!] = validation;
+                        } else if (nestedPath.length > 1) {
+                            // Handle deeper nesting (e.g., 'info.data.label')
+                            let current = nestedShape;
+                            for (let i = 0; i < nestedPath.length - 1; i++) {
+                                const key = nestedPath[i]!;
+                                if (current[key] && current[key]._def?.typeName === 'ZodObject') {
+                                    current[key] = { ...current[key].shape };
+                                    current = current[key];
+                                }
+                            }
+                            const lastKey = nestedPath[nestedPath.length - 1]!;
+                            if (current[lastKey]) {
+                                current[lastKey] = validation;
+                            }
+                        }
+                        
+                        const newNestedSchema = z.object(nestedShape);
+                        // Preserve the optionality of the parent object
+                        shape[field!] = isOptional ? newNestedSchema.optional() : newNestedSchema;
+                    }
+                }
+            } else {
+                // Handle top-level fields - directly replace with the validation
+                shape[path] = validation;
+            }
+        }
+
+        return z.object(shape);
+    }
+
     public getFilterSchema(): ZodObject<any> {
         const baseSchema = this.getZodObjectSchema({ excludeRelations: true, excludeFunctions: true });
         const filterShape: Record<string, any> = {};

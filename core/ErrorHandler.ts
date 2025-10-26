@@ -37,12 +37,18 @@ export function handleGraphQLError(err: any): never {
     if (err instanceof z.ZodError) {
         // Convert Zod errors to user-friendly messages
         const userFriendlyErrors = err.issues.map((issue: any) => {
+            // Use custom Zod message if available, otherwise use mapped error
+            const customMessage = issue.message && issue.message !== 'Required' && issue.message !== 'Invalid' 
+                ? issue.message 
+                : null;
+            
             const errorCode = mapZodPathToErrorCode(issue.path);
             const errorInfo = getErrorMessage(errorCode);
+            
             return {
                 field: issue.path.join('.'),
-                message: errorInfo.userMessage,
-                suggestion: errorInfo.suggestion,
+                message: customMessage || errorInfo.userMessage,
+                suggestion: customMessage ? undefined : errorInfo.suggestion,
                 code: errorCode
             };
         });
