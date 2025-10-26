@@ -10,6 +10,17 @@ import { printSchema } from "graphql";
 import "reflect-metadata";
 import { Query, type FilterSchema } from "../query";
 
+const archetypeFunctionsSymbol = Symbol("archetypeFunctions");
+
+export function ArcheTypeFunction(options?: { returnType?: string }) {
+    return function (target: any, propertyKey: string) {
+        if (!target[archetypeFunctionsSymbol]) {
+            target[archetypeFunctionsSymbol] = [];
+        }
+        target[archetypeFunctionsSymbol].push({ propertyKey, options });
+    };
+}
+
 const InputFilterSchema = z.object({
     field: z.string(),
     op: z.string().default("eq"),
@@ -435,6 +446,7 @@ export class BaseArcheType {
     public unionMap: Record<string, (new (...args: any[]) => BaseComponent)[]> =
         {};
     protected unionOptions: Record<string, ArcheTypeFieldOptions> = {};
+    public functions: Array<{ propertyKey: string; options?: { returnType?: string } }> = [];
 
     public resolver?: {
         fields: Record<string, ArcheTypeResolver>;
@@ -484,6 +496,9 @@ export class BaseArcheType {
                 if (options) this.relationOptions[fieldName] = options;
             }
         }
+
+        // Collect archetype functions
+        this.functions = this.constructor.prototype[archetypeFunctionsSymbol] || [];
     }
 
     // constructor(components: Array<new (...args: any[]) => BaseComponent>) {
@@ -1269,6 +1284,17 @@ export class BaseArcheType {
             }
         }
 
+        // Generate resolvers for archetype functions
+        for (const { propertyKey } of this.functions) {
+            resolvers.push({
+                typeName: archetypeName,
+                fieldName: propertyKey,
+                resolver: (parent: Entity) => {
+                    return (this as any)[propertyKey](parent);
+                },
+            });
+        }
+
         return resolvers;
     }
 
@@ -1483,6 +1509,30 @@ export class BaseArcheType {
                     zodShapes[field] = zodShapes[field].nullish();
                 }
             }
+        }
+
+        // Process archetype functions
+        for (const { propertyKey, options } of this.functions) {
+            let zodType;
+            if (options?.returnType === 'number') {
+                zodType = z.number();
+            } else if (options?.returnType === 'string') {
+                zodType = z.string();
+            } else if (options?.returnType === 'boolean') {
+                zodType = z.boolean();
+            } else {
+                const returnType = Reflect.getMetadata("design:returntype", this.constructor.prototype, propertyKey);
+                if (returnType === String) {
+                    zodType = z.string();
+                } else if (returnType === Number) {
+                    zodType = z.number();
+                } else if (returnType === Boolean) {
+                    zodType = z.boolean();
+                } else {
+                    zodType = z.any();
+                }
+            }
+            zodShapes[propertyKey] = zodType;
         }
 
         const archetypeId = storage.getComponentId(this.constructor.name);

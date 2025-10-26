@@ -174,8 +174,74 @@ class Query {
     }
 
     public count(): Promise<number> {
-        // TODO: Implement count functionality
-        return Promise.resolve(0);
+        return new Promise<number>((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                logger.error(`Query count execution timeout`);
+                reject(new Error(`Query count execution timeout after 30 seconds`));
+            }, 30000);
+            this.doCount()
+                .then(result => {
+                    clearTimeout(timeout);
+                    resolve(result);
+                })
+                .catch(error => {
+                    clearTimeout(timeout);
+                    reject(error);
+                });
+        });
+    }
+
+    private async doCount(): Promise<number> {
+        // Build the DAG
+        const dag = new QueryDAG();
+
+        // Check if we have an OR query
+        if (this.orQuery) {
+            // For OR queries, we need to ensure entities have all required components first
+            if (this.context.componentIds.size > 0) {
+                // ComponentInclusionNode is the root, OrNode is the leaf
+                const componentNode = new ComponentInclusionNode();
+                dag.setRootNode(componentNode);
+
+                // OrNode filters on top of the base requirements
+                const orNode = new OrNode(this.orQuery);
+                orNode.addDependency(componentNode);
+                dag.addNode(orNode);
+            } else {
+                // No base requirements, OrNode is both root and leaf
+                const orNode = new OrNode(this.orQuery);
+                dag.setRootNode(orNode);
+            }
+        } else {
+            // Use SourceNode + ComponentInclusionNode for regular AND logic
+            const sourceNode = new SourceNode();
+            dag.setRootNode(sourceNode);
+
+            if (this.context.componentIds.size > 0 || this.context.excludedComponentIds.size > 0) {
+                const componentNode = new ComponentInclusionNode();
+                componentNode.addDependency(sourceNode);
+                dag.addNode(componentNode);
+            }
+        }
+
+        // Execute the DAG
+        const result = dag.execute(this.context);
+
+        // Modify SQL for count
+        const countSql = `SELECT COUNT(*) as count FROM (${result.sql}) AS subquery`;
+
+        // Debug logging
+        if (this.debug) {
+            console.log('🔍 Query Count Debug:');
+            console.log('SQL:', countSql);
+            console.log('Params:', result.params);
+            console.log('---');
+        }
+
+        // Execute the count query
+        const countResult = await db.unsafe(countSql, result.params);
+
+        return countResult[0].count;
     }
 
     @timed("Query.exec")
