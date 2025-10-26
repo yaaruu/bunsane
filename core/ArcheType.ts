@@ -8,7 +8,7 @@ import { weave } from "@gqloom/core";
 import { ZodWeaver, asEnumType, asUnionType, asObjectType } from "@gqloom/zod";
 import { printSchema } from "graphql";
 import "reflect-metadata";
-import Query from "./Query";
+import { Query, type FilterSchema } from "../query";
 
 const InputFilterSchema = z.object({
     field: z.string(),
@@ -1614,6 +1614,42 @@ export class BaseArcheType {
         }
         const filterSchema = z.object(filterShape);
         return filterSchema;
+    }
+
+    public buildFilterBranches(filter?: FilterSchema<any>): any[] {
+        if (!filter) return [];
+        const branches = [];
+
+        for (const [fieldName, componentCtor] of Object.entries(this.componentMap)) {
+            const fieldOption = this.fieldOptions[fieldName];
+            if (fieldOption?.filterable && filter[fieldName]?.value) {
+                const filterPart = filter[fieldName];
+                const defaultField = this.getDefaultFilterField(componentCtor);
+                const operator = filterPart.op ? Query.filterOp[(filterPart.op.toUpperCase() as keyof typeof Query.filterOp)] : Query.filterOp.LIKE;
+
+                branches.push({
+                    component: componentCtor,
+                    filters: [
+                        {
+                            field: filterPart.field || defaultField,
+                            operator,
+                            value: operator === Query.filterOp.LIKE ? `%${filterPart.value}%` : filterPart.value,
+                        },
+                    ],
+                });
+            }
+        }
+
+        return branches;
+    }
+
+    private getDefaultFilterField(componentCtor: any): string {
+        const storage = getMetadataStorage();
+        const typeId = storage.getComponentId(componentCtor.name);
+        const props = storage.getComponentProperties(typeId);
+        const hasValue = props.some(p => p.propertyKey === 'value');
+        const hasLabel = props.some(p => p.propertyKey === 'label');
+        return hasValue ? 'value' : hasLabel ? 'label' : props[0]?.propertyKey || 'value';
     }
 }
 
