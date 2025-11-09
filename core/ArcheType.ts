@@ -115,81 +115,86 @@ export function weaveAllArchetypes() {
     // Combine both archetype and component schemas for weaving
     const allSchemas = archetypeSchemas;
 
-    const schema = weave(ZodWeaver, ...allSchemas);
-    let schemaString = printSchema(schema);
+    try {
+        const schema = weave(ZodWeaver, ...allSchemas);
+        let schemaString = printSchema(schema);
 
-    // Post-process: Replace 'id: String' with 'id: ID' for all id fields
-    schemaString = schemaString.replace(/\bid:\s*String\b/g, "id: ID");
+        // Post-process: Replace 'id: String' with 'id: ID' for all id fields
+        schemaString = schemaString.replace(/\bid:\s*String\b/g, "id: ID");
 
-    // Post-process: Replace relation String fields with proper GraphQL type references
-    // Collect all relation metadata from all archetypes
-    for (const archetypeMetadata of storage.archetypes) {
-        try {
-            const ArchetypeClass = archetypeMetadata.target as any;
-            const instance = new ArchetypeClass();
-            const archetypeName = archetypeMetadata.name;
-            
-            // Process each relation field
-            for (const [field, relatedArcheType] of Object.entries(instance.relationMap)) {
-                const relationType = instance.relationTypes[field];
-                const isArray = relationType === "hasMany" || relationType === "belongsToMany";
+        // Post-process: Replace relation String fields with proper GraphQL type references
+        // Collect all relation metadata from all archetypes
+        for (const archetypeMetadata of storage.archetypes) {
+            try {
+                const ArchetypeClass = archetypeMetadata.target as any;
+                const instance = new ArchetypeClass();
+                const archetypeName = archetypeMetadata.name;
                 
-                let relatedTypeName: string;
-                if (typeof relatedArcheType === "string") {
-                    relatedTypeName = relatedArcheType;
-                } else {
-                    const relatedArchetypeId = storage.getComponentId((relatedArcheType as any).name);
-                    const relatedArchetypeMetadata = storage.archetypes.find(
-                        (a) => a.typeId === relatedArchetypeId
-                    );
-                    relatedTypeName = relatedArchetypeMetadata?.name || (relatedArcheType as any).name.replace(/ArcheType$/, "");
-                }
-                
-                if (isArray) {
-                    // Step 1: Add description if it doesn't exist
-                    const hasDescription = new RegExp(`"""Reference to ${relatedTypeName} type"""[\\s\\S]{0,50}${field}:`).test(schemaString);
-                    if (!hasDescription) {
-                        const addDescPattern = new RegExp(
-                            `(type ${archetypeName} \\{[\\s\\S]*?)(\\n\\s+)(${field}:\\s*\\[String!?\\]!?)`,
+                // Process each relation field
+                for (const [field, relatedArcheType] of Object.entries(instance.relationMap)) {
+                    const relationType = instance.relationTypes[field];
+                    const isArray = relationType === "hasMany" || relationType === "belongsToMany";
+                    
+                    let relatedTypeName: string;
+                    if (typeof relatedArcheType === "string") {
+                        relatedTypeName = relatedArcheType;
+                    } else {
+                        const relatedArchetypeId = storage.getComponentId((relatedArcheType as any).name);
+                        const relatedArchetypeMetadata = storage.archetypes.find(
+                            (a) => a.typeId === relatedArchetypeId
+                        );
+                        relatedTypeName = relatedArchetypeMetadata?.name || (relatedArcheType as any).name.replace(/ArcheType$/, "");
+                    }
+                    
+                    if (isArray) {
+                        // Step 1: Add description if it doesn't exist
+                        const hasDescription = new RegExp(`"""Reference to ${relatedTypeName} type"""[\\s\\S]{0,50}${field}:`).test(schemaString);
+                        if (!hasDescription) {
+                            const addDescPattern = new RegExp(
+                                `(type ${archetypeName} \\{[\\s\\S]*?)(\\n\\s+)(${field}:\\s*\\[String!?\\]!?)`,
+                                "g"
+                            );
+                            schemaString = schemaString.replace(
+                                addDescPattern,
+                                `$1$2"""Reference to ${relatedTypeName} type"""$2$3`
+                            );
+                        }
+                        
+                        // Step 2: Replace [String!] with [TypeName!]
+                        const shouldBeRequired = instance.relationOptions[field]?.nullable === false;
+                        const suffix = shouldBeRequired ? "!" : "";
+                        const replacePattern = new RegExp(
+                            `(type ${archetypeName} \\{[\\s\\S]*?${field}:\\s*)\\[String!?\\](!?)`,
                             "g"
                         );
                         schemaString = schemaString.replace(
-                            addDescPattern,
-                            `$1$2"""Reference to ${relatedTypeName} type"""$2$3`
+                            replacePattern,
+                            `$1[${relatedTypeName}!]${suffix}`
+                        );
+                    } else {
+                        // Singular relations already have descriptions from Zod, just replace type
+                        const pattern = new RegExp(
+                            `(type ${archetypeName} \\{[\\s\\S]*?${field}:\\s*)String(!?)`,
+                            "g"
+                        );
+                        const isNullable = instance.relationOptions[field]?.nullable;
+                        const suffix = isNullable ? "" : "!";
+                        schemaString = schemaString.replace(
+                            pattern,
+                            `$1${relatedTypeName}${suffix}`
                         );
                     }
-                    
-                    // Step 2: Replace [String!] with [TypeName!]
-                    const shouldBeRequired = instance.relationOptions[field]?.nullable === false;
-                    const suffix = shouldBeRequired ? "!" : "";
-                    const replacePattern = new RegExp(
-                        `(type ${archetypeName} \\{[\\s\\S]*?${field}:\\s*)\\[String!?\\](!?)`,
-                        "g"
-                    );
-                    schemaString = schemaString.replace(
-                        replacePattern,
-                        `$1[${relatedTypeName}!]${suffix}`
-                    );
-                } else {
-                    // Singular relations already have descriptions from Zod, just replace type
-                    const pattern = new RegExp(
-                        `(type ${archetypeName} \\{[\\s\\S]*?${field}:\\s*)String(!?)`,
-                        "g"
-                    );
-                    const isNullable = instance.relationOptions[field]?.nullable;
-                    const suffix = isNullable ? "" : "!";
-                    schemaString = schemaString.replace(
-                        pattern,
-                        `$1${relatedTypeName}${suffix}`
-                    );
                 }
+            } catch (error) {
+                console.warn(`Could not process relations for archetype ${archetypeMetadata.name}:`, error);
             }
-        } catch (error) {
-            console.warn(`Could not process relations for archetype ${archetypeMetadata.name}:`, error);
         }
-    }
 
-    return schemaString;
+        return schemaString;
+    } catch (error) {
+        console.warn(`Failed to weave all archetypes due to duplicate types: ${error}`);
+        return null;
+    }
 }
 
 // Generate Zod schema for a component and cache it
