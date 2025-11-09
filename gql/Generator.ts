@@ -262,8 +262,14 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
                     let fieldDef = `${name}`;
                     if (input) {
                         const inputName = `${name}Input`;
+                        // Store the original input for validation (before any preprocessing)
+                        let originalInput: any = null;
+                        
                         // Check if input is a Zod schema
                         if (input && typeof input === 'object' && '_def' in input) {
+                            // Store the original input for later traversal and validation
+                            originalInput = input;
+                            
                             // It's a Zod schema - use GQLoom's weave to generate GraphQL type
                             try {
                                 // Add __typename to input zod object, handling optional schemas
@@ -272,6 +278,43 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
                                 if (wasOptional) {
                                     innerInput = input.unwrap();
                                 }
+                                
+                                // Preprocess schema: Replace z.union containing scalar literals with just the literal
+                                // This is needed because GQLoom's weave doesn't handle z.union well
+                                const shape = typeof innerInput._def.shape === 'function' ? innerInput._def.shape() : innerInput._def.shape;
+                                if (shape) {
+                                    const processedShape: any = {};
+                                    for (const [key, value] of Object.entries(shape)) {
+                                        const fieldSchema = value as any;
+                                        const typeName = fieldSchema._def?.typeName || fieldSchema._def?.type;
+                                        
+                                        // Check if it's a union containing a scalar literal
+                                        if (typeName === 'ZodUnion' || typeName === 'union') {
+                                            const options = fieldSchema._def?.options || [];
+                                            let foundScalarLiteral = null;
+                                            
+                                            for (const option of options) {
+                                                const optionTypeName = option._def?.typeName || option._def?.type;
+                                                if (optionTypeName === 'ZodLiteral' || optionTypeName === 'literal') {
+                                                    const value = option._def?.value ?? (option._def?.values ? option._def.values[0] : undefined);
+                                                    if (typeof value === 'string' && scalarTypes.has(value)) {
+                                                        foundScalarLiteral = option;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            
+                                            // Replace union with just the literal for schema generation
+                                            processedShape[key] = foundScalarLiteral || fieldSchema;
+                                        } else {
+                                            processedShape[key] = fieldSchema;
+                                        }
+                                    }
+                                    
+                                    // Create new schema with processed shape
+                                    innerInput = z.object(processedShape);
+                                }
+                                
                                 innerInput = innerInput.extend({ __typename: z.literal(inputName).nullish() });
                                 if (wasOptional) {
                                     input = innerInput.optional();
@@ -297,19 +340,73 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
                                         return `input ${name}Input`;
                                     }
                                 });
-                                        // Update field types for custom types
-                                        inputTypeDefs = inputTypeDefs.replace(/: (\w+)([!\[\]]*)(\s|$)/g, (match, type, suffix, end) => {
-                                            if (typeNames.includes(type)) {
-                                                return `: ${type.endsWith('Input') ? type : type + 'Input'}${suffix}${end}`;
-                                            } else {
-                                                return match;
-                                            }
-                                        });
-                                
-                                // Deduplicate input types - only add if not already defined
+                                // Update field types for custom types
+                                inputTypeDefs = inputTypeDefs.replace(/: (\[?)(\w+)([!\[\]]*)(\s|$)/g, (match, bracketStart, type, suffix, end) => {
+                                    if (typeNames.includes(type)) {
+                                        return `: ${bracketStart}${type.endsWith('Input') ? type : type + 'Input'}${suffix}${end}`;
+                                    } else {
+                                        return match;
+                                    }
+                                });                                // Deduplicate input types - only add if not already defined
                                 const deduplicatedInputTypeDefs = deduplicateInputTypes(inputTypeDefs, definedInputTypes);
                                 typeDefs += deduplicatedInputTypeDefs;
                                 typeDefs += `\n`;
+                                
+                                // Post-process to handle z.literal scalars
+                                // Use the original input before __typename was added
+                                let schemaToTraverse: any = originalInput;
+                                
+                                // Unwrap optional if needed
+                                const defType = (schemaToTraverse._def as any)?.typeName || (schemaToTraverse._def as any)?.type;
+                                if (defType === 'ZodOptional' || defType === 'optional') {
+                                    schemaToTraverse = (schemaToTraverse as any)._def.innerType;
+                                }
+                                
+                                // Find all z.literal fields that match scalar names
+                                const literalFields: Record<string, string> = {};
+                                function traverseZod(obj: any, path: string[] = []) {
+                                    if (!obj || !obj._def) {
+                                        return;
+                                    }
+                                    const typeName = (obj._def as any).typeName || (obj._def as any).type;
+                                    if (typeName === 'ZodLiteral' || typeName === 'literal') {
+                                        // Zod v3 uses 'value', Zod v4 uses 'values' array
+                                        const defObj = obj._def as any;
+                                        const value = defObj.value ?? (defObj.values ? defObj.values[0] : undefined);
+                                        if (typeof value === 'string' && scalarTypes.has(value)) {
+                                            literalFields[path.join('.')] = value;
+                                        }
+                                    } else if (typeName === 'ZodUnion' || typeName === 'union') {
+                                        // Handle z.union - check if any option is a literal scalar
+                                        const options = (obj._def as any).options || [];
+                                        for (const option of options) {
+                                            const optionTypeName = (option._def as any)?.typeName || (option._def as any)?.type;
+                                            if (optionTypeName === 'ZodLiteral' || optionTypeName === 'literal') {
+                                                const defObj = option._def as any;
+                                                const value = defObj.value ?? (defObj.values ? defObj.values[0] : undefined);
+                                                if (typeof value === 'string' && scalarTypes.has(value)) {
+                                                    literalFields[path.join('.')] = value;
+                                                    break; // Found a scalar literal, use it
+                                                }
+                                            }
+                                        }
+                                    } else if (typeName === 'ZodObject' || typeName === 'object') {
+                                        const shape = typeof obj._def.shape === 'function' ? obj._def.shape() : obj._def.shape;
+                                        if (shape) {
+                                            for (const [key, value] of Object.entries(shape)) {
+                                                traverseZod(value, [...path, key]);
+                                            }
+                                        }
+                                    }
+                                }
+                                traverseZod(schemaToTraverse);
+                                
+                                // Replace in typeDefs
+                                for (const [fieldPath, scalarName] of Object.entries(literalFields)) {
+                                    const fieldName = fieldPath.split('.').pop()!;
+                                    typeDefs = typeDefs.replace(new RegExp(`(\\s+${fieldName}:\\s+)String!`, 'g'), `$1${scalarName}!`);
+                                }
+                                
                                 logger.trace(`Successfully generated input types for ${name}`);
                             } catch (error) {
                                 logger.error(`Failed to weave Zod schema for ${name}: ${error}`);
@@ -323,7 +420,10 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
                         }
 
                         // Store the Zod schema for validation if it's a Zod type
-                        const zodSchema = (input && typeof input === 'object' && '_def' in input) ? input as ZodType : null;
+                        // Use originalInput if it exists (to preserve unions), otherwise use input
+                        const zodSchema = (originalInput && typeof originalInput === 'object' && '_def' in originalInput) 
+                            ? originalInput as ZodType 
+                            : (input && typeof input === 'object' && '_def' in input) ? input as ZodType : null;
 
                         // Determine GraphQL input nullability based on Zod schema acceptance of undefined/null
                         // If the Zod schema accepts undefined or null (i.e. is optional/nullable), we omit the '!' for the input param.

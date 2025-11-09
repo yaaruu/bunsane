@@ -5,10 +5,27 @@ import { Entity } from "./Entity";
 import { getMetadataStorage } from "./metadata";
 import { z, ZodObject } from "zod";
 import { weave } from "@gqloom/core";
-import { ZodWeaver, asEnumType, asUnionType } from "@gqloom/zod";
+import { ZodWeaver, asEnumType, asUnionType, asObjectType } from "@gqloom/zod";
 import { printSchema } from "graphql";
 import "reflect-metadata";
-import Query from "./Query";
+import { Query, type FilterSchema } from "../query";
+
+const archetypeFunctionsSymbol = Symbol("archetypeFunctions");
+
+export function ArcheTypeFunction(options?: { returnType?: string }) {
+    return function (target: any, propertyKey: string) {
+        if (!target[archetypeFunctionsSymbol]) {
+            target[archetypeFunctionsSymbol] = [];
+        }
+        target[archetypeFunctionsSymbol].push({ propertyKey, options });
+    };
+}
+
+const InputFilterSchema = z.object({
+    field: z.string(),
+    op: z.string().default("eq"),
+    value: z.string(),
+}).register(asObjectType, { name: "InputFilter" });
 
 const customTypeRegistry = new Map<any, any>();
 const customTypeNameRegistry = new Map<any, string>();
@@ -52,12 +69,15 @@ export function registerCustomZodType(
     }
 }
 
-export function getArchetypeSchema(archetypeName: string) {
-    return archetypeSchemaCache.get(archetypeName);
+export function getArchetypeSchema(archetypeName: string, excludeRelations = false, excludeFunctions = false) {
+    const cacheKey = `${archetypeName}_${excludeRelations}_${excludeFunctions}`;
+    return archetypeSchemaCache.get(cacheKey);
 }
 
 export function getAllArchetypeSchemas() {
-    return Array.from(archetypeSchemaCache.values());
+    return Array.from(archetypeSchemaCache.entries())
+        .filter(([key]) => key.endsWith('_false_false'))
+        .map(([, value]) => value);
 }
 
 export function getRegisteredCustomTypes() {
@@ -69,7 +89,8 @@ export function weaveAllArchetypes() {
     const storage = getMetadataStorage();
     for (const archetypeMetadata of storage.archetypes) {
         const archetypeName = archetypeMetadata.name;
-        if (!archetypeSchemaCache.has(archetypeName)) {
+        const fullSchemaCacheKey = `${archetypeName}_false_false`;
+        if (!archetypeSchemaCache.has(fullSchemaCacheKey)) {
             try {
                 const ArchetypeClass = archetypeMetadata.target as any;
                 const instance = new ArchetypeClass();
@@ -99,6 +120,74 @@ export function weaveAllArchetypes() {
 
     // Post-process: Replace 'id: String' with 'id: ID' for all id fields
     schemaString = schemaString.replace(/\bid:\s*String\b/g, "id: ID");
+
+    // Post-process: Replace relation String fields with proper GraphQL type references
+    // Collect all relation metadata from all archetypes
+    for (const archetypeMetadata of storage.archetypes) {
+        try {
+            const ArchetypeClass = archetypeMetadata.target as any;
+            const instance = new ArchetypeClass();
+            const archetypeName = archetypeMetadata.name;
+            
+            // Process each relation field
+            for (const [field, relatedArcheType] of Object.entries(instance.relationMap)) {
+                const relationType = instance.relationTypes[field];
+                const isArray = relationType === "hasMany" || relationType === "belongsToMany";
+                
+                let relatedTypeName: string;
+                if (typeof relatedArcheType === "string") {
+                    relatedTypeName = relatedArcheType;
+                } else {
+                    const relatedArchetypeId = storage.getComponentId((relatedArcheType as any).name);
+                    const relatedArchetypeMetadata = storage.archetypes.find(
+                        (a) => a.typeId === relatedArchetypeId
+                    );
+                    relatedTypeName = relatedArchetypeMetadata?.name || (relatedArcheType as any).name.replace(/ArcheType$/, "");
+                }
+                
+                if (isArray) {
+                    // Step 1: Add description if it doesn't exist
+                    const hasDescription = new RegExp(`"""Reference to ${relatedTypeName} type"""[\\s\\S]{0,50}${field}:`).test(schemaString);
+                    if (!hasDescription) {
+                        const addDescPattern = new RegExp(
+                            `(type ${archetypeName} \\{[\\s\\S]*?)(\\n\\s+)(${field}:\\s*\\[String!?\\]!?)`,
+                            "g"
+                        );
+                        schemaString = schemaString.replace(
+                            addDescPattern,
+                            `$1$2"""Reference to ${relatedTypeName} type"""$2$3`
+                        );
+                    }
+                    
+                    // Step 2: Replace [String!] with [TypeName!]
+                    const shouldBeRequired = instance.relationOptions[field]?.nullable === false;
+                    const suffix = shouldBeRequired ? "!" : "";
+                    const replacePattern = new RegExp(
+                        `(type ${archetypeName} \\{[\\s\\S]*?${field}:\\s*)\\[String!?\\](!?)`,
+                        "g"
+                    );
+                    schemaString = schemaString.replace(
+                        replacePattern,
+                        `$1[${relatedTypeName}!]${suffix}`
+                    );
+                } else {
+                    // Singular relations already have descriptions from Zod, just replace type
+                    const pattern = new RegExp(
+                        `(type ${archetypeName} \\{[\\s\\S]*?${field}:\\s*)String(!?)`,
+                        "g"
+                    );
+                    const isNullable = instance.relationOptions[field]?.nullable;
+                    const suffix = isNullable ? "" : "!";
+                    schemaString = schemaString.replace(
+                        pattern,
+                        `$1${relatedTypeName}${suffix}`
+                    );
+                }
+            }
+        } catch (error) {
+            console.warn(`Could not process relations for archetype ${archetypeMetadata.name}:`, error);
+        }
+    }
 
     return schemaString;
 }
@@ -429,6 +518,7 @@ export class BaseArcheType {
     public unionMap: Record<string, (new (...args: any[]) => BaseComponent)[]> =
         {};
     protected unionOptions: Record<string, ArcheTypeFieldOptions> = {};
+    public functions: Array<{ propertyKey: string; options?: { returnType?: string } }> = [];
 
     public resolver?: {
         fields: Record<string, ArcheTypeResolver>;
@@ -478,6 +568,9 @@ export class BaseArcheType {
                 if (options) this.relationOptions[fieldName] = options;
             }
         }
+
+        // Collect archetype functions
+        this.functions = this.constructor.prototype[archetypeFunctionsSymbol] || [];
     }
 
     // constructor(components: Array<new (...args: any[]) => BaseComponent>) {
@@ -1263,6 +1356,17 @@ export class BaseArcheType {
             }
         }
 
+        // Generate resolvers for archetype functions
+        for (const { propertyKey } of this.functions) {
+            resolvers.push({
+                typeName: archetypeName,
+                fieldName: propertyKey,
+                resolver: (parent: Entity) => {
+                    return (this as any)[propertyKey](parent);
+                },
+            });
+        }
+
         return resolvers;
     }
 
@@ -1304,8 +1408,9 @@ export class BaseArcheType {
         }
     }
 
-    public getZodObjectSchema(options?: { excludeRelations?: boolean }): ZodObject<any> {
+    public getZodObjectSchema(options?: { excludeRelations?: boolean; excludeFunctions?: boolean }): ZodObject<any> {
         const excludeRelations = options?.excludeRelations ?? false;
+        const excludeFunctions = options?.excludeFunctions ?? false;
         const zodShapes: Record<string, any> = {};
         const storage = getMetadataStorage();
         const unionSchemas: Array<{
@@ -1463,19 +1568,55 @@ export class BaseArcheType {
                 // For GraphQL relations, we just store the type name as a string reference
                 // The GraphQL schema will use the type name directly, and the full type definition
                 // will be generated when each archetype's getZodObjectSchema() is called
+                
+                // For singular relations, add description to the string schema
                 const relatedTypeSchema = z
                     .string()
                     .describe(`Reference to ${relatedTypeName} type`);
 
                 if (isArray) {
-                    zodShapes[field] = z.array(relatedTypeSchema);
+                    // HasMany and BelongsToMany should be optional by default (nullable array)
+                    // unless explicitly marked as required via nullable: false
+                    const shouldBeRequired = this.relationOptions[field]?.nullable === false;
+                    // For array relations, the description on the inner string won't show up in GraphQL
+                    // We need to store metadata about this being a relation for post-processing
+                    zodShapes[field] = shouldBeRequired 
+                        ? z.array(relatedTypeSchema) 
+                        : z.array(relatedTypeSchema).optional();
                 } else {
                     zodShapes[field] = relatedTypeSchema;
+                    
+                    // For singular relations, apply nullable option
+                    if (this.relationOptions[field]?.nullable) {
+                        zodShapes[field] = zodShapes[field].nullish();
+                    }
                 }
+            }
+        }
 
-                if (this.relationOptions[field]?.nullable) {
-                    zodShapes[field] = zodShapes[field].nullish();
+        // Process archetype functions
+        if (!excludeFunctions) {
+            for (const { propertyKey, options } of this.functions) {
+                let zodType;
+                if (options?.returnType === 'number') {
+                    zodType = z.number();
+                } else if (options?.returnType === 'string') {
+                    zodType = z.string();
+                } else if (options?.returnType === 'boolean') {
+                    zodType = z.boolean();
+                } else {
+                    const returnType = Reflect.getMetadata("design:returntype", this.constructor.prototype, propertyKey);
+                    if (returnType === String) {
+                        zodType = z.string();
+                    } else if (returnType === Number) {
+                        zodType = z.number();
+                    } else if (returnType === Boolean) {
+                        zodType = z.boolean();
+                    } else {
+                        zodType = z.any();
+                    }
                 }
+                zodShapes[propertyKey] = zodType.optional();
             }
         }
 
@@ -1554,15 +1695,32 @@ export class BaseArcheType {
 
             // Replace the String field with proper GraphQL type reference
             if (isArray) {
-                const isNullable = this.relationOptions[field]?.nullable;
-                const suffix = isNullable ? "" : "!";
-                const pattern = new RegExp(
-                    `${field}:\\s*\\[String!?\\]!?`,
+                // For arrays: should be required only if explicitly set nullable: false
+                const shouldBeRequired = this.relationOptions[field]?.nullable === false;
+                const suffix = shouldBeRequired ? "!" : "";
+                
+                // Step 1: Add description comment if it doesn't exist
+                const descriptionPattern = new RegExp(`"""Reference to ${relatedTypeName} type"""[\\s\\S]*?${field}:`);
+                if (!descriptionPattern.test(graphqlSchemaString)) {
+                    // Add description before the field
+                    const addDescriptionPattern = new RegExp(
+                        `(\\n\\s+)(${field}:\\s*\\[String!?\\]!?)`,
+                        "g"
+                    );
+                    graphqlSchemaString = graphqlSchemaString.replace(
+                        addDescriptionPattern,
+                        `$1"""Reference to ${relatedTypeName} type"""\n$1$2`
+                    );
+                }
+                
+                // Step 2: Replace [String!] or [String] with [TypeName!]
+                const replaceTypePattern = new RegExp(
+                    `(${field}:\\s*)\\[String!?\\](!?)`,
                     "g"
                 );
                 graphqlSchemaString = graphqlSchemaString.replace(
-                    pattern,
-                    `${field}: [${relatedTypeName}!]${suffix}`
+                    replaceTypePattern,
+                    `$1[${relatedTypeName}!]${suffix}`
                 );
             } else {
                 const isNullable = this.relationOptions[field]?.nullable;
@@ -1578,7 +1736,8 @@ export class BaseArcheType {
         // console.log("WeavedSchema:", graphqlSchemaString);
 
         // Cache the schema for this archetype
-        archetypeSchemaCache.set(nameFromStorage, {
+        const cacheKey = `${nameFromStorage}_${excludeRelations}_${excludeFunctions}`;
+        archetypeSchemaCache.set(cacheKey, {
             zodSchema: r,
             graphqlSchema: graphqlSchemaString,
         });
@@ -1590,27 +1749,129 @@ export class BaseArcheType {
     }
 
     /**
-     * Get a Zod schema suitable for GraphQL input types (excludes relations)
+     * Get a Zod schema suitable for GraphQL input types (excludes relations and functions)
      */
     public getInputSchema(): ZodObject<any> {
-        return this.getZodObjectSchema({ excludeRelations: true });
+        return this.getZodObjectSchema({ excludeRelations: true, excludeFunctions: true });
+    }
+
+    /**
+     * Apply validations to specific fields in the input schema
+     * @param validations - Object mapping field paths to Zod schemas or refinement functions
+     * @returns Modified Zod schema with validations applied
+     * 
+     * @example
+     * archetype.withValidation({
+     *   name: z.string().min(3),
+     *   'info.label': z.string().min(3)
+     * })
+     */
+    public withValidation(validations: Record<string, any>): ZodObject<any> {
+        const baseSchema = this.getInputSchema();
+        const shape = { ...baseSchema.shape };
+
+        for (const [path, validation] of Object.entries(validations)) {
+            if (path.includes('.')) {
+                // Handle nested fields like 'info.label'
+                const [field, ...nestedPath] = path.split('.');
+                
+                if (shape[field!]) {
+                    const currentField = shape[field!];
+                    
+                    // Check if it's an optional field and unwrap it
+                    const isOptional = currentField._def?.typeName === 'ZodOptional';
+                    const innerSchema = isOptional ? currentField.unwrap() : currentField;
+                    
+                    // Check if it's a ZodObject - handle both typeName and type property
+                    const isZodObject = innerSchema._def?.typeName === 'ZodObject' || 
+                                       innerSchema._def?.type === 'object' || 
+                                       innerSchema.type === 'object';
+                    
+                    if (isZodObject && innerSchema.shape) {
+                        // Deep clone the nested shape to avoid mutations
+                        const nestedShape = { ...innerSchema.shape };
+                        
+                        // Apply validation to the nested field
+                        if (nestedPath.length === 1 && nestedShape[nestedPath[0]!]) {
+                            nestedShape[nestedPath[0]!] = validation;
+                        } else if (nestedPath.length > 1) {
+                            // Handle deeper nesting (e.g., 'info.data.label')
+                            let current = nestedShape;
+                            for (let i = 0; i < nestedPath.length - 1; i++) {
+                                const key = nestedPath[i]!;
+                                if (current[key] && current[key]._def?.typeName === 'ZodObject') {
+                                    current[key] = { ...current[key].shape };
+                                    current = current[key];
+                                }
+                            }
+                            const lastKey = nestedPath[nestedPath.length - 1]!;
+                            if (current[lastKey]) {
+                                current[lastKey] = validation;
+                            }
+                        }
+                        
+                        const newNestedSchema = z.object(nestedShape);
+                        // Preserve the optionality of the parent object
+                        shape[field!] = isOptional ? newNestedSchema.optional() : newNestedSchema;
+                    }
+                }
+            } else {
+                // Handle top-level fields - directly replace with the validation
+                shape[path] = validation;
+            }
+        }
+
+        return z.object(shape);
     }
 
     public getFilterSchema(): ZodObject<any> {
-        const baseSchema = this.getZodObjectSchema({ excludeRelations: true });
+        const baseSchema = this.getZodObjectSchema({ excludeRelations: true, excludeFunctions: true });
         const filterShape: Record<string, any> = {};
         for (const key of Object.keys(baseSchema.shape)) {
             // Only include fields that are explicitly set to filterable: true
             const isFilterable = this.fieldOptions[key]?.filterable === true || this.unionOptions[key]?.filterable === true;
             if (isFilterable) {
-                filterShape[key] = z.object({
-                    field: z.string().default(key),
-                    op: z.string().default("eq"),
-                    value: z.string(),
-                }).optional();
+                filterShape[key] = InputFilterSchema.optional();
             }
         }
-        return z.object(filterShape);
+        const filterSchema = z.object(filterShape);
+        return filterSchema;
+    }
+
+    public buildFilterBranches(filter?: FilterSchema<any>): any[] {
+        if (!filter) return [];
+        const branches = [];
+
+        for (const [fieldName, componentCtor] of Object.entries(this.componentMap)) {
+            const fieldOption = this.fieldOptions[fieldName];
+            if (fieldOption?.filterable && filter[fieldName]?.value) {
+                const filterPart = filter[fieldName];
+                const defaultField = this.getDefaultFilterField(componentCtor);
+                const operator = filterPart.op ? Query.filterOp[(filterPart.op.toUpperCase() as keyof typeof Query.filterOp)] : Query.filterOp.LIKE;
+
+                branches.push({
+                    component: componentCtor,
+                    filters: [
+                        {
+                            field: filterPart.field || defaultField,
+                            operator,
+                            value: operator === Query.filterOp.LIKE ? `%${filterPart.value}%` : filterPart.value,
+                        },
+                    ],
+                });
+            }
+        }
+
+        return branches;
+    }
+
+    private getDefaultFilterField(componentCtor: any): string {
+        const storage = getMetadataStorage();
+        const typeId = storage.getComponentId(componentCtor.name);
+        const props = storage.getComponentProperties(typeId);
+        const hasValue = props.some(p => p.propertyKey === 'value');
+        const hasLabel = props.some(p => p.propertyKey === 'label');
+        return hasValue ? 'value' : hasLabel ? 'label' : props[0]?.propertyKey || 'value';
     }
 }
 

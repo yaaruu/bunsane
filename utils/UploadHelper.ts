@@ -30,6 +30,7 @@ export class UploadHelper {
                 // Create and attach upload component
                 const uploadComponent = new UploadComponent();
                 uploadComponent.setUploadData({
+                    success: result.success,
                     uploadId: result.uploadId,
                     fileName: result.fileName!,
                     originalFileName: result.originalFileName!,
@@ -83,6 +84,7 @@ export class UploadHelper {
                 // Attach upload component to entity
                 const uploadComponent = new UploadComponent();
                 uploadComponent.setUploadData({
+                    success: result.success,
                     uploadId: result.uploadId!,
                     fileName: result.fileName!,
                     originalFileName: result.originalFileName!,
@@ -227,6 +229,7 @@ export class UploadHelper {
                     // Create new upload component for target entity
                     const newUpload = new UploadComponent();
                     newUpload.setUploadData({
+                        success: true,
                         uploadId: targetEntity.id,
                         fileName: sourceUpload.fileName,
                         originalFileName: sourceUpload.originalFileName,
@@ -253,6 +256,7 @@ export class UploadHelper {
                     // Remove from source and add to target
                     const newUpload = new UploadComponent();
                     newUpload.setUploadData({
+                        success: true,
                         uploadId: targetEntity.id,
                         fileName: sourceUpload.fileName,
                         originalFileName: sourceUpload.originalFileName,
@@ -301,6 +305,22 @@ export class UploadHelper {
             
         } catch (error) {
             logger.warn(`Failed to add image metadata: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+    }
+
+    static async deleteFile(path: string): Promise<boolean> {
+        try {
+            const provider = this.uploadManager.getStorageProvider();
+            const success = await provider.delete(path);
+            if (success) {
+                logger.info(`Deleted file at path: ${path}`);
+            } else {
+                logger.warn(`File at path ${path} not found for deletion`);
+            }
+            return success;
+        } catch (error) {
+            logger.error(`Failed to delete file at path ${path}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            return false;
         }
     }
 }

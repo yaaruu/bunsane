@@ -127,11 +127,6 @@ export class BaseComponent {
         const props = storage.componentProperties.get(this._typeId);
         if(!props) return [];
         return props.map(p => p.propertyKey);
-        //
-        // return Object.keys(this).filter(prop => {
-        //     const meta = Reflect.getMetadata("compData", Object.getPrototypeOf(this), prop);
-        //     return meta && meta.isData;
-        // });
     }
 
     /**
