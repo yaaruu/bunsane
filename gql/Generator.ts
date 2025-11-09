@@ -134,6 +134,62 @@ function deduplicateInputTypes(inputTypeDefs: string, definedTypes: Set<string>)
 }
 
 /**
+ * Deduplicate all type definitions in the typeDefs string.
+ * @param typeDefs - The type definitions string to deduplicate
+ * @returns Deduplicated type definitions
+ */
+function deduplicateTypeDefs(typeDefs: string): string {
+    const lines = typeDefs.split('\n');
+    const typeDefinitions = new Map<string, string>();
+    let currentType = '';
+    let currentTypeName = '';
+    let inTypeDefinition = false;
+
+    for (const line of lines) {
+        const trimmed = line.trim();
+        const typeMatch = trimmed.match(/^(type|input|enum|scalar|interface|union)\s+(\w+)/);
+        
+        if (typeMatch) {
+            // Save previous type if we were in one
+            if (inTypeDefinition && currentTypeName && !typeDefinitions.has(currentTypeName)) {
+                typeDefinitions.set(currentTypeName, currentType);
+            }
+            
+            // Start new type
+            currentTypeName = typeMatch[2] || '';
+            currentType = line + '\n';
+            inTypeDefinition = true;
+        } else if (inTypeDefinition) {
+            currentType += line + '\n';
+            
+            // Check if this is the closing brace
+            if (trimmed === '}') {
+                if (!typeDefinitions.has(currentTypeName)) {
+                    typeDefinitions.set(currentTypeName, currentType);
+                }
+                currentType = '';
+                currentTypeName = '';
+                inTypeDefinition = false;
+            }
+        } else {
+            // Other lines, like comments or empty lines
+            if (!typeDefinitions.has('__other')) {
+                typeDefinitions.set('__other', '');
+            }
+            typeDefinitions.set('__other', typeDefinitions.get('__other')! + line + '\n');
+        }
+    }
+    
+    // Handle last type if file doesn't end with closing brace
+    if (inTypeDefinition && currentTypeName && !typeDefinitions.has(currentTypeName)) {
+        typeDefinitions.set(currentTypeName, currentType);
+    }
+
+    const result = Array.from(typeDefinitions.values()).join('');
+    return result;
+}
+
+/**
  * Helper function to get the registered GraphQL type name from an archetype instance.
  * This respects the custom name set via @ArcheType("CustomName") decorator.
  * Falls back to inferring from class name if not found in registry.
@@ -574,6 +630,9 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
 
     logger.trace(`Query fields count: ${queryFields.length}, Mutation fields count: ${mutationFields.length}`);
     logger.trace(`System Type Defs: ${typeDefs}`);
+    // Deduplicate type definitions to prevent duplicate type errors
+    typeDefs = deduplicateTypeDefs(typeDefs);
+    logger.trace(`Deduplicated Type Defs: ${typeDefs}`);
     let schema : GraphQLSchema | null = null;
     // Check if typeDefs contains actual schema definitions, not just whitespace
     if(typeDefs.trim() !== "" && (queryFields.length > 0 || mutationFields.length > 0 || scalarTypes.size > 0))  {
