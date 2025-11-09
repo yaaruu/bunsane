@@ -1,4 +1,4 @@
-import { getAllArchetypeSchemas, getArchetypeSchema } from "../core/ArcheType";
+import { getAllArchetypeSchemas, getArchetypeSchema, weaveAllArchetypes } from "../core/ArcheType";
 import { logger as MainLogger } from "../core/Logger";
 
 const logger = MainLogger.child({ scope: "ArchetypeOperations" });
@@ -25,9 +25,6 @@ export function generateArchetypeOperations(config: ArchetypeOperationConfig = {
         enableMutations = { create: true, update: true, delete: true }
     } = config;
 
-    const schemas = getAllArchetypeSchemas();
-    logger.trace(`getAllArchetypeSchemas returned ${schemas.length} schemas`);
-    
     let typeDefs = "\n# Auto-generated Archetype Types\n";
     const queryFields: string[] = [];
     const mutationFields: string[] = [];
@@ -36,23 +33,39 @@ export function generateArchetypeOperations(config: ArchetypeOperationConfig = {
     // Track defined types to prevent duplicates
     const definedTypes = new Set<string>();
 
-    schemas.forEach(({ zodSchema, graphqlSchema }) => {
-        // Extract archetype name from the schema
-        const archetypeName = extractArchetypeName(graphqlSchema);
-        if (!archetypeName) {
-            logger.warn(`Could not extract archetype name from schema: ${graphqlSchema.substring(0, 100)}`);
-            return;
-        }
-
-        logger.trace(`Generating operations for archetype: ${archetypeName}`);
-
-        // Add the archetype type definition (without Query/Mutation)
-        // Extract and deduplicate type definitions
-        const typeDefinitions = extractTypeDefinitions(graphqlSchema);
+    // Get the full weaved schema that includes all archetypes and their relations
+    const fullSchema = weaveAllArchetypes();
+    if (fullSchema) {
+        logger.trace(`Using full weaved schema for type definitions`);
+        // Extract and deduplicate type definitions from the full schema
+        const typeDefinitions = extractTypeDefinitions(fullSchema);
         const deduplicatedTypes = deduplicateTypeDefinitions(typeDefinitions, definedTypes);
-        logger.trace(`Adding ${deduplicatedTypes.length} characters of type definitions for ${archetypeName}`);
+        logger.trace(`Adding ${deduplicatedTypes.length} characters of type definitions`);
         typeDefs += deduplicatedTypes;
-    });
+    } else {
+        logger.warn(`No full schema available, falling back to individual schemas`);
+        // Fallback to individual schemas if weaving fails
+        const schemas = getAllArchetypeSchemas();
+        logger.trace(`getAllArchetypeSchemas returned ${schemas.length} schemas`);
+        
+        schemas.forEach(({ zodSchema, graphqlSchema }) => {
+            // Extract archetype name from the schema
+            const archetypeName = extractArchetypeName(graphqlSchema);
+            if (!archetypeName) {
+                logger.warn(`Could not extract archetype name from schema: ${graphqlSchema.substring(0, 100)}`);
+                return;
+            }
+
+            logger.trace(`Generating operations for archetype: ${archetypeName}`);
+
+            // Add the archetype type definition (without Query/Mutation)
+            // Extract and deduplicate type definitions
+            const typeDefinitions = extractTypeDefinitions(graphqlSchema);
+            const deduplicatedTypes = deduplicateTypeDefinitions(typeDefinitions, definedTypes);
+            logger.trace(`Adding ${deduplicatedTypes.length} characters of type definitions for ${archetypeName}`);
+            typeDefs += deduplicatedTypes;
+        });
+    }
 
     typeDefs += "\n# END AUTO-GENERATED TYPES\n";
     logger.trace(`Final typeDefs length: ${typeDefs.length}`);

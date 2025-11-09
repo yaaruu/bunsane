@@ -69,12 +69,15 @@ export function registerCustomZodType(
     }
 }
 
-export function getArchetypeSchema(archetypeName: string) {
-    return archetypeSchemaCache.get(archetypeName);
+export function getArchetypeSchema(archetypeName: string, excludeRelations = false, excludeFunctions = false) {
+    const cacheKey = `${archetypeName}_${excludeRelations}_${excludeFunctions}`;
+    return archetypeSchemaCache.get(cacheKey);
 }
 
 export function getAllArchetypeSchemas() {
-    return Array.from(archetypeSchemaCache.values());
+    return Array.from(archetypeSchemaCache.entries())
+        .filter(([key]) => key.endsWith('_false_false'))
+        .map(([, value]) => value);
 }
 
 export function getRegisteredCustomTypes() {
@@ -86,7 +89,8 @@ export function weaveAllArchetypes() {
     const storage = getMetadataStorage();
     for (const archetypeMetadata of storage.archetypes) {
         const archetypeName = archetypeMetadata.name;
-        if (!archetypeSchemaCache.has(archetypeName)) {
+        const fullSchemaCacheKey = `${archetypeName}_false_false`;
+        if (!archetypeSchemaCache.has(fullSchemaCacheKey)) {
             try {
                 const ArchetypeClass = archetypeMetadata.target as any;
                 const instance = new ArchetypeClass();
@@ -116,6 +120,11 @@ export function weaveAllArchetypes() {
 
     // Post-process: Replace 'id: String' with 'id: ID' for all id fields
     schemaString = schemaString.replace(/\bid:\s*String\b/g, "id: ID");
+
+    // Post-process: Replace relation String fields with proper GraphQL type references
+    schemaString = schemaString.replace(/  """Reference to (\w+) type"""\s*  (\w+):\s*String([!\[\]]*)/g, (match, typeName, field, suffix) => {
+        return `  """Reference to ${typeName} type"""\n  ${field}: ${typeName}${suffix}`;
+    });
 
     return schemaString;
 }
@@ -1637,7 +1646,8 @@ export class BaseArcheType {
         // console.log("WeavedSchema:", graphqlSchemaString);
 
         // Cache the schema for this archetype
-        archetypeSchemaCache.set(nameFromStorage, {
+        const cacheKey = `${nameFromStorage}_${excludeRelations}_${excludeFunctions}`;
+        archetypeSchemaCache.set(cacheKey, {
             zodSchema: r,
             graphqlSchema: graphqlSchemaString,
         });

@@ -264,6 +264,9 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
                         const inputName = `${name}Input`;
                         // Check if input is a Zod schema
                         if (input && typeof input === 'object' && '_def' in input) {
+                            // Store the original input for later traversal
+                            const originalInput = input;
+                            
                             // It's a Zod schema - use GQLoom's weave to generate GraphQL type
                             try {
                                 // Add __typename to input zod object, handling optional schemas
@@ -308,6 +311,48 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
                                 const deduplicatedInputTypeDefs = deduplicateInputTypes(inputTypeDefs, definedInputTypes);
                                 typeDefs += deduplicatedInputTypeDefs;
                                 typeDefs += `\n`;
+                                
+                                // Post-process to handle z.literal scalars
+                                // Use the original input before __typename was added
+                                let schemaToTraverse: any = originalInput;
+                                
+                                // Unwrap optional if needed
+                                const defType = (schemaToTraverse._def as any)?.typeName || (schemaToTraverse._def as any)?.type;
+                                if (defType === 'ZodOptional' || defType === 'optional') {
+                                    schemaToTraverse = (schemaToTraverse as any)._def.innerType;
+                                }
+                                
+                                // Find all z.literal fields that match scalar names
+                                const literalFields: Record<string, string> = {};
+                                function traverseZod(obj: any, path: string[] = []) {
+                                    if (!obj || !obj._def) {
+                                        return;
+                                    }
+                                    const typeName = (obj._def as any).typeName || (obj._def as any).type;
+                                    if (typeName === 'ZodLiteral' || typeName === 'literal') {
+                                        // Zod v3 uses 'value', Zod v4 uses 'values' array
+                                        const defObj = obj._def as any;
+                                        const value = defObj.value ?? (defObj.values ? defObj.values[0] : undefined);
+                                        if (typeof value === 'string' && scalarTypes.has(value)) {
+                                            literalFields[path.join('.')] = value;
+                                        }
+                                    } else if (typeName === 'ZodObject' || typeName === 'object') {
+                                        const shape = typeof obj._def.shape === 'function' ? obj._def.shape() : obj._def.shape;
+                                        if (shape) {
+                                            for (const [key, value] of Object.entries(shape)) {
+                                                traverseZod(value, [...path, key]);
+                                            }
+                                        }
+                                    }
+                                }
+                                traverseZod(schemaToTraverse);
+                                
+                                // Replace in typeDefs
+                                for (const [fieldPath, scalarName] of Object.entries(literalFields)) {
+                                    const fieldName = fieldPath.split('.').pop()!;
+                                    typeDefs = typeDefs.replace(new RegExp(`(\\s+${fieldName}:\\s+)String!`, 'g'), `$1${scalarName}!`);
+                                }
+                                
                                 logger.trace(`Successfully generated input types for ${name}`);
                             } catch (error) {
                                 logger.error(`Failed to weave Zod schema for ${name}: ${error}`);

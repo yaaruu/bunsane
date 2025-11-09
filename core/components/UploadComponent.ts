@@ -1,5 +1,5 @@
 import { BaseComponent, Component, CompData } from "../Components";
-import type { UploadComponentData } from "../../types/upload.types";
+import type { UploadResult } from "../../types/upload.types";
 
 /**
  * UploadComponent - Stores file upload metadata in entities
@@ -37,15 +37,15 @@ export class UploadComponent extends BaseComponent {
     /**
      * Set upload data from UploadResult
      */
-    public setUploadData(data: UploadComponentData): void {
-        this.uploadId = data.uploadId;
-        this.fileName = data.fileName;
-        this.originalFileName = data.originalFileName;
-        this.mimeType = data.mimeType;
-        this.size = data.size;
-        this.path = data.path;
-        this.url = data.url;
-        this.uploadedAt = data.uploadedAt;
+    public setUploadData(data: UploadResult): void {
+        this.uploadId = data.uploadId ?? "";
+        this.fileName = data.fileName ?? "";
+        this.originalFileName = data.originalFileName ?? "";
+        this.mimeType = data.mimeType ?? "";
+        this.size = data.size ?? 0;
+        this.path = data.path ?? "";
+        this.url = data.url ?? "";
+        this.uploadedAt = new Date().toISOString();
         this.metadata = JSON.stringify(data.metadata || {});
     }
 
