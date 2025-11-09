@@ -1660,7 +1660,7 @@ export class BaseArcheType {
         }
 
         // Weave archetype schema along with its component schemas
-        const schemasToWeave = [r, ...componentSchemasToWeave];
+        const schemasToWeave = [r];
         const schema = weave(ZodWeaver, ...schemasToWeave);
         let graphqlSchemaString = printSchema(schema);
 
