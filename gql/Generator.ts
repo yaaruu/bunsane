@@ -3,7 +3,7 @@ import { createSchema } from "graphql-yoga";
 import { logger as MainLogger } from "core/Logger";
 import type { GraphQLType } from "./helpers";
 import { generateArchetypeOperations } from "./ArchetypeOperations";
-import { getArchetypeSchema } from "../core/ArcheType";
+import { getArchetypeSchema, weaveAllArchetypes, getAllArchetypeSchemas } from "../core/ArcheType";
 import BaseArcheType from "../core/ArcheType";
 import { getMetadataStorage } from "../core/metadata";
 import type { BaseService } from "service";
@@ -236,6 +236,63 @@ function getArchetypeTypeName(archetypeInstance: any): string | null {
     return inferredName;
 }
 
+/**
+ * Extract type definitions from a GraphQL schema string.
+ * @param schemaString - The GraphQL schema string
+ * @returns Array of type definition strings
+ */
+function extractTypeDefinitions(schemaString: string): string[] {
+    const lines = schemaString.split('\n');
+    const typeDefinitions: string[] = [];
+    let currentType = '';
+    let inTypeDefinition = false;
+
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('type ') || trimmed.startsWith('input ') || trimmed.startsWith('enum ') || trimmed.startsWith('scalar ') || trimmed.startsWith('interface ') || trimmed.startsWith('union ')) {
+            if (inTypeDefinition) {
+                typeDefinitions.push(currentType);
+            }
+            currentType = line + '\n';
+            inTypeDefinition = true;
+        } else if (inTypeDefinition) {
+            currentType += line + '\n';
+            if (trimmed === '}') {
+                typeDefinitions.push(currentType);
+                currentType = '';
+                inTypeDefinition = false;
+            }
+        }
+    }
+    if (inTypeDefinition) {
+        typeDefinitions.push(currentType);
+    }
+    return typeDefinitions;
+}
+
+/**
+ * Deduplicate type definitions by name.
+ * @param typeDefinitions - Array of type definition strings
+ * @param definedTypes - Set to track defined type names
+ * @returns Deduplicated type definitions as a single string
+ */
+function deduplicateTypeDefinitions(typeDefinitions: string[], definedTypes: Set<string>): string {
+    const result: string[] = [];
+    for (const typeDef of typeDefinitions) {
+        const match = typeDef.match(/(?:type|input|enum|scalar|interface|union)\s+(\w+)/);
+        if (match) {
+            const typeName = match[1];
+            if (typeName && !definedTypes.has(typeName)) {
+                result.push(typeDef);
+                definedTypes.add(typeName);
+            }
+        } else {
+            result.push(typeDef);
+        }
+    }
+    return result.join('');
+}
+
 export function generateGraphQLSchema(services: any[], options?: { enableArchetypeOperations?: boolean }): { schema: GraphQLSchema | null; resolvers: any } {
     logger.trace(`generateGraphQLSchema called with ${services.length} services`);
     let typeDefs = `
@@ -267,6 +324,19 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
         }
     });
     logger.trace(`Completed pre-generation of archetype schemas`);
+
+    // Add archetype types first
+    const fullSchema = weaveAllArchetypes();
+    if (fullSchema) {
+        const typeDefinitions = extractTypeDefinitions(fullSchema);
+        typeDefs += deduplicateTypeDefs(typeDefinitions.join(''));
+    } else {
+        const schemas = getAllArchetypeSchemas();
+        for (const { graphqlSchema } of schemas) {
+            const typeDefinitions = extractTypeDefinitions(graphqlSchema);
+            typeDefs += deduplicateTypeDefs(typeDefinitions.join(''));
+        }
+    }
 
     // Generate archetype operations if enabled
     if (options?.enableArchetypeOperations !== false) {
