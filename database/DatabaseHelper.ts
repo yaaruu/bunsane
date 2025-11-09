@@ -259,6 +259,44 @@ export const CreateEntityComponentTable = async () => {
     await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_type_entity_deleted ON entity_components (type_id, entity_id, deleted_at)`;
     await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_deleted_type ON entity_components (deleted_at, type_id) WHERE deleted_at IS NULL`;
     await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_component_id ON entity_components (component_id)`;
+    
+    // Add component_id column if it doesn't exist (for backward compatibility)
+    try {
+        await db`ALTER TABLE entity_components ADD COLUMN IF NOT EXISTS component_id UUID`;
+        
+        // Populate component_id for existing rows that don't have it set
+        await db`UPDATE entity_components 
+                 SET component_id = c.id 
+                 FROM components c 
+                 WHERE entity_components.entity_id = c.entity_id 
+                 AND entity_components.type_id = c.type_id 
+                 AND entity_components.component_id IS NULL`;
+        
+        logger.info(`Added component_id column to entity_components table and populated existing data`);
+    } catch (error) {
+        logger.warn(`Could not add component_id column to entity_components table: ${error}`);
+    }
+}
+
+export const EnsureDatabaseMigrations = async () => {
+    logger.trace(`Checking for database migrations...`);
+    
+    // Check if entity_components table has component_id column
+    try {
+        const columnCheck = await db`SELECT column_name FROM information_schema.columns 
+                                     WHERE table_name = 'entity_components' 
+                                     AND column_name = 'component_id' 
+                                     AND table_schema = 'public'`;
+        
+        if (columnCheck.length === 0) {
+            logger.info(`entity_components table missing component_id column, running migration...`);
+            await CreateEntityComponentTable();
+        } else {
+            logger.trace(`entity_components table has component_id column`);
+        }
+    } catch (error) {
+        logger.error(`Failed to check for component_id column: ${error}`);
+    }
 }
 
 export const GenerateTableName = (name: string) => `components_${name.toLowerCase().replace(/\s+/g, '_')}`;

@@ -1,5 +1,5 @@
 import ApplicationLifecycle, {ApplicationPhase} from "core/ApplicationLifecycle";
-import { GenerateTableName, HasValidBaseTable, PrepareDatabase, UpdateComponentIndexes } from "database/DatabaseHelper";
+import { GenerateTableName, HasValidBaseTable, PrepareDatabase, UpdateComponentIndexes, EnsureDatabaseMigrations } from "database/DatabaseHelper";
 import ComponentRegistry from "core/ComponentRegistry";
 import { logger as MainLogger } from "core/Logger";
 const logger = MainLogger.child({ scope: "App" });
@@ -175,6 +175,9 @@ export default class App {
         if(ApplicationLifecycle.getCurrentPhase() === ApplicationPhase.DATABASE_INITIALIZING) {
             if(!await HasValidBaseTable()) {
                 await PrepareDatabase();
+            } else {
+                // Check for missing columns and run migrations
+                await EnsureDatabaseMigrations();
             }
             logger.trace(`Database prepared...`);
             ApplicationLifecycle.setPhase(ApplicationPhase.DATABASE_READY);
