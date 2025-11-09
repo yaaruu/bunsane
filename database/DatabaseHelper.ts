@@ -68,6 +68,7 @@ export const PrepareDatabase = async () => {
     }
     try {
         await CreateEntityComponentTable();
+        await PopulateComponentIds();
     } catch (error) {
         logger.error(`Failed to create entity component table: ${error}`);
         throw error;
@@ -263,7 +264,14 @@ export const CreateEntityComponentTable = async () => {
     // Add component_id column if it doesn't exist (for backward compatibility)
     try {
         await db`ALTER TABLE entity_components ADD COLUMN IF NOT EXISTS component_id UUID`;
-        
+        logger.info(`Added component_id column to entity_components table`);
+    } catch (error) {
+        logger.warn(`Could not add component_id column to entity_components table: ${error}`);
+    }
+}
+
+export const PopulateComponentIds = async () => {
+    try {
         // Populate component_id for existing rows that don't have it set
         await db`UPDATE entity_components 
                  SET component_id = c.id 
@@ -272,30 +280,48 @@ export const CreateEntityComponentTable = async () => {
                  AND entity_components.type_id = c.type_id 
                  AND entity_components.component_id IS NULL`;
         
-        logger.info(`Added component_id column to entity_components table and populated existing data`);
+        logger.info(`Populated component_id for existing entity_components rows`);
     } catch (error) {
-        logger.warn(`Could not add component_id column to entity_components table: ${error}`);
+        logger.warn(`Could not populate component_id for existing rows: ${error}`);
     }
 }
 
 export const EnsureDatabaseMigrations = async () => {
     logger.trace(`Checking for database migrations...`);
     
-    // Check if entity_components table has component_id column
     try {
+        // First, ensure the table exists and has the basic structure
+        await CreateEntityComponentTable();
+        
+        // Check if entity_components table has component_id column
         const columnCheck = await db`SELECT column_name FROM information_schema.columns 
                                      WHERE table_name = 'entity_components' 
                                      AND column_name = 'component_id' 
                                      AND table_schema = 'public'`;
         
         if (columnCheck.length === 0) {
-            logger.info(`entity_components table missing component_id column, running migration...`);
-            await CreateEntityComponentTable();
+            logger.info(`entity_components table missing component_id column, adding it...`);
+            // Add the column
+            await db`ALTER TABLE entity_components ADD COLUMN component_id UUID`;
+            logger.info(`Added component_id column to entity_components table`);
+            
+            // Wait a bit for the column to be available
+            await new Promise(resolve => setTimeout(resolve, 500));
+            
+            // Populate existing data
+            await PopulateComponentIds();
         } else {
-            logger.trace(`entity_components table has component_id column`);
+            logger.trace(`entity_components table already has component_id column`);
         }
     } catch (error) {
-        logger.error(`Failed to check for component_id column: ${error}`);
+        logger.error(`Failed during database migration: ${error}`);
+        // Try to add the column anyway in case the check failed
+        try {
+            await db`ALTER TABLE entity_components ADD COLUMN IF NOT EXISTS component_id UUID`;
+            logger.info(`Attempted to add component_id column as fallback`);
+        } catch (fallbackError) {
+            logger.error(`Fallback column addition also failed: ${fallbackError}`);
+        }
     }
 }
 
