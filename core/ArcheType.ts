@@ -297,7 +297,7 @@ function getOrCreateComponentSchema(
 function compNameToFieldName(compName: string): string {
     return (
         compName.charAt(0).toLowerCase() +
-        compName.slice(1).replace(/Component$/, "")
+        compName.slice(1).replace(/Component$/, "Component")
     );
 }
 
