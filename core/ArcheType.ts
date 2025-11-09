@@ -113,7 +113,7 @@ export function weaveAllArchetypes() {
     const componentSchemas = Array.from(componentSchemaCache.values());
 
     // Combine both archetype and component schemas for weaving
-    const allSchemas = [...archetypeSchemas, ...componentSchemas];
+    const allSchemas = archetypeSchemas;
 
     const schema = weave(ZodWeaver, ...allSchemas);
     let schemaString = printSchema(schema);
