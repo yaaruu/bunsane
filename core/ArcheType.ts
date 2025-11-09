@@ -122,9 +122,72 @@ export function weaveAllArchetypes() {
     schemaString = schemaString.replace(/\bid:\s*String\b/g, "id: ID");
 
     // Post-process: Replace relation String fields with proper GraphQL type references
-    schemaString = schemaString.replace(/  """Reference to (\w+) type"""\s*  (\w+):\s*String([!\[\]]*)/g, (match, typeName, field, suffix) => {
-        return `  """Reference to ${typeName} type"""\n  ${field}: ${typeName}${suffix}`;
-    });
+    // Collect all relation metadata from all archetypes
+    for (const archetypeMetadata of storage.archetypes) {
+        try {
+            const ArchetypeClass = archetypeMetadata.target as any;
+            const instance = new ArchetypeClass();
+            const archetypeName = archetypeMetadata.name;
+            
+            // Process each relation field
+            for (const [field, relatedArcheType] of Object.entries(instance.relationMap)) {
+                const relationType = instance.relationTypes[field];
+                const isArray = relationType === "hasMany" || relationType === "belongsToMany";
+                
+                let relatedTypeName: string;
+                if (typeof relatedArcheType === "string") {
+                    relatedTypeName = relatedArcheType;
+                } else {
+                    const relatedArchetypeId = storage.getComponentId((relatedArcheType as any).name);
+                    const relatedArchetypeMetadata = storage.archetypes.find(
+                        (a) => a.typeId === relatedArchetypeId
+                    );
+                    relatedTypeName = relatedArchetypeMetadata?.name || (relatedArcheType as any).name.replace(/ArcheType$/, "");
+                }
+                
+                if (isArray) {
+                    // Step 1: Add description if it doesn't exist
+                    const hasDescription = new RegExp(`"""Reference to ${relatedTypeName} type"""[\\s\\S]{0,50}${field}:`).test(schemaString);
+                    if (!hasDescription) {
+                        const addDescPattern = new RegExp(
+                            `(type ${archetypeName} \\{[\\s\\S]*?)(\\n\\s+)(${field}:\\s*\\[String!?\\]!?)`,
+                            "g"
+                        );
+                        schemaString = schemaString.replace(
+                            addDescPattern,
+                            `$1$2"""Reference to ${relatedTypeName} type"""$2$3`
+                        );
+                    }
+                    
+                    // Step 2: Replace [String!] with [TypeName!]
+                    const shouldBeRequired = instance.relationOptions[field]?.nullable === false;
+                    const suffix = shouldBeRequired ? "!" : "";
+                    const replacePattern = new RegExp(
+                        `(type ${archetypeName} \\{[\\s\\S]*?${field}:\\s*)\\[String!?\\](!?)`,
+                        "g"
+                    );
+                    schemaString = schemaString.replace(
+                        replacePattern,
+                        `$1[${relatedTypeName}!]${suffix}`
+                    );
+                } else {
+                    // Singular relations already have descriptions from Zod, just replace type
+                    const pattern = new RegExp(
+                        `(type ${archetypeName} \\{[\\s\\S]*?${field}:\\s*)String(!?)`,
+                        "g"
+                    );
+                    const isNullable = instance.relationOptions[field]?.nullable;
+                    const suffix = isNullable ? "" : "!";
+                    schemaString = schemaString.replace(
+                        pattern,
+                        `$1${relatedTypeName}${suffix}`
+                    );
+                }
+            }
+        } catch (error) {
+            console.warn(`Could not process relations for archetype ${archetypeMetadata.name}:`, error);
+        }
+    }
 
     return schemaString;
 }
@@ -1505,18 +1568,28 @@ export class BaseArcheType {
                 // For GraphQL relations, we just store the type name as a string reference
                 // The GraphQL schema will use the type name directly, and the full type definition
                 // will be generated when each archetype's getZodObjectSchema() is called
+                
+                // For singular relations, add description to the string schema
                 const relatedTypeSchema = z
                     .string()
                     .describe(`Reference to ${relatedTypeName} type`);
 
                 if (isArray) {
-                    zodShapes[field] = z.array(relatedTypeSchema);
+                    // HasMany and BelongsToMany should be optional by default (nullable array)
+                    // unless explicitly marked as required via nullable: false
+                    const shouldBeRequired = this.relationOptions[field]?.nullable === false;
+                    // For array relations, the description on the inner string won't show up in GraphQL
+                    // We need to store metadata about this being a relation for post-processing
+                    zodShapes[field] = shouldBeRequired 
+                        ? z.array(relatedTypeSchema) 
+                        : z.array(relatedTypeSchema).optional();
                 } else {
                     zodShapes[field] = relatedTypeSchema;
-                }
-
-                if (this.relationOptions[field]?.nullable) {
-                    zodShapes[field] = zodShapes[field].nullish();
+                    
+                    // For singular relations, apply nullable option
+                    if (this.relationOptions[field]?.nullable) {
+                        zodShapes[field] = zodShapes[field].nullish();
+                    }
                 }
             }
         }
@@ -1622,15 +1695,32 @@ export class BaseArcheType {
 
             // Replace the String field with proper GraphQL type reference
             if (isArray) {
-                const isNullable = this.relationOptions[field]?.nullable;
-                const suffix = isNullable ? "" : "!";
-                const pattern = new RegExp(
-                    `${field}:\\s*\\[String!?\\]!?`,
+                // For arrays: should be required only if explicitly set nullable: false
+                const shouldBeRequired = this.relationOptions[field]?.nullable === false;
+                const suffix = shouldBeRequired ? "!" : "";
+                
+                // Step 1: Add description comment if it doesn't exist
+                const descriptionPattern = new RegExp(`"""Reference to ${relatedTypeName} type"""[\\s\\S]*?${field}:`);
+                if (!descriptionPattern.test(graphqlSchemaString)) {
+                    // Add description before the field
+                    const addDescriptionPattern = new RegExp(
+                        `(\\n\\s+)(${field}:\\s*\\[String!?\\]!?)`,
+                        "g"
+                    );
+                    graphqlSchemaString = graphqlSchemaString.replace(
+                        addDescriptionPattern,
+                        `$1"""Reference to ${relatedTypeName} type"""\n$1$2`
+                    );
+                }
+                
+                // Step 2: Replace [String!] or [String] with [TypeName!]
+                const replaceTypePattern = new RegExp(
+                    `(${field}:\\s*)\\[String!?\\](!?)`,
                     "g"
                 );
                 graphqlSchemaString = graphqlSchemaString.replace(
-                    pattern,
-                    `${field}: [${relatedTypeName}!]${suffix}`
+                    replaceTypePattern,
+                    `$1[${relatedTypeName}!]${suffix}`
                 );
             } else {
                 const isNullable = this.relationOptions[field]?.nullable;

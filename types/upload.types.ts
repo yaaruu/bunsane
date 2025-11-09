@@ -88,6 +88,7 @@ export interface UploadResult {
     path?: string;
     url?: string;
     metadata?: Record<string, any>;
+    uploadedAt?: string;
     thumbnails?: Array<{ size: string; url: string; path: string }>;
     error?: UploadError;
 }
