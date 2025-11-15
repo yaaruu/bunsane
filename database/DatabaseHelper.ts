@@ -106,6 +106,76 @@ export const CreateEntityTable = async () => {
 }
 
 export const CreateComponentTable = async () => {
+    const partitionStrategy = process.env.BUNSANE_PARTITION_STRATEGY === 'list' ? 'list' : 'hash'; // Default to hash, use list only if explicitly set
+    
+    if (partitionStrategy === 'hash') {
+        // Clean up any existing LIST partition tables before creating HASH partitions
+        await cleanupOldListPartitions();
+        await CreateHashPartitionedComponentTable();
+    } else {
+        // Original LIST partitioning
+        await db`CREATE TABLE IF NOT EXISTS components (
+            id UUID,
+            entity_id UUID REFERENCES entities(id) ON DELETE CASCADE,
+            type_id varchar(64) NOT NULL,
+            name varchar(128),
+            data jsonb,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW(),
+            deleted_at TIMESTAMP,
+            PRIMARY KEY (id, type_id),
+            UNIQUE(entity_id, type_id)
+        ) PARTITION BY LIST (type_id);`;
+        await db`CREATE INDEX IF NOT EXISTS idx_components_entity_id ON components (entity_id)`;
+        await db`CREATE INDEX IF NOT EXISTS idx_components_type_id ON components (type_id)`;
+        await db`CREATE INDEX IF NOT EXISTS idx_components_data_gin ON components USING GIN (data)`;
+        await db`CREATE INDEX IF NOT EXISTS idx_components_entity_type_deleted ON components (entity_id, type_id, deleted_at)`;
+        await db`CREATE INDEX IF NOT EXISTS idx_components_type_deleted ON components (type_id, deleted_at) WHERE deleted_at IS NULL`;
+        await db`CREATE INDEX IF NOT EXISTS idx_components_deleted_entity ON components (deleted_at, entity_id) WHERE deleted_at IS NULL`;
+        await db`CREATE INDEX IF NOT EXISTS idx_components_entity_created_desc ON components (entity_id, created_at DESC)`;
+        await db`CREATE INDEX IF NOT EXISTS idx_components_type_entity_created ON components (type_id, entity_id, created_at DESC)`;
+    }
+}
+
+const cleanupOldListPartitions = async () => {
+    try {
+        logger.info(`Cleaning up old LIST partition tables before creating HASH partitions`);
+        
+        // Get all existing LIST partition tables
+        const existingPartitions = await db.unsafe(`
+            SELECT tablename 
+            FROM pg_tables 
+            WHERE tablename LIKE 'components_%' 
+            AND schemaname = 'public'
+            AND tablename != 'components'
+        `);
+        
+        for (const row of existingPartitions) {
+            const tableName = row.tablename;
+            logger.trace(`Dropping old LIST partition table: ${tableName}`);
+            await db.unsafe(`DROP TABLE IF EXISTS ${tableName} CASCADE`);
+        }
+        
+        // Drop the main components table if it exists (to recreate with HASH partitioning)
+        const mainTableExists = await db.unsafe(`
+            SELECT 1 FROM information_schema.tables 
+            WHERE table_name = 'components' 
+            AND table_schema = 'public'
+        `);
+        
+        if (mainTableExists.length > 0) {
+            logger.trace(`Dropping existing components table for HASH partitioning`);
+            await db.unsafe(`DROP TABLE IF EXISTS components CASCADE`);
+        }
+        
+        logger.info(`Cleaned up ${existingPartitions.length} old partition tables`);
+    } catch (error) {
+        logger.warn(`Could not clean up old LIST partitions: ${error}`);
+        // Continue anyway - the table creation might still work
+    }
+}
+
+export const CreateHashPartitionedComponentTable = async (partitionCount: number = 16) => {
     await db`CREATE TABLE IF NOT EXISTS components (
         id UUID,
         entity_id UUID REFERENCES entities(id) ON DELETE CASCADE,
@@ -117,7 +187,15 @@ export const CreateComponentTable = async () => {
         deleted_at TIMESTAMP,
         PRIMARY KEY (id, type_id),
         UNIQUE(entity_id, type_id)
-    ) PARTITION BY LIST (type_id);`;
+    ) PARTITION BY HASH (type_id);`;
+
+    // Create hash partitions
+    for (let i = 0; i < partitionCount; i++) {
+        await db.unsafe(`CREATE TABLE IF NOT EXISTS components_p${i}
+            PARTITION OF components
+            FOR VALUES WITH (MODULUS ${partitionCount}, REMAINDER ${i});`);
+    }
+
     await db`CREATE INDEX IF NOT EXISTS idx_components_entity_id ON components (entity_id)`;
     await db`CREATE INDEX IF NOT EXISTS idx_components_type_id ON components (type_id)`;
     await db`CREATE INDEX IF NOT EXISTS idx_components_data_gin ON components USING GIN (data)`;
@@ -132,6 +210,24 @@ export const UpdateComponentIndexes = async (table_name: string, indexedProperti
         table_name = validateIdentifier(table_name);
         indexedProperties = indexedProperties.map(prop => validateIdentifier(prop));
         logger.trace(`Updating indexes for component table: ${table_name}`);
+
+        // Check if this is a hash partitioned table
+        const partitionStrategy = await GetPartitionStrategy();
+        if (partitionStrategy === 'hash' && table_name !== 'components') {
+            // For hash partitioning, indexes should be on the parent table
+            logger.trace(`Redirecting index update to parent table 'components' for hash partitioning`);
+            table_name = 'components';
+        }
+
+        // Check if table is partitioned
+        const partitionCheck = await db.unsafe(`
+            SELECT relkind
+            FROM pg_class
+            WHERE relname = '${table_name}' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+        `);
+        const isPartitioned = partitionCheck.length > 0 && partitionCheck[0].relkind === 'p';
+        const useConcurrently = !isPartitioned; // Cannot use CONCURRENTLY on partitioned tables
+
         const indexes_list = await db.unsafe(`
             SELECT indexname 
             FROM pg_indexes 
@@ -147,7 +243,7 @@ export const UpdateComponentIndexes = async (table_name: string, indexedProperti
                 if (!existingIndexes.includes(indexName)) {
                     logger.trace(`Creating missing index ${indexName} for property ${prop}`);
                     await retryWithBackoff(async () => {
-                        await db.unsafe(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${indexName} ON ${table_name} USING GIN ((data->'${prop}'))`);
+                        await db.unsafe(`CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} IF NOT EXISTS ${indexName} ON ${table_name} USING GIN ((data->'${prop}'))`);
                     });
                     addedIndexes.add(indexName);
                 } else {
@@ -163,7 +259,7 @@ export const UpdateComponentIndexes = async (table_name: string, indexedProperti
                 const prop = match[1];
                 if (!indexedProperties.includes(prop) && !addedIndexes.has(index)) {
                     await retryWithBackoff(async () => {
-                        await db.unsafe(`DROP INDEX CONCURRENTLY IF EXISTS ${index}`);
+                        await db.unsafe(`DROP INDEX${useConcurrently ? ' CONCURRENTLY' : ''} IF EXISTS ${index}`);
                     });
                     logger.info(`Dropped obsolete index ${index} for property ${prop}`);
                 }
@@ -180,7 +276,33 @@ export const CreateComponentPartitionTable = async (comp_name: string, type_id: 
     try {
         comp_name = validateIdentifier(comp_name);
         logger.trace(`Attempt adding partition table for component: ${comp_name}`);
-        // const table_name = `components_${comp_name.toLowerCase().replace(/\s+/g, '_')}`;
+
+        // Check partitioning strategy
+        const partitionStrategy = await GetPartitionStrategy();
+        logger.trace(`Current partition strategy: ${partitionStrategy}`);
+
+        if (partitionStrategy === 'hash') {
+            // For HASH partitioning, partitions are pre-created and data is automatically distributed
+            // We just need to ensure indexes are created for this component type
+            logger.info(`Component ${comp_name} will use existing hash partitions`);
+            
+            // For hash partitioning, indexes are created at the parent table level
+            // But we can still create component-specific indexes if needed
+            const storage = getMetadataStorage();
+            const componentId = storage.getComponentId(comp_name);
+            const indexedFields = storage.getIndexedFields(componentId);
+            
+            if (indexedFields.length > 0) {
+                logger.trace(`Ensuring specialized indexes for ${comp_name} on hash partitions`);
+                // For hash partitioning, indexes on parent table should suffice
+                // But we can add component-specific logic here if needed
+                logger.trace(`Hash partitioning handles indexes at parent table level`);
+            }
+            
+            return;
+        }
+
+        // Original LIST partitioning logic
         const table_name = GenerateTableName(comp_name);
         logger.trace(`Checking for existing partition table: ${table_name}`);
         const existingPartition = await db.unsafe(`SELECT 1 FROM information_schema.tables 
@@ -227,6 +349,18 @@ export const CreateComponentPartitionTable = async (comp_name: string, type_id: 
 export const DeleteComponentPartitionTable = async (comp_name: string) => {
     try {
         comp_name = validateIdentifier(comp_name);
+        
+        // Check partitioning strategy
+        const partitionStrategy = await GetPartitionStrategy();
+        
+        if (partitionStrategy === 'hash') {
+            // For HASH partitioning, partitions are managed automatically
+            // No individual partition tables to delete
+            logger.info(`Component ${comp_name} uses hash partitions - no individual table to delete`);
+            return;
+        }
+        
+        // Original LIST partitioning logic
         const table_name = `components_${comp_name.toLowerCase().replace(/\s+/g, '_')}`;
 
         const existingPartition = await db.unsafe(`
@@ -336,11 +470,23 @@ export const AnalyzeAllComponentTables = async (): Promise<void> => {
     try {
         logger.trace(`Analyzing all component tables`);
 
+        // Check partitioning strategy
+        const partitionStrategy = await GetPartitionStrategy();
+        
+        let tablePattern: string;
+        if (partitionStrategy === 'hash') {
+            // For hash partitioning, analyze the hash partition tables
+            tablePattern = 'components_p%';
+        } else {
+            // For list partitioning, analyze the component-specific partition tables
+            tablePattern = 'components_%';
+        }
+
         // Get all component partition tables
         const tables = await db.unsafe(`
             SELECT tablename
             FROM pg_tables
-            WHERE tablename LIKE 'components_%' AND schemaname = 'public'
+            WHERE tablename LIKE '${tablePattern}' AND schemaname = 'public'
         `);
 
         for (const row of tables) {
@@ -354,6 +500,90 @@ export const AnalyzeAllComponentTables = async (): Promise<void> => {
         logger.error(`Failed to analyze component tables: ${error}`);
         throw error;
     }
+}
+
+export const GetPartitionStrategy = async (): Promise<'list' | 'hash' | null> => {
+    try {
+        const result = await db.unsafe(`
+            SELECT 
+                CASE 
+                    WHEN partstrat = 'l' THEN 'list'
+                    WHEN partstrat = 'h' THEN 'hash'
+                    ELSE NULL
+                END as strategy
+            FROM pg_partitioned_table 
+            WHERE partrelid = (SELECT oid FROM pg_class WHERE relname = 'components' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public'))
+        `);
+        return result.length > 0 ? result[0].strategy : null;
+    } catch (error) {
+        logger.warn(`Could not determine partition strategy: ${error}`);
+        return null;
+    }
+}
+
+export const BenchmarkPartitionCounts = async (partitionCounts: number[] = [8, 16, 32]) => {
+    const results: Array<{partitionCount: number, planningTime: number, executionTime: number}> = [];
+    
+    for (const count of partitionCounts) {
+        logger.info(`Benchmarking with ${count} partitions`);
+        
+        // Create temporary hash partitioned table
+        const tempTableName = `components_benchmark_${count}`;
+        await db.unsafe(`CREATE TABLE ${tempTableName} (
+            id UUID,
+            entity_id UUID,
+            type_id varchar(64) NOT NULL,
+            name varchar(128),
+            data jsonb,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW(),
+            deleted_at TIMESTAMP,
+            PRIMARY KEY (id, type_id),
+            UNIQUE(entity_id, type_id)
+        ) PARTITION BY HASH (type_id);`);
+        
+        // Create partitions
+        for (let i = 0; i < count; i++) {
+            await db.unsafe(`CREATE TABLE ${tempTableName}_p${i}
+                PARTITION OF ${tempTableName}
+                FOR VALUES WITH (MODULUS ${count}, REMAINDER ${i});`);
+        }
+        
+        // Copy sample data (limit to avoid long benchmark)
+        await db.unsafe(`INSERT INTO ${tempTableName} (id, entity_id, type_id, name, data, created_at, updated_at, deleted_at)
+            SELECT id, entity_id, type_id, name, data, created_at, updated_at, deleted_at
+            FROM components 
+            TABLESAMPLE BERNOULLI(10) -- Sample 10% of data
+            LIMIT 10000;`);
+        
+        // Create indexes
+        await db.unsafe(`CREATE INDEX idx_${tempTableName}_type_id ON ${tempTableName} (type_id)`);
+        await db.unsafe(`ANALYZE ${tempTableName}`);
+        
+        // Run benchmark query
+        const explainResult = await db.unsafe(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) 
+            SELECT DISTINCT ec.entity_id as id 
+            FROM entity_components ec 
+            WHERE ec.type_id = (SELECT type_id FROM ${tempTableName} LIMIT 1) 
+            AND ec.deleted_at IS NULL`);
+        
+        const plan = explainResult[0]['QUERY PLAN'] ? JSON.parse(explainResult[0]['QUERY PLAN']) : explainResult[0];
+        const planningTime = plan.Planning ? plan.Planning.Time : 0;
+        const executionTime = plan.Execution ? plan.Execution.Time : 0;
+        
+        results.push({
+            partitionCount: count,
+            planningTime,
+            executionTime
+        });
+        
+        // Clean up
+        await db.unsafe(`DROP TABLE ${tempTableName} CASCADE;`);
+        
+        logger.info(`Partition count ${count}: planning=${planningTime}ms, execution=${executionTime}ms`);
+    }
+    
+    return results;
 }
 
 export const GenerateTableName = (name: string) => `components_${name.toLowerCase().replace(/\s+/g, '_')}`;

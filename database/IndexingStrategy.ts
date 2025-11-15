@@ -53,12 +53,22 @@ export const ensureJSONBPathIndex = async (
             return;
         }
 
+        // Check if table is partitioned
+        const partitionCheck = await db.unsafe(`
+            SELECT relkind
+            FROM pg_class
+            WHERE relname = '${tableName}' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+        `);
+
+        const isPartitioned = partitionCheck.length > 0 && partitionCheck[0].relkind === 'p';
+        const useConcurrently = !isPartitioned; // Cannot use CONCURRENTLY on partitioned tables
+
         let indexSQL: string;
 
         switch (indexType) {
             case 'gin':
-                // GIN indexes always use CONCURRENTLY for non-blocking operation
-                indexSQL = `CREATE INDEX CONCURRENTLY ${indexName} ON ${tableName} USING GIN ((data->'${field}') jsonb_path_ops)`;
+                // GIN indexes always use CONCURRENTLY for non-blocking operation (if not partitioned)
+                indexSQL = `CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} ${indexName} ON ${tableName} USING GIN ((data->'${field}') jsonb_path_ops)`;
                 break;
 
             case 'btree':
@@ -66,16 +76,16 @@ export const ensureJSONBPathIndex = async (
                     // BTREE index on date field - store as text and let PostgreSQL handle conversions at query time
                     // Note: Direct casting in index expressions requires IMMUTABLE functions
                     // Storing as text allows the index to work while queries can still cast when filtering
-                    indexSQL = `CREATE INDEX CONCURRENTLY ${indexName} ON ${tableName} ((data->>'${field}'))`;
+                    indexSQL = `CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} ${indexName} ON ${tableName} ((data->>'${field}'))`;
                 } else {
                     // BTREE index on text field
-                    indexSQL = `CREATE INDEX CONCURRENTLY ${indexName} ON ${tableName} ((data->>'${field}'))`;
+                    indexSQL = `CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} ${indexName} ON ${tableName} ((data->>'${field}'))`;
                 }
                 break;
 
             case 'hash':
                 // HASH index (generally not recommended for JSONB fields)
-                indexSQL = `CREATE INDEX CONCURRENTLY ${indexName} ON ${tableName} USING HASH ((data->>'${field}'))`;
+                indexSQL = `CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} ${indexName} ON ${tableName} USING HASH ((data->>'${field}'))`;
                 break;
 
             default:
@@ -84,7 +94,7 @@ export const ensureJSONBPathIndex = async (
 
         logger.trace(`Creating index with SQL: ${indexSQL}`);
         await db.unsafe(indexSQL);
-        logger.info(`Created ${indexType.toUpperCase()} index ${indexName} on ${tableName}`);
+        logger.info(`Created ${indexType.toUpperCase()} index ${indexName} on ${tableName}${useConcurrently ? ' (concurrently)' : ' (blocking)'}`);
 
     } catch (error) {
         logger.error(`Failed to create ${indexType} index on ${tableName} for field ${field}: ${error}`);
