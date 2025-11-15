@@ -27,6 +27,8 @@ export class QueryContext {
     public withId: string | null = null;
     public limit: number | null = null;
     public offsetValue: number = 0;
+    public hasCTE: boolean = false;
+    public cteName: string = "";
 
     public getNextAlias(prefix: string = "t"): string {
         const count = this.tableAliases.size;
@@ -70,6 +72,8 @@ export class QueryContext {
         clone.withId = this.withId;
         clone.limit = this.limit;
         clone.offsetValue = this.offsetValue;
+        clone.hasCTE = this.hasCTE;
+        clone.cteName = this.cteName;
         return clone;
     }
 }

@@ -213,14 +213,14 @@ class Query {
                 dag.setRootNode(orNode);
             }
         } else {
-            // Use SourceNode + ComponentInclusionNode for regular AND logic
-            const sourceNode = new SourceNode();
-            dag.setRootNode(sourceNode);
-
-            if (this.context.componentIds.size > 0 || this.context.excludedComponentIds.size > 0) {
-                const componentNode = new ComponentInclusionNode();
-                componentNode.addDependency(sourceNode);
-                dag.addNode(componentNode);
+            // Use buildBasicQuery for regular AND logic (includes CTE optimization)
+            const optimizedDag = QueryDAG.buildBasicQuery(this.context);
+            // Copy nodes from optimized DAG to our DAG
+            for (const node of optimizedDag.getNodes()) {
+                dag.addNode(node);
+            }
+            if (optimizedDag.getRootNode()) {
+                dag.setRootNode(optimizedDag.getRootNode()!);
             }
         }
 
@@ -287,14 +287,14 @@ class Query {
                 dag.setRootNode(orNode);
             }
         } else {
-            // Use SourceNode + ComponentInclusionNode for regular AND logic
-            const sourceNode = new SourceNode();
-            dag.setRootNode(sourceNode);
-
-            if (this.context.componentIds.size > 0 || this.context.excludedComponentIds.size > 0) {
-                const componentNode = new ComponentInclusionNode();
-                componentNode.addDependency(sourceNode);
-                dag.addNode(componentNode);
+            // Use buildBasicQuery for regular AND logic (includes CTE optimization)
+            const optimizedDag = QueryDAG.buildBasicQuery(this.context);
+            // Copy nodes from optimized DAG to our DAG
+            for (const node of optimizedDag.getNodes()) {
+                dag.addNode(node);
+            }
+            if (optimizedDag.getRootNode()) {
+                dag.setRootNode(optimizedDag.getRootNode()!);
             }
         }
 
@@ -327,6 +327,57 @@ class Query {
             entity.setDirty(false);
             return entity;
         });
+    }
+
+    /**
+     * Execute query with EXPLAIN ANALYZE for performance debugging
+     * Returns the query plan and execution statistics
+     */
+    public async explainAnalyze(buffers: boolean = true): Promise<string> {
+        // Build the DAG (same as exec)
+        const dag = new QueryDAG();
+
+        if (this.orQuery) {
+            if (this.context.componentIds.size > 0) {
+                const componentNode = new ComponentInclusionNode();
+                dag.setRootNode(componentNode);
+
+                const orNode = new OrNode(this.orQuery);
+                orNode.addDependency(componentNode);
+                dag.addNode(orNode);
+            } else {
+                const orNode = new OrNode(this.orQuery);
+                dag.setRootNode(orNode);
+            }
+        } else {
+            const optimizedDag = QueryDAG.buildBasicQuery(this.context);
+            for (const node of optimizedDag.getNodes()) {
+                dag.addNode(node);
+            }
+            if (optimizedDag.getRootNode()) {
+                dag.setRootNode(optimizedDag.getRootNode()!);
+            }
+        }
+
+        // Execute the DAG
+        const result = dag.execute(this.context);
+
+        // Create EXPLAIN ANALYZE query
+        const explainSql = `EXPLAIN (ANALYZE${buffers ? ', BUFFERS' : ''}) ${result.sql}`;
+
+        // Debug logging
+        if (this.debug) {
+            console.log('🔍 Query EXPLAIN ANALYZE Debug:');
+            console.log('SQL:', explainSql);
+            console.log('Params:', result.params);
+            console.log('---');
+        }
+
+        // Execute the EXPLAIN ANALYZE query
+        const explainResult = await db.unsafe(explainSql, result.params);
+
+        // Format the result
+        return explainResult.map((row: any) => row['QUERY PLAN']).join('\n');
     }
 
     static filterOp = FilterOp;
