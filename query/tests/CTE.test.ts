@@ -25,11 +25,9 @@ describe('CTENode', () => {
         await ComponentRegistry.ensureComponentsRegistered();
 
         context = new QueryContext();
-        // Add component IDs to context
-        const comp1Id = context.getComponentId(TestComponent1);
-        const comp2Id = context.getComponentId(TestComponent2);
-        if (comp1Id) context.componentIds.add(comp1Id);
-        if (comp2Id) context.componentIds.add(comp2Id);
+        // For testing, manually set up component IDs since test components may not be registered
+        context.componentIds.add("test-component-1");
+        context.componentIds.add("test-component-2");
     });
 
     it('should generate CTE SQL for multiple components', () => {
@@ -57,10 +55,7 @@ describe('CTENode', () => {
     });
 
     it('should handle excluded component types', () => {
-        const excludedCompId = context.getComponentId(TestComponent1);
-        if (excludedCompId) {
-            context.excludedComponentIds.add(excludedCompId);
-        }
+        context.excludedComponentIds.add("test-component-1");
 
         const cteNode = new CTENode();
         const result = cteNode.execute(context);

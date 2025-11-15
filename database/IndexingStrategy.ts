@@ -1,0 +1,153 @@
+import db from "database";
+import { logger } from "../core/Logger";
+
+const validateIdentifier = (str: string, maxLength: number = 64): string => {
+    if (!str || typeof str !== 'string' || str.length === 0 || str.length > maxLength) {
+        throw new Error(`Invalid identifier: ${str}`);
+    }
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(str)) {
+        throw new Error(`Invalid identifier format: ${str}`);
+    }
+    return str;
+};
+
+export type IndexType = 'gin' | 'btree' | 'hash';
+
+export interface IndexDefinition {
+    tableName: string;
+    field: string;
+    indexType: IndexType;
+    isDateField?: boolean;
+}
+
+/**
+ * Ensures a JSONB path-specific index exists on a table
+ * @param tableName The table name to create index on
+ * @param field The JSONB field path to index
+ * @param indexType The type of index to create
+ * @param isDateField Whether this field should be cast to DATE for BTREE indexing
+ */
+export const ensureJSONBPathIndex = async (
+    tableName: string,
+    field: string,
+    indexType: IndexType = 'gin',
+    isDateField: boolean = false
+): Promise<void> => {
+    try {
+        tableName = validateIdentifier(tableName);
+        field = validateIdentifier(field);
+
+        const indexName = `idx_${tableName}_${field}_${indexType}${isDateField ? '_date' : ''}`;
+
+        logger.trace(`Ensuring ${indexType.toUpperCase()} index ${indexName} on ${tableName} for field ${field}${isDateField ? ' (date field - indexed as text)' : ''}`);
+
+        // Check if index already exists
+        const existingIndexes = await db.unsafe(`
+            SELECT indexname
+            FROM pg_indexes
+            WHERE tablename = '${tableName}' AND indexname = '${indexName}'
+        `);
+
+        if (existingIndexes.length > 0) {
+            logger.trace(`Index ${indexName} already exists`);
+            return;
+        }
+
+        let indexSQL: string;
+
+        switch (indexType) {
+            case 'gin':
+                // GIN indexes always use CONCURRENTLY for non-blocking operation
+                indexSQL = `CREATE INDEX CONCURRENTLY ${indexName} ON ${tableName} USING GIN ((data->'${field}') jsonb_path_ops)`;
+                break;
+
+            case 'btree':
+                if (isDateField) {
+                    // BTREE index on date field - store as text and let PostgreSQL handle conversions at query time
+                    // Note: Direct casting in index expressions requires IMMUTABLE functions
+                    // Storing as text allows the index to work while queries can still cast when filtering
+                    indexSQL = `CREATE INDEX CONCURRENTLY ${indexName} ON ${tableName} ((data->>'${field}'))`;
+                } else {
+                    // BTREE index on text field
+                    indexSQL = `CREATE INDEX CONCURRENTLY ${indexName} ON ${tableName} ((data->>'${field}'))`;
+                }
+                break;
+
+            case 'hash':
+                // HASH index (generally not recommended for JSONB fields)
+                indexSQL = `CREATE INDEX CONCURRENTLY ${indexName} ON ${tableName} USING HASH ((data->>'${field}'))`;
+                break;
+
+            default:
+                throw new Error(`Unsupported index type: ${indexType}`);
+        }
+
+        logger.trace(`Creating index with SQL: ${indexSQL}`);
+        await db.unsafe(indexSQL);
+        logger.info(`Created ${indexType.toUpperCase()} index ${indexName} on ${tableName}`);
+
+    } catch (error) {
+        logger.error(`Failed to create ${indexType} index on ${tableName} for field ${field}: ${error}`);
+        throw error;
+    }
+};
+
+/**
+ * Ensures multiple JSONB path indexes exist on a table
+ * @param tableName The table name to create indexes on
+ * @param indexDefinitions Array of index definitions to create
+ */
+export const ensureMultipleJSONBPathIndexes = async (
+    tableName: string,
+    indexDefinitions: IndexDefinition[]
+): Promise<void> => {
+    for (const def of indexDefinitions) {
+        await ensureJSONBPathIndex(
+            def.tableName,
+            def.field,
+            def.indexType,
+            def.isDateField
+        );
+    }
+};
+
+/**
+ * Analyzes a table to update query planner statistics
+ * @param tableName The table name to analyze
+ */
+export const analyzeTable = async (tableName: string): Promise<void> => {
+    try {
+        tableName = validateIdentifier(tableName);
+        logger.trace(`Running ANALYZE on table ${tableName}`);
+        await db.unsafe(`ANALYZE ${tableName}`);
+        logger.info(`Completed ANALYZE on table ${tableName}`);
+    } catch (error) {
+        logger.error(`Failed to ANALYZE table ${tableName}: ${error}`);
+        throw error;
+    }
+};
+
+/**
+ * Analyzes all component partition tables
+ */
+export const analyzeAllComponentTables = async (): Promise<void> => {
+    try {
+        logger.trace(`Analyzing all component tables`);
+
+        // Get all component partition tables
+        const tables = await db.unsafe(`
+            SELECT tablename
+            FROM pg_tables
+            WHERE tablename LIKE 'components_%' AND schemaname = 'public'
+        `);
+
+        for (const row of tables) {
+            await analyzeTable(row.tablename);
+        }
+
+        logger.info(`Completed ANALYZE on ${tables.length} component tables`);
+    } catch (error) {
+        logger.error(`Failed to analyze component tables: ${error}`);
+        throw error;
+    }
+};

@@ -1,5 +1,7 @@
 import db from "database";
 import { logger as MainLogger } from "core/Logger";
+import { getMetadataStorage } from "core/metadata";
+import { ensureMultipleJSONBPathIndexes } from "./IndexingStrategy";
 const logger = MainLogger.child({ scope: "DatabaseHelper" });
 
 const BUNSANE_RELATION_TYPED_COLUMN = process.env.BUNSANE_RELATION_TYPED_COLUMN === 'true' || false;
@@ -199,17 +201,22 @@ export const CreateComponentPartitionTable = async (comp_name: string, type_id: 
         });
         logger.trace(`Successfully created partition table: ${table_name}`);
 
-        // TODO: Not sure if this is needed here or should be handled separately
-        // if (BUNSANE_RELATION_TYPED_COLUMN && indexedProperties?.includes('value')) {
-        //     logger.trace(`Adding typed FK column for ${table_name}`);
-        //     await retryWithBackoff(async () => {
-        //         await db.unsafe(`ALTER TABLE ${table_name} ADD COLUMN IF NOT EXISTS fk_id UUID GENERATED ALWAYS AS ((data->>'value')::UUID) STORED`);
-        //     });
-        //     await retryWithBackoff(async () => {
-        //         await db.unsafe(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${table_name}_fk_id ON ${table_name} (fk_id)`);
-        //     });
-        //     logger.trace(`Added fk_id column and index for ${table_name}`);
-        // }
+        // Automatically create indexes based on component metadata
+        const storage = getMetadataStorage();
+        const componentId = storage.getComponentId(comp_name);
+        const indexedFields = storage.getIndexedFields(componentId);
+        
+        if (indexedFields.length > 0) {
+            logger.trace(`Creating ${indexedFields.length} specialized indexes for ${comp_name}`);
+            const indexDefinitions = indexedFields.map(field => ({
+                tableName: table_name,
+                field: field.propertyKey,
+                indexType: field.indexType,
+                isDateField: field.isDateField
+            }));
+            await ensureMultipleJSONBPathIndexes(table_name, indexDefinitions);
+            logger.trace(`Created specialized indexes for ${comp_name}`);
+        }
         
     } catch (error) {
         logger.error(`Failed to create component partition table for ${comp_name}: ${error}`);
@@ -322,6 +329,30 @@ export const EnsureDatabaseMigrations = async () => {
         } catch (fallbackError) {
             logger.error(`Fallback column addition also failed: ${fallbackError}`);
         }
+    }
+}
+
+export const AnalyzeAllComponentTables = async (): Promise<void> => {
+    try {
+        logger.trace(`Analyzing all component tables`);
+
+        // Get all component partition tables
+        const tables = await db.unsafe(`
+            SELECT tablename
+            FROM pg_tables
+            WHERE tablename LIKE 'components_%' AND schemaname = 'public'
+        `);
+
+        for (const row of tables) {
+            logger.trace(`Running ANALYZE on table ${row.tablename}`);
+            await db.unsafe(`ANALYZE ${row.tablename}`);
+            logger.trace(`Completed ANALYZE on table ${row.tablename}`);
+        }
+
+        logger.info(`Completed ANALYZE on ${tables.length} component tables`);
+    } catch (error) {
+        logger.error(`Failed to analyze component tables: ${error}`);
+        throw error;
     }
 }
 

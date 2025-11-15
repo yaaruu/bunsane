@@ -15,3 +15,10 @@ export interface ComponentPropertyMetadata {
     enumKeys?: string[];
     isOptional: boolean;
 }
+
+export interface IndexedFieldMetadata {
+    componentId: string;
+    propertyKey: string;
+    indexType: 'gin' | 'btree' | 'hash';
+    isDateField: boolean;
+}

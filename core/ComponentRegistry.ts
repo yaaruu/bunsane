@@ -1,6 +1,7 @@
 import { generateTypeId, type BaseComponent } from "./Components";
 import ApplicationLifecycle, { ApplicationPhase } from "./ApplicationLifecycle";
-import { CreateComponentPartitionTable, GenerateTableName, UpdateComponentIndexes } from "database/DatabaseHelper";
+import { CreateComponentPartitionTable, GenerateTableName, UpdateComponentIndexes, AnalyzeAllComponentTables } from "database/DatabaseHelper";
+import { ensureMultipleJSONBPathIndexes } from "database/IndexingStrategy";
 import { GetSchema } from "database/DatabaseHelper";
 import { logger as MainLogger } from "./Logger";
 import { getMetadataStorage } from "./metadata";
@@ -230,16 +231,37 @@ class ComponentRegistry {
         }
     }
 
+    private getIndexedFieldsForComponent(componentName: string) {
+        const storage = getMetadataStorage();
+        const componentId = storage.getComponentId(componentName);
+        return storage.getIndexedFields(componentId);
+    }
+
     private async setupComponentFeatures(): Promise<void> {
         const components = this.getComponents();
         
         // Update component indexes for components that have indexed properties
         for(const {name, ctor} of components) {
             const instance = new ctor();
+            const table_name = GenerateTableName(name);
+            
+            // Handle legacy @CompData(indexed: true) properties
             if(instance.indexedProperties().length > 0) {
-                const table_name = GenerateTableName(name);
                 UpdateComponentIndexes(table_name, instance.indexedProperties());
-                logger.trace(`Updated indexes for component: ${name}`);
+                logger.trace(`Updated legacy indexes for component: ${name}`);
+            }
+            
+            // Handle new @IndexedField decorators
+            const indexedFields = this.getIndexedFieldsForComponent(name);
+            if(indexedFields.length > 0) {
+                const indexDefinitions = indexedFields.map(field => ({
+                    tableName: table_name,
+                    field: field.propertyKey,
+                    indexType: field.indexType,
+                    isDateField: field.isDateField
+                }));
+                await ensureMultipleJSONBPathIndexes(table_name, indexDefinitions);
+                logger.trace(`Created specialized indexes for component: ${name}`);
             }
         }
 
@@ -254,6 +276,9 @@ class ComponentRegistry {
             }
         }
         logger.info(`Registered hooks for ${services.length} services`);
+
+        // Run ANALYZE on all component tables to update query planner statistics
+        await AnalyzeAllComponentTables();
     }
 }
 

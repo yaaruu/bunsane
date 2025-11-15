@@ -251,14 +251,45 @@ export class ComponentInclusionNode extends QueryNode {
 
         // If using LATERAL joins, add them to the FROM clause and conditions to WHERE
         if (useLateralJoins && lateralJoins.length > 0) {
-            // Find the FROM clause and add LATERAL joins after the table name
+            // Add LATERAL conditions to WHERE clause FIRST (before inserting LATERAL joins)
+            let whereClause = '';
+            if (lateralConditions.length > 0) {
+                const conditionsString = lateralConditions.join(' AND ');
+                
+                // Find ORDER BY or GROUP BY to determine WHERE insertion point
+                const orderByMatch = sql.match(/\s+(ORDER\s+BY)/i);
+                const groupByMatch = sql.match(/\s+(GROUP\s+BY)/i);
+                
+                let insertIndex = -1;
+                if (orderByMatch) {
+                    insertIndex = orderByMatch.index!;
+                } else if (groupByMatch) {
+                    insertIndex = groupByMatch.index!;
+                }
+                
+                // Check if WHERE already exists in the query (before ORDER BY/GROUP BY)
+                const beforeClause = insertIndex !== -1 ? sql.substring(0, insertIndex) : sql;
+                const hasWhere = beforeClause.includes(' WHERE ');
+                const whereKeyword = hasWhere ? ' AND' : ' WHERE';
+                whereClause = `${whereKeyword} ${conditionsString}`;
+                
+                if (insertIndex !== -1) {
+                    // Insert before ORDER BY or GROUP BY
+                    sql = sql.substring(0, insertIndex) + whereClause + sql.substring(insertIndex);
+                } else {
+                    // No ORDER BY or GROUP BY, append at end
+                    sql += whereClause;
+                }
+            }
+            
+            // Now find the FROM clause and add LATERAL joins after the table name
             const fromIndex = sql.indexOf(' FROM ');
             if (fromIndex !== -1) {
                 const afterFromStart = fromIndex + 6; // Position after "FROM "
                 const afterFromPart = sql.substring(afterFromStart);
                 
                 // Find the end of the table name/alias (before WHERE, ORDER BY, or GROUP BY)
-                let tableEndIndex = afterFromPart.search(/\s+(WHERE|ORDER\s+BY|GROUP\s+BY|$)/i);
+                let tableEndIndex = afterFromPart.search(/\s+(WHERE|AND|ORDER\s+BY|GROUP\s+BY)/i);
                 if (tableEndIndex === -1) {
                     tableEndIndex = afterFromPart.length;
                 }
@@ -269,47 +300,6 @@ export class ComponentInclusionNode extends QueryNode {
                 const beforeFrom = sql.substring(0, afterFromStart);
                 const lateralSql = lateralJoins.join(' ');
                 sql = beforeFrom + tableName + ' ' + lateralSql + restOfQuery;
-            }
-
-            // Add LATERAL conditions to WHERE clause (before ORDER BY)
-            if (lateralConditions.length > 0) {
-                const conditionsString = lateralConditions.join(' AND ');
-                if (!sql.includes(conditionsString)) {
-                    // Find ORDER BY or GROUP BY to insert WHERE before it
-                    const orderByIndex = sql.search(/\s+ORDER\s+BY/i);
-                    const groupByIndex = sql.search(/\s+GROUP\s+BY/i);
-                    const insertIndex = orderByIndex !== -1 ? orderByIndex : (groupByIndex !== -1 ? groupByIndex : -1);
-                    
-                    // Check if there's a WHERE clause in the main query after LATERAL joins
-                    // We need to check the portion between the last ')' (end of last LATERAL) and ORDER BY/GROUP BY
-                    let hasWhereInMainQuery = false;
-                    if (insertIndex !== -1) {
-                        // Check between LATERAL joins end and ORDER BY/GROUP BY
-                        const lastParenIndex = sql.lastIndexOf(')', insertIndex);
-                        if (lastParenIndex !== -1) {
-                            const betweenSection = sql.substring(lastParenIndex, insertIndex);
-                            hasWhereInMainQuery = betweenSection.includes(' WHERE ');
-                        }
-                    } else {
-                        // No ORDER BY/GROUP BY, check from last ')' to end
-                        const lastParenIndex = sql.lastIndexOf(')');
-                        if (lastParenIndex !== -1) {
-                            const afterSection = sql.substring(lastParenIndex);
-                            hasWhereInMainQuery = afterSection.includes(' WHERE ');
-                        }
-                    }
-                    
-                    const whereKeyword = hasWhereInMainQuery ? 'AND' : 'WHERE';
-                    const whereClause = ` ${whereKeyword} ${conditionsString}`;
-                    
-                    if (insertIndex !== -1) {
-                        // Insert before ORDER BY or GROUP BY
-                        sql = sql.substring(0, insertIndex) + whereClause + sql.substring(insertIndex);
-                    } else {
-                        // No ORDER BY or GROUP BY, append at end
-                        sql += whereClause;
-                    }
-                }
             }
         }
 

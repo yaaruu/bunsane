@@ -36,15 +36,13 @@ describe('Query Performance Benchmarks', () => {
     it('should use CTE for queries with multiple component filters', async () => {
       const context = new QueryContext();
 
-      // Add component IDs to context to simulate multiple filters
-      const comp1Id = context.getComponentId(TestComponent1);
-      const comp2Id = context.getComponentId(TestComponent2);
-      if (comp1Id) context.componentIds.add(comp1Id);
-      if (comp2Id) context.componentIds.add(comp2Id);
+      // Manually set up component IDs for testing (similar to LateralJoins test)
+      context.componentIds.add("test-component-1");
+      context.componentIds.add("test-component-2");
 
       // Add filters to trigger CTE optimization (>= 2 filters)
-      context.componentFilters.set(comp1Id!, [{ field: 'value', operator: '=', value: 'test1' }]);
-      context.componentFilters.set(comp2Id!, [{ field: 'value', operator: '=', value: 'test2' }]);
+      context.componentFilters.set("test-component-1", [{ field: 'value', operator: '=', value: 'test1' }]);
+      context.componentFilters.set("test-component-2", [{ field: 'value', operator: '=', value: 'test2' }]);
 
       // Build basic query - this should automatically insert CTE
       const dag = QueryDAG.buildBasicQuery(context);
@@ -61,11 +59,10 @@ describe('Query Performance Benchmarks', () => {
       const context = new QueryContext(); // Fresh context
 
       // Add only one component ID to context
-      const comp1Id = context.getComponentId(TestComponent1);
-      if (comp1Id) context.componentIds.add(comp1Id);
+      context.componentIds.add("test-component-1");
 
       // Add only one filter (should not trigger CTE)
-      context.componentFilters.set(comp1Id!, [{ field: 'value', operator: '=', value: 'test' }]);
+      context.componentFilters.set("test-component-1", [{ field: 'value', operator: '=', value: 'test' }]);
 
       // Build basic query - this should NOT insert CTE
       const dag = QueryDAG.buildBasicQuery(context);
@@ -81,11 +78,9 @@ describe('Query Performance Benchmarks', () => {
     it('should generate correct CTE SQL structure', async () => {
       const context = new QueryContext();
 
-      // Add component IDs to context
-      const comp1Id = context.getComponentId(TestComponent1);
-      const comp2Id = context.getComponentId(TestComponent2);
-      if (comp1Id) context.componentIds.add(comp1Id);
-      if (comp2Id) context.componentIds.add(comp2Id);
+      // Manually set up component IDs
+      context.componentIds.add("test-component-1");
+      context.componentIds.add("test-component-2");
 
       const cteNode = new CTENode();
       const result = cteNode.execute(context);
@@ -104,15 +99,13 @@ describe('Query Performance Benchmarks', () => {
 
       const context = new QueryContext();
 
-      // Add component IDs to context
-      const comp1Id = context.getComponentId(TestComponent1);
-      const comp2Id = context.getComponentId(TestComponent2);
-      if (comp1Id) context.componentIds.add(comp1Id);
-      if (comp2Id) context.componentIds.add(comp2Id);
+      // Manually set up component IDs
+      context.componentIds.add("test-component-1");
+      context.componentIds.add("test-component-2");
 
       // Add multiple filters to trigger CTE
-      context.componentFilters.set(comp1Id!, [{ field: 'value', operator: '=', value: 'test1' }]);
-      context.componentFilters.set(comp2Id!, [{ field: 'value', operator: '=', value: 'test2' }]);
+      context.componentFilters.set("test-component-1", [{ field: 'value', operator: '=', value: 'test1' }]);
+      context.componentFilters.set("test-component-2", [{ field: 'value', operator: '=', value: 'test2' }]);
 
       const dag = QueryDAG.buildBasicQuery(context);
       const result = dag.execute(context);
@@ -129,11 +122,10 @@ describe('Query Performance Benchmarks', () => {
       const context = new QueryContext();
 
       // Add component ID to context
-      const comp1Id = context.getComponentId(TestComponent1);
-      if (comp1Id) context.componentIds.add(comp1Id);
+      context.componentIds.add("test-component-1");
 
       // Add multiple filters on the same component (like the monthlyUsage query)
-      context.componentFilters.set(comp1Id!, [
+      context.componentFilters.set("test-component-1", [
         { field: 'account_id', operator: '=', value: 'test-uuid' },
         { field: 'date', operator: '>=', value: '2025-10-31' },
         { field: 'date', operator: '<', value: '2025-11-30' }
