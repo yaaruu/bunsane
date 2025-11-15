@@ -58,6 +58,26 @@ export class QueryContext {
         return ComponentRegistry.getComponentId(componentCtor.name);
     }
 
+    /**
+     * Generate a cache key fingerprint for prepared statement caching
+     */
+    public generateCacheKey(): string {
+        // Create a deterministic fingerprint of the query structure
+        const components = Array.from(this.componentIds).sort().join(',');
+        const excludedComponents = Array.from(this.excludedComponentIds).sort().join(',');
+        const filters = Array.from(this.componentFilters.entries())
+            .map(([typeId, filters]) => `${typeId}:${filters.map(f => `${f.field}${f.operator}`).sort().join('|')}`)
+            .sort()
+            .join(';');
+        const sorts = this.sortOrders
+            .map(s => `${s.component}.${s.property}:${s.direction}`)
+            .sort()
+            .join(',');
+
+        const key = `${components}|${excludedComponents}|${filters}|${sorts}|${this.hasCTE}|${this.cteName}`;
+        return key;
+    }
+
     public clone(): QueryContext {
         const clone = new QueryContext();
         clone.params = [...this.params];

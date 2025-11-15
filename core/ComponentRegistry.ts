@@ -7,6 +7,7 @@ import { logger as MainLogger } from "./Logger";
 import { getMetadataStorage } from "./metadata";
 import { registerDecoratedHooks } from "./decorators/EntityHooks";
 import ServiceRegistry from "service/ServiceRegistry";
+import { preparedStatementCache } from "../database/PreparedStatementCache";
 const logger = MainLogger.child({ scope: "ComponentRegistry" });
 
 type ComponentConstructor = new () => BaseComponent;
@@ -239,6 +240,10 @@ class ComponentRegistry {
 
     private async setupComponentFeatures(): Promise<void> {
         const components = this.getComponents();
+        
+        // Invalidate prepared statement cache when component schemas change
+        preparedStatementCache.clear();
+        logger.trace("Cleared prepared statement cache due to component schema changes");
         
         // Check partitioning strategy for index creation
         const partitionStrategy = await GetPartitionStrategy();

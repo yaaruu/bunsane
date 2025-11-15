@@ -8,6 +8,7 @@ import { inList } from "../database/sqlHelpers";
 import { QueryContext, QueryDAG, SourceNode, ComponentInclusionNode } from "./index";
 import { OrQuery } from "./OrQuery";
 import { OrNode } from "./OrNode";
+import { preparedStatementCache } from "../database/PreparedStatementCache";
 
 export type FilterOperator = "=" | ">" | "<" | ">=" | "<=" | "!=" | "LIKE" | "IN" | "NOT IN" | string;
 
@@ -230,16 +231,21 @@ class Query {
         // Modify SQL for count
         const countSql = `SELECT COUNT(*) as count FROM (${result.sql}) AS subquery`;
 
+        // Check prepared statement cache
+        const cacheKey = this.context.generateCacheKey();
+        const { statement, isHit } = await preparedStatementCache.getOrCreate(countSql, cacheKey, db);
+
         // Debug logging
         if (this.debug) {
             console.log('🔍 Query Count Debug:');
             console.log('SQL:', countSql);
             console.log('Params:', result.params);
+            console.log('Cache Hit:', isHit);
             console.log('---');
         }
 
-        // Execute the count query
-        const countResult = await db.unsafe(countSql, result.params);
+        // Execute the count query using prepared statement
+        const countResult = await preparedStatementCache.execute(statement, result.params, db);
 
         return countResult[0].count;
     }
@@ -301,16 +307,21 @@ class Query {
         // Execute the DAG
         const result = dag.execute(this.context);
 
+        // Check prepared statement cache
+        const cacheKey = this.context.generateCacheKey();
+        const { statement, isHit } = await preparedStatementCache.getOrCreate(result.sql, cacheKey, db);
+
         // Debug logging
         if (this.debug) {
             console.log('🔍 Query Debug:');
             console.log('SQL:', result.sql);
             console.log('Params:', result.params);
+            console.log('Cache Hit:', isHit);
             console.log('---');
         }
 
-        // Execute the query
-        const entities = await db.unsafe(result.sql, result.params);
+        // Execute the query using prepared statement
+        const entities = await preparedStatementCache.execute(statement, result.params, db);
 
         // Convert to Entity objects
         const entityIds: string[] = entities.map((row: any) => row.id);
@@ -378,6 +389,13 @@ class Query {
 
         // Format the result
         return explainResult.map((row: any) => row['QUERY PLAN']).join('\n');
+    }
+
+    /**
+     * Get prepared statement cache statistics
+     */
+    public static getCacheStats() {
+        return preparedStatementCache.getStats();
     }
 
     static filterOp = FilterOp;
