@@ -19,7 +19,7 @@ export class ComponentInclusionNode extends QueryNode {
 
         let sql = "";
         const componentCount = componentIds.length;
-        const useLateralJoins = shouldUseLateralJoins();
+        const useLateralJoins = Boolean(shouldUseLateralJoins());
 
         // Check if CTE is available and use it to avoid redundant entity_components scans
         const useCTE = context.hasCTE && context.cteName;
@@ -41,12 +41,12 @@ export class ComponentInclusionNode extends QueryNode {
                     sql += ` WHERE EXISTS (
                         SELECT 1 FROM entity_components ec
                         WHERE ec.entity_id = ${context.cteName}.entity_id
-                        AND ec.type_id = $${context.addParam(componentId)}
+                        AND ec.type_id = $${context.addParam(componentId)}::text
                         AND ec.deleted_at IS NULL
                     )`;
                 }
             } else {
-                sql = `SELECT DISTINCT ec.entity_id as id FROM entity_components ec WHERE ec.type_id = $${context.addParam(componentId)} AND ec.deleted_at IS NULL`;
+                sql = `SELECT DISTINCT ec.entity_id as id FROM entity_components ec WHERE ec.type_id = $${context.addParam(componentId)}::text AND ec.deleted_at IS NULL`;
             }
 
             if (context.withId) {
@@ -78,13 +78,20 @@ export class ComponentInclusionNode extends QueryNode {
             }
 
             // Apply component filters for single component
-            sql = this.applyComponentFilters(context, componentIds, useCTE, useLateralJoins, lateralJoins, lateralConditions, sql);
+            sql = this.applyComponentFilters(context, componentIds, useCTE, useLateralJoins, lateralJoins, lateralConditions, sql, new Map());
 
             const tableAlias = useCTE ? context.cteName : "ec";
             sql += ` ORDER BY ${tableAlias}.entity_id`;
         } else {
             // Multiple components case
-            const componentPlaceholders = componentIds.map((id) => `$${context.addParam(id)}`).join(', ');
+            // Create parameter indices for component IDs to avoid duplicates
+            const componentParamIndices: Map<string, number> = new Map();
+            const componentPlaceholders = componentIds.map((id) => {
+                if (!componentParamIndices.has(id)) {
+                    componentParamIndices.set(id, context.addParam(id));
+                }
+                return `$${componentParamIndices.get(id)}::text`;
+            }).join(', ');
             
             if (useCTE) {
                 // Use CTE for base entity filtering
@@ -92,15 +99,18 @@ export class ComponentInclusionNode extends QueryNode {
                 
                 // Ensure all required components are present
                 sql += ` WHERE (`;
-                const componentChecks = componentIds.map(compId => 
-                    `EXISTS (
+                const componentChecks = componentIds.map(compId => {
+                    if (!componentParamIndices.has(compId)) {
+                        componentParamIndices.set(compId, context.addParam(compId));
+                    }
+                    return `EXISTS (
                         SELECT 1 FROM entity_components ec
                         WHERE ec.entity_id = ${context.cteName}.entity_id
-                        AND ec.type_id = $${context.addParam(compId)}
+                        AND ec.type_id = $${componentParamIndices.get(compId)}::text
                         AND ec.deleted_at IS NULL
-                    )`
-                ).join(' AND ');
-                sql += componentChecks + `)`;
+                    )`;
+                });
+                sql += componentChecks.join(' AND ') + `)`;
             } else {
                 sql = `SELECT DISTINCT ec.entity_id as id FROM entity_components ec WHERE ec.type_id IN (${componentPlaceholders}) AND ec.deleted_at IS NULL`;
             }
@@ -134,7 +144,7 @@ export class ComponentInclusionNode extends QueryNode {
             }
 
             // Apply component filters for multiple components
-            sql = this.applyComponentFilters(context, componentIds, useCTE, useLateralJoins, lateralJoins, lateralConditions, sql);
+            sql = this.applyComponentFilters(context, componentIds, useCTE, useLateralJoins, lateralJoins, lateralConditions, sql, componentParamIndices);
 
             if (!useCTE) {
                 sql += ` GROUP BY ec.entity_id HAVING COUNT(DISTINCT ec.type_id) = $${context.addParam(componentCount)}`;
@@ -161,7 +171,8 @@ export class ComponentInclusionNode extends QueryNode {
         useLateralJoins: boolean,
         lateralJoins: string[],
         lateralConditions: string[],
-        sql: string
+        sql: string,
+        componentParamIndices: Map<string, number>
     ): string {
         for (const [compId, filters] of context.componentFilters) {
             for (const filter of filters) {
@@ -226,7 +237,7 @@ export class ComponentInclusionNode extends QueryNode {
                             SELECT 1 FROM entity_components ec_f
                             JOIN components c ON ec_f.component_id = c.id
                             WHERE ec_f.entity_id = ${tableAlias}.entity_id
-                            AND ec_f.type_id = $${context.addParam(compId)}
+                            AND ec_f.type_id = $${componentParamIndices.has(compId) ? componentParamIndices.get(compId) : context.addParam(compId)}::text
                             AND ${condition}
                             AND ec_f.deleted_at IS NULL
                             AND c.deleted_at IS NULL
@@ -240,7 +251,7 @@ export class ComponentInclusionNode extends QueryNode {
                         SELECT 1 FROM entity_components ec_f
                         JOIN components c ON ec_f.component_id = c.id
                         WHERE ec_f.entity_id = ${tableAlias}.entity_id
-                        AND ec_f.type_id = $${context.addParam(compId)}
+                        AND ec_f.type_id = $${componentParamIndices.has(compId) ? componentParamIndices.get(compId) : context.addParam(compId)}::text
                         AND ${condition}
                         AND ec_f.deleted_at IS NULL
                         AND c.deleted_at IS NULL

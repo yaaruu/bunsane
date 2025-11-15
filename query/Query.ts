@@ -247,7 +247,9 @@ class Query {
         // Execute the count query using prepared statement
         const countResult = await preparedStatementCache.execute(statement, result.params, db);
 
-        return countResult[0].count;
+        // Ensure count is returned as a number (PostgreSQL may return as string)
+        const count = countResult[0].count;
+        return typeof count === 'string' ? parseInt(count, 10) : count;
     }
 
     @timed("Query.exec")
