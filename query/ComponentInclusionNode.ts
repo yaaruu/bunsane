@@ -2,6 +2,7 @@ import { QueryNode } from "./QueryNode";
 import type { QueryResult } from "./QueryNode";
 import { QueryContext } from "./QueryContext";
 import { shouldUseLateralJoins } from "../core/Config";
+import { FilterBuilderRegistry } from "./FilterBuilderRegistry";
 
 export class ComponentInclusionNode extends QueryNode {
     public execute(context: QueryContext): QueryResult {
@@ -176,50 +177,60 @@ export class ComponentInclusionNode extends QueryNode {
     ): string {
         for (const [compId, filters] of context.componentFilters) {
             for (const filter of filters) {
-                // Check if value looks like a UUID (case-insensitive, with or without hyphens)
-                const valueStr = String(filter.value);
-                const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(valueStr);
-                
-                // Debug logging
-                // console.log('[ComponentInclusionNode] Filter:', { 
-                //     field: filter.field, 
-                //     operator: filter.operator, 
-                //     value: filter.value,
-                //     valueStr,
-                //     isUUID 
-                // });
-                
-                // Build JSON path for nested fields (e.g., "device.unique_id" -> "c.data->'device'->>'unique_id'")
-                let jsonPath: string;
-                if (filter.field.includes('.')) {
-                    const parts = filter.field.split('.');
-                    const lastPart = parts.pop()!;
-                    const nestedPath = parts.map(p => `'${p}'`).join('->');
-                    jsonPath = `c.data->${nestedPath}->>'${lastPart}'`;
-                } else {
-                    jsonPath = `c.data->>'${filter.field}'`;
-                }
-                
                 let condition: string;
-                if (isUUID && filter.operator === '=') {
-                    // UUID equality comparison - only cast the parameter, compare as text
-                    // This allows matching UUID parameter against both UUID and text fields
-                    condition = `${jsonPath} = $${context.addParam(filter.value)}`;
-                } else if (filter.operator === 'LIKE' || filter.operator === 'NOT LIKE') {
-                    // String LIKE comparison - no casting
-                    condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
-                } else if (filter.operator === 'IN' || filter.operator === 'NOT IN') {
-                    // IN/NOT IN comparison - no casting
-                    condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
-                } else if (typeof filter.value === 'number') {
-                    // Only treat as numeric if the value is actually a number type, not a string
-                    condition = `(${jsonPath})::numeric ${filter.operator} $${context.addParam(filter.value)}::numeric`;
+
+                // Check for custom filter builder first
+                if (FilterBuilderRegistry.has(filter.operator)) {
+                    const customBuilder = FilterBuilderRegistry.get(filter.operator)!;
+                    const result = customBuilder(filter, "c", context);
+                    condition = result.sql;
+                    // Note: custom builder is responsible for adding parameters via context.addParam()
                 } else {
-                    // Default: text comparison without casting
-                    condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
+                    // Default filter logic
+                    // Check if value looks like a UUID (case-insensitive, with or without hyphens)
+                    const valueStr = String(filter.value);
+                    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(valueStr);
+                    
+                    // Debug logging
+                    // console.log('[ComponentInclusionNode] Filter:', { 
+                    //     field: filter.field, 
+                    //     operator: filter.operator, 
+                    //     value: filter.value,
+                    //     valueStr,
+                    //     isUUID 
+                    // });
+                    
+                    // Build JSON path for nested fields (e.g., "device.unique_id" -> "c.data->'device'->>'unique_id'")
+                    let jsonPath: string;
+                    if (filter.field.includes('.')) {
+                        const parts = filter.field.split('.');
+                        const lastPart = parts.pop()!;
+                        const nestedPath = parts.map(p => `'${p}'`).join('->');
+                        jsonPath = `c.data->${nestedPath}->>'${lastPart}'`;
+                    } else {
+                        jsonPath = `c.data->>'${filter.field}'`;
+                    }
+                    
+                    if (isUUID && filter.operator === '=') {
+                        // UUID equality comparison - only cast the parameter, compare as text
+                        // This allows matching UUID parameter against both UUID and text fields
+                        condition = `${jsonPath} = $${context.addParam(filter.value)}`;
+                    } else if (filter.operator === 'LIKE' || filter.operator === 'NOT LIKE') {
+                        // String LIKE comparison - no casting
+                        condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
+                    } else if (filter.operator === 'IN' || filter.operator === 'NOT IN') {
+                        // IN/NOT IN comparison - no casting
+                        condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
+                    } else if (typeof filter.value === 'number') {
+                        // Only treat as numeric if the value is actually a number type, not a string
+                        condition = `(${jsonPath})::numeric ${filter.operator} $${context.addParam(filter.value)}::numeric`;
+                    } else {
+                        // Default: text comparison without casting
+                        condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
+                    }
+                    
+                    // console.log('[ComponentInclusionNode] Condition:', condition);
                 }
-                
-                // console.log('[ComponentInclusionNode] Condition:', condition);
                 
                 const tableAlias = useCTE ? context.cteName : "ec";
                 const whereKeyword = sql.includes('WHERE') ? 'AND' : 'WHERE';

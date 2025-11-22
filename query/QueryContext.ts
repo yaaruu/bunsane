@@ -1,5 +1,6 @@
 import type { BaseComponent, ComponentDataType } from "../core/Components";
 import ComponentRegistry from "../core/ComponentRegistry";
+import { FilterBuilderRegistry } from "./FilterBuilderRegistry";
 
 export interface QueryFilter {
     field: string;
@@ -74,8 +75,30 @@ export class QueryContext {
             .sort()
             .join(',');
 
-        const key = `${components}|${excludedComponents}|${filters}|${sorts}|${this.hasCTE}|${this.cteName}`;
+        // Extract custom filter operators for cache key differentiation
+        const customOperators = this.extractCustomOperators();
+        const customOps = customOperators.length > 0 ? `customOps:${customOperators.sort().join(',')}` : '';
+
+        const key = `${components}|${excludedComponents}|${filters}|${sorts}|${this.hasCTE}|${this.cteName}|${customOps}`;
         return key;
+    }
+
+    /**
+     * Extract custom filter operators from component filters
+     * Used for cache key generation to differentiate queries with custom filters
+     */
+    private extractCustomOperators(): string[] {
+        const customOperators: string[] = [];
+
+        for (const filters of this.componentFilters.values()) {
+            for (const filter of filters) {
+                if (FilterBuilderRegistry.has(filter.operator)) {
+                    customOperators.push(filter.operator);
+                }
+            }
+        }
+
+        return customOperators;
     }
 
     public clone(): QueryContext {

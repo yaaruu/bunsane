@@ -14,3 +14,8 @@ export type FilterSchema<T = any> = {
         value: string;
     } | undefined;
 }
+
+// Custom Filter Builder exports
+export type { FilterBuilder, FilterResult, FilterBuilderOptions } from "./FilterBuilder";
+export { buildJSONPath } from "./FilterBuilder";
+export { FilterBuilderRegistry } from "./FilterBuilderRegistry";
