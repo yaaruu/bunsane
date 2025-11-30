@@ -16,6 +16,7 @@ interface RegistryEntry {
     options?: FilterBuilderOptions;
     registeredBy?: string; // Plugin name for debugging
     registeredAt: Date;
+    version?: string; // Semantic version for the filter implementation
 }
 
 /**
@@ -36,13 +37,15 @@ export class FilterBuilderRegistry {
      * @param builder - The filter builder function
      * @param options - Optional configuration for the filter builder
      * @param pluginName - Name of the plugin registering this builder (for debugging)
-     * @throws Error if the operator is already registered
+     * @param version - Optional semantic version for the filter implementation (allows upgrades)
+     * @throws Error if the operator is already registered by a different plugin (unless version allows override)
      */
     public static register(
         operator: string,
         builder: FilterBuilder,
         options?: FilterBuilderOptions,
-        pluginName?: string
+        pluginName?: string,
+        version?: string
     ): void {
         // Simple lock mechanism for thread safety
         while (this.lock) {
@@ -53,16 +56,26 @@ export class FilterBuilderRegistry {
         this.lock = true;
 
         try {
-            if (this.registry.has(operator)) {
-                throw new Error(`Filter operator '${operator}' is already registered. ` +
-                    `Existing registration by: ${this.registry.get(operator)!.registeredBy || 'unknown'}`);
+            const existing = this.registry.get(operator);
+
+            if (existing) {
+                // Allow override if same plugin or if version is newer
+                const canOverride =
+                    (pluginName && existing.registeredBy === pluginName) ||
+                    (version && existing.version && this.isNewerVersion(version, existing.version));
+
+                if (!canOverride) {
+                    throw new Error(`Filter operator '${operator}' is already registered by '${existing.registeredBy || 'unknown'}' (v${existing.version || 'unknown'}). ` +
+                        `Cannot register from '${pluginName || 'unknown'}' (v${version || 'unknown'}) without version upgrade.`);
+                }
             }
 
             this.registry.set(operator, {
                 builder,
                 options,
                 registeredBy: pluginName,
-                registeredAt: new Date()
+                registeredAt: new Date(),
+                version
             });
         } finally {
             this.lock = false;
@@ -130,12 +143,14 @@ export class FilterBuilderRegistry {
         options?: FilterBuilderOptions;
         registeredBy?: string;
         registeredAt: Date;
+        version?: string;
     }> {
         return Array.from(this.registry.entries()).map(([operator, entry]) => ({
             operator,
             options: entry.options,
             registeredBy: entry.registeredBy,
-            registeredAt: entry.registeredAt
+            registeredAt: entry.registeredAt,
+            version: entry.version
         }));
     }
 
@@ -154,6 +169,34 @@ export class FilterBuilderRegistry {
             this.registry.clear();
         } finally {
             this.lock = false;
+        }
+    }
+
+    /**
+     * Compare two semantic versions to determine if the first is newer
+     *
+     * @param newVersion - The new version string
+     * @param oldVersion - The old version string
+     * @returns true if newVersion is semantically newer than oldVersion
+     */
+    private static isNewerVersion(newVersion: string, oldVersion: string): boolean {
+        try {
+            const newParts = newVersion.split('.').map(n => parseInt(n, 10));
+            const oldParts = oldVersion.split('.').map(n => parseInt(n, 10));
+
+            // Compare major, minor, patch versions
+            for (let i = 0; i < Math.max(newParts.length, oldParts.length); i++) {
+                const newPart = newParts[i] || 0;
+                const oldPart = oldParts[i] || 0;
+
+                if (newPart > oldPart) return true;
+                if (newPart < oldPart) return false;
+            }
+
+            return false; // Same version
+        } catch {
+            // If parsing fails, fall back to string comparison
+            return newVersion > oldVersion;
         }
     }
 }

@@ -181,6 +181,12 @@ export class ComponentInclusionNode extends QueryNode {
 
                 // Check for custom filter builder first
                 if (FilterBuilderRegistry.has(filter.operator)) {
+                    // Validate filter if validator is provided
+                    const options = FilterBuilderRegistry.getOptions(filter.operator);
+                    if (options?.validate && !options.validate(filter)) {
+                        throw new Error(`Invalid filter value for operator '${filter.operator}': ${JSON.stringify(filter.value)}`);
+                    }
+
                     const customBuilder = FilterBuilderRegistry.get(filter.operator)!;
                     const result = customBuilder(filter, "c", context);
                     condition = result.sql;
