@@ -202,6 +202,62 @@ console.log(publicUserData);
 // }
 ```
 
+### Loading Entities with Components
+
+```typescript
+// Load entity with all archetype components pre-populated
+const userEntity = await UserArcheType.getEntityWithID(userId);
+
+// All components are now loaded and cached
+const profile = await userEntity.get(UserProfile); // No additional DB query
+const preferences = await userEntity.get(UserPreferences); // No additional DB query
+```
+
+#### Advanced Loading Options
+
+```typescript
+// Load only specific components
+const userEntity = await UserArcheType.getEntityWithID(userId, {
+  includeComponents: ['userProfile', 'userPreferences']
+});
+
+// Exclude certain components
+const userEntity = await UserArcheType.getEntityWithID(userId, {
+  excludeComponents: ['userStats']
+});
+
+// Load with relations populated
+const userEntity = await UserArcheType.getEntityWithID(userId, {
+  populateRelations: true
+});
+
+// Throw error if entity not found
+const userEntity = await UserArcheType.getEntityWithID(userId, {
+  throwOnNotFound: true
+});
+```
+
+#### Static Method Usage
+
+```typescript
+// Using static method for convenience
+const userEntity = await BaseArcheType.getEntityWithID(UserArcheTypeClass, userId);
+```
+
+#### Migration from Manual Loading
+
+```typescript
+// Before: Manual component loading (multiple DB queries)
+const entity = await Entity.FindById(userId);
+const profile = await entity.get(UserProfile);
+const preferences = await entity.get(UserPreferences);
+const stats = await entity.get(UserStats);
+
+// After: Single optimized query with all components
+const entity = await UserArcheType.getEntityWithID(userId);
+// All components are pre-loaded and cached
+```
+
 ## 🏷️ ArcheType Inheritance and Composition
 
 ### Base ArcheTypes

@@ -1,6 +1,7 @@
 import type { BaseComponent, ComponentDataType } from "./Components";
 import type { ComponentPropertyMetadata } from "./metadata/definitions/Component";
 import type { ArcheTypeFieldOptions } from "./metadata/definitions/ArcheType";
+import type { GetEntityOptions } from "../types/archetype.types";
 import { Entity } from "./Entity";
 import { getMetadataStorage } from "./metadata";
 import { z, ZodObject } from "zod";
@@ -794,6 +795,240 @@ export class BaseArcheType {
     }
 
     /**
+     * Retrieves an entity by ID and populates it with all components defined in this archetype.
+     * 
+     * @param id The entity ID to retrieve
+     * @param options Optional configuration for component loading and behavior
+     * @returns A promise that resolves to the populated Entity or null if not found
+     * 
+     * @example
+     * // Basic usage
+     * const serviceArea = await serviceAreaArcheType.getEntityWithID('uuid-123');
+     * 
+     * @example
+     * // With options
+     * const serviceArea = await serviceAreaArcheType.getEntityWithID('uuid-123', {
+     *   includeComponents: ['info', 'label'],
+     *   populateRelations: true,
+     *   throwOnNotFound: true
+     * });
+     */
+    public async getEntityWithID(id: string, options?: GetEntityOptions): Promise<Entity | null> {
+        const { Query } = await import("../query");
+        
+        // Build query with selected components for batch loading
+        let query = new Query().findById(id);
+        
+        // Determine which components to load
+        const componentsToLoad = this.getComponentsToLoad(options);
+        
+        for (const componentCtor of componentsToLoad) {
+            query = query.with(componentCtor as any);
+        }
+        
+        const entities = await query.exec();
+        if (entities.length === 0) {
+            if (options?.throwOnNotFound) {
+                throw new Error(`Entity with ID ${id} not found`);
+            }
+            return null;
+        }
+        
+        const entity = entities[0]!;
+        
+        // Populate relations if requested
+        if (options?.populateRelations) {
+            await this.populateRelations(entity);
+        }
+        
+        return entity;
+    }
+
+    /**
+     * Determines which components should be loaded based on the options.
+     * @param options The options specifying component inclusion/exclusion
+     * @returns Array of component constructors to load
+     */
+    private getComponentsToLoad(options?: GetEntityOptions): (new (...args: any[]) => BaseComponent)[] {
+        let componentsToLoad: (new (...args: any[]) => BaseComponent)[] = [];
+
+        // Start with all regular components
+        componentsToLoad.push(...Object.values(this.componentMap));
+
+        // Add union components
+        for (const componentCtors of Object.values(this.unionMap)) {
+            componentsToLoad.push(...componentCtors);
+        }
+
+        // Apply include filter
+        if (options?.includeComponents) {
+            const includeSet = new Set(options.includeComponents);
+            componentsToLoad = componentsToLoad.filter(ctor => {
+                const fieldName = compNameToFieldName(ctor.name);
+                return includeSet.has(fieldName);
+            });
+        }
+
+        // Apply exclude filter
+        if (options?.excludeComponents) {
+            const excludeSet = new Set(options.excludeComponents);
+            componentsToLoad = componentsToLoad.filter(ctor => {
+                const fieldName = compNameToFieldName(ctor.name);
+                return !excludeSet.has(fieldName);
+            });
+        }
+
+        // Respect nullable options (skip nullable components by default unless explicitly included)
+        if (!options?.includeComponents) {
+            componentsToLoad = componentsToLoad.filter(ctor => {
+                const fieldName = compNameToFieldName(ctor.name);
+                const isNullable = this.fieldOptions[fieldName]?.nullable === true;
+                return !isNullable;
+            });
+        }
+
+        return componentsToLoad;
+    }
+
+    /**
+     * Populates relations for the given entity.
+     * @param entity The entity to populate relations for
+     */
+    private async populateRelations(entity: Entity): Promise<void> {
+        const { Query } = await import("../query");
+        const storage = getMetadataStorage();
+
+        for (const [fieldName, relatedArchetype] of Object.entries(this.relationMap)) {
+            const relationType = this.relationTypes[fieldName];
+            const relationOptions = this.relationOptions[fieldName];
+
+            if (relationType === "belongsTo") {
+                // For belongsTo, load the related entity using foreign key
+                const foreignKey = relationOptions?.foreignKey;
+                if (foreignKey) {
+                    let foreignId: string | undefined;
+
+                    // Get foreign key value from entity's components
+                    if (foreignKey.includes('.')) {
+                        const [fieldName, propName] = foreignKey.split('.');
+                        const compCtor = this.componentMap[fieldName];
+                        if (compCtor) {
+                            const componentInstance = await entity.get(compCtor as any);
+                            if (componentInstance && (componentInstance as any)[propName] !== undefined) {
+                                foreignId = (componentInstance as any)[propName];
+                            }
+                        }
+                    } else {
+                        for (const compCtor of Object.values(this.componentMap)) {
+                            const typeId = storage.getComponentId(compCtor.name);
+                            const componentProps = storage.getComponentProperties(typeId);
+                            const hasForeignKey = componentProps.some(prop => prop.propertyKey === foreignKey);
+                            if (!hasForeignKey) continue;
+                            
+                            const componentInstance = await entity.get(compCtor as any);
+                            if (componentInstance && (componentInstance as any)[foreignKey] !== undefined) {
+                                foreignId = (componentInstance as any)[foreignKey];
+                                break;
+                            }
+                        }
+                    }
+
+                    if (foreignId) {
+                        // Load related entity
+                        let relatedArchetypeInstance: BaseArcheType;
+                        if (typeof relatedArchetype === "function") {
+                            relatedArchetypeInstance = new (relatedArchetype as any)();
+                        } else {
+                            // Find archetype by name
+                            const relatedArchetypeMetadata = storage.archetypes.find((a) => a.name === relatedArchetype);
+                            if (relatedArchetypeMetadata) {
+                                relatedArchetypeInstance = new (relatedArchetypeMetadata.target as any)();
+                            } else {
+                                continue;
+                            }
+                        }
+
+                        const relatedEntity = await relatedArchetypeInstance.getEntityWithID(foreignId);
+                        if (relatedEntity) {
+                            // Attach as computed property (non-persisted)
+                            (entity as any)[fieldName] = relatedEntity;
+                        }
+                    }
+                }
+            } else if (relationType === "hasMany") {
+                // For hasMany, query related entities that reference this entity
+                const foreignKey = relationOptions?.foreignKey;
+                if (foreignKey) {
+                    let relatedArchetypeInstance: BaseArcheType;
+                    if (typeof relatedArchetype === "function") {
+                        relatedArchetypeInstance = new (relatedArchetype as any)();
+                    } else {
+                        const relatedArchetypeMetadata = storage.archetypes.find((a) => a.name === relatedArchetype);
+                        if (relatedArchetypeMetadata) {
+                            relatedArchetypeInstance = new (relatedArchetypeMetadata.target as any)();
+                        } else {
+                            continue;
+                        }
+                    }
+
+                    // Find the component in related archetype that has the foreign key
+                    let foreignKeyComponent: any = null;
+                    for (const compCtor of Object.values(relatedArchetypeInstance.componentMap)) {
+                        const typeId = storage.getComponentId(compCtor.name);
+                        const componentProps = storage.getComponentProperties(typeId);
+                        const hasForeignKey = componentProps.some(prop => prop.propertyKey === foreignKey);
+                        if (hasForeignKey) {
+                            foreignKeyComponent = compCtor;
+                            break;
+                        }
+                    }
+
+                    if (foreignKeyComponent) {
+                        // Query related entities
+                        const relatedEntities = await new Query()
+                            .with(foreignKeyComponent)
+                            .exec();
+
+                        // Filter entities that reference this entity
+                        const matchingEntities: Entity[] = [];
+                        for (const relatedEntity of relatedEntities) {
+                            const componentInstance = await relatedEntity.get(foreignKeyComponent);
+                            if (componentInstance && (componentInstance as any)[foreignKey] === entity.id) {
+                                matchingEntities.push(relatedEntity);
+                            }
+                        }
+
+                        // Attach as computed property
+                        (entity as any)[fieldName] = matchingEntities;
+                    }
+                }
+            }
+            // Note: hasOne and belongsToMany not implemented yet
+        }
+    }
+
+    /**
+     * Static convenience method to get an entity with ID using an archetype class.
+     * 
+     * @param archetypeClass The archetype class to use for loading
+     * @param id The entity ID to retrieve
+     * @param options Optional configuration for component loading and behavior
+     * @returns A promise that resolves to the populated Entity or null if not found
+     * 
+     * @example
+     * // Using static method
+     * const serviceArea = await BaseArcheType.getEntityWithID(ServiceAreaArcheTypeClass, 'uuid-123');
+     */
+    static async getEntityWithID<T extends BaseArcheType>(
+        archetypeClass: new () => T,
+        id: string,
+        options?: GetEntityOptions
+    ): Promise<Entity | null> {
+        const instance = new archetypeClass();
+        return instance.getEntityWithID(id, options);
+    }
+
+    /**
      * Unwraps an entity into a plain object containing the component data.
      * @param entity The entity to unwrap
      * @param exclude An optional array of field names to exclude from the result (e.g., sensitive data like passwords)
@@ -1412,6 +1647,7 @@ export class BaseArcheType {
      * }
      */
     public registerFieldResolvers(service: any): void {
+        this.getZodObjectSchema(); // Ensure schema is generated
         const resolvers = this.generateFieldResolvers();
 
         if (!service.__graphqlFields) {
