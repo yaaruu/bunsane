@@ -36,6 +36,9 @@ const customTypeResolvers: any[] = []; // Store resolvers for custom types
 // Component-level schema cache
 const componentSchemaCache = new Map<string, ZodObject<any>>(); // componentId -> Zod schema
 
+// Enum schema cache to prevent duplicate registrations
+const enumSchemaCache = new Map<string, any>(); // enumTypeName -> Zod enum schema
+
 const archetypeSchemaCache = new Map<
     string,
     { zodSchema: ZodObject<any>; graphqlSchema: string }
@@ -87,8 +90,11 @@ export function getRegisteredCustomTypes() {
 export function weaveAllArchetypes() {
     // First, ensure all archetype schemas are generated
     const storage = getMetadataStorage();
+    const archetypeNames: string[] = [];
+    
     for (const archetypeMetadata of storage.archetypes) {
         const archetypeName = archetypeMetadata.name;
+        archetypeNames.push(archetypeName);
         const fullSchemaCacheKey = `${archetypeName}_false_false`;
         if (!archetypeSchemaCache.has(fullSchemaCacheKey)) {
             try {
@@ -192,7 +198,11 @@ export function weaveAllArchetypes() {
 
         return schemaString;
     } catch (error) {
-        console.warn(`Failed to weave all archetypes due to duplicate types: ${error}`);
+        console.warn(
+            `Failed to weave all archetypes due to duplicate types.\n` +
+            `Archetypes being processed: ${archetypeNames.join(', ')}\n` +
+            `Error: ${error}`
+        );
         return null;
     }
 }
@@ -249,22 +259,33 @@ function getOrCreateComponentSchema(
             const enumTypeName =
                 prop.propertyType?.name ||
                 `${componentCtor.name}_${prop.propertyKey}_Enum`;
-            zodFields[prop.propertyKey] = z
-                .enum(prop.enumValues as any)
-                .register(asEnumType, {
-                    name: enumTypeName,
-                    valuesConfig: prop.enumKeys.reduce(
-                        (
-                            acc: Record<string, { description: string }>,
-                            key,
-                            idx
-                        ) => {
-                            acc[key] = { description: prop.enumValues![idx]! };
-                            return acc;
-                        },
-                        {}
-                    ),
-                });
+            
+            // Check if this enum has already been registered
+            let enumSchema = enumSchemaCache.get(enumTypeName);
+            
+            if (!enumSchema) {
+                // Register the enum for the first time
+                enumSchema = z
+                    .enum(prop.enumValues as any)
+                    .register(asEnumType, {
+                        name: enumTypeName,
+                        valuesConfig: prop.enumKeys.reduce(
+                            (
+                                acc: Record<string, { description: string }>,
+                                key,
+                                idx
+                            ) => {
+                                acc[key] = { description: prop.enumValues![idx]! };
+                                return acc;
+                            },
+                            {}
+                        ),
+                    });
+                // Cache it for reuse
+                enumSchemaCache.set(enumTypeName, enumSchema);
+            }
+            
+            zodFields[prop.propertyKey] = enumSchema;
             if (prop.isOptional) {
                 zodFields[prop.propertyKey] =
                     zodFields[prop.propertyKey].optional();

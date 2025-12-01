@@ -19,7 +19,6 @@ export function CompData(options?: { indexed?: boolean; nullable?: boolean }) {
         const typeId = storage.getComponentId(target.constructor.name);
         const propType = Reflect.getMetadata("design:type", target, propertyKey);
         let isEnum = !!(Reflect.getMetadata("isEnum", propType));
-        if (propType.name === 'ServiceType') isEnum = true;
         // console.log(`Property ${propertyKey} type:`, propType?.name);
         // console.log(`Is Enum:`, isEnum);
         let enumValues: string[] | undefined = undefined;
