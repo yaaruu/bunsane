@@ -1,5 +1,24 @@
 import "reflect-metadata";
-export {getMetadataStorage} from "./getMetadataStorage";
+import { getMetadataStorage } from "./getMetadataStorage";
+
+export { getMetadataStorage } from "./getMetadataStorage";
+
+export function getSerializedMetadataStorage() {
+    const storage = getMetadataStorage();
+    return {
+        components: storage.components.map((c) => ({
+            name: c.name,
+            options: c.options,
+        })),
+        archetypes: storage.archetypes.map((a) => ({
+            name: a.name,
+            options: a.options,
+        })),
+        indexedFields: Object.fromEntries(storage.indexedFields),
+        componentProperties: Object.fromEntries(storage.componentProperties),
+    };
+}
+
 export function Enum() {
     return (target: any) => {
         Reflect.defineMetadata("isEnum", true, target);

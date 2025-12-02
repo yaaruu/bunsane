@@ -2,6 +2,7 @@ import ApplicationLifecycle, {ApplicationPhase} from "core/ApplicationLifecycle"
 import { GenerateTableName, HasValidBaseTable, PrepareDatabase, UpdateComponentIndexes, EnsureDatabaseMigrations } from "database/DatabaseHelper";
 import ComponentRegistry from "core/ComponentRegistry";
 import { logger as MainLogger } from "core/Logger";
+import { getSerializedMetadataStorage } from "core/metadata";
 const logger = MainLogger.child({ scope: "App" });
 import { createYogaInstance } from "gql";
 import ServiceRegistry from "service/ServiceRegistry";
@@ -20,8 +21,16 @@ export default class App {
     private yoga: any;
     private yogaPlugins: Plugin[] = [];
     private contextFactory?: (context: any) => any;
-    private restEndpoints: Array<{ method: string; path: string; handler: Function; service: any }> = [];
-    private restEndpointMap: Map<string, { method: string; path: string; handler: Function; service: any }> = new Map();
+    private restEndpoints: Array<{
+        method: string;
+        path: string;
+        handler: Function;
+        service: any;
+    }> = [];
+    private restEndpointMap: Map<
+        string,
+        { method: string; path: string; handler: Function; service: any }
+    > = new Map();
     private staticAssets: Map<string, string> = new Map();
     private openAPISpecGenerator: OpenAPISpecGenerator | null = null;
     private enforceDocs: boolean = false;
@@ -35,8 +44,29 @@ export default class App {
         if (appVersion) this.version = appVersion;
         this.openAPISpecGenerator = new OpenAPISpecGenerator(
             this.name,
-            this.version,
+            this.version
         );
+
+        // Automatically serve the studio if it exists
+        const studioPath = path.join(
+            import.meta.dirname,
+            "..",
+            "studio",
+            "dist"
+        );
+        try {
+            const studioDir = Bun.file(studioPath);
+            if (studioDir) {
+                this.addStaticAssets("/studio", studioPath);
+                logger.info("Studio assets loaded from:", studioPath);
+            }
+        } catch (error) {
+            logger.warn(
+                "Studio not found, skipping studio setup:",
+                error as any
+            );
+        }
+
         return this;
     }
 
@@ -45,8 +75,8 @@ export default class App {
         ComponentRegistry.init();
         ServiceRegistry.init();
         // Plugin initialization
-        for(const plugin of this.plugins) {
-            if(plugin.init) {
+        for (const plugin of this.plugins) {
+            if (plugin.init) {
                 await plugin.init(this);
             }
         }
@@ -55,41 +85,53 @@ export default class App {
             const phase = event.detail;
             logger.info(`Application phase changed to: ${phase}`);
             // Notify plugins of phase change
-            for(const plugin of this.plugins) {
-                if(plugin.onPhaseChange) {
+            for (const plugin of this.plugins) {
+                if (plugin.onPhaseChange) {
                     await plugin.onPhaseChange(phase, this);
                 }
             }
-            switch(phase) {
+            switch (phase) {
                 case ApplicationPhase.DATABASE_READY: {
                     // Warm up prepared statement cache with common query patterns
                     try {
                         await this.warmUpPreparedStatementCache();
                     } catch (error) {
-                        logger.warn("Failed to warm up prepared statement cache:", error as any);
+                        logger.warn(
+                            "Failed to warm up prepared statement cache:",
+                            error as any
+                        );
                     }
                     break;
                 }
                 case ApplicationPhase.SYSTEM_READY: {
                     try {
                         const schema = ServiceRegistry.getSchema();
-                        
+
                         // Wrap user's context factory to automatically spread Yoga context
-                        const wrappedContextFactory = this.contextFactory 
+                        const wrappedContextFactory = this.contextFactory
                             ? (yogaContext: any) => {
-                                const userContext = this.contextFactory!(yogaContext);
+                                const userContext =
+                                    this.contextFactory!(yogaContext);
                                 // Merge Yoga's context with user's context, preserving Yoga properties
                                 return {
-                                    ...yogaContext,  // Yoga context (request, params, etc.)
-                                    ...userContext,  // User's additional context
+                                    ...yogaContext, // Yoga context (request, params, etc.)
+                                    ...userContext, // User's additional context
                                 };
                             }
                             : undefined;
-                        
+
                         if (schema) {
-                            this.yoga = createYogaInstance(schema, this.yogaPlugins, wrappedContextFactory);
+                            this.yoga = createYogaInstance(
+                                schema,
+                                this.yogaPlugins,
+                                wrappedContextFactory
+                            );
                         } else {
-                            this.yoga = createYogaInstance(undefined, this.yogaPlugins, wrappedContextFactory);
+                            this.yoga = createYogaInstance(
+                                undefined,
+                                this.yogaPlugins,
+                                wrappedContextFactory
+                            );
                         }
 
                         // Get all services for processing
@@ -103,68 +145,121 @@ export default class App {
                             try {
                                 registerScheduledTasks(service);
                             } catch (error) {
-                                logger.warn(`Failed to register scheduled tasks for service ${service.constructor.name}`);
+                                logger.warn(
+                                    `Failed to register scheduled tasks for service ${service.constructor.name}`
+                                );
                                 logger.warn(error);
                             }
                         }
-                        logger.info(`Registered scheduled tasks for ${services.length} services`);
+                        logger.info(
+                            `Registered scheduled tasks for ${services.length} services`
+                        );
 
                         // Collect REST endpoints from all services
                         for (const service of services) {
-                            const endpoints = (service.constructor as any).httpEndpoints;
+                            const endpoints = (service.constructor as any)
+                                .httpEndpoints;
                             if (endpoints) {
                                 for (const endpoint of endpoints) {
                                     const endpointInfo = {
                                         method: endpoint.method,
                                         path: endpoint.path,
                                         handler: endpoint.handler.bind(service),
-                                        service: service
+                                        service: service,
                                     };
-                                    logger.trace(`Registered REST endpoint: [${endpoint.method}] ${endpoint.path} for service ${service.constructor.name}`);
+                                    logger.trace(
+                                        `Registered REST endpoint: [${endpoint.method}] ${endpoint.path} for service ${service.constructor.name}`
+                                    );
                                     this.restEndpoints.push(endpointInfo);
-                                    this.restEndpointMap.set(`${endpoint.method}:${endpoint.path}`, endpointInfo);
+                                    this.restEndpointMap.set(
+                                        `${endpoint.method}:${endpoint.path}`,
+                                        endpointInfo
+                                    );
 
                                     // Check if this endpoint has a swagger operation
-                                    if ((endpoint.handler as any).swaggerOperation) {
+                                    if (
+                                        (endpoint.handler as any)
+                                            .swaggerOperation
+                                    ) {
                                         // Collect tags from class and method decorators
-                                        const classTags = (service.constructor as any).swaggerClassTags || [];
-                                        const methodTags = (service.constructor as any).swaggerMethodTags?.[endpoint.handler.name] || [];
-                                        const allTags = [...classTags, ...methodTags];
+                                        const classTags =
+                                            (service.constructor as any)
+                                                .swaggerClassTags || [];
+                                        const methodTags =
+                                            (service.constructor as any)
+                                                .swaggerMethodTags?.[
+                                                endpoint.handler.name
+                                            ] || [];
+                                        const allTags = [
+                                            ...classTags,
+                                            ...methodTags,
+                                        ];
 
-                                        logger.trace(`Generating OpenAPI spec for endpoint: [${endpoint.method}] ${endpoint.path} with tags: ${allTags.join(", ")}`);
-                                        
+                                        logger.trace(
+                                            `Generating OpenAPI spec for endpoint: [${
+                                                endpoint.method
+                                            }] ${
+                                                endpoint.path
+                                            } with tags: ${allTags.join(", ")}`
+                                        );
+
                                         // Merge tags into the operation
-                                        const operation = { ...(endpoint.handler as any).swaggerOperation };
+                                        const operation = {
+                                            ...(endpoint.handler as any)
+                                                .swaggerOperation,
+                                        };
                                         if (allTags.length > 0) {
-                                            operation.tags = [...(operation.tags || []), ...allTags];
-                                        }   
-                                        
+                                            operation.tags = [
+                                                ...(operation.tags || []),
+                                                ...allTags,
+                                            ];
+                                        }
+
                                         this.openAPISpecGenerator!.addEndpoint({
                                             method: endpoint.method,
                                             path: endpoint.path,
-                                            operation
+                                            operation,
                                         });
-                                        logger.trace(`Registered OpenAPI spec for endpoint: [${endpoint.method}] ${endpoint.path}`);
+                                        logger.trace(
+                                            `Registered OpenAPI spec for endpoint: [${endpoint.method}] ${endpoint.path}`
+                                        );
                                     } else {
-                                        if(this.enforceDocs) {
-                                            logger.warn(`No swagger operation found for endpoint: [${endpoint.method}] ${endpoint.path} in service ${service.constructor.name}`);
-                                            this.openAPISpecGenerator!.addEndpoint({
-                                                method: endpoint.method,
-                                                path: endpoint.path,
-                                                operation: {
-                                                    summary: `No description for ${endpoint.path}. Don't use this endpoint until it's properly documented!`,
-                                                    requestBody: {content: {"application/json": {schema: {}}}},
-                                                    responses: { "200": { description: "Success" } }
+                                        if (this.enforceDocs) {
+                                            logger.warn(
+                                                `No swagger operation found for endpoint: [${endpoint.method}] ${endpoint.path} in service ${service.constructor.name}`
+                                            );
+                                            this.openAPISpecGenerator!.addEndpoint(
+                                                {
+                                                    method: endpoint.method,
+                                                    path: endpoint.path,
+                                                    operation: {
+                                                        summary: `No description for ${endpoint.path}. Don't use this endpoint until it's properly documented!`,
+                                                        requestBody: {
+                                                            content: {
+                                                                "application/json":
+                                                                    {
+                                                                        schema: {},
+                                                                    },
+                                                            },
+                                                        },
+                                                        responses: {
+                                                            "200": {
+                                                                description:
+                                                                    "Success",
+                                                            },
+                                                        },
+                                                    },
                                                 }
-                                            });
+                                            );
                                         }
                                     }
                                 }
                             }
                         }
 
-
-                        ApplicationLifecycle.setPhase(ApplicationPhase.APPLICATION_READY);
+                        ApplicationLifecycle.setPhase(
+                            ApplicationPhase.APPLICATION_READY
+                        );
                     } catch (error) {
                         logger.error("Error during SYSTEM_READY phase:");
                         logger.error(error);
@@ -172,7 +267,7 @@ export default class App {
                     break;
                 }
                 case ApplicationPhase.APPLICATION_READY: {
-                    if(process.env.NODE_ENV !== "test") {
+                    if (process.env.NODE_ENV !== "test") {
                         this.start();
                     }
                     break;
@@ -180,8 +275,11 @@ export default class App {
             }
         });
 
-        if(ApplicationLifecycle.getCurrentPhase() === ApplicationPhase.DATABASE_INITIALIZING) {
-            if(!await HasValidBaseTable()) {
+        if (
+            ApplicationLifecycle.getCurrentPhase() ===
+            ApplicationPhase.DATABASE_INITIALIZING
+        ) {
+            if (!(await HasValidBaseTable())) {
                 await PrepareDatabase();
             } else {
                 // Check for missing columns and run migrations
@@ -192,14 +290,15 @@ export default class App {
             await ComponentRegistry.registerAllComponents();
             ApplicationLifecycle.setPhase(ApplicationPhase.SYSTEM_REGISTERING);
         }
-
-        
     }
 
     waitForAppReady(): Promise<void> {
-        return new Promise(resolve => {
+        return new Promise((resolve) => {
             const interval = setInterval(() => {
-                if (ApplicationLifecycle.getCurrentPhase() >= ApplicationPhase.APPLICATION_READY) {
+                if (
+                    ApplicationLifecycle.getCurrentPhase() >=
+                    ApplicationPhase.APPLICATION_READY
+                ) {
                     clearInterval(interval);
                     resolve();
                 }
@@ -224,7 +323,7 @@ export default class App {
 
     public addPlugin(plugin: BasePlugin) {
         this.plugins.push(plugin);
-    }   
+    }
 
     public addStaticAssets(route: string, folder: string) {
         // Resolve the folder path relative to the current working directory
@@ -236,7 +335,7 @@ export default class App {
         const url = new URL(req.url);
         const method = req.method;
         const startTime = Date.now();
-      
+
         // Add request timeout
         const controller = new AbortController();
         const timeoutId = setTimeout(() => {
@@ -246,27 +345,30 @@ export default class App {
 
         try {
             // Health check endpoint
-            if (url.pathname === '/health') {
+            if (url.pathname === "/health") {
                 clearTimeout(timeoutId);
-                return new Response(JSON.stringify({ 
-                    status: 'ok', 
-                    timestamp: new Date().toISOString(),
-                    uptime: process.uptime()
-                }), {
-                    headers: { 'Content-Type': 'application/json' }
-                });
+                return new Response(
+                    JSON.stringify({
+                        status: "ok",
+                        timestamp: new Date().toISOString(),
+                        uptime: process.uptime(),
+                    }),
+                    {
+                        headers: { "Content-Type": "application/json" },
+                    }
+                );
             }
 
             // OpenAPI spec endpoint
-            if (url.pathname === '/openapi.json') {
+            if (url.pathname === "/openapi.json") {
                 clearTimeout(timeoutId);
                 return new Response(this.openAPISpecGenerator!.toJSON(), {
-                    headers: { 'Content-Type': 'application/json' }
+                    headers: { "Content-Type": "application/json" },
                 });
             }
 
             // Swagger UI endpoint
-            if (url.pathname === '/docs') {
+            if (url.pathname === "/docs") {
                 clearTimeout(timeoutId);
                 const swaggerUIHTML = `
 <!DOCTYPE html>
@@ -303,8 +405,53 @@ export default class App {
 </body>
 </html>`;
                 return new Response(swaggerUIHTML, {
-                    headers: { 'Content-Type': 'text/html' }
+                    headers: { "Content-Type": "text/html" },
                 });
+            }
+
+            // Studio endpoint
+            if (url.pathname === "/studio") {
+                clearTimeout(timeoutId);
+                const studioIndexPath = path.join(
+                    import.meta.dirname,
+                    "..",
+                    "studio",
+                    "dist",
+                    "index.html"
+                );
+                try {
+                    const studioFile = Bun.file(studioIndexPath);
+                    if (await studioFile.exists()) {
+                        let html = await studioFile.text();
+                        // Inject metadata into the HTML
+                        const metadata = getSerializedMetadataStorage();
+                        const metadataScript = `<script>window.bunsaneMetadata = ${JSON.stringify(
+                            metadata
+                        )};</script>`;
+                        // Insert before the closing </head> tag
+                        html = html.replace(
+                            "</head>",
+                            `${metadataScript}</head>`
+                        );
+                        return new Response(html, {
+                            headers: { "Content-Type": "text/html" },
+                        });
+                    } else {
+                        return new Response(
+                            "Studio not built. Run `bun run build:studio` to build the studio.",
+                            {
+                                status: 404,
+                                headers: { "Content-Type": "text/plain" },
+                            }
+                        );
+                    }
+                } catch (error) {
+                    console.log("Error loading studio index.html:", error);
+                    return new Response("Studio not available", {
+                        status: 404,
+                        headers: { "Content-Type": "text/plain" },
+                    });
+                }
             }
             for (const [route, folder] of this.staticAssets) {
                 if (url.pathname.startsWith(route)) {
@@ -317,7 +464,10 @@ export default class App {
                             return new Response(file);
                         }
                     } catch (error) {
-                        logger.error(`Error serving static file ${filePath}:`, error as any);
+                        logger.error(
+                            `Error serving static file ${filePath}:`,
+                            error as any
+                        );
                     }
                 }
             }
@@ -329,24 +479,32 @@ export default class App {
                 try {
                     const result = await endpoint.handler(req);
                     const duration = Date.now() - startTime;
-                    logger.trace(`REST ${method} ${url.pathname} completed in ${duration}ms`);
-                    
+                    logger.trace(
+                        `REST ${method} ${url.pathname} completed in ${duration}ms`
+                    );
+
                     clearTimeout(timeoutId);
                     if (result instanceof Response) {
                         return result;
                     } else {
                         return new Response(JSON.stringify(result), {
-                            headers: { 'Content-Type': 'application/json' }
+                            headers: { "Content-Type": "application/json" },
                         });
                     }
                 } catch (error) {
                     const duration = Date.now() - startTime;
-                    logger.error(`Error in REST endpoint ${method} ${endpoint.path} after ${duration}ms`, error as any);
+                    logger.error(
+                        `Error in REST endpoint ${method} ${endpoint.path} after ${duration}ms`,
+                        error as any
+                    );
                     clearTimeout(timeoutId);
-                    return new Response(JSON.stringify({ error: 'Internal server error' }), {
-                        status: 500,
-                        headers: { 'Content-Type': 'application/json' }
-                    });
+                    return new Response(
+                        JSON.stringify({ error: "Internal server error" }),
+                        {
+                            status: 500,
+                            headers: { "Content-Type": "application/json" },
+                        }
+                    );
                 }
             }
 
@@ -359,23 +517,32 @@ export default class App {
             }
 
             clearTimeout(timeoutId);
-            return new Response('Not Found', { status: 404 });
+            return new Response("Not Found", { status: 404 });
         } catch (error) {
             const duration = Date.now() - startTime;
-            logger.error(`Request failed after ${duration}ms: ${method} ${url.pathname}`, error as any);
+            logger.error(
+                `Request failed after ${duration}ms: ${method} ${url.pathname}`,
+                error as any
+            );
             clearTimeout(timeoutId);
-            
-            if ((error as Error).name === 'AbortError') {
-                return new Response(JSON.stringify({ error: 'Request timeout' }), {
-                    status: 408,
-                    headers: { 'Content-Type': 'application/json' }
-                });
+
+            if ((error as Error).name === "AbortError") {
+                return new Response(
+                    JSON.stringify({ error: "Request timeout" }),
+                    {
+                        status: 408,
+                        headers: { "Content-Type": "application/json" },
+                    }
+                );
             }
-            
-            return new Response(JSON.stringify({ error: 'Internal server error' }), {
-                status: 500,
-                headers: { 'Content-Type': 'application/json' }
-            });
+
+            return new Response(
+                JSON.stringify({ error: "Internal server error" }),
+                {
+                    status: 500,
+                    headers: { "Content-Type": "application/json" },
+                }
+            );
         }
     }
 
@@ -401,9 +568,11 @@ export default class App {
     private async warmUpPreparedStatementCache(): Promise<void> {
         // Get registered components for generating common queries
         const components = ComponentRegistry.getComponents();
-        
+
         if (components.length === 0) {
-            logger.trace("No components registered yet, skipping cache warm-up");
+            logger.trace(
+                "No components registered yet, skipping cache warm-up"
+            );
             return;
         }
 
@@ -413,7 +582,7 @@ export default class App {
         // 1. Simple entity count
         commonQueries.push({
             sql: "SELECT COUNT(*) as count FROM (SELECT DISTINCT ec.entity_id as id FROM entity_components ec WHERE ec.deleted_at IS NULL) AS subquery",
-            key: "count_all_entities"
+            key: "count_all_entities",
         });
 
         // 2. Common component queries (first few components)
@@ -425,7 +594,7 @@ export default class App {
                 if (typeId) {
                     commonQueries.push({
                         sql: `SELECT DISTINCT ec.entity_id as id FROM entity_components ec WHERE ec.type_id = '${typeId}' AND ec.deleted_at IS NULL LIMIT 10`,
-                        key: `find_${name.toLowerCase()}_sample`
+                        key: `find_${name.toLowerCase()}_sample`,
                     });
                 }
             }
@@ -433,14 +602,18 @@ export default class App {
 
         // 3. Multi-component queries (if we have multiple components)
         if (components.length >= 2) {
-            const typeIds = components.slice(0, 3).map((component: { name: string; ctor: any }) => 
-                ComponentRegistry.getComponentId(component.name)
-            ).filter((id: string | undefined) => id).join("','");
+            const typeIds = components
+                .slice(0, 3)
+                .map((component: { name: string; ctor: any }) =>
+                    ComponentRegistry.getComponentId(component.name)
+                )
+                .filter((id: string | undefined) => id)
+                .join("','");
 
             if (typeIds) {
                 commonQueries.push({
                     sql: `SELECT DISTINCT ec.entity_id as id FROM entity_components ec WHERE ec.type_id IN ('${typeIds}') AND ec.deleted_at IS NULL LIMIT 10`,
-                    key: "find_multi_component_sample"
+                    key: "find_multi_component_sample",
                 });
             }
         }
@@ -455,12 +628,20 @@ export default class App {
             port: port,
             fetch: this.handleRequest.bind(this),
         });
-        
-        // Update the OpenAPI spec with the actual server URL
-        this.openAPISpecGenerator!.addServer(`http://localhost:${port}`, "Development server");
-        
-        logger.info(`Server is running on ${new URL(this.yoga?.graphqlEndpoint || '/graphql', `http://${server.hostname}:${server.port}`)}`)
 
-        this.appReadyCallbacks.forEach(cb => cb());
+        // Update the OpenAPI spec with the actual server URL
+        this.openAPISpecGenerator!.addServer(
+            `http://localhost:${port}`,
+            "Development server"
+        );
+
+        logger.info(
+            `Server is running on ${new URL(
+                this.yoga?.graphqlEndpoint || "/graphql",
+                `http://${server.hostname}:${server.port}`
+            )}`
+        );
+
+        this.appReadyCallbacks.forEach((cb) => cb());
     }
 }
