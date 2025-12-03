@@ -5,17 +5,21 @@ export { getMetadataStorage } from "./getMetadataStorage";
 
 export function getSerializedMetadataStorage() {
     const storage = getMetadataStorage();
+    const archeTypes: Record<string, any> = {};
+    
+    storage.archetypes_field_map.forEach((v, k) =>{
+        archeTypes[k] = v.map((value) => {
+            return {
+                fieldName: value.fieldName,
+                componentName: value.component.name,
+            }
+        })
+    })
+
+    console.log(archeTypes, 'archeTypes');
+    
     return {
-        components: storage.components.map((c) => ({
-            name: c.name,
-            options: c.options,
-        })),
-        archetypes: storage.archetypes.map((a) => ({
-            name: a.name,
-            options: a.options,
-        })),
-        indexedFields: Object.fromEntries(storage.indexedFields),
-        componentProperties: Object.fromEntries(storage.componentProperties),
+        archeTypes
     };
 }
 
