@@ -12,14 +12,15 @@
         "graphql",
         "typescript"
     ],
+    "module": "index.ts",
+    "type": "module",
     "scripts": {
         "build": "bun run build:studio && tsc",
         "build:studio": "cd studio && bun install && bun run build",
         "dev": "tsc --watch"
     },
     "devDependencies": {
-        "@types/bun": "latest",
-        "vite": "^5.4.0"
+        "@types/bun": "latest"
     },
     "peerDependencies": {
         "typescript": "^5"
