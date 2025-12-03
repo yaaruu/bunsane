@@ -3,6 +3,12 @@ import { getMetadataStorage } from "./getMetadataStorage";
 
 export { getMetadataStorage } from "./getMetadataStorage";
 
+function toFieldLabel(fieldName: string): string {
+    let label = fieldName.replace(/_/g, ' ');
+    label = label.split(' ').map(word => word === 'id' ? 'ID' : word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()).join(' ');
+    return label;
+}
+
 export function getSerializedMetadataStorage() {
     const storage = getMetadataStorage();
     const archeTypes: Record<string, any> = {};
@@ -12,6 +18,7 @@ export function getSerializedMetadataStorage() {
             return {
                 fieldName: value.fieldName,
                 componentName: value.component.name,
+                fieldLabel: toFieldLabel(value.fieldName)
             }
         })
     })
@@ -19,7 +26,7 @@ export function getSerializedMetadataStorage() {
     console.log(archeTypes, 'archeTypes');
     
     return {
-        archeTypes
+        archeTypes,
     };
 }
 
