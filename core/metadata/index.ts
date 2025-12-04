@@ -9,7 +9,13 @@ function toFieldLabel(fieldName: string): string {
     return label;
 }
 
-export function getSerializedMetadataStorage() {
+export function getSerializedMetadataStorage(): {
+    archeTypes: Record<string, {
+        fieldName: string;
+        componentName: string;
+        fieldLabel: string;
+    }[]>;
+} {
     const storage = getMetadataStorage();
     const archeTypes: Record<string, any> = {};
     
@@ -23,7 +29,7 @@ export function getSerializedMetadataStorage() {
         })
     })
 
-    console.log(archeTypes, 'archeTypes');
+    // console.log(archeTypes, 'archeTypes');
     
     return {
         archeTypes,

@@ -415,6 +415,11 @@ export default class App {
             // Studio API endpoints
             if (this.studioEnabled && url.pathname.startsWith("/studio/api/")) {
                 clearTimeout(timeoutId);
+            
+                // Studio tables endpoint
+                if (url.pathname === "/studio/api/tables") {
+                    return studioEndpoint.getTables();
+                }
 
                 const studioApiPath = url.pathname.replace("/studio/api/", "");
                 const pathSegments = studioApiPath.split("/");
@@ -465,6 +470,7 @@ export default class App {
                     }
                 );
             }
+
 
             // Studio endpoint
             if (url.pathname === "/studio") {

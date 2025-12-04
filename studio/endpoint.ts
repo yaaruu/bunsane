@@ -248,20 +248,33 @@ export async function handleStudioArcheTypeRecordsRequest(
         while (validEntities.length < limit && hasMoreData) {
             if (searchTerm) {
                 const searchPattern = `%${searchTerm}%`;
-                const searchParamIndex = requiredComponentNames.length + 1;
+                const componentNamePlaceholders = requiredComponentNames
+                    .map((_, index) => `$${index + 2}`)
+                    .join(", ");
 
+                // First find entities that have all required components (archetype membership)
+                // Then filter by search term in any of their components
                 entityIdsResult = await db.unsafe(
                     `SELECT entity_id FROM (
-                         SELECT c.entity_id, MAX(c.created_at) as max_created_at
-                         FROM components c
-                         WHERE c.name = $1
-                         AND c.deleted_at IS NULL
-                         AND c.data::text ILIKE $${searchParamIndex}
-                         GROUP BY c.entity_id
-                         ORDER BY max_created_at DESC
-                         LIMIT $${searchParamIndex + 1} OFFSET $${searchParamIndex + 2}
-                     ) sub`,
-                    [indicatorComponentName, searchPattern, batchSize, currentOffset]
+                         SELECT entity_id, MAX(created_at) as max_created_at
+                         FROM components
+                         WHERE deleted_at IS NULL
+                         GROUP BY entity_id
+                         HAVING COUNT(DISTINCT CASE WHEN name IN (${componentNamePlaceholders}) THEN name END) = $${requiredComponentNames.length + 2}
+                     ) archetype_entities
+                     WHERE entity_id IN (
+                         SELECT DISTINCT entity_id
+                         FROM components
+                         WHERE deleted_at IS NULL
+                         AND (
+                             data::text ILIKE $1
+                             OR id::text ILIKE $1
+                             OR entity_id::text ILIKE $1
+                         )
+                     )
+                     ORDER BY max_created_at DESC
+                     LIMIT $${requiredComponentNames.length + 3} OFFSET $${requiredComponentNames.length + 4}`,
+                    [searchPattern, ...requiredComponentNames, requiredComponentCount, batchSize, currentOffset]
                 );
             } else {
                 entityIdsResult = await db.unsafe(
@@ -350,13 +363,27 @@ export async function handleStudioArcheTypeRecordsRequest(
 
         if (searchTerm) {
             const searchPattern = `%${searchTerm}%`;
+            const componentNamePlaceholders = requiredComponentNames
+                .map((_, index) => `$${index + 2}`)
+                .join(", ");
+
             totalResult = await db.unsafe(
                 `SELECT COUNT(DISTINCT c.entity_id) as count
                  FROM components c
-                 WHERE c.name = $1
-                 AND c.deleted_at IS NULL
-                 AND c.data::text ILIKE $2`,
-                [indicatorComponentName, searchPattern]
+                 WHERE c.deleted_at IS NULL
+                 AND (
+                     c.data::text ILIKE $1
+                     OR c.id::text ILIKE $1
+                     OR c.entity_id::text ILIKE $1
+                 )
+                 AND c.entity_id IN (
+                     SELECT entity_id
+                     FROM components
+                     WHERE deleted_at IS NULL
+                     GROUP BY entity_id
+                     HAVING COUNT(DISTINCT CASE WHEN name IN (${componentNamePlaceholders}) THEN name END) = $${requiredComponentNames.length + 2}
+                 )`,
+                [searchPattern, ...requiredComponentNames, requiredComponentCount]
             );
         } else {
             totalResult = await db.unsafe(
@@ -517,12 +544,47 @@ export async function handleStudioArcheTypeDeleteRequest(
     }
 }
 
+export async function handleGetTables(): Promise<Response> {
+    try {
+        // Fetch all tables except ECS tables
+        const ecsTables = ['components', 'entities', 'entity_components', 'spatial_ref_sys'];
+        const ecsTablePlaceholders = ecsTables.map((_, index) => `$${index + 1}`).join(", ");
+
+        const result = await db.unsafe(
+            `SELECT table_name
+             FROM information_schema.tables
+             WHERE table_schema = 'public'
+             AND table_type = 'BASE TABLE'
+             AND table_name NOT IN (${ecsTablePlaceholders})
+             AND table_name NOT LIKE 'components_%'
+             ORDER BY table_name`,
+            ecsTables
+        );
+
+        const tables = result.map((row: { table_name: string }) => row.table_name);
+
+        return new Response(JSON.stringify({ tables }), {
+            headers: { "Content-Type": "application/json" },
+        });
+    } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Unknown error";
+        return new Response(
+            JSON.stringify({ error: `Failed to fetch tables: ${errorMessage}` }),
+            {
+                status: 500,
+                headers: { "Content-Type": "application/json" },
+            }
+        );
+    }
+}
+
 const studioEndpoint = {
     handleStudioTableRequest,
     handleStudioArcheTypeRequest,
     handleStudioArcheTypeRecordsRequest,
     handleStudioTableDeleteRequest,
     handleStudioArcheTypeDeleteRequest,
+    getTables: handleGetTables,
 };
 
 export default studioEndpoint;
