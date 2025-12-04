@@ -14,6 +14,7 @@ import { OpenAPISpecGenerator, type SwaggerEndpointMetadata } from "swagger";
 import type BasePlugin from "plugins";
 import { preparedStatementCache } from "database/PreparedStatementCache";
 import db from "database";
+import studioEndpoint from "studio/endpoint";
 
 export default class App {
     private name: string = "BunSane Application";
@@ -39,6 +40,8 @@ export default class App {
 
     private plugins: BasePlugin[] = [];
 
+    private studioEnabled: boolean = false;
+
     constructor(appName?: string, appVersion?: string) {
         if (appName) this.name = appName;
         if (appVersion) this.version = appVersion;
@@ -58,7 +61,7 @@ export default class App {
             const studioDir = Bun.file(studioPath);
             if (studioDir) {
                 this.addStaticAssets("/studio", studioPath);
-                logger.info("Studio assets loaded from:", studioPath);
+                logger.info("Studio assets loaded from:" + studioPath);
             }
         } catch (error) {
             logger.warn(
@@ -409,6 +412,60 @@ export default class App {
                 });
             }
 
+            // Studio API endpoints
+            if (this.studioEnabled && url.pathname.startsWith("/studio/api/")) {
+                clearTimeout(timeoutId);
+
+                const studioApiPath = url.pathname.replace("/studio/api/", "");
+                const pathSegments = studioApiPath.split("/");
+
+                if (pathSegments[0] === "table" && pathSegments[1]) {
+                    const tableName = pathSegments[1];
+
+                    if (method === "POST") {
+                        const body = await req.json();
+                        return studioEndpoint.handleStudioTableDeleteRequest(tableName, body);
+                    }
+
+                    const limit = url.searchParams.get("limit");
+                    const offset = url.searchParams.get("offset");
+                    const search = url.searchParams.get("search");
+
+                    return studioEndpoint.handleStudioTableRequest(tableName, {
+                        limit: limit ? parseInt(limit, 10) : undefined,
+                        offset: offset ? parseInt(offset, 10) : undefined,
+                        search: search ?? undefined,
+                    });
+                }
+
+                if (pathSegments[0] === "arche-type" && pathSegments[1]) {
+                    const archeTypeName = pathSegments[1];
+
+                    if (method === "POST") {
+                        const body = await req.json();
+                        return studioEndpoint.handleStudioArcheTypeDeleteRequest(archeTypeName, body);
+                    }
+
+                    const limit = url.searchParams.get("limit");
+                    const offset = url.searchParams.get("offset");
+                    const search = url.searchParams.get("search");
+
+                    return studioEndpoint.handleStudioArcheTypeRecordsRequest(archeTypeName, {
+                        limit: limit ? parseInt(limit, 10) : undefined,
+                        offset: offset ? parseInt(offset, 10) : undefined,
+                        search: search ?? undefined,
+                    });
+                }
+
+                return new Response(
+                    JSON.stringify({ error: "Studio API endpoint not found" }),
+                    {
+                        status: 404,
+                        headers: { "Content-Type": "application/json" },
+                    }
+                );
+            }
+
             // Studio endpoint
             if (url.pathname === "/studio") {
                 clearTimeout(timeoutId);
@@ -560,6 +617,11 @@ export default class App {
 
     public enforceSwaggerDocs(value: boolean) {
         this.enforceDocs = value;
+    }
+
+    public enableStudio() {
+        this.studioEnabled = true;
+        logger.info("Studio API enabled");
     }
 
     /**
