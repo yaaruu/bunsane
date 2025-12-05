@@ -44,9 +44,9 @@ export function ArcheType() {
       const result = await fetchArcheTypeData(name!, { offset, limit: 50, search: search || undefined })
 
       if (reset) {
-        setData(result.data)
+        setData(result.data as any)
       } else {
-        setData(prev => [...prev, ...result.data])
+        setData(prev => [...prev, ...result.data as any])
       }
 
       setHasMore(result.hasMore)
@@ -123,9 +123,8 @@ export function ArcheType() {
             <div className="max-w-xs">
               <ReactJson
                 src={value}
-                theme="monokai"
                 collapsed={true}
-                enableClipboard={false}
+                enableClipboard
                 displayDataTypes={false}
                 displayObjectSize={false}
                 name={null}

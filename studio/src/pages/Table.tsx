@@ -75,9 +75,8 @@ export function Table() {
                     <div className="max-w-xs">
                       <ReactJson
                         src={value}
-                        theme="monokai"
                         collapsed={true}
-                        enableClipboard={false}
+                        enableClipboard
                         displayDataTypes={false}
                         displayObjectSize={false}
                         name={null}
