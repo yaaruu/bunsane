@@ -472,48 +472,67 @@ export default class App {
             }
 
 
-            // Studio endpoint
-            if (url.pathname === "/studio") {
+            // Studio endpoint - handle both root and all sub-routes
+            if (url.pathname === "/studio" || url.pathname.startsWith("/studio/")) {
                 clearTimeout(timeoutId);
-                const studioIndexPath = path.join(
-                    import.meta.dirname,
-                    "..",
-                    "studio",
-                    "dist",
-                    "index.html"
-                );
-                try {
-                    const studioFile = Bun.file(studioIndexPath);
-                    if (await studioFile.exists()) {
-                        let html = await studioFile.text();
-                        // Inject metadata into the HTML
-                        const metadata = getSerializedMetadataStorage();
-                        const metadataScript = `<script>window.bunsaneMetadata = ${JSON.stringify(
-                            metadata
-                        )};</script>`;
-                        // Insert before the closing </head> tag
-                        html = html.replace(
-                            "</head>",
-                            `${metadataScript}</head>`
-                        );
-                        return new Response(html, {
-                            headers: { "Content-Type": "text/html" },
+                
+                // Skip API routes - they're handled by the API handler above
+                if (url.pathname.startsWith("/studio/api/")) {
+                    return new Response(
+                        JSON.stringify({ error: "Studio API endpoint not found" }),
+                        {
+                            status: 404,
+                            headers: { "Content-Type": "application/json" },
+                        }
+                    );
+                }
+                
+                // Check if this is a request for static assets (CSS, JS, etc.)
+                if (url.pathname.startsWith("/studio/assets/")) {
+                    // Let the static assets handler below handle this
+                    // Don't return here, fall through to static assets handler
+                } else {
+                    // For all other /studio/* routes, serve the React app's index.html
+                    const studioIndexPath = path.join(
+                        import.meta.dirname,
+                        "..",
+                        "studio",
+                        "dist",
+                        "index.html"
+                    );
+                    try {
+                        const studioFile = Bun.file(studioIndexPath);
+                        if (await studioFile.exists()) {
+                            let html = await studioFile.text();
+                            // Inject metadata into the HTML
+                            const metadata = getSerializedMetadataStorage();
+                            const metadataScript = `<script>window.bunsaneMetadata = ${JSON.stringify(
+                                metadata
+                            )};</script>`;
+                            // Insert before the closing </head> tag
+                            html = html.replace(
+                                "</head>",
+                                `${metadataScript}</head>`
+                            );
+                            return new Response(html, {
+                                headers: { "Content-Type": "text/html" },
+                            });
+                        } else {
+                            return new Response(
+                                "Studio not built. Run `bun run build:studio` to build the studio.",
+                                {
+                                    status: 404,
+                                    headers: { "Content-Type": "text/plain" },
+                                }
+                            );
+                        }
+                    } catch (error) {
+                        console.log("Error loading studio index.html:", error);
+                        return new Response("Studio not available", {
+                            status: 404,
+                            headers: { "Content-Type": "text/plain" },
                         });
-                    } else {
-                        return new Response(
-                            "Studio not built. Run `bun run build:studio` to build the studio.",
-                            {
-                                status: 404,
-                                headers: { "Content-Type": "text/plain" },
-                            }
-                        );
                     }
-                } catch (error) {
-                    console.log("Error loading studio index.html:", error);
-                    return new Response("Studio not available", {
-                        status: 404,
-                        headers: { "Content-Type": "text/plain" },
-                    });
                 }
             }
             for (const [route, folder] of this.staticAssets) {
