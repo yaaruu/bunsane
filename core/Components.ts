@@ -13,7 +13,7 @@ export function generateTypeId(name: string): string {
 const primitiveTypes = [String, Number, Boolean, Symbol, BigInt];
 
 //TODO: Continue here
-export function CompData(options?: { indexed?: boolean; nullable?: boolean }) {
+export function CompData(options?: { indexed?: boolean; nullable?: boolean; arrayOf?: any }) {
     return (target: any, propertyKey: string) => {
         const storage = getMetadataStorage();
         const typeId = storage.getComponentId(target.constructor.name);
@@ -60,6 +60,7 @@ export function CompData(options?: { indexed?: boolean; nullable?: boolean }) {
             enumValues: enumValues,
             enumKeys: enumKeys,
             isOptional: options?.nullable ?? false,
+            arrayOf: options?.arrayOf,
         })
         // Reflect.metadata("compData", { isData: true, indexed: options?.indexed ?? false })(target, propertyKey);
     };

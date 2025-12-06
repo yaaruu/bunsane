@@ -11,6 +11,8 @@ import { printSchema } from "graphql";
 import "reflect-metadata";
 import { Query, type FilterSchema } from "../query";
 
+const primitiveTypes = [String, Number, Boolean, Date];
+
 const archetypeFunctionsSymbol = Symbol("archetypeFunctions");
 
 export function ArcheTypeFunction(options?: { returnType?: string }) {
@@ -298,6 +300,26 @@ function getOrCreateComponentSchema(
             if (prop.isOptional) {
                 zodFields[prop.propertyKey] =
                     zodFields[prop.propertyKey].optional();
+            }
+        } else if (prop.arrayOf) {
+            if (customTypeRegistry.has(prop.arrayOf)) {
+                zodFields[prop.propertyKey] = z.array(customTypeRegistry.get(prop.arrayOf)!);
+            } else if (primitiveTypes.includes(prop.arrayOf)) {
+                if (prop.arrayOf === String) {
+                    zodFields[prop.propertyKey] = z.array(z.string());
+                } else if (prop.arrayOf === Number) {
+                    zodFields[prop.propertyKey] = z.array(z.number());
+                } else if (prop.arrayOf === Boolean) {
+                    zodFields[prop.propertyKey] = z.array(z.boolean());
+                } else if (prop.arrayOf === Date) {
+                    zodFields[prop.propertyKey] = z.array(z.date());
+                }
+            } else {
+                console.warn(`[ArcheType] Unknown array element type for ${componentCtor.name}.${prop.propertyKey}: ${prop.arrayOf?.name}. Falling back to z.array(z.string())`);
+                zodFields[prop.propertyKey] = z.array(z.string());
+            }
+            if (prop.isOptional) {
+                zodFields[prop.propertyKey] = zodFields[prop.propertyKey].optional();
             }
         } else {
             console.warn(`[ArcheType] Unknown type for ${componentCtor.name}.${prop.propertyKey}: ${prop.propertyType?.name}. Falling back to z.string()`);
