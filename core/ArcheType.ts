@@ -11,6 +11,8 @@ import { printSchema } from "graphql";
 import "reflect-metadata";
 import { Query, type FilterSchema } from "../query";
 
+export {asEnumType, asUnionType, asObjectType};
+
 const primitiveTypes = [String, Number, Boolean, Date];
 
 const archetypeFunctionsSymbol = Symbol("archetypeFunctions");
