@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { type ColumnDef } from '@tanstack/react-table'
-import { fetchTableData, deleteTableRecord } from '../lib/api'
+import { fetchTableData, deleteTableRecords } from '../lib/api'
 import { DataTable } from '../components/DataTable'
 import { useDataTable } from '../hooks/useDataTable'
 import { createSelectColumn, createTextColumn } from '../utils/columnHelpers'
@@ -29,7 +29,7 @@ export function Table() {
   } = useDataTable<TableRecord>({
     key: name || '',
     fetchData: (params) => fetchTableData(name!, params),
-    deleteRecords: (ids) => Promise.all(ids.map(id => deleteTableRecord(name!, id))).then(() => {}),
+    deleteRecords: (ids) => deleteTableRecords(name!, ids),
     fetchErrorMessage: 'Failed to load table data',
     deleteErrorMessage: 'Failed to delete table records',
   })

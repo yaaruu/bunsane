@@ -1,7 +1,7 @@
 import { useParams } from 'react-router-dom'
 import { type ColumnDef } from '@tanstack/react-table'
 import { useStudioStore } from '../store/studio'
-import { fetchArcheTypeData, deleteArcheTypeRecord } from '../lib/api'
+import { fetchArcheTypeData, deleteArcheTypeRecords } from '../lib/api'
 import { DataTable } from '../components/DataTable'
 import { useDataTable } from '../hooks/useDataTable'
 import { createSelectColumn, createIdColumn, createTextColumn } from '../utils/columnHelpers'
@@ -30,9 +30,12 @@ export function ArcheType() {
   } = useDataTable<ArcheTypeRecord>({
     key: name || '',
     fetchData: (params) => fetchArcheTypeData(name!, params) as Promise<{ data: ArcheTypeRecord[], hasMore: boolean }>,
-    deleteRecords: (ids) => Promise.all(ids.map(id => deleteArcheTypeRecord(name!, id))).then(() => {}),
-    fetchErrorMessage: 'Failed to load archetype data',
-    deleteErrorMessage: 'Failed to delete archetype records',
+    deleteRecords: (ids) => deleteArcheTypeRecords(name!, ids),
+    fetchErrorMessage: 'Failed to load archetype entities',
+    deleteErrorMessage: 'Failed to delete archetype entities',
+    deleteSuccessMessage: 'Deleted {count} {item}',
+    itemSingular: 'entity',
+    itemPlural: 'entities',
   })
 
   const archeTypeFields = metadata?.archeTypes[name || ''] || []
@@ -56,7 +59,7 @@ export function ArcheType() {
   return (
     <DataTable
       title={`${name} Archetype`}
-      description={`Browse and manage records for the ${name} archetype`}
+      description={`Browse and manage entities for the ${name} archetype`}
       data={data}
       columns={columns}
       loading={loading}
@@ -70,6 +73,7 @@ export function ArcheType() {
       onDelete={handleDelete}
       getRecordId={(record) => record.id}
       loadMoreRef={loadMoreRef}
+      isArcheType
     />
   )
 }

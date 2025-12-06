@@ -72,28 +72,30 @@ export async function fetchArcheTypeData(
   }
 }
 
-export async function deleteTableRecord(tableName: string, id: string): Promise<void> {
+export async function deleteTableRecords(tableName: string, ids: string[]): Promise<void> {
   const response = await fetch(`${API_BASE}/table/${tableName}`, {
-    method: 'POST',
+    method: 'DELETE',
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ action: 'delete', id }),
+    body: JSON.stringify({ ids }),
   })
   if (!response.ok) {
-    throw new Error('Failed to delete table record')
+    const error = await response.json().catch(() => ({ error: 'Failed to delete table records' }))
+    throw new Error(error.error || 'Failed to delete table records')
   }
 }
 
-export async function deleteArcheTypeRecord(archeTypeName: string, id: string): Promise<void> {
+export async function deleteArcheTypeRecords(archeTypeName: string, entityIds: string[]): Promise<void> {
   const response = await fetch(`${API_BASE}/arche-type/${archeTypeName}`, {
-    method: 'POST',
+    method: 'DELETE',
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ action: 'delete', id }),
+    body: JSON.stringify({ entityIds }),
   })
   if (!response.ok) {
-    throw new Error('Failed to delete archetype record')
+    const error = await response.json().catch(() => ({ error: 'Failed to delete archetype records' }))
+    throw new Error(error.error || 'Failed to delete archetype records')
   }
 }

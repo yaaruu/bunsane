@@ -427,7 +427,7 @@ export default class App {
                 if (pathSegments[0] === "table" && pathSegments[1]) {
                     const tableName = pathSegments[1];
 
-                    if (method === "POST") {
+                    if (method === "DELETE") {
                         const body = await req.json();
                         return studioEndpoint.handleStudioTableDeleteRequest(tableName, body);
                     }
@@ -446,7 +446,7 @@ export default class App {
                 if (pathSegments[0] === "arche-type" && pathSegments[1]) {
                     const archeTypeName = pathSegments[1];
 
-                    if (method === "POST") {
+                    if (method === "DELETE") {
                         const body = await req.json();
                         return studioEndpoint.handleStudioArcheTypeDeleteRequest(archeTypeName, body);
                     }

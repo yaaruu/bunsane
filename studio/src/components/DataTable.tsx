@@ -9,6 +9,7 @@ import {
 import { Search, Trash2, Loader2 } from 'lucide-react'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
+import { pluralize } from '../lib/utils'
 
 interface DataTableProps<T> {
   title: string
@@ -26,6 +27,7 @@ interface DataTableProps<T> {
   onDelete?: () => void
   getRecordId: (record: T) => string
   loadMoreRef: (node?: Element | null) => void
+  isArcheType?: boolean
 }
 
 export function DataTable<T extends Record<string, any>>({
@@ -44,6 +46,7 @@ export function DataTable<T extends Record<string, any>>({
   onDelete,
   getRecordId,
   loadMoreRef,
+  isArcheType = false,
 }: DataTableProps<T>) {
   const table = useReactTable({
     data,
@@ -93,7 +96,7 @@ export function DataTable<T extends Record<string, any>>({
         <div className="relative flex-1 max-w-sm">
           <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
           <Input
-            placeholder="Search records..."
+            placeholder={`Search ${isArcheType ? "entities" : "records"}...`}
             value={search}
             onChange={(e) => onSearchChange(e.target.value)}
             className="pl-10"
@@ -103,7 +106,11 @@ export function DataTable<T extends Record<string, any>>({
         {onDelete && selectedRecords.size > 0 && (
           <Button
             variant="destructive"
-            onClick={onDelete}
+            onClick={() => {
+              if (window.confirm(`Are you sure you want to delete ${selectedRecords.size} ${pluralize(selectedRecords.size, isArcheType ? 'entity' : 'record', isArcheType ? 'entities' : 'records')}? This action cannot be undone.`)) {
+                onDelete()
+              }
+            }}
             className="flex items-center gap-2"
           >
             <Trash2 className="h-4 w-4" />
@@ -169,17 +176,17 @@ export function DataTable<T extends Record<string, any>>({
             {loading ? (
               <div className="flex items-center justify-center gap-2">
                 <Loader2 className="h-4 w-4 animate-spin" />
-                Loading more records...
+                Loading more {isArcheType ? "entities" : "records"}...
               </div>
             ) : (
-              <div className="text-muted-foreground">Scroll for more records</div>
+              <div className="text-muted-foreground">Scroll for more {isArcheType ? "entities" : "records"} </div>
             )}
           </div>
         )}
 
         {!loading && data.length === 0 && (
           <div className="p-8 text-center text-muted-foreground">
-            No records found
+            No {isArcheType ? "entities" : "records"} found
           </div>
         )}
       </div>

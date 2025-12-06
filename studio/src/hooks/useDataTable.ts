@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useInView } from 'react-intersection-observer'
 import { type SortingState } from '@tanstack/react-table'
 import { toast } from 'sonner'
+import { pluralize } from '../lib/utils'
 
 interface UseDataTableOptions<T> {
   /** Unique identifier for the data (e.g., table name, archetype name) */
@@ -17,6 +18,12 @@ interface UseDataTableOptions<T> {
   fetchErrorMessage?: string
   /** Optional: Custom error message for delete failure */
   deleteErrorMessage?: string
+  /** Optional: Custom success message for delete (use {count} and {item} as placeholders) */
+  deleteSuccessMessage?: string
+  /** Optional: Singular form of the item type (e.g., "record", "entity") */
+  itemSingular?: string
+  /** Optional: Plural form of the item type (e.g., "records", "entities") */
+  itemPlural?: string
 }
 
 export function useDataTable<T>({
@@ -25,6 +32,9 @@ export function useDataTable<T>({
   deleteRecords,
   fetchErrorMessage = 'Failed to load data',
   deleteErrorMessage = 'Failed to delete records',
+  deleteSuccessMessage = 'Deleted {count} {item}',
+  itemSingular = 'record',
+  itemPlural = 'records',
 }: UseDataTableOptions<T>) {
   const [data, setData] = useState<T[]>([])
   const [loading, setLoading] = useState(false)
@@ -82,7 +92,8 @@ export function useDataTable<T>({
 
     try {
       await deleteRecords(Array.from(selectedRecords))
-      toast.success(`Deleted ${selectedRecords.size} records`)
+      const itemText = pluralize(selectedRecords.size, itemSingular, itemPlural)
+      toast.success(deleteSuccessMessage.replace('{count}', selectedRecords.size.toString()).replace('{item}', itemText))
       setSelectedRecords(new Set())
       loadMore(true)
     } catch (error) {
