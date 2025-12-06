@@ -5,7 +5,7 @@ import { logger as MainLogger } from "core/Logger";
 const logger = MainLogger.child({ scope: "App" });
 import { createYogaInstance } from "gql";
 import ServiceRegistry from "service/ServiceRegistry";
-import type { Plugin } from "graphql-yoga";
+import { type Plugin, createPubSub } from "graphql-yoga";
 import * as path from "path";
 import { SchedulerManager } from "core/SchedulerManager";
 import { registerScheduledTasks } from "core/decorators/ScheduledTask";
@@ -29,6 +29,8 @@ export default class App {
     private appReadyCallbacks: Array<() => void> = [];
 
     private plugins: BasePlugin[] = [];
+
+    pubSub = createPubSub();
 
     constructor(appName?: string, appVersion?: string) {
         if (appName) this.name = appName;
@@ -452,6 +454,7 @@ export default class App {
         logger.info("Application Started");
         const port = parseInt(process.env.APP_PORT || "3000");
         const server = Bun.serve({
+            idleTimeout: 0, // Disable idle timeout because we have subscriptions
             port: port,
             fetch: this.handleRequest.bind(this),
         });
