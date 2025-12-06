@@ -40,7 +40,7 @@ export function renderCellValue(value: any, extractValue = false): JSX.Element {
       <div className="max-w-xs">
         <ReactJson
           src={actualValue}
-          collapsed={true}
+          collapsed={2}
           enableClipboard
           displayDataTypes={false}
           displayObjectSize={false}
