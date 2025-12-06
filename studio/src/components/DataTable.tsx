@@ -7,6 +7,7 @@ import {
   type SortingState,
 } from '@tanstack/react-table'
 import { Loader2 } from "lucide-react";
+import { toast } from "sonner";
 
 interface DataTableProps<T> {
     data: T[];
@@ -78,6 +79,43 @@ export function DataTable<T extends Record<string, any>>({
         },
     });
 
+    const handleCellClick = (cell: any, event: React.MouseEvent) => {
+        // Skip copy for select column
+        if (cell.column.id === "select") return;
+
+        // Prevent event bubbling
+        event.stopPropagation();
+
+        const value = cell.getValue();
+        let textToCopy = "";
+
+        // Extract the actual value if it has a .value property
+        let actualValue = value;
+        if (typeof value === "object" && value !== null && "value" in value) {
+            actualValue = value.value;
+        }
+
+        // Only copy primitive values (not objects)
+        if (typeof actualValue === "object" && actualValue !== null) {
+            return; // Don't copy objects, let ReactJson handle it
+        } else {
+            textToCopy = String(actualValue ?? "");
+        }
+
+        if (textToCopy) {
+            navigator.clipboard
+                .writeText(textToCopy)
+                .then(() => {
+                    toast.success("Copied to clipboard", {
+                        position: "top-center",
+                    });
+                })
+                .catch(() => {
+                    toast.error("Failed to copy", { position: "top-center" });
+                });
+        }
+    };
+
     return (
         <div className="bg-card rounded-lg border border-border overflow-hidden">
             <div className="overflow-x-auto">
@@ -126,7 +164,10 @@ export function DataTable<T extends Record<string, any>>({
                                 {row.getVisibleCells().map((cell) => (
                                     <td
                                         key={cell.id}
-                                        className="px-4 py-3 text-sm"
+                                        className="px-4 py-3 text-sm cursor-pointer hover:bg-muted/30"
+                                        onClick={(e) =>
+                                            handleCellClick(cell, e)
+                                        }
                                     >
                                         {flexRender(
                                             cell.column.columnDef.cell,
