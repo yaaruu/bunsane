@@ -1,160 +1,14 @@
 import { getSerializedMetadataStorage } from "../core/metadata";
-import { findIndicatorComponentName } from "./utils";
+import { findIndicatorComponentName } from "../studio/utils";
 import db from "../database";
-
-interface StudioTableQueryParams {
-    limit?: number;
-    offset?: number;
-    search?: string;
-}
-
-interface StudioArcheTypeQueryParams {
-    limit?: number;
-    offset?: number;
-    search?: string;
-}
-
-interface TableColumn {
-    name: string;
-    type: string;
-    nullable: boolean;
-    primary: boolean;
-}
-
-interface TableRowData {
-    [key: string]: unknown;
-}
-
-interface StudioTableResponse {
-    name: string;
-    columns: TableColumn[];
-    rows: TableRowData[];
-    total: number;
-    limit: number;
-    offset: number;
-}
-
-export async function handleStudioTableRequest(
-    tableName: string,
-    params: StudioTableQueryParams = {}
-): Promise<Response> {
-    const limit = Math.min(Math.max(params.limit ?? 50, 1), 1000);
-    const offset = Math.max(params.offset ?? 0, 0);
-    const searchTerm = params.search ?? "";
-
-    try {
-        const columnsResult = await db`
-            SELECT 
-                column_name,
-                data_type,
-                is_nullable,
-                column_default
-            FROM information_schema.columns
-            WHERE table_name = ${tableName}
-            AND table_schema = 'public'
-            ORDER BY ordinal_position
-        `;
-
-        if (columnsResult.length === 0) {
-            return new Response(
-                JSON.stringify({ error: `Table '${tableName}' not found` }),
-                {
-                    status: 404,
-                    headers: { "Content-Type": "application/json" },
-                }
-            );
-        }
-
-        const primaryKeyResult = await db`
-            SELECT kcu.column_name
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu 
-                ON tc.constraint_name = kcu.constraint_name
-                AND tc.table_schema = kcu.table_schema
-            WHERE tc.constraint_type = 'PRIMARY KEY'
-            AND tc.table_name = ${tableName}
-            AND tc.table_schema = 'public'
-        `;
-        const primaryKeyColumns = new Set(
-            primaryKeyResult.map((row: { column_name: string }) => row.column_name)
-        );
-
-        const columns: TableColumn[] = columnsResult.map((col: {
-            column_name: string;
-            data_type: string;
-            is_nullable: string;
-        }) => ({
-            name: col.column_name,
-            type: col.data_type,
-            nullable: col.is_nullable === "YES",
-            primary: primaryKeyColumns.has(col.column_name),
-        }));
-
-        const textColumns = columnsResult
-            .filter((col: { data_type: string }) =>
-                ["character varying", "text", "varchar", "char", "uuid"].includes(col.data_type)
-            )
-            .map((col: { column_name: string }) => col.column_name);
-
-        let rows: TableRowData[];
-        let totalResult: { count: number }[];
-
-        if (searchTerm && textColumns.length > 0) {
-            const searchPattern = `%${searchTerm}%`;
-            const searchConditions = textColumns
-                .map((col: string) => `"${col}"::text ILIKE $1`)
-                .join(" OR ");
-
-            rows = await db.unsafe(
-                `SELECT * FROM "${tableName}" 
-                 WHERE ${searchConditions}
-                 ORDER BY created_at DESC NULLS LAST
-                 LIMIT $2 OFFSET $3`,
-                [searchPattern, limit, offset]
-            );
-
-            totalResult = await db.unsafe(
-                `SELECT COUNT(*) as count FROM "${tableName}" WHERE ${searchConditions}`,
-                [searchPattern]
-            );
-        } else {
-            rows = await db.unsafe(
-                `SELECT * FROM "${tableName}" 
-                 ORDER BY created_at DESC NULLS LAST
-                 LIMIT $1 OFFSET $2`,
-                [limit, offset]
-            );
-
-            totalResult = await db.unsafe(
-                `SELECT COUNT(*) as count FROM "${tableName}"`
-            );
-        }
-
-        const total = Number(totalResult[0]?.count ?? 0);
-
-        const responseData: StudioTableResponse = {
-            name: tableName,
-            columns,
-            rows,
-            total,
-            limit,
-            offset,
-        };
-
-        return new Response(JSON.stringify(responseData), {
-            headers: { "Content-Type": "application/json" },
-        });
-    } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : "Unknown error";
-        return new Response(
-            JSON.stringify({ error: `Failed to fetch table data: ${errorMessage}` }),
-            {
-                status: 500,
-                headers: { "Content-Type": "application/json" },
-            }
-        );
-    }
-}
+import type {
+    StudioArcheTypeQueryParams,
+    StudioArcheTypeResponse,
+    DeleteArcheTypeEntitiesRequest,
+    DeleteResponse,
+    ArcheTypeField,
+    ArcheTypeEntityRecord,
+} from "./types";
 
 export function handleStudioArcheTypeRequest(archeTypeName: string): Response {
     const mockArcheTypeData = {
@@ -175,27 +29,6 @@ export function handleStudioArcheTypeRequest(archeTypeName: string): Response {
     });
 }
 
-interface ArcheTypeField {
-    fieldName: string;
-    componentName: string;
-    fieldLabel: string;
-}
-
-interface ArcheTypeEntityRecord {
-    entityId: string;
-    components: Record<string, unknown>;
-}
-
-interface StudioArcheTypeResponse {
-    name: string;
-    fields: ArcheTypeField[];
-    indicatorComponent: string | null;
-    entities: ArcheTypeEntityRecord[];
-    total: number;
-    limit: number;
-    offset: number;
-}
-
 export async function handleStudioArcheTypeRecordsRequest(
     archeTypeName: string,
     params: StudioArcheTypeQueryParams = {}
@@ -206,11 +39,14 @@ export async function handleStudioArcheTypeRecordsRequest(
 
     try {
         const metadataStorage = getSerializedMetadataStorage();
-        const archeTypeFields: ArcheTypeField[] | undefined = metadataStorage.archeTypes[archeTypeName];
+        const archeTypeFields: ArcheTypeField[] | undefined =
+            metadataStorage.archeTypes[archeTypeName];
 
         if (!archeTypeFields || archeTypeFields.length === 0) {
             return new Response(
-                JSON.stringify({ error: `ArcheType '${archeTypeName}' not found` }),
+                JSON.stringify({
+                    error: `ArcheType '${archeTypeName}' not found`,
+                }),
                 {
                     status: 404,
                     headers: { "Content-Type": "application/json" },
@@ -218,11 +54,16 @@ export async function handleStudioArcheTypeRecordsRequest(
             );
         }
 
-        const indicatorComponentName = findIndicatorComponentName(archeTypeName, archeTypeFields);
+        const indicatorComponentName = findIndicatorComponentName(
+            archeTypeName,
+            archeTypeFields
+        );
 
         if (!indicatorComponentName) {
             return new Response(
-                JSON.stringify({ error: `No indicator component found for '${archeTypeName}'` }),
+                JSON.stringify({
+                    error: `No indicator component found for '${archeTypeName}'`,
+                }),
                 {
                     status: 400,
                     headers: { "Content-Type": "application/json" },
@@ -230,7 +71,9 @@ export async function handleStudioArcheTypeRecordsRequest(
             );
         }
 
-        const requiredComponentNames = archeTypeFields.map(field => field.componentName);
+        const requiredComponentNames = archeTypeFields.map(
+            (field) => field.componentName
+        );
         const requiredComponentCount = requiredComponentNames.length;
 
         const componentPlaceholders = requiredComponentNames
@@ -260,7 +103,9 @@ export async function handleStudioArcheTypeRecordsRequest(
                          FROM components
                          WHERE deleted_at IS NULL
                          GROUP BY entity_id
-                         HAVING COUNT(DISTINCT CASE WHEN name IN (${componentNamePlaceholders}) THEN name END) = $${requiredComponentNames.length + 2}
+                         HAVING COUNT(DISTINCT CASE WHEN name IN (${componentNamePlaceholders}) THEN name END) = $${
+                        requiredComponentNames.length + 2
+                    }
                      ) archetype_entities
                      WHERE entity_id IN (
                          SELECT DISTINCT entity_id
@@ -273,8 +118,16 @@ export async function handleStudioArcheTypeRecordsRequest(
                          )
                      )
                      ORDER BY max_created_at DESC
-                     LIMIT $${requiredComponentNames.length + 3} OFFSET $${requiredComponentNames.length + 4}`,
-                    [searchPattern, ...requiredComponentNames, requiredComponentCount, batchSize, currentOffset]
+                     LIMIT $${requiredComponentNames.length + 3} OFFSET $${
+                        requiredComponentNames.length + 4
+                    }`,
+                    [
+                        searchPattern,
+                        ...requiredComponentNames,
+                        requiredComponentCount,
+                        batchSize,
+                        currentOffset,
+                    ]
                 );
             } else {
                 entityIdsResult = await db.unsafe(
@@ -296,7 +149,7 @@ export async function handleStudioArcheTypeRecordsRequest(
                 break;
             }
 
-            const entityIds = entityIdsResult.map(row => row.entity_id);
+            const entityIds = entityIdsResult.map((row) => row.entity_id);
 
             const entityIdPlaceholders = entityIds
                 .map((_, index) => `$${index + 1}`)
@@ -325,15 +178,20 @@ export async function handleStudioArcheTypeRecordsRequest(
                 if (!entityComponentsMap.has(entityId)) {
                     entityComponentsMap.set(entityId, new Map());
                 }
-                entityComponentsMap.get(entityId)!.set(componentName, componentData);
+                entityComponentsMap
+                    .get(entityId)!
+                    .set(componentName, componentData);
             }
 
             for (const entityId of entityIds) {
                 const componentsMap = entityComponentsMap.get(entityId);
 
-                if (componentsMap && componentsMap.size === requiredComponentCount) {
+                if (
+                    componentsMap &&
+                    componentsMap.size === requiredComponentCount
+                ) {
                     const allComponentsPresent = requiredComponentNames.every(
-                        name => componentsMap.has(name)
+                        (name) => componentsMap.has(name)
                     );
 
                     if (allComponentsPresent) {
@@ -381,9 +239,15 @@ export async function handleStudioArcheTypeRecordsRequest(
                      FROM components
                      WHERE deleted_at IS NULL
                      GROUP BY entity_id
-                     HAVING COUNT(DISTINCT CASE WHEN name IN (${componentNamePlaceholders}) THEN name END) = $${requiredComponentNames.length + 2}
+                     HAVING COUNT(DISTINCT CASE WHEN name IN (${componentNamePlaceholders}) THEN name END) = $${
+                    requiredComponentNames.length + 2
+                }
                  )`,
-                [searchPattern, ...requiredComponentNames, requiredComponentCount]
+                [
+                    searchPattern,
+                    ...requiredComponentNames,
+                    requiredComponentCount,
+                ]
             );
         } else {
             totalResult = await db.unsafe(
@@ -414,69 +278,6 @@ export async function handleStudioArcheTypeRecordsRequest(
         const errorMessage = error instanceof Error ? error.message : "Unknown error";
         return new Response(
             JSON.stringify({ error: `Failed to fetch archetype data: ${errorMessage}` }),
-            {
-                status: 500,
-                headers: { "Content-Type": "application/json" },
-            }
-        );
-    }
-}
-
-interface DeleteTableRowsRequest {
-    ids: string[];
-}
-
-interface DeleteArcheTypeEntitiesRequest {
-    entityIds: string[];
-}
-
-interface DeleteResponse {
-    success: boolean;
-    deletedCount: number;
-    message: string;
-}
-
-export async function handleStudioTableDeleteRequest(
-    tableName: string,
-    requestBody: DeleteTableRowsRequest
-): Promise<Response> {
-    const { ids } = requestBody;
-
-    if (!ids || !Array.isArray(ids) || ids.length === 0) {
-        return new Response(
-            JSON.stringify({ error: "ids array is required and must not be empty" }),
-            {
-                status: 400,
-                headers: { "Content-Type": "application/json" },
-            }
-        );
-    }
-
-    try {
-        const idPlaceholders = ids.map((_, index) => `$${index + 1}`).join(", ");
-
-        const result = await db.unsafe(
-            `DELETE FROM "${tableName}" WHERE id IN (${idPlaceholders})`,
-            ids
-        );
-
-        const deletedCount = typeof result === "object" && result !== null && "count" in result
-            ? Number(result.count)
-            : ids.length;
-
-        const responseData: DeleteResponse = {
-            success: true,
-            deletedCount,
-            message: `Successfully deleted ${deletedCount} row(s) from ${tableName}`,
-        };
-
-        return new Response(JSON.stringify(responseData), {
-            headers: { "Content-Type": "application/json" },
-        });
-    } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : "Unknown error";
-        return new Response(
-            JSON.stringify({ error: `Failed to delete rows: ${errorMessage}` }),
             {
                 status: 500,
                 headers: { "Content-Type": "application/json" },
@@ -543,48 +344,3 @@ export async function handleStudioArcheTypeDeleteRequest(
         );
     }
 }
-
-export async function handleGetTables(): Promise<Response> {
-    try {
-        // Fetch all tables except ECS tables
-        const ecsTables = ['components', 'entities', 'entity_components', 'spatial_ref_sys'];
-        const ecsTablePlaceholders = ecsTables.map((_, index) => `$${index + 1}`).join(", ");
-
-        const result = await db.unsafe(
-            `SELECT table_name
-             FROM information_schema.tables
-             WHERE table_schema = 'public'
-             AND table_type = 'BASE TABLE'
-             AND table_name NOT IN (${ecsTablePlaceholders})
-             AND table_name NOT LIKE 'components_%'
-             ORDER BY table_name`,
-            ecsTables
-        );
-
-        const tables = result.map((row: { table_name: string }) => row.table_name);
-
-        return new Response(JSON.stringify({ tables }), {
-            headers: { "Content-Type": "application/json" },
-        });
-    } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : "Unknown error";
-        return new Response(
-            JSON.stringify({ error: `Failed to fetch tables: ${errorMessage}` }),
-            {
-                status: 500,
-                headers: { "Content-Type": "application/json" },
-            }
-        );
-    }
-}
-
-const studioEndpoint = {
-    handleStudioTableRequest,
-    handleStudioArcheTypeRequest,
-    handleStudioArcheTypeRecordsRequest,
-    handleStudioTableDeleteRequest,
-    handleStudioArcheTypeDeleteRequest,
-    getTables: handleGetTables,
-};
-
-export default studioEndpoint;

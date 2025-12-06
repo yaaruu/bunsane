@@ -14,7 +14,7 @@ import { OpenAPISpecGenerator, type SwaggerEndpointMetadata } from "swagger";
 import type BasePlugin from "plugins";
 import { preparedStatementCache } from "database/PreparedStatementCache";
 import db from "database";
-import studioEndpoint from "studio/endpoint";
+import studioEndpoint from "../endpoints";
 
 export default class App {
     private name: string = "BunSane Application";
