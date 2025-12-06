@@ -1,6 +1,6 @@
-import db from "database";
-import { getSerializedMetadataStorage } from "core/metadata";
+import { getSerializedMetadataStorage } from "../core/metadata";
 import { findIndicatorComponentName } from "./utils";
+import db from "../database";
 
 interface StudioTableQueryParams {
     limit?: number;
