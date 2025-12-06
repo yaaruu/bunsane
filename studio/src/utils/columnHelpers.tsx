@@ -29,46 +29,61 @@ export function createSelectColumn<T>(): ColumnDef<T> {
 /**
  * Renders a cell value, displaying objects as ReactJson and primitives as text
  */
-export function renderCellValue(value: any, extractValue = false): JSX.Element {
-  // If extractValue is true and value has a .value property, extract it
-  let actualValue = extractValue && value?.value !== undefined ? value.value : value
+export function renderCellValue(
+    value: any,
+    extractValue = false,
+    autoExpandRow = false
+): JSX.Element {
+    // If extractValue is true and value has a .value property, extract it
+    let actualValue =
+        extractValue && value?.value !== undefined ? value.value : value;
 
-  actualValue = actualValue ?? '-'
-  
-  if (typeof actualValue === 'object' && actualValue !== null) {
+    actualValue = actualValue ?? "-";
+
+    if (typeof actualValue === "object" && actualValue !== null) {
+        return (
+            <div className="max-w-xs">
+                <ReactJson
+                    src={actualValue}
+                    collapsed={autoExpandRow ? 2 : 0}
+                    enableClipboard
+                    displayDataTypes={false}
+                    displayObjectSize={false}
+                    name={null}
+                />
+            </div>
+        );
+    }
+
     return (
-      <div className="max-w-xs">
-        <ReactJson
-          src={actualValue}
-          collapsed={2}
-          enableClipboard
-          displayDataTypes={false}
-          displayObjectSize={false}
-          name={null}
-        />
-      </div>
-    )
-  }
-  
-  return <span className="truncate max-w-xs block">{String(actualValue)}</span>
+        <span className="truncate max-w-xs block">{String(actualValue)}</span>
+    );
 }
 
 /**
  * Creates a standard text column with proper rendering
  */
 export function createTextColumn<T>(
-  key: string,
-  header: string,
-  options: { extractValue?: boolean; className?: string } = {}
+    key: string,
+    header: string,
+    options: {
+        extractValue?: boolean;
+        className?: string;
+        autoExpandRow?: boolean;
+    } = {}
 ): ColumnDef<T> {
-  return {
-    accessorKey: key,
-    header,
-    cell: ({ getValue }) => {
-      const value = getValue()
-      return renderCellValue(value, options.extractValue)
-    },
-  }
+    return {
+        accessorKey: key,
+        header,
+        cell: ({ getValue }) => {
+            const value = getValue();
+            return renderCellValue(
+                value,
+                options.extractValue,
+                options.autoExpandRow
+            );
+        },
+    };
 }
 
 /**
