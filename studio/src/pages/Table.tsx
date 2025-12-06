@@ -10,7 +10,6 @@ import {
   type SortingState,
 } from '@tanstack/react-table'
 import { Search, Trash2, Loader2 } from 'lucide-react'
-import { useStudioStore } from '../store/studio'
 import { fetchTableData, deleteTableRecord } from '../lib/api'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
@@ -68,6 +67,7 @@ export function Table() {
             ...Object.keys(sampleRecord).map(key => ({
               accessorKey: key,
               header: key,
+              // @ts-ignore
               cell: ({ getValue }) => {
                 const value = getValue()
                 if (typeof value === 'object' && value !== null) {
