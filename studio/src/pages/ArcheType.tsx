@@ -2,6 +2,9 @@ import { useParams } from 'react-router-dom'
 import { type ColumnDef } from '@tanstack/react-table'
 import { useStudioStore } from '../store/studio'
 import { fetchArcheTypeData, deleteArcheTypeRecords } from '../lib/api'
+import { PageContainer } from "../components/PageContainer";
+import { PageHeader } from "../components/PageHeader";
+import { SearchBar } from "../components/SearchBar";
 import { DataTable } from '../components/DataTable'
 import { useDataTable } from '../hooks/useDataTable'
 import { createSelectColumn, createIdColumn, createTextColumn } from '../utils/columnHelpers'
@@ -57,23 +60,34 @@ export function ArcheType() {
   }
 
   return (
-    <DataTable
-      title={`${name} Archetype`}
-      description={`Browse and manage entities for the ${name} archetype`}
-      data={data}
-      columns={columns}
-      loading={loading}
-      hasMore={hasMore}
-      search={search}
-      onSearchChange={setSearch}
-      sorting={sorting}
-      onSortingChange={setSorting}
-      selectedRecords={selectedRecords}
-      onSelectionChange={setSelectedRecords}
-      onDelete={handleDelete}
-      getRecordId={(record) => record.id}
-      loadMoreRef={loadMoreRef}
-      isArcheType
-    />
-  )
+      <PageContainer>
+          <PageHeader
+              title={`${name} Archetype`}
+              description={`Browse and manage entities for the ${name} archetype`}
+          />
+          <SearchBar
+              search={search}
+              onSearchChange={setSearch}
+              placeholder="Search entities..."
+              selectedCount={selectedRecords.size}
+              onDelete={handleDelete}
+              itemSingular="entity"
+              itemPlural="entities"
+          />
+          <DataTable
+              data={data}
+              columns={columns}
+              loading={loading}
+              hasMore={hasMore}
+              sorting={sorting}
+              onSortingChange={setSorting}
+              selectedRecords={selectedRecords}
+              onSelectionChange={setSelectedRecords}
+              getRecordId={(record) => record.id}
+              loadMoreRef={loadMoreRef}
+              emptyMessage="No entities found"
+              loadingMessage="Loading more entities..."
+          />
+      </PageContainer>
+  );
 }

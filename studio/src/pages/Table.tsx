@@ -2,6 +2,9 @@ import { useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { type ColumnDef } from '@tanstack/react-table'
 import { fetchTableData, deleteTableRecords } from '../lib/api'
+import { PageContainer } from "../components/PageContainer";
+import { PageHeader } from "../components/PageHeader";
+import { SearchBar } from "../components/SearchBar";
 import { DataTable } from '../components/DataTable'
 import { useDataTable } from '../hooks/useDataTable'
 import { createSelectColumn, createTextColumn } from '../utils/columnHelpers'
@@ -58,22 +61,34 @@ export function Table() {
   }
 
   return (
-    <DataTable
-      title={`${name} Table`}
-      description={`Browse and manage records in the ${name} table`}
-      data={data}
-      columns={columns}
-      loading={loading}
-      hasMore={hasMore}
-      search={search}
-      onSearchChange={setSearch}
-      sorting={sorting}
-      onSortingChange={setSorting}
-      selectedRecords={selectedRecords}
-      onSelectionChange={setSelectedRecords}
-      onDelete={handleDelete}
-      getRecordId={(record) => String(record.id)}
-      loadMoreRef={loadMoreRef}
-    />
-  )
+      <PageContainer>
+          <PageHeader
+              title={`${name} Table`}
+              description={`Browse and manage records in the ${name} table`}
+          />
+          <SearchBar
+              search={search}
+              onSearchChange={setSearch}
+              placeholder="Search records..."
+              selectedCount={selectedRecords.size}
+              onDelete={handleDelete}
+              itemSingular="record"
+              itemPlural="records"
+          />
+          <DataTable
+              data={data}
+              columns={columns}
+              loading={loading}
+              hasMore={hasMore}
+              sorting={sorting}
+              onSortingChange={setSorting}
+              selectedRecords={selectedRecords}
+              onSelectionChange={setSelectedRecords}
+              getRecordId={(record) => String(record.id)}
+              loadMoreRef={loadMoreRef}
+              emptyMessage="No records found"
+              loadingMessage="Loading more records..."
+          />
+      </PageContainer>
+  );
 }
