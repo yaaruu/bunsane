@@ -25,6 +25,7 @@ export {
     isFieldRequested
 }
 export { GraphQLSchemaOrchestrator } from "./orchestration";
+export { generateGraphQLSchemaV2 } from "./GeneratorV2";
 export type {
     GraphQLType,
     TypeFromGraphQL,

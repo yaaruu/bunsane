@@ -29,7 +29,7 @@ export class GraphQLSchemaOrchestrator {
      * Generate a complete GraphQL schema from service instances.
      * This is the main entry point that orchestrates the entire generation process.
      */
-    async generateSchema(services: any[]): Promise<GraphQLSchema | null> {
+    generateSchema(services: any[]): GraphQLSchema | null {
         try {
             logger.info("Starting GraphQL schema generation with orchestrator");
 
@@ -37,13 +37,13 @@ export class GraphQLSchemaOrchestrator {
             this.services = services;
 
             // Phase 1: Build graph from services
-            await this.buildGraphFromServices(services);
+            this.buildGraphFromServices(services);
 
             // Phase 2: Run preprocessing visitors
-            await this.runPreprocessingVisitors();
+            this.runPreprocessingVisitors();
 
             // Phase 3: Run generation visitors
-            const generationResults = await this.runGenerationVisitors();
+            const generationResults = this.runGenerationVisitors();
 
             // Phase 4: Sort operations alphabetically
             this.sortOperationsAlphabetically(generationResults);
@@ -63,7 +63,7 @@ export class GraphQLSchemaOrchestrator {
     /**
      * Phase 1: Build the schema graph from service instances using the ServiceScanner.
      */
-    private async buildGraphFromServices(services: any[]): Promise<void> {
+    private buildGraphFromServices(services: any[]): void {
         logger.debug("Phase 1: Building graph from services", { serviceCount: services.length });
 
         // Clear any existing nodes
@@ -81,7 +81,7 @@ export class GraphQLSchemaOrchestrator {
     /**
      * Phase 2: Run preprocessing visitors to prepare the graph for generation.
      */
-    private async runPreprocessingVisitors(): Promise<void> {
+    private runPreprocessingVisitors(): void {
         logger.debug("Phase 2: Running preprocessing visitors");
 
         const composer = new VisitorComposer();
@@ -109,10 +109,10 @@ export class GraphQLSchemaOrchestrator {
     /**
      * Phase 3: Run generation visitors to produce typeDefs and resolvers.
      */
-    private async runGenerationVisitors(): Promise<{
+    private runGenerationVisitors(): {
         typeDefs: string;
         resolvers: Record<string, any>;
-    }> {
+    } {
         logger.debug("Phase 3: Running generation visitors");
 
         const composer = new VisitorComposer();
@@ -129,15 +129,55 @@ export class GraphQLSchemaOrchestrator {
         const schemaResults = results["visitor-0"];
         const resolverResults = results["visitor-1"];
 
+        // Add field resolvers from services (for archetype field resolvers)
+        this.addFieldResolvers(resolverResults);
+
+        // Filter out empty resolver types to avoid schema validation errors
+        const filteredResolvers: Record<string, any> = {};
+        for (const [type, typeResolvers] of Object.entries(resolverResults || {})) {
+            if (typeResolvers && Object.keys(typeResolvers).length > 0) {
+                filteredResolvers[type] = typeResolvers;
+            }
+        }
+
         logger.debug("Generation completed", {
             typeDefsLength: schemaResults?.typeDefs?.length || 0,
-            resolverCount: Object.keys(resolverResults?.resolvers || {}).length
+            resolverCount: Object.keys(filteredResolvers).length
         });
 
         return {
             typeDefs: schemaResults?.typeDefs || "",
-            resolvers: resolverResults?.resolvers || {}
+            resolvers: filteredResolvers
         };
+    }
+
+    /**
+     * Add field resolvers from services (registered via archetype.registerFieldResolvers)
+     */
+    private addFieldResolvers(resolvers: Record<string, any>): void {
+        for (const service of this.services) {
+            const fields = service.__graphqlFields || service.constructor.prototype.__graphqlFields;
+            if (!fields) continue;
+
+            for (const fieldMeta of fields) {
+                const { type, field, propertyKey } = fieldMeta;
+                
+                // Ensure the type exists in resolvers
+                if (!resolvers[type]) {
+                    resolvers[type] = {};
+                }
+
+                // Add field resolver
+                resolvers[type][field] = async (parent: any, args: any, context: any, info: any) => {
+                    try {
+                        return await service[propertyKey](parent, args, context, info);
+                    } catch (error) {
+                        logger.error(`Error in field resolver ${type}.${field}:`, error);
+                        throw error;
+                    }
+                };
+            }
+        }
     }
 
     /**

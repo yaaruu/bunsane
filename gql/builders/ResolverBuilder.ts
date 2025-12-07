@@ -25,9 +25,19 @@ export class ResolverBuilder {
   addResolver(definition: ResolverDefinition): void {
     const { name, type, service, propertyKey, zodSchema, hasInput } = definition;
 
-    const resolver = hasInput
-      ? this.createResolverWithInput(service, propertyKey, zodSchema)
-      : this.createResolverWithoutInput(service, propertyKey);
+    let resolver: any;
+
+    if (type === "Subscription") {
+      // Subscriptions need special handling with subscribe/resolve pattern
+      resolver = hasInput
+        ? this.createSubscriptionResolverWithInput(service, propertyKey, zodSchema)
+        : this.createSubscriptionResolverWithoutInput(service, propertyKey);
+    } else {
+      // Queries and Mutations use regular resolver pattern
+      resolver = hasInput
+        ? this.createResolverWithInput(service, propertyKey, zodSchema)
+        : this.createResolverWithoutInput(service, propertyKey);
+    }
 
     this.resolvers[type][name] = resolver;
     logger.trace(`Added ${type} resolver: ${name}`);
@@ -39,12 +49,17 @@ export class ResolverBuilder {
   private createResolverWithInput(service: any, propertyKey: string, zodSchema?: ZodType): Function {
     return async (_: any, args: any, context: any, info: any) => {
       try {
+        logger.debug(`[V2] Resolver ${propertyKey} RAW args from GraphQL:`, JSON.stringify(args, null, 2));
         const inputArgs = args.input || args;
+        logger.debug(`[V2] Resolver ${propertyKey} inputArgs (after extraction):`, JSON.stringify(inputArgs, null, 2));
+        logger.debug(`[V2] Resolver ${propertyKey} has zodSchema:`, !!zodSchema);
 
         // Automatically validate with Zod schema if provided
         if (zodSchema) {
           try {
+            logger.debug(`[V2] About to parse with Zod for ${propertyKey}`);
             const validated = zodSchema.parse(inputArgs);
+            logger.debug(`[V2] Validated input for ${propertyKey}:`, JSON.stringify(validated, null, 2));
             return await service[propertyKey](validated, context, info);
           } catch (error) {
             if (error instanceof z.ZodError) {
@@ -79,7 +94,8 @@ export class ResolverBuilder {
   private createResolverWithoutInput(service: any, propertyKey: string): Function {
     return async (_: any, args: any, context: any, info: any) => {
       try {
-        return await service[propertyKey]({}, context, info);
+        const result = await service[propertyKey]({}, context, info);
+        return result;
       } catch (error) {
         logger.error(`Error in resolver without input:`);
         logger.error(error);
@@ -93,6 +109,74 @@ export class ResolverBuilder {
           }
         });
       }
+    };
+  }
+
+  /**
+   * Create a subscription resolver with input (returns { subscribe, resolve })
+   */
+  private createSubscriptionResolverWithInput(service: any, propertyKey: string, zodSchema?: ZodType): any {
+    return {
+      subscribe: async (_: any, args: any, context: any, info: any) => {
+        try {
+          const inputArgs = args.input || args;
+
+          // Automatically validate with Zod schema if provided
+          if (zodSchema) {
+            try {
+              const validated = zodSchema.parse(inputArgs);
+              return await service[propertyKey](validated, context, info);
+            } catch (error) {
+              if (error instanceof z.ZodError) {
+                const { handleGraphQLError } = await import("../../core/ErrorHandler");
+                handleGraphQLError(error);
+              }
+              throw error;
+            }
+          } else {
+            return await service[propertyKey](inputArgs, context, info);
+          }
+        } catch (error) {
+          logger.error(`Error in subscription with input:`);
+          logger.error(error);
+          if (error instanceof GraphQLError) {
+            throw error;
+          }
+          throw new GraphQLError(`Internal error in subscription`, {
+            extensions: {
+              code: "INTERNAL_ERROR",
+              originalError: process.env.NODE_ENV === 'development' ? error : undefined
+            }
+          });
+        }
+      },
+      resolve: (payload: any) => payload
+    };
+  }
+
+  /**
+   * Create a subscription resolver without input (returns { subscribe, resolve })
+   */
+  private createSubscriptionResolverWithoutInput(service: any, propertyKey: string): any {
+    return {
+      subscribe: async (_: any, args: any, context: any, info: any) => {
+        try {
+          return await service[propertyKey]({}, context, info);
+        } catch (error) {
+          logger.error(`Error in subscription without input:`);
+          logger.error(error);
+          if (error instanceof GraphQLError) {
+            throw error;
+          }
+          throw new GraphQLError(`Internal error in subscription`, {
+            extensions: {
+              code: "INTERNAL_ERROR",
+              originalError: process.env.NODE_ENV === 'development' ? error : undefined
+            }
+          });
+        }
+      },
+      resolve: (payload: any) => payload
     };
   }
 

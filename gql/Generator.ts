@@ -678,6 +678,9 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
                         const outputName = `${name}Output`;
                         typeDefs += `type ${outputName} {\n${Object.entries(output).map(([k, v]) => `  ${k}: ${v}`).join('\n')}\n}\n`;
                         fieldDef += `: ${outputName}`;
+                    } else {
+                        // Default case when output is not specified - assume String
+                        fieldDef += `: String`;
                     }
                     if (type === 'Query') {
                         queryFields.push(fieldDef);

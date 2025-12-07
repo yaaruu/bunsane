@@ -11,6 +11,7 @@ import { OperationType, GraphQLTypeKind } from "../graph/GraphNode";
  */
 export class ServiceScanner {
     private graph: SchemaGraph;
+    private allScalarTypes: Set<string> = new Set();
 
     constructor(graph: SchemaGraph) {
         this.graph = graph;
@@ -21,6 +22,17 @@ export class ServiceScanner {
      * @param services Array of service instances to scan
      */
     public scanServices(services: BaseService[]): void {
+        // First pass: collect all scalar types
+        for (const service of services) {
+            const scalarTypes = this.getServiceMetadata(service, '__graphqlScalarTypes') as string[];
+            if (scalarTypes) {
+                for (const scalarName of scalarTypes) {
+                    this.allScalarTypes.add(scalarName);
+                }
+            }
+        }
+        
+        // Second pass: scan services with scalar types available
         for (const service of services) {
             this.scanService(service);
         }
@@ -91,27 +103,31 @@ export class ServiceScanner {
         if (!operations) return;
 
         for (const op of operations) {
-            // Create input node if input is an object
+            // Create input node if input is a plain object (not Zod schema)
             let inputNodeId: string | undefined;
-            if (op.input && typeof op.input === 'object' && !Array.isArray(op.input)) {
+            if (op.input && typeof op.input === 'object' && !Array.isArray(op.input) && !('_def' in op.input)) {
                 const inputTypeName = this.extractTypeNameFromInput(op.input, op.name!);
-                const inputFields = Object.entries(op.input as Record<string, any>)
-                    .map(([key, type]) => `  ${key}: ${type}`)
-                    .join('\n');
-                const inputTypeDef = `input ${inputTypeName} {\n${inputFields}\n}`;
-                const inputNode = new InputNode(
-                    inputTypeName,
-                    inputTypeName,
-                    inputTypeDef,
-                    false,
-                    {
-                        serviceName: service.constructor.name,
-                        operationName: op.name,
-                        description: `Input type for ${op.name} operation`
-                    }
-                );
-                this.graph.addNode(inputNode);
-                inputNodeId = inputTypeName;
+                
+                // Only create node if it doesn't already exist
+                if (inputTypeName && !this.graph.getNode(inputTypeName)) {
+                    const inputFields = Object.entries(op.input as Record<string, any>)
+                        .map(([key, type]) => `  ${key}: ${type}`)
+                        .join('\n');
+                    const inputTypeDef = `input ${inputTypeName} {\n${inputFields}\n}`;
+                    const inputNode = new InputNode(
+                        inputTypeName,
+                        inputTypeName,
+                        inputTypeDef,
+                        false,
+                        {
+                            serviceName: service.constructor.name,
+                            operationName: op.name,
+                            description: `Input type for ${op.name} operation`
+                        }
+                    );
+                    this.graph.addNode(inputNode);
+                }
+                inputNodeId = inputTypeName || undefined;
             }
 
             const operationType = op.type.toLowerCase() === 'query' ? OperationType.QUERY : OperationType.MUTATION;
@@ -127,6 +143,7 @@ export class ServiceScanner {
                     propertyKey: op.propertyKey,
                     input: op.input,
                     output: op.output,
+                    scalarTypes: this.allScalarTypes,
                     description: `${op.type} operation defined in ${service.constructor.name}`
                 }
             );
@@ -158,6 +175,7 @@ export class ServiceScanner {
                     propertyKey: sub.propertyKey,
                     input: sub.input,
                     output: sub.output,
+                    scalarTypes: this.allScalarTypes,
                     description: `Subscription defined in ${service.constructor.name}`
                 }
             );
@@ -177,8 +195,16 @@ export class ServiceScanner {
         if (!fields) return;
 
         for (const field of fields) {
+            // Create a unique ID for the field node to avoid conflicts across services
+            const fieldId = `${service.constructor.name}-${field.field}`;
+            
+            // Skip if field node already exists (duplicate field definition)
+            if (this.graph.getNode(fieldId)) {
+                continue;
+            }
+            
             const fieldNode = new FieldNode(
-                field.field,
+                fieldId,
                 'unknown', // typeName - we don't know the parent type yet
                 field.field,
                 field.type,
@@ -201,14 +227,15 @@ export class ServiceScanner {
         // Add dependency on input type if it exists
         if (operationMeta.input) {
             const inputTypeName = this.extractTypeNameFromInput(operationMeta.input, operationMeta.name!);
-            if (inputTypeName) {
+            if (inputTypeName && this.graph.getNode(inputTypeName)) {
                 this.graph.addDependency(operationNode.id, inputTypeName);
             }
         }
 
-        // Add dependency on output type
+        // Add dependency on output type if it exists in the graph
+        // Note: Archetype types may not exist yet - they're added by ArchetypePreprocessorVisitor
         const outputTypeName = this.extractTypeNameFromOutput(operationMeta.output);
-        if (outputTypeName) {
+        if (outputTypeName && this.graph.getNode(outputTypeName)) {
             this.graph.addDependency(operationNode.id, outputTypeName);
         }
     }
@@ -222,14 +249,15 @@ export class ServiceScanner {
         // Add dependency on input type if it exists
         if (subscriptionMeta.input) {
             const inputTypeName = this.extractTypeNameFromInput(subscriptionMeta.input, subscriptionMeta.name!);
-            if (inputTypeName) {
+            if (inputTypeName && this.graph.getNode(inputTypeName)) {
                 this.graph.addDependency(subscriptionNode.id, inputTypeName);
             }
         }
 
-        // Add dependency on output type
+        // Add dependency on output type if it exists in the graph
+        // Note: Archetype types may not exist yet - they're added by ArchetypePreprocessorVisitor
         const outputTypeName = this.extractTypeNameFromOutput(subscriptionMeta.output);
-        if (outputTypeName) {
+        if (outputTypeName && this.graph.getNode(outputTypeName)) {
             this.graph.addDependency(subscriptionNode.id, outputTypeName);
         }
     }

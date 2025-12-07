@@ -33,14 +33,18 @@ export class ResolverGeneratorVisitor extends GraphVisitor {
         const type = node.operationType.charAt(0).toUpperCase() + node.operationType.slice(1).toLowerCase() as "Query" | "Mutation" | "Subscription";
         logger.debug(`Creating resolver for ${type}.${node.name} with service ${node.metadata.serviceName}`);
 
+        // Extract Zod schema from input if it's a Zod type (check for '_def' property)
+        const input = node.metadata.input;
+        const zodSchema = (input && typeof input === 'object' && '_def' in input) ? input as any : null;
+
         // Create resolver definitions for operations
         const resolverDef = {
             name: node.name,
             type: type,
             service: service, // Service instance
             propertyKey: node.metadata.propertyKey, // Method name from metadata
-            zodSchema: node.metadata.zodSchema, // Zod schema if available
-            hasInput: !!node.inputNodeId // Whether this operation has input
+            zodSchema: zodSchema, // Zod schema if available
+            hasInput: !!node.inputNodeId || !!zodSchema // Whether this operation has input (either InputNode or Zod schema)
         };
 
         this.resolverBuilder.addResolver(resolverDef);
