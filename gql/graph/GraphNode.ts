@@ -119,8 +119,8 @@ export class OperationNode extends GraphNode {
 
     constructor(
         id: string,
-        operationType: OperationType,
         name: string,
+        operationType: OperationType,
         fieldDef: string,
         inputNodeId?: string,
         outputNodeId?: string,
@@ -128,8 +128,8 @@ export class OperationNode extends GraphNode {
         dependencies: string[] = []
     ) {
         super(id, NodeType.OPERATION, metadata, dependencies);
-        this.operationType = operationType;
         this.name = name;
+        this.operationType = operationType;
         this.fieldDef = fieldDef;
         this.inputNodeId = inputNodeId;
         this.outputNodeId = outputNodeId;

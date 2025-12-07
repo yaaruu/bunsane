@@ -122,6 +122,17 @@ export class ResolverBuilder {
   }
 
   /**
+   * Clear all resolvers
+   */
+  clear(): void {
+    this.resolvers = {
+      Query: {},
+      Mutation: {},
+      Subscription: {}
+    };
+  }
+
+  /**
    * Get statistics
    */
   getStats(): { queries: number; mutations: number; subscriptions: number } {
