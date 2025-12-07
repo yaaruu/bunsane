@@ -1015,13 +1015,13 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
     });
 
     if (queryFields.length > 0) {
-        typeDefs += `type Query {\n${queryFields.map(f => `  ${f}`).join('\n')}\n}\n`;
+        typeDefs += `type Query {\n${queryFields.sort().map(f => `  ${f}`).join('\n')}\n}\n`;
     }
     if (mutationFields.length > 0) {
-        typeDefs += `type Mutation {\n${mutationFields.map(f => `  ${f}`).join('\n')}\n}\n`;
+        typeDefs += `type Mutation {\n${mutationFields.sort().map(f => `  ${f}`).join('\n')}\n}\n`;
     }
     if (subscriptionFields.length > 0) {
-        typeDefs += `type Subscription {\n${subscriptionFields.map(f => `  ${f}`).join('\n')}\n}\n`;
+        typeDefs += `type Subscription {\n${subscriptionFields.sort().map(f => `  ${f}`).join('\n')}\n}\n`;
     }
 
     logger.trace(`Query fields count: ${queryFields.length}, Mutation fields count: ${mutationFields.length}, Subscription fields count: ${subscriptionFields.length}`);
