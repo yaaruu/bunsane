@@ -268,4 +268,11 @@ export class SchemaGraph {
             errors
         };
     }
+
+    /**
+     * Get the number of nodes in the graph
+     */
+    size(): number {
+        return this.nodes.size;
+    }
 }

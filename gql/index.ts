@@ -24,6 +24,7 @@ export {
     GraphQLScalarType,
     isFieldRequested
 }
+export { GraphQLSchemaOrchestrator } from "./orchestration";
 export type {
     GraphQLType,
     TypeFromGraphQL,

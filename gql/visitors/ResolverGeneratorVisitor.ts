@@ -1,6 +1,7 @@
 import { GraphVisitor } from "./GraphVisitor";
 import { TypeNode, OperationNode, FieldNode, InputNode, ScalarNode } from "../graph/GraphNode";
 import { ResolverBuilder } from "../builders/ResolverBuilder";
+import { logger } from "../../core/Logger";
 
 /**
  * Visitor that generates the GraphQL resolvers object.
@@ -8,9 +9,11 @@ import { ResolverBuilder } from "../builders/ResolverBuilder";
  */
 export class ResolverGeneratorVisitor extends GraphVisitor {
     private resolverBuilder: ResolverBuilder;
+    private services: any[];
 
-    constructor() {
+    constructor(services: any[]) {
         super();
+        this.services = services;
         this.resolverBuilder = new ResolverBuilder();
     }
 
@@ -20,11 +23,21 @@ export class ResolverGeneratorVisitor extends GraphVisitor {
     }
 
     visitOperationNode(node: OperationNode): void {
+        // Find the service instance that matches the service name
+        const service = this.services.find(s => s.constructor.name === node.metadata.serviceName);
+        if (!service) {
+            logger.warn(`Service ${node.metadata.serviceName} not found for operation ${node.name}`);
+            return;
+        }
+
+        const type = node.operationType.charAt(0).toUpperCase() + node.operationType.slice(1).toLowerCase() as "Query" | "Mutation" | "Subscription";
+        logger.debug(`Creating resolver for ${type}.${node.name} with service ${node.metadata.serviceName}`);
+
         // Create resolver definitions for operations
         const resolverDef = {
             name: node.name,
-            type: node.operationType.charAt(0).toUpperCase() + node.operationType.slice(1).toLowerCase() as "Query" | "Mutation" | "Subscription",
-            service: node.metadata.service, // Service instance from metadata
+            type: type,
+            service: service, // Service instance
             propertyKey: node.metadata.propertyKey, // Method name from metadata
             zodSchema: node.metadata.zodSchema, // Zod schema if available
             hasInput: !!node.inputNodeId // Whether this operation has input

@@ -117,8 +117,8 @@ export class ServiceScanner {
             const operationType = op.type.toLowerCase() === 'query' ? OperationType.QUERY : OperationType.MUTATION;
             const operationNode = new OperationNode(
                 op.name!,
-                operationType,
                 op.name!,
+                operationType,
                 `${op.name}: String`, // Placeholder field definition
                 inputNodeId,
                 undefined, // outputNodeId
@@ -148,8 +148,8 @@ export class ServiceScanner {
         for (const sub of subscriptions) {
             const subscriptionNode = new OperationNode(
                 sub.name!,
-                OperationType.SUBSCRIPTION,
                 sub.name!,
+                OperationType.SUBSCRIPTION,
                 `${sub.name}: String`, // Placeholder field definition
                 undefined, // inputNodeId
                 undefined, // outputNodeId
