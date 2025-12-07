@@ -49,17 +49,12 @@ export class ResolverBuilder {
   private createResolverWithInput(service: any, propertyKey: string, zodSchema?: ZodType): Function {
     return async (_: any, args: any, context: any, info: any) => {
       try {
-        logger.debug(`[V2] Resolver ${propertyKey} RAW args from GraphQL:`, JSON.stringify(args, null, 2));
         const inputArgs = args.input || args;
-        logger.debug(`[V2] Resolver ${propertyKey} inputArgs (after extraction):`, JSON.stringify(inputArgs, null, 2));
-        logger.debug(`[V2] Resolver ${propertyKey} has zodSchema:`, !!zodSchema);
 
         // Automatically validate with Zod schema if provided
         if (zodSchema) {
           try {
-            logger.debug(`[V2] About to parse with Zod for ${propertyKey}`);
             const validated = zodSchema.parse(inputArgs);
-            logger.debug(`[V2] Validated input for ${propertyKey}:`, JSON.stringify(validated, null, 2));
             return await service[propertyKey](validated, context, info);
           } catch (error) {
             if (error instanceof z.ZodError) {

@@ -64,25 +64,18 @@ export class GraphQLSchemaOrchestrator {
      * Phase 1: Build the schema graph from service instances using the ServiceScanner.
      */
     private buildGraphFromServices(services: any[]): void {
-        logger.debug("Phase 1: Building graph from services", { serviceCount: services.length });
 
         // Clear any existing nodes
         this.schemaGraph.clear();
 
         // Scan all services - this adds nodes directly to the graph
         this.serviceScanner.scanServices(services);
-
-        logger.debug("Graph built successfully", {
-            nodeCount: this.schemaGraph.size(),
-            serviceCount: services.length
-        });
     }
 
     /**
      * Phase 2: Run preprocessing visitors to prepare the graph for generation.
      */
     private runPreprocessingVisitors(): void {
-        logger.debug("Phase 2: Running preprocessing visitors");
 
         const composer = new VisitorComposer();
 
@@ -100,10 +93,7 @@ export class GraphQLSchemaOrchestrator {
         const archetypeResults = results["visitor-0"];
         const deduplicationResults = results["visitor-1"];
 
-        logger.debug("Preprocessing completed", {
-            archetypeSchemas: archetypeResults?.archetypeSchemas?.length || 0,
-            duplicateNodes: deduplicationResults?.duplicateNodeIds?.length || 0
-        });
+        
     }
 
     /**
@@ -113,7 +103,6 @@ export class GraphQLSchemaOrchestrator {
         typeDefs: string;
         resolvers: Record<string, any>;
     } {
-        logger.debug("Phase 3: Running generation visitors");
 
         const composer = new VisitorComposer();
 
@@ -140,10 +129,7 @@ export class GraphQLSchemaOrchestrator {
             }
         }
 
-        logger.debug("Generation completed", {
-            typeDefsLength: schemaResults?.typeDefs?.length || 0,
-            resolverCount: Object.keys(filteredResolvers).length
-        });
+        
 
         return {
             typeDefs: schemaResults?.typeDefs || "",
@@ -187,7 +173,6 @@ export class GraphQLSchemaOrchestrator {
         typeDefs: string;
         resolvers: Record<string, any>;
     }): void {
-        logger.debug("Phase 4: Sorting operations alphabetically");
 
         // Sort resolvers alphabetically within each type
         const operationTypes = ["Query", "Mutation", "Subscription"] as const;
@@ -207,7 +192,6 @@ export class GraphQLSchemaOrchestrator {
             }
         }
 
-        logger.debug("Operations sorted alphabetically");
     }
 
     /**
@@ -217,8 +201,6 @@ export class GraphQLSchemaOrchestrator {
         typeDefs: string;
         resolvers: Record<string, any>;
     }): GraphQLSchema | null {
-        logger.debug("Phase 5: Creating GraphQL schema");
-
         // Check if there are any operations to create a schema for
         const hasOperations = Object.values(generationResults.resolvers).some(
             (typeResolvers: any) => Object.keys(typeResolvers).length > 0
@@ -235,11 +217,10 @@ export class GraphQLSchemaOrchestrator {
                 resolvers: generationResults.resolvers
             });
 
-            logger.debug("GraphQL schema created successfully");
             return schema;
 
         } catch (error) {
-            logger.error("Failed to create GraphQL schema", { error });
+            logger.error({error},"Failed to create GraphQL schema");
             throw new Error(`Schema creation failed: ${error instanceof Error ? error.message : String(error)}`);
         }
     }
@@ -256,6 +237,5 @@ export class GraphQLSchemaOrchestrator {
      */
     clear(): void {
         this.schemaGraph.clear();
-        logger.debug("Orchestrator state cleared");
     }
 }
