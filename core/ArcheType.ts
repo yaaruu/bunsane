@@ -957,6 +957,10 @@ export class BaseArcheType {
                         }
                     }
 
+                    if (!foreignId && foreignKey === 'id') {
+                        foreignId = entity.id;
+                    }
+
                     if (foreignId) {
                         // Load related entity
                         let relatedArchetypeInstance: BaseArcheType;
@@ -1412,6 +1416,10 @@ export class BaseArcheType {
                                     }
                                 }
                             }
+                        }
+
+                        if (!foreignId && relationOptions.foreignKey === 'id') {
+                            foreignId = entity.id;
                         }
 
                         if (!foreignId) {
