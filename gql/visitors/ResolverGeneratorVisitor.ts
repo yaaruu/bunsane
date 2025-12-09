@@ -15,6 +15,28 @@ export class ResolverGeneratorVisitor extends GraphVisitor {
         super();
         this.services = services;
         this.resolverBuilder = new ResolverBuilder();
+        
+        // Add Date scalar resolver
+        this.resolverBuilder.addScalarResolver('Date', {
+            serialize: (value: any) => {
+                if (value instanceof Date) {
+                    return value.toISOString();
+                }
+                return value;
+            },
+            parseValue: (value: any) => {
+                if (typeof value === 'string') {
+                    return new Date(value);
+                }
+                return value;
+            },
+            parseLiteral: (ast: any) => {
+                if (ast.kind === 'StringValue') {
+                    return new Date(ast.value);
+                }
+                return null;
+            }
+        });
     }
 
     visitTypeNode(node: TypeNode): void {

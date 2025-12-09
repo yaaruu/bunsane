@@ -201,6 +201,16 @@ export class ResolverBuilder {
   }
 
   /**
+   * Add a scalar resolver
+   */
+  addScalarResolver(name: string, resolver: any): void {
+    if (!this.resolvers[name]) {
+      this.resolvers[name] = resolver;
+      logger.trace(`Added scalar resolver: ${name}`);
+    }
+  }
+
+  /**
    * Clear all resolvers
    */
   clear(): void {
