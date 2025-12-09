@@ -9,6 +9,7 @@ import { QueryContext, QueryDAG, SourceNode, ComponentInclusionNode } from "./in
 import { OrQuery } from "./OrQuery";
 import { OrNode } from "./OrNode";
 import { preparedStatementCache } from "../database/PreparedStatementCache";
+import { getMetadataStorage } from "../core/metadata";
 
 export type FilterOperator = "=" | ">" | "<" | ">=" | "<=" | "!=" | "LIKE" | "IN" | "NOT IN" | string;
 
@@ -55,6 +56,7 @@ class Query {
     private context: QueryContext;
     private debug: boolean = false;
     private orQuery: OrQuery | null = null;
+    private shouldPopulate: boolean = false;
 
     constructor() {
         this.context = new QueryContext();
@@ -127,7 +129,7 @@ class Query {
     }
 
     public populate(): this {
-        // TODO: Implement populate functionality
+        this.shouldPopulate = true;
         return this;
     }
 
@@ -332,14 +334,85 @@ class Query {
             return [];
         }
 
-        // TODO: Handle populate functionality
-        // For now, return basic Entity objects
-        return entityIds.map((id: string) => {
+        // Create Entity objects
+        const entityMap = new Map<string, Entity>();
+        for (const id of entityIds) {
             const entity = new Entity(id);
             entity.setPersisted(true);
             entity.setDirty(false);
-            return entity;
-        });
+            entityMap.set(id, entity);
+        }
+
+        // Populate entities with components if requested
+        if (this.shouldPopulate && this.context.componentIds.size > 0) {
+            await this.populateComponents(entityMap);
+        }
+
+        // Return entities in the same order as the query results
+        return entityIds.map(id => entityMap.get(id)!);
+    }
+
+    /**
+     * Bulk fetch and attach components to entities
+     * @private
+     */
+    private async populateComponents(entityMap: Map<string, Entity>): Promise<void> {
+        const entityIds = Array.from(entityMap.keys());
+        const componentTypeIds = Array.from(this.context.componentIds);
+
+        if (entityIds.length === 0 || componentTypeIds.length === 0) {
+            return;
+        }
+
+        // Bulk fetch all components for all entities and all requested component types
+        const components = await db`
+            SELECT id, entity_id, type_id, data 
+            FROM components 
+            WHERE entity_id = ANY(${entityIds})
+            AND type_id = ANY(${componentTypeIds})
+            AND deleted_at IS NULL
+        `;
+
+        // Get metadata storage for Date deserialization
+        const storage = getMetadataStorage();
+
+        // Group components by entity_id and attach them to entities
+        for (const row of components) {
+            const entity = entityMap.get(row.entity_id);
+            if (!entity) continue;
+
+            // Get the component constructor from registry
+            const ComponentCtor = ComponentRegistry.getConstructor(row.type_id);
+            if (!ComponentCtor) {
+                logger.warn(`Component constructor not found for type_id: ${row.type_id}`);
+                continue;
+            }
+
+            // Create component instance
+            const component = new ComponentCtor();
+            
+            // Parse and assign component data
+            const componentData = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+            Object.assign(component, componentData);
+
+            // Deserialize Date properties
+            const props = storage.componentProperties.get(row.type_id);
+            if (props) {
+                for (const prop of props) {
+                    if (prop.propertyType === Date && typeof (component as any)[prop.propertyKey] === 'string') {
+                        (component as any)[prop.propertyKey] = new Date((component as any)[prop.propertyKey]);
+                    }
+                }
+            }
+
+            // Set component metadata
+            component.id = row.id;
+            component.setPersisted(true);
+            component.setDirty(false);
+
+            // Add component to entity (using protected method)
+            (entity as any).addComponent(component);
+        }
     }
 
     /**

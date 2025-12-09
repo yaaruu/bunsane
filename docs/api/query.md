@@ -188,7 +188,7 @@ const users = await new Query()
 
 #### `query.populate()`
 
-Fully populates all components for matching entities. This is equivalent to calling `Entity.LoadMultiple()` on the results.
+Pre-fills entity objects with the components specified in `.with()` calls. When enabled, entities returned by `.exec()` will have their components already loaded in memory, avoiding the need for subsequent database queries when calling `entity.get()` or `entity.getComponent()` on those specific components.
 
 ```typescript
 populate(): this
@@ -196,13 +196,29 @@ populate(): this
 
 **Returns:** `this` - Query instance for chaining
 
+**Behavior:**
+- Performs a single bulk query to fetch all requested components for all matching entities
+- Components are attached to entities during query execution
+- Only populates components specified in `.with()` calls
+- Significantly improves performance when you know you'll need component data
+- Entities returned will have components already cached, so `entity.get(Component)` won't trigger additional database queries
+
 **Example:**
 ```typescript
-const fullUsers = await new Query()
-  .with(UserTag)
+const users = await new Query()
+  .with(NameComponent)
+  .with(EmailComponent)
   .populate()
-  .exec(); // Returns fully loaded Entity objects
+  .exec();
+
+// No additional database queries - components already loaded
+for (const user of users) {
+  const name = await user.get(NameComponent);  // Instant - already in memory
+  const email = await user.get(EmailComponent); // Instant - already in memory
+}
 ```
+
+**Performance Note:** Without `.populate()`, each `entity.get()` call would trigger a separate database query. With `.populate()`, all component data is fetched in one optimized bulk query.
 
 #### `query.findById(id)`
 
