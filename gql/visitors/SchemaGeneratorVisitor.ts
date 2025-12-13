@@ -47,6 +47,9 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
                 this.typeDefs += this.deduplicateTypeDefs(typeDefinitions.join(''));
             }
         }
+
+        // Add default scalars
+        this.typeDefs += 'scalar Upload\n';
     }
     
     /**
@@ -338,41 +341,84 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
                 innerInput = (zodSchema as any).unwrap();
             }
             
-            // Preprocess schema: Replace z.union containing scalar literals with just the literal
-            // This is needed because GQLoom's weave doesn't handle z.union well
-            const shape = typeof innerInput._def?.shape === 'function' ? innerInput._def.shape() : innerInput._def?.shape;
-            if (shape) {
-                const processedShape: any = {};
-                for (const [key, value] of Object.entries(shape)) {
-                    const fieldSchema = value as any;
-                    const typeName = fieldSchema._def?.typeName || fieldSchema._def?.type;
+            // Preprocess schema: Replace z.union containing scalar literals with z.string() recursively
+            // This is needed because GQLoom's weave doesn't handle z.union or z.literal well
+            // We'll replace the String type with the actual scalar type after weaving
+            const scalarFieldNames = new Map<string, string>(); // Track which fields should be scalars (full path)
+            
+            // Recursive function to process schemas and handle all Zod wrapper types
+            const processSchema = (schema: any, path: string[] = []): any => {
+                if (!schema || !schema._def) return schema;
+                
+                const typeName = schema._def?.typeName || schema._def?.type;
+                
+                // Handle wrapper types (optional, nullable, default, etc.) - process inner type and re-wrap
+                if (typeName === 'ZodOptional' || typeName === 'optional') {
+                    const inner = processSchema(schema._def.innerType, path);
+                    return inner.optional();
+                }
+                if (typeName === 'ZodNullable' || typeName === 'nullable') {
+                    const inner = processSchema(schema._def.innerType, path);
+                    return inner.nullable();
+                }
+                if (typeName === 'ZodDefault' || typeName === 'default') {
+                    const inner = processSchema(schema._def.innerType, path);
+                    return inner.default(schema._def.defaultValue());
+                }
+                if (typeName === 'ZodEffects' || typeName === 'effects') {
+                    // Effects (transform, refine, etc.) - process the inner schema
+                    const inner = processSchema(schema._def.schema, path);
+                    // Return as-is since we can't easily re-apply effects
+                    return inner;
+                }
+                if (typeName === 'ZodArray' || typeName === 'array') {
+                    const inner = processSchema(schema._def.type, path);
+                    return z.array(inner);
+                }
+                
+                // Handle unions containing scalar literals
+                if (typeName === 'ZodUnion' || typeName === 'union') {
+                    const options = schema._def?.options || [];
+                    let foundScalarName = null;
                     
-                    // Check if it's a union containing a scalar literal
-                    if (typeName === 'ZodUnion' || typeName === 'union') {
-                        const options = fieldSchema._def?.options || [];
-                        let foundScalarLiteral = null;
-                        
-                        for (const option of options) {
-                            const optionTypeName = option._def?.typeName || option._def?.type;
-                            if (optionTypeName === 'ZodLiteral' || optionTypeName === 'literal') {
-                                const value = option._def?.value ?? (option._def?.values ? option._def.values[0] : undefined);
-                                if (typeof value === 'string' && scalarTypes.has(value)) {
-                                    foundScalarLiteral = option;
-                                    break;
-                                }
+                    for (const option of options) {
+                        const optionTypeName = option._def?.typeName || option._def?.type;
+                        if (optionTypeName === 'ZodLiteral' || optionTypeName === 'literal') {
+                            const value = option._def?.value ?? (option._def?.values ? option._def.values[0] : undefined);
+                            if (typeof value === 'string' && scalarTypes.has(value)) {
+                                foundScalarName = value;
+                                break;
                             }
                         }
-                        
-                        // Replace union with just the literal for schema generation
-                        processedShape[key] = foundScalarLiteral || fieldSchema;
-                    } else {
-                        processedShape[key] = fieldSchema;
+                    }
+                    
+                    if (foundScalarName) {
+                        scalarFieldNames.set(path.join('.') || path[path.length - 1] || 'root', foundScalarName);
+                        return z.string();
+                    }
+                    
+                    // Process each option in the union recursively (for non-scalar unions)
+                    const processedOptions = options.map((opt: any) => processSchema(opt, path));
+                    // Can't easily recreate union, return original if no scalar found
+                    return schema;
+                }
+                
+                // Handle objects recursively
+                if (typeName === 'ZodObject' || typeName === 'object') {
+                    const shape = typeof schema._def.shape === 'function' ? schema._def.shape() : schema._def.shape;
+                    if (shape) {
+                        const processedShape: any = {};
+                        for (const [key, value] of Object.entries(shape)) {
+                            processedShape[key] = processSchema(value, [...path, key]);
+                        }
+                        return z.object(processedShape);
                     }
                 }
                 
-                // Create new schema with processed shape
-                innerInput = z.object(processedShape);
-            }
+                return schema;
+            };
+            
+            innerInput = processSchema(innerInput);
             
             innerInput = innerInput.extend({ __typename: z.literal(inputName).nullish() });
             const input = wasOptional ? innerInput.optional() : innerInput;
@@ -407,6 +453,15 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
                     return match;
                 }
             });
+            
+            // Replace String with scalar types for fields we tracked during preprocessing
+            for (const [fieldPath, scalarName] of scalarFieldNames.entries()) {
+                const fieldName = fieldPath.split('.').pop()!;
+                inputTypeDefs = inputTypeDefs.replace(
+                    new RegExp(`(\\s+${fieldName}:\\s+)String(!?)`, 'g'),
+                    `$1${scalarName}$2`
+                );
+            }
             
             // Post-process to handle z.literal scalars
             // Use the original input before __typename was added

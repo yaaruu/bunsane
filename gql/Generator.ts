@@ -325,6 +325,10 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
     const subscriptionFields: string[] = [];
     const definedInputTypes: Set<string> = new Set(); // Track defined input types to prevent duplicates
 
+    // Add default scalar types
+    scalarTypes.add("Upload");
+    typeDefs += `scalar Upload\n`;
+
     // PRE-GENERATE ALL ARCHETYPE SCHEMAS
     // Scan all services for archetype instances and generate their schemas upfront
     logger.trace(`Pre-generating archetype schemas from service operations and subscriptions...`);
@@ -506,7 +510,17 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
                                     } else {
                                         return match;
                                     }
-                                });                                // Deduplicate input types - only add if not already defined
+                                });
+                                
+                                // Replace String with scalar types for fields we tracked during preprocessing
+                                for (const [fieldName, scalarName] of scalarFieldNames.entries()) {
+                                    inputTypeDefs = inputTypeDefs.replace(
+                                        new RegExp(`(\\s+${fieldName}:\\s+)String(!?)`, 'g'),
+                                        `$1${scalarName}$2`
+                                    );
+                                }
+                                
+                                // Deduplicate input types - only add if not already defined
                                 const deduplicatedInputTypeDefs = deduplicateInputTypes(inputTypeDefs, definedInputTypes);
                                 typeDefs += deduplicatedInputTypeDefs;
                                 typeDefs += `\n`;

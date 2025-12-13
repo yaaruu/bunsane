@@ -230,6 +230,9 @@ export class ComponentInclusionNode extends QueryNode {
                     } else if (typeof filter.value === 'number') {
                         // Only treat as numeric if the value is actually a number type, not a string
                         condition = `(${jsonPath})::numeric ${filter.operator} $${context.addParam(filter.value)}::numeric`;
+                    } else if (typeof filter.value === 'boolean') {
+                        // Boolean comparison - cast JSON text to boolean
+                        condition = `(${jsonPath})::boolean ${filter.operator} $${context.addParam(filter.value)}`;
                     } else {
                         // Default: text comparison without casting
                         condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;

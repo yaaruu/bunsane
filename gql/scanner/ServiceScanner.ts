@@ -11,7 +11,7 @@ import { OperationType, GraphQLTypeKind } from "../graph/GraphNode";
  */
 export class ServiceScanner {
     private graph: SchemaGraph;
-    private allScalarTypes: Set<string> = new Set();
+    private allScalarTypes: Set<string> = new Set(['Upload']); // Include default scalars
 
     constructor(graph: SchemaGraph) {
         this.graph = graph;

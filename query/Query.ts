@@ -365,13 +365,16 @@ class Query {
         }
 
         // Bulk fetch all components for all entities and all requested component types
-        const components = await db`
+        const entityIdList = inList(entityIds, 1);
+        const typeIdList = inList(componentTypeIds, entityIdList.newParamIndex);
+        
+        const components = await db.unsafe(`
             SELECT id, entity_id, type_id, data 
             FROM components 
-            WHERE entity_id = ANY(${entityIds})
-            AND type_id = ANY(${componentTypeIds})
+            WHERE entity_id IN ${entityIdList.sql}
+            AND type_id IN ${typeIdList.sql}
             AND deleted_at IS NULL
-        `;
+        `, [...entityIdList.params, ...typeIdList.params]);
 
         // Get metadata storage for Date deserialization
         const storage = getMetadataStorage();

@@ -525,6 +525,21 @@ export class Entity implements IEntity {
         return ref;
     }
 
+    /**
+     * Serialize the entity with only the currently loaded components
+     * @returns Object containing id and components data
+     */
+    public serialize(): { id: string; components: Record<string, any> } {
+        const components: Record<string, any> = {};
+        for (const comp of this.components.values()) {
+            components[comp.constructor.name] = comp.serializableData();
+        }
+        return {
+            id: this.id,
+            components
+        };
+    }
+
 
 }
 
