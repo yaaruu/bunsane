@@ -10,25 +10,6 @@ import type {
     ArcheTypeEntityRecord,
 } from "./types";
 
-export function handleStudioArcheTypeRequest(archeTypeName: string): Response {
-    const mockArcheTypeData = {
-        name: archeTypeName,
-        components: [
-            { name: "PositionComponent", properties: ["x", "y", "z"] },
-            { name: "VelocityComponent", properties: ["vx", "vy", "vz"] },
-        ],
-        entityCount: 128,
-        metadata: {
-            createdAt: new Date().toISOString(),
-            version: "1.0.0",
-        },
-    };
-
-    return new Response(JSON.stringify(mockArcheTypeData), {
-        headers: { "Content-Type": "application/json" },
-    });
-}
-
 export async function handleStudioArcheTypeRecordsRequest(
     archeTypeName: string,
     params: StudioArcheTypeQueryParams = {}
@@ -71,14 +52,15 @@ export async function handleStudioArcheTypeRecordsRequest(
             );
         }
 
-        const requiredComponentNames = archeTypeFields.map(
+        const requiredComponentNames = archeTypeFields
+            .filter((field) => !field?.nullable)
+            .map((field) => field.componentName);
+
+        const allComponentNames = archeTypeFields.map(
             (field) => field.componentName
         );
-        const requiredComponentCount = requiredComponentNames.length;
 
-        const componentPlaceholders = requiredComponentNames
-            .map((_, index) => `$${index + 1}`)
-            .join(", ");
+        const requiredComponentCount = requiredComponentNames.length;
 
         let entityIdsResult: { entity_id: string }[];
         let totalResult: { count: number }[];
@@ -155,7 +137,7 @@ export async function handleStudioArcheTypeRecordsRequest(
                 .map((_, index) => `$${index + 1}`)
                 .join(", ");
             const componentNameStartIndex = entityIds.length + 1;
-            const componentNamePlaceholders = requiredComponentNames
+            const componentNamePlaceholders = allComponentNames
                 .map((_, index) => `$${componentNameStartIndex + index}`)
                 .join(", ");
 
@@ -165,7 +147,7 @@ export async function handleStudioArcheTypeRecordsRequest(
                  WHERE c.entity_id IN (${entityIdPlaceholders})
                  AND c.name IN (${componentNamePlaceholders})
                  AND c.deleted_at IS NULL`,
-                [...entityIds, ...requiredComponentNames]
+                [...entityIds, ...allComponentNames]
             );
 
             const entityComponentsMap = new Map<string, Map<string, unknown>>();
@@ -186,28 +168,29 @@ export async function handleStudioArcheTypeRecordsRequest(
             for (const entityId of entityIds) {
                 const componentsMap = entityComponentsMap.get(entityId);
 
-                if (
-                    componentsMap &&
-                    componentsMap.size === requiredComponentCount
-                ) {
-                    const allComponentsPresent = requiredComponentNames.every(
-                        (name) => componentsMap.has(name)
+                if (!componentsMap) {
+                    continue;
+                }
+
+                // Check if all required components are present
+                const allRequiredComponentsPresent =
+                    requiredComponentNames.every((name) =>
+                        componentsMap.has(name)
                     );
 
-                    if (allComponentsPresent) {
-                        const componentsObject: Record<string, unknown> = {};
-                        for (const [name, data] of componentsMap) {
-                            componentsObject[name] = data;
-                        }
+                if (allRequiredComponentsPresent) {
+                    const componentsObject: Record<string, unknown> = {};
+                    for (const [name, data] of componentsMap) {
+                        componentsObject[name] = data;
+                    }
 
-                        validEntities.push({
-                            entityId,
-                            components: componentsObject,
-                        });
+                    validEntities.push({
+                        entityId,
+                        components: componentsObject,
+                    });
 
-                        if (validEntities.length >= limit) {
-                            break;
-                        }
+                    if (validEntities.length >= limit) {
+                        break;
                     }
                 }
             }
@@ -275,9 +258,12 @@ export async function handleStudioArcheTypeRecordsRequest(
             headers: { "Content-Type": "application/json" },
         });
     } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : "Unknown error";
+        const errorMessage =
+            error instanceof Error ? error.message : "Unknown error";
         return new Response(
-            JSON.stringify({ error: `Failed to fetch archetype data: ${errorMessage}` }),
+            JSON.stringify({
+                error: `Failed to fetch archetype data: ${errorMessage}`,
+            }),
             {
                 status: 500,
                 headers: { "Content-Type": "application/json" },
@@ -294,7 +280,9 @@ export async function handleStudioArcheTypeDeleteRequest(
 
     if (!entityIds || !Array.isArray(entityIds) || entityIds.length === 0) {
         return new Response(
-            JSON.stringify({ error: "entityIds array is required and must not be empty" }),
+            JSON.stringify({
+                error: "entityIds array is required and must not be empty",
+            }),
             {
                 status: 400,
                 headers: { "Content-Type": "application/json" },
@@ -303,7 +291,9 @@ export async function handleStudioArcheTypeDeleteRequest(
     }
 
     try {
-        const idPlaceholders = entityIds.map((_, index) => `$${index + 1}`).join(", ");
+        const idPlaceholders = entityIds
+            .map((_, index) => `$${index + 1}`)
+            .join(", ");
 
         // Delete in correct order to avoid foreign key constraint violations
         // 1. Delete from entity_components (junction table)
@@ -334,9 +324,12 @@ export async function handleStudioArcheTypeDeleteRequest(
             headers: { "Content-Type": "application/json" },
         });
     } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : "Unknown error";
+        const errorMessage =
+            error instanceof Error ? error.message : "Unknown error";
         return new Response(
-            JSON.stringify({ error: `Failed to delete entities: ${errorMessage}` }),
+            JSON.stringify({
+                error: `Failed to delete entities: ${errorMessage}`,
+            }),
             {
                 status: 500,
                 headers: { "Content-Type": "application/json" },

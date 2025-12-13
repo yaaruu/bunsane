@@ -62,7 +62,7 @@ export function ArcheType() {
 
     // Preprocess data: transform Tag component values to "true" when useRealDbFieldName is enabled
     const preprocessedData = useMemo(() => {
-        if (!useRealDbFieldName) return data;
+        if (useRealDbFieldName) return data;
 
         return data.map((record) => {
             const newRecord = { ...record };
