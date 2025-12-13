@@ -14,6 +14,7 @@ export interface ComponentPropertyMetadata {
     enumValues?: string[];
     enumKeys?: string[];
     isOptional: boolean;
+    arrayOf?: any;
 }
 
 export interface IndexedFieldMetadata {
