@@ -56,6 +56,10 @@ export async function handleStudioArcheTypeRecordsRequest(
             .filter((field) => !field?.nullable)
             .map((field) => field.componentName);
 
+        const allComponentNames = archeTypeFields.map(
+            (field) => field.componentName
+        );
+
         const requiredComponentCount = requiredComponentNames.length;
 
         let entityIdsResult: { entity_id: string }[];
@@ -133,7 +137,7 @@ export async function handleStudioArcheTypeRecordsRequest(
                 .map((_, index) => `$${index + 1}`)
                 .join(", ");
             const componentNameStartIndex = entityIds.length + 1;
-            const componentNamePlaceholders = requiredComponentNames
+            const componentNamePlaceholders = allComponentNames
                 .map((_, index) => `$${componentNameStartIndex + index}`)
                 .join(", ");
 
@@ -143,7 +147,7 @@ export async function handleStudioArcheTypeRecordsRequest(
                  WHERE c.entity_id IN (${entityIdPlaceholders})
                  AND c.name IN (${componentNamePlaceholders})
                  AND c.deleted_at IS NULL`,
-                [...entityIds, ...requiredComponentNames]
+                [...entityIds, ...allComponentNames]
             );
 
             const entityComponentsMap = new Map<string, Map<string, unknown>>();
@@ -164,28 +168,29 @@ export async function handleStudioArcheTypeRecordsRequest(
             for (const entityId of entityIds) {
                 const componentsMap = entityComponentsMap.get(entityId);
 
-                if (
-                    componentsMap &&
-                    componentsMap.size === requiredComponentCount
-                ) {
-                    const allComponentsPresent = requiredComponentNames.every(
-                        (name) => componentsMap.has(name)
+                if (!componentsMap) {
+                    continue;
+                }
+
+                // Check if all required components are present
+                const allRequiredComponentsPresent =
+                    requiredComponentNames.every((name) =>
+                        componentsMap.has(name)
                     );
 
-                    if (allComponentsPresent) {
-                        const componentsObject: Record<string, unknown> = {};
-                        for (const [name, data] of componentsMap) {
-                            componentsObject[name] = data;
-                        }
+                if (allRequiredComponentsPresent) {
+                    const componentsObject: Record<string, unknown> = {};
+                    for (const [name, data] of componentsMap) {
+                        componentsObject[name] = data;
+                    }
 
-                        validEntities.push({
-                            entityId,
-                            components: componentsObject,
-                        });
+                    validEntities.push({
+                        entityId,
+                        components: componentsObject,
+                    });
 
-                        if (validEntities.length >= limit) {
-                            break;
-                        }
+                    if (validEntities.length >= limit) {
+                        break;
                     }
                 }
             }
