@@ -10,25 +10,6 @@ import type {
     ArcheTypeEntityRecord,
 } from "./types";
 
-export function handleStudioArcheTypeRequest(archeTypeName: string): Response {
-    const mockArcheTypeData = {
-        name: archeTypeName,
-        components: [
-            { name: "PositionComponent", properties: ["x", "y", "z"] },
-            { name: "VelocityComponent", properties: ["vx", "vy", "vz"] },
-        ],
-        entityCount: 128,
-        metadata: {
-            createdAt: new Date().toISOString(),
-            version: "1.0.0",
-        },
-    };
-
-    return new Response(JSON.stringify(mockArcheTypeData), {
-        headers: { "Content-Type": "application/json" },
-    });
-}
-
 export async function handleStudioArcheTypeRecordsRequest(
     archeTypeName: string,
     params: StudioArcheTypeQueryParams = {}
