@@ -7,12 +7,26 @@ const loggerInstance = logger.child({ scope: "ScheduledTaskDecorator" });
 
 /**
  * Decorator for registering scheduled tasks
- * @param options Task configuration options including interval and component target
+ * @param options Task configuration options including interval and query function
+ * @example
+ * ```typescript
+ * @ScheduledTask({
+ *     interval: ScheduleInterval.MINUTE,
+ *     query: () => {
+ *         return new Query()
+ *             .with(SessionComponent)
+ *             .with(PhoneComponent)
+ *             .without(AuthenticatedTag);
+ *     }
+ * })
+ * async myTask(entities: Entity[]) {
+ *     // Process entities
+ * }
+ * ```
  */
 export function ScheduledTask(
     options: ScheduledTaskOptions & { 
-        interval: ScheduleInterval; 
-        componentTarget?: ComponentTargetConfig
+        interval: ScheduleInterval;
     }
 ) {
     return function (target: any, propertyKey: string, descriptor: PropertyDescriptor) {
@@ -29,8 +43,8 @@ export function ScheduledTask(
         const taskInfo = {
             id: taskId,
             name: options.name || `${target.constructor.name}.${propertyKey}`,
-            componentTarget: options.componentTarget, // Legacy support
             interval: options.interval,
+            cronExpression: options.cronExpression,
             options: {
                 runOnStart: options.runOnStart ?? false,
                 timeout: options.timeout ?? 30000,
@@ -45,7 +59,15 @@ export function ScheduledTask(
             enabled: true
         };
 
-        target.constructor.__scheduledTasks.push(taskInfo);
+        // Check if task with this ID already exists in the array to prevent duplicates
+        const existingTaskIndex = target.constructor.__scheduledTasks.findIndex(
+            (t: any) => t.id === taskId
+        );
+        if (existingTaskIndex === -1) {
+            target.constructor.__scheduledTasks.push(taskInfo);
+        } else {
+            loggerInstance.warn(`Task ${taskId} already exists in __scheduledTasks array. Skipping duplicate.`);
+        }
 
         // Return the original descriptor to maintain method functionality
         return descriptor;
@@ -65,7 +87,17 @@ export function registerScheduledTasks(service: any): void {
 
     const scheduler = SchedulerManager.getInstance();
 
+    // Deduplicate tasks by ID to prevent duplicate registrations
+    const uniqueTasks = new Map<string, any>();
     for (const task of constructor.__scheduledTasks) {
+        if (!uniqueTasks.has(task.id)) {
+            uniqueTasks.set(task.id, task);
+        } else {
+            loggerInstance.warn(`Duplicate task found in __scheduledTasks array: ${task.id}. Using first occurrence only.`);
+        }
+    }
+
+    for (const task of uniqueTasks.values()) {
         const taskWithService = {
             ...task,
             service: service

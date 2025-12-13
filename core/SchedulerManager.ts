@@ -12,7 +12,7 @@ import type {
     SchedulerConfig,
     TaskMetrics
 } from "../types/scheduler.types";
-import Query from "./Query";
+import { Query } from "../query/Query";
 import { Entity } from "./Entity";
 import { CronParser } from "../utils/cronParser";
 import type { ComponentTargetConfig } from "./EntityHookManager";
@@ -78,8 +78,15 @@ export class SchedulerManager {
         }
 
         // Validate task info
-        if (!taskInfo.id || !taskInfo.name || (!taskInfo.componentTarget && !taskInfo.options?.componentTarget) || !taskInfo.interval) {
-            const error = new Error(`Invalid task info: missing required fields (id, name, componentTarget/componentTarget config, interval)`);
+        if (!taskInfo.id || !taskInfo.name || !taskInfo.interval) {
+            const error = new Error(`Invalid task info: missing required fields (id, name, interval)`);
+            loggerInstance.error(`Failed to register task: ${error.message}`);
+            throw error;
+        }
+
+        // Validate query configuration
+        if (!taskInfo.options?.query && !taskInfo.options?.componentTarget && !taskInfo.componentTarget) {
+            const error = new Error(`Invalid task info: must provide either query function, componentTarget config, or legacy componentTarget`);
             loggerInstance.error(`Failed to register task: ${error.message}`);
             throw error;
         }
@@ -188,6 +195,12 @@ export class SchedulerManager {
 
         taskInfo.nextExecution = nextExecution;
 
+        // Clear any existing timeout for this task before creating a new one
+        const existingTimeout = this.intervals.get(taskInfo.id);
+        if (existingTimeout) {
+            clearTimeout(existingTimeout as any);
+        }
+
         // Schedule the task to run at the calculated time
         const timeoutId = setTimeout(async () => {
             await this.executeTask(taskInfo.id);
@@ -240,51 +253,24 @@ export class SchedulerManager {
         const timeout = taskInfo.options?.timeout || this.config.defaultTimeout;
 
         try {
-            // Create query based on component targeting configuration
+            // Create query based on targeting configuration
             let query: Query;
 
-            if (taskInfo.options?.componentTarget) {
-                // Use new component targeting configuration
+            if (taskInfo.options?.query) {
+                // Use custom query function (preferred approach)
+                query = taskInfo.options.query();
+            } else if (taskInfo.options?.componentTarget) {
+                // Use component targeting configuration (deprecated - use query instead)
                 const componentTarget = taskInfo.options.componentTarget;
                 query = this.buildQueryFromComponentTarget(componentTarget);
             } else if (taskInfo.componentTarget) {
-                // Use legacy single component targeting
+                // Use legacy single component targeting (deprecated - use query instead)
                 query = new Query().with(taskInfo.componentTarget);
             } else {
-                throw new Error('No component target specified');
+                throw new Error('No query function or component target specified');
             }
 
-            // Apply component filters if specified
-            if (taskInfo.options?.componentFilters && taskInfo.options.componentFilters.length > 0) {
-                // Group filters by component for the Query API
-                const filtersByComponent = new Map<string, any[]>();
-
-                for (const filter of taskInfo.options.componentFilters) {
-                    // For now, we'll assume filters are for the main component
-                    // In a more advanced implementation, we could support filters for different components
-                    const mainComponent = taskInfo.componentTarget || taskInfo.options?.componentTarget?.includeComponents?.[0];
-                    if (mainComponent) {
-                        const componentName = typeof mainComponent === 'function' ? mainComponent.name : 'unknown';
-                        if (!filtersByComponent.has(componentName)) {
-                            filtersByComponent.set(componentName, []);
-                        }
-                        filtersByComponent.get(componentName)!.push(filter);
-                    }
-                }
-
-                // Apply filters to components
-                for (const [componentName, filters] of filtersByComponent.entries()) {
-                    // This is a simplified implementation - in practice, you'd need to map component names to actual component classes
-                    if (filters.length > 0) {
-                        // For legacy compatibility, apply to the main component
-                        if (taskInfo.componentTarget) {
-                            query.with(taskInfo.componentTarget, Query.filters(...filters));
-                        }
-                    }
-                }
-            }
-
-            // Apply entity limit if specified
+            // Apply entity limit if specified (can be used with query function)
             if (taskInfo.options?.maxEntitiesPerExecution) {
                 query.take(taskInfo.options.maxEntitiesPerExecution);
             }
