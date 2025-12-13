@@ -3,7 +3,8 @@
  * Comprehensive TypeScript types for the BunSane scheduler system
  */
 
-import type { QueryFilter } from "../core/Query";
+import type { QueryFilter } from "../query/Query";
+import type { Query } from "../query/Query";
 import type { ComponentTargetConfig } from "../core/EntityHookManager";
 
 export enum ScheduleInterval {
@@ -34,14 +35,32 @@ export interface ScheduledTaskOptions {
     retryDelay?: number;
     /** Whether to continue retrying on failure */
     continueOnError?: boolean;
-    /** Query filters to apply when querying components */
-    componentFilters?: QueryFilter[];
-    /** Maximum number of entities to process per execution */
+    /** 
+     * Maximum number of entities to process per execution
+     * Note: This is applied after the query executes. For better performance,
+     * include .take() in your query function instead.
+     */
     maxEntitiesPerExecution?: number;
     /** Whether to enable task metrics collection */
     enableMetrics?: boolean;
-    /** Component targeting configuration for fine-grained entity selection */
+    /** 
+     * Component targeting configuration for fine-grained entity selection
+     * @deprecated Use query() function instead for better flexibility and readability
+     */
     componentTarget?: ComponentTargetConfig;
+    /** 
+     * Custom query function for advanced entity selection (preferred approach)
+     * @example
+     * query: () => {
+     *     return new Query()
+     *         .with(SessionComponent)
+     *         .with(PhoneComponent)
+     *         .without(AuthenticatedTag);
+     * }
+     */
+    query?: () => Query;
+    /** Cron expression (when interval is CRON) */
+    cronExpression?: string;
 }
 
 export interface ScheduledTaskInfo {
@@ -49,7 +68,10 @@ export interface ScheduledTaskInfo {
     id: string;
     /** Task name */
     name: string;
-    /** Target component class (legacy - use options.componentTarget instead) */
+    /** 
+     * Target component class (legacy - use options.query instead) 
+     * @deprecated Use options.query for better flexibility
+     */
     componentTarget?: new (...args: any[]) => any;
     /** Schedule interval */
     interval: ScheduleInterval;

@@ -10,27 +10,32 @@ function toFieldLabel(fieldName: string): string {
 }
 
 export function getSerializedMetadataStorage(): {
-    archeTypes: Record<string, {
-        fieldName: string;
-        componentName: string;
-        fieldLabel: string;
-    }[]>;
+    archeTypes: Record<
+        string,
+        {
+            fieldName: string;
+            componentName: string;
+            fieldLabel: string;
+            nullable?: boolean;
+        }[]
+    >;
 } {
     const storage = getMetadataStorage();
     const archeTypes: Record<string, any> = {};
-    
-    storage.archetypes_field_map.forEach((v, k) =>{
+
+    storage.archetypes_field_map.forEach((v, k) => {
         archeTypes[k] = v.map((value) => {
             return {
                 fieldName: value.fieldName,
                 componentName: value.component.name,
-                fieldLabel: toFieldLabel(value.fieldName)
-            }
-        })
-    })
+                fieldLabel: toFieldLabel(value.fieldName),
+                nullable: value.options?.nullable,
+            };
+        });
+    });
 
     // console.log(archeTypes, 'archeTypes');
-    
+
     return {
         archeTypes,
     };

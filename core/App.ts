@@ -9,7 +9,7 @@ import ServiceRegistry from "service/ServiceRegistry";
 import { type Plugin, createPubSub } from "graphql-yoga";
 import * as path from "path";
 import { SchedulerManager } from "core/SchedulerManager";
-import { registerScheduledTasks } from "core/decorators/ScheduledTask";
+import { registerScheduledTasks } from "../scheduler";
 import { OpenAPISpecGenerator, type SwaggerEndpointMetadata } from "swagger";
 import type BasePlugin from "plugins";
 import { preparedStatementCache } from "database/PreparedStatementCache";

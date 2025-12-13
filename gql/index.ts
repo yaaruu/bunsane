@@ -4,6 +4,7 @@ import { GraphQLObjectType, GraphQLField, GraphQLOperation, GraphQLScalarType } 
 import {GraphQLFieldTypes} from "./types"
 import {logger as MainLogger} from "core/Logger"
 import { isFieldRequested } from './helpers';
+import * as z from "zod";
 
 const logger = MainLogger.child({scope: "GQL"});
 
@@ -24,6 +25,8 @@ export {
     GraphQLScalarType,
     isFieldRequested
 }
+export { GraphQLSchemaOrchestrator } from "./orchestration";
+export { generateGraphQLSchemaV2 } from "./GeneratorV2";
 export type {
     GraphQLType,
     TypeFromGraphQL,
@@ -143,5 +146,7 @@ export function createYogaInstance(schema?: GraphQLSchema, plugins: Plugin[] = [
         return createYoga(yogaConfig);
     }
 }
+
+export const Upload = z.union([z.literal("Upload"), z.any()]);
 
 export const yoga = createYogaInstance();

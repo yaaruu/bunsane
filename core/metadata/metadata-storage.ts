@@ -88,7 +88,19 @@ export class MetadataStorage {
     }
 
     collectArcheTypeMetadata(metadata: ArcheTypeMetadata) {
-        this.archetypes.push(metadata);
+        // Check if archetype already exists and update it
+        const existingIndex = this.archetypes.findIndex(
+            a => a.typeId === metadata.typeId
+        );
+        if (existingIndex !== -1) {
+            // Update existing metadata
+            if (metadata.functions) {
+                this.archetypes[existingIndex].functions = metadata.functions;
+            }
+        } else {
+            // Add new metadata
+            this.archetypes.push(metadata);
+        }
     }
 }
 

@@ -34,6 +34,7 @@ interface ArcheTypeField {
     fieldName: string;
     componentName: string;
     fieldLabel: string;
+    nullable?: boolean;
 }
 
 interface ArcheTypeEntityRecord {

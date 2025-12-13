@@ -1,6 +1,6 @@
 import type { BaseComponent, ComponentDataType } from "./Components";
 import type { ComponentPropertyMetadata } from "./metadata/definitions/Component";
-import type { ArcheTypeFieldOptions } from "./metadata/definitions/ArcheType";
+import type { ArcheTypeFieldOptions, ArcheTypeFunctionMetadata } from "./metadata/definitions/ArcheType";
 import type { GetEntityOptions } from "../types/archetype.types";
 import { Entity } from "./Entity";
 import { getMetadataStorage } from "./metadata";
@@ -97,9 +97,13 @@ export function weaveAllArchetypes() {
     const storage = getMetadataStorage();
     const archetypeNames: string[] = [];
     
+    console.log(`[weaveAllArchetypes] Total archetypes in storage: ${storage.archetypes.length}`);
+    
     for (const archetypeMetadata of storage.archetypes) {
         const archetypeName = archetypeMetadata.name;
         archetypeNames.push(archetypeName);
+        console.log(`[weaveAllArchetypes] Processing archetype: ${archetypeName}`);
+        console.log(`[weaveAllArchetypes] Functions metadata:`, archetypeMetadata.functions);
         const fullSchemaCacheKey = `${archetypeName}_false_false`;
         if (!archetypeSchemaCache.has(fullSchemaCacheKey)) {
             try {
@@ -130,16 +134,27 @@ export function weaveAllArchetypes() {
         const schema = weave(ZodWeaver, ...allSchemas);
         let schemaString = printSchema(schema);
 
+        // Add Date scalar if not present
+        if (!schemaString.includes('scalar Date')) {
+            schemaString = 'scalar Date\n\n' + schemaString;
+        }
+
         // Post-process: Replace 'id: String' with 'id: ID' for all id fields
         schemaString = schemaString.replace(/\bid:\s*String\b/g, "id: ID");
+
+        // Post-process: Replace date fields (start_at, end_at, created_at, updated_at, etc.) with Date scalar
+        // Match common date field patterns
+        schemaString = schemaString.replace(/\b(\w*_at|\w*_date|\w*Date|date\w*):\s*String(!?)/gi, (match, fieldName, nullable) => {
+            return `${fieldName}: Date${nullable}`;
+        });
 
         // Post-process: Replace relation String fields with proper GraphQL type references
         // Collect all relation metadata from all archetypes
         for (const archetypeMetadata of storage.archetypes) {
+            const archetypeName = archetypeMetadata.name;
             try {
                 const ArchetypeClass = archetypeMetadata.target as any;
                 const instance = new ArchetypeClass();
-                const archetypeName = archetypeMetadata.name;
                 
                 // Process each relation field
                 for (const [field, relatedArcheType] of Object.entries(instance.relationMap)) {
@@ -198,6 +213,36 @@ export function weaveAllArchetypes() {
                 }
             } catch (error) {
                 console.warn(`Could not process relations for archetype ${archetypeMetadata.name}:`, error);
+            }
+
+            // Process each function field
+            if (archetypeMetadata.functions) {
+                console.log(`[ArcheType] Processing functions for ${archetypeName}:`, archetypeMetadata.functions);
+                for (const { propertyKey, options } of archetypeMetadata.functions) {
+                    console.log(`[ArcheType] Function ${propertyKey}, returnType:`, options?.returnType);
+                    if (options?.returnType && !['string', 'number', 'boolean'].includes(options.returnType)) {
+                        console.log(`[ArcheType] Replacing String with ${options.returnType} for ${propertyKey}`);
+                        // Simple pattern that matches the field directly
+                        const simplePattern = new RegExp(
+                            `(\\s+${propertyKey}:\\s*)String(\\??)`,
+                            "g"
+                        );
+                        
+                        const beforeReplace = schemaString;
+                        schemaString = schemaString.replace(
+                            simplePattern,
+                            `$1${options.returnType}$2`
+                        );
+                        
+                        if (beforeReplace !== schemaString) {
+                            console.log(`[ArcheType] Successfully replaced ${propertyKey}: String with ${propertyKey}: ${options.returnType}`);
+                        } else {
+                            console.log(`[ArcheType] Pattern did not match for ${propertyKey}`);
+                        }
+                    }
+                }
+            } else {
+                console.log(`[ArcheType] No functions found for ${archetypeName}`);
             }
         }
 
@@ -476,6 +521,18 @@ export function ArcheType<T extends new () => BaseArcheType>(
                 );
             }
         }
+
+        // Process functions
+        const functions = prototype[archetypeFunctionsSymbol];
+        if (functions) {
+            storage.collectArcheTypeMetadata({
+                name: archetype_name,
+                typeId: typeId,
+                target: target,
+                functions: functions,
+            });
+        }
+
         return target;
     };
 }
@@ -1898,6 +1955,9 @@ export class BaseArcheType {
                     zodType = z.string();
                 } else if (options?.returnType === 'boolean') {
                     zodType = z.boolean();
+                } else if (options?.returnType) {
+                    // Assume it's a GraphQL type name, create a string reference
+                    zodType = z.string().describe(`Reference to ${options.returnType} type`);
                 } else {
                     const returnType = Reflect.getMetadata("design:returntype", this.constructor.prototype, propertyKey);
                     if (returnType === String) {

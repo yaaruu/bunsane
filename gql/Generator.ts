@@ -325,6 +325,10 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
     const subscriptionFields: string[] = [];
     const definedInputTypes: Set<string> = new Set(); // Track defined input types to prevent duplicates
 
+    // Add default scalar types
+    scalarTypes.add("Upload");
+    typeDefs += `scalar Upload\n`;
+
     // PRE-GENERATE ALL ARCHETYPE SCHEMAS
     // Scan all services for archetype instances and generate their schemas upfront
     logger.trace(`Pre-generating archetype schemas from service operations and subscriptions...`);
@@ -506,7 +510,17 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
                                     } else {
                                         return match;
                                     }
-                                });                                // Deduplicate input types - only add if not already defined
+                                });
+                                
+                                // Replace String with scalar types for fields we tracked during preprocessing
+                                for (const [fieldName, scalarName] of scalarFieldNames.entries()) {
+                                    inputTypeDefs = inputTypeDefs.replace(
+                                        new RegExp(`(\\s+${fieldName}:\\s+)String(!?)`, 'g'),
+                                        `$1${scalarName}$2`
+                                    );
+                                }
+                                
+                                // Deduplicate input types - only add if not already defined
                                 const deduplicatedInputTypeDefs = deduplicateInputTypes(inputTypeDefs, definedInputTypes);
                                 typeDefs += deduplicatedInputTypeDefs;
                                 typeDefs += `\n`;
@@ -678,6 +692,9 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
                         const outputName = `${name}Output`;
                         typeDefs += `type ${outputName} {\n${Object.entries(output).map(([k, v]) => `  ${k}: ${v}`).join('\n')}\n}\n`;
                         fieldDef += `: ${outputName}`;
+                    } else {
+                        // Default case when output is not specified - assume String
+                        fieldDef += `: String`;
                     }
                     if (type === 'Query') {
                         queryFields.push(fieldDef);
@@ -1015,13 +1032,13 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
     });
 
     if (queryFields.length > 0) {
-        typeDefs += `type Query {\n${queryFields.map(f => `  ${f}`).join('\n')}\n}\n`;
+        typeDefs += `type Query {\n${queryFields.sort().map(f => `  ${f}`).join('\n')}\n}\n`;
     }
     if (mutationFields.length > 0) {
-        typeDefs += `type Mutation {\n${mutationFields.map(f => `  ${f}`).join('\n')}\n}\n`;
+        typeDefs += `type Mutation {\n${mutationFields.sort().map(f => `  ${f}`).join('\n')}\n}\n`;
     }
     if (subscriptionFields.length > 0) {
-        typeDefs += `type Subscription {\n${subscriptionFields.map(f => `  ${f}`).join('\n')}\n}\n`;
+        typeDefs += `type Subscription {\n${subscriptionFields.sort().map(f => `  ${f}`).join('\n')}\n}\n`;
     }
 
     logger.trace(`Query fields count: ${queryFields.length}, Mutation fields count: ${mutationFields.length}, Subscription fields count: ${subscriptionFields.length}`);

@@ -259,12 +259,18 @@ export class CronParser {
     static getNextExecution(cronFields: CronFields, fromDate: Date = new Date()): Date | null {
         const date = new Date(fromDate.getTime());
 
-        // Start from the next minute to avoid returning the current time if it matches
-        date.setMinutes(date.getMinutes() + 1);
-        date.setSeconds(0, 0);
+        // For 6-field expressions (with seconds), start from the next second
+        // For 5-field expressions, start from the next minute
+        const hasSeconds = !!cronFields.second;
+        if (hasSeconds) {
+            date.setSeconds(date.getSeconds() + 1);
+        } else {
+            date.setMinutes(date.getMinutes() + 1);
+            date.setSeconds(0);
+        }
 
         // Try up to 1 year in the future
-        const maxAttempts = 60 * 24 * 365; // 1 year in minutes
+        const maxAttempts = hasSeconds ? 60 * 60 * 24 * 365 : 60 * 24 * 365; // seconds or minutes
         let attempts = 0;
 
         while (attempts < maxAttempts) {
@@ -272,8 +278,12 @@ export class CronParser {
                 return new Date(date);
             }
 
-            // Move to next minute
-            date.setMinutes(date.getMinutes() + 1);
+            // Move to next second or minute
+            if (hasSeconds) {
+                date.setSeconds(date.getSeconds() + 1);
+            } else {
+                date.setMinutes(date.getMinutes() + 1);
+            }
             attempts++;
         }
 

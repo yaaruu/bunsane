@@ -8,6 +8,7 @@ import { sql } from "bun";
 // import Query from "./Query"; // Lazy import to avoid cycle
 import { timed } from "./Decorators";
 import EntityHookManager from "./EntityHookManager";
+import { getMetadataStorage } from "./metadata";
 import { EntityCreatedEvent, EntityUpdatedEvent, EntityDeletedEvent, ComponentAddedEvent, ComponentUpdatedEvent, ComponentRemovedEvent } from "./events/EntityLifecycleEvents";
 import type { IEntity } from "./EntityInterface";
 
@@ -147,6 +148,16 @@ export class Entity implements IEntity {
                     const comp = new ctor();
                     const componentData = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
                     Object.assign(comp, componentData);
+                    // Deserialize Date properties
+                    const storage = getMetadataStorage();
+                    const props = storage.componentProperties.get(typeId);
+                    if (props) {
+                        for (const prop of props) {
+                            if (prop.propertyType === Date && typeof comp[prop.propertyKey] === 'string') {
+                                comp[prop.propertyKey] = new Date(comp[prop.propertyKey]);
+                            }
+                        }
+                    }
                     comp.id = row.id;
                     comp.setPersisted(true);
                     comp.setDirty(false);
@@ -182,6 +193,16 @@ export class Entity implements IEntity {
                     const comp = new ctor();
                     const componentData = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
                     Object.assign(comp, componentData);
+                    // Deserialize Date properties
+                    const storage = getMetadataStorage();
+                    const props = storage.componentProperties.get(typeId);
+                    if (props) {
+                        for (const prop of props) {
+                            if (prop.propertyType === Date && typeof comp[prop.propertyKey] === 'string') {
+                                comp[prop.propertyKey] = new Date(comp[prop.propertyKey]);
+                            }
+                        }
+                    }
                     comp.id = row.id;
                     comp.setPersisted(true);
                     comp.setDirty(false);
@@ -502,6 +523,21 @@ export class Entity implements IEntity {
             ref.addComponent(refComp);
         }
         return ref;
+    }
+
+    /**
+     * Serialize the entity with only the currently loaded components
+     * @returns Object containing id and components data
+     */
+    public serialize(): { id: string; components: Record<string, any> } {
+        const components: Record<string, any> = {};
+        for (const comp of this.components.values()) {
+            components[comp.constructor.name] = comp.serializableData();
+        }
+        return {
+            id: this.id,
+            components
+        };
     }
 
 

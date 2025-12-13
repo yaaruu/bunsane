@@ -10,7 +10,7 @@ export function generateTypeId(name: string): string {
   return createHash('sha256').update(name).digest('hex');
 }
 
-const primitiveTypes = [String, Number, Boolean, Symbol, BigInt];
+const primitiveTypes = [String, Number, Boolean, Symbol, BigInt, Date];
 
 //TODO: Continue here
 export function CompData(options?: { indexed?: boolean; nullable?: boolean; arrayOf?: any }) {
@@ -141,6 +141,25 @@ export class BaseComponent {
         return data as ComponentDataType<T>;
     }
 
+    /**
+     * Get serializable data for database storage
+     * @returns Object with Dates serialized to ISO strings
+     */
+    serializableData(): Record<string, any> {
+        const data: Record<string, any> = {};
+        const storage = getMetadataStorage();
+        const props = storage.componentProperties.get(this._typeId);
+        this.properties().forEach((prop: string) => {
+            let value = (this as any)[prop];
+            const propMeta = props?.find(p => p.propertyKey === prop);
+            if (propMeta?.propertyType === Date && value instanceof Date) {
+                value = value.toISOString();
+            }
+            data[prop] = value;
+        });
+        return data;
+    }
+
     async save(trx: Bun.SQL, entity_id: string) {
         logger.trace(`Saving component ${this._comp_name} for entity ${entity_id}`);
         // Only check readiness if component is not yet registered
@@ -164,7 +183,7 @@ export class BaseComponent {
         }
         await trx`INSERT INTO components 
         (id, entity_id, name, type_id, data)
-        VALUES (${this.id}, ${entity_id}, ${this._comp_name}, ${this._typeId}, ${this.data()})`
+        VALUES (${this.id}, ${entity_id}, ${this._comp_name}, ${this._typeId}, ${this.serializableData()})`
         await trx`INSERT INTO entity_components (entity_id, type_id, component_id) VALUES (${entity_id}, ${this._typeId}, ${this.id}) ON CONFLICT DO NOTHING`
     }
 
@@ -172,7 +191,7 @@ export class BaseComponent {
         if(this.id === "") {
             throw new Error("Component must have an ID to be updated");
         }
-        await trx`UPDATE components SET data = ${this.data()} WHERE id = ${this.id}`
+        await trx`UPDATE components SET data = ${this.serializableData()} WHERE id = ${this.id}`
     }
 
     public setPersisted(persisted: boolean) {
