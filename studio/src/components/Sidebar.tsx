@@ -39,16 +39,18 @@ type SidebarSection = {
 
 export function Sidebar() {
     const location = useLocation();
-    const { metadata, tables, setMetadata, setTables, setLoading, setError } =
-        useStudioStore();
-
-    const [isCollapsed, setIsCollapsed] = useState(false);
-    const [expandedSections, setExpandedSections] = useState<
-        Record<string, boolean>
-    >({
-        archeTypes: true,
-        tables: true,
-    });
+    const {
+        metadata,
+        tables,
+        setMetadata,
+        setTables,
+        setLoading,
+        setError,
+        isSidebarCollapsed,
+        expandedSections,
+        setSidebarCollapsed,
+        toggleSection,
+    } = useStudioStore();
 
     useEffect(() => {
         // Load metadata from window
@@ -95,40 +97,36 @@ export function Sidebar() {
         },
     ];
 
-    const toggleSection = (section: string) => {
-        if (isCollapsed) {
-            setIsCollapsed(false);
-            setExpandedSections((prev) => ({
-                ...prev,
-                [section]: true,
-            }));
-
+    const handleToggleSection = (section: string) => {
+        if (isSidebarCollapsed) {
+            setSidebarCollapsed(false);
+            if (!expandedSections[section]) {
+                toggleSection(section);
+            }
             return;
         }
-        setExpandedSections((prev) => ({
-            ...prev,
-            [section]: !prev[section],
-        }));
+
+        toggleSection(section);
     };
 
-    const toggleSidebar = () => {
-        setIsCollapsed(!isCollapsed);
+    const handleToggleSidebar = () => {
+        setSidebarCollapsed(!isSidebarCollapsed);
     };
 
     return (
         <aside
             className={cn(
                 "bg-card border-r border-border flex flex-col transition-all duration-300",
-                isCollapsed ? "w-16" : "w-80"
+                isSidebarCollapsed ? "w-16" : "w-80"
             )}
         >
             <div
                 className={cn(
                     "p-6 border-b border-border flex items-center justify-between",
-                    isCollapsed && "p-4"
+                    isSidebarCollapsed && "p-4"
                 )}
             >
-                {!isCollapsed && (
+                {!isSidebarCollapsed && (
                     <div>
                         <h1 className="text-2xl font-bold text-primary">
                             BunSane Studio
@@ -141,13 +139,13 @@ export function Sidebar() {
                 <Button
                     variant="ghost"
                     size="icon"
-                    onClick={toggleSidebar}
+                    onClick={handleToggleSidebar}
                     className={cn(
                         "text-muted-foreground hover:text-foreground",
-                        isCollapsed && "mx-auto"
+                        isSidebarCollapsed && "mx-auto"
                     )}
                 >
-                    {isCollapsed ? (
+                    {isSidebarCollapsed ? (
                         <PanelLeftOpenIcon className="h-5 w-5" />
                     ) : (
                         <PanelLeftCloseIcon className="h-5 w-5" />
@@ -165,12 +163,12 @@ export function Sidebar() {
                             location.pathname === "/"
                                 ? "bg-primary text-primary-foreground"
                                 : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
-                            isCollapsed && "justify-center px-0"
+                            isSidebarCollapsed && "justify-center px-0"
                         )}
-                        title={isCollapsed ? "Welcome" : undefined}
+                        title={isSidebarCollapsed ? "Welcome" : undefined}
                     >
                         <Home className="h-4 w-4" />
-                        {!isCollapsed && "Welcome"}
+                        {!isSidebarCollapsed && "Welcome"}
                     </Link>
 
                     {/* Dynamic Sections */}
@@ -181,19 +179,22 @@ export function Sidebar() {
                         return (
                             <div key={section.id} className="space-y-1">
                                 <button
-                                    onClick={() => toggleSection(section.id)}
+                                    onClick={() =>
+                                        handleToggleSection(section.id)
+                                    }
                                     className={cn(
                                         "w-full flex items-center gap-2 px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground rounded-md transition-colors",
-                                        isCollapsed && "justify-center px-0"
+                                        isSidebarCollapsed &&
+                                            "justify-center px-0"
                                     )}
                                     title={
-                                        isCollapsed
+                                        isSidebarCollapsed
                                             ? `${section.title} (${section.items.length})`
                                             : undefined
                                     }
                                 >
                                     <Icon className="h-4 w-4" />
-                                    {!isCollapsed && (
+                                    {!isSidebarCollapsed && (
                                         <>
                                             <span className="flex-1 text-left">
                                                 {section.title} (
@@ -207,7 +208,7 @@ export function Sidebar() {
                                         </>
                                     )}
                                 </button>
-                                {!isCollapsed && isExpanded && (
+                                {!isSidebarCollapsed && isExpanded && (
                                     <div className="ml-4 space-y-1">
                                         {section.items.map((item) => {
                                             const routePath =
