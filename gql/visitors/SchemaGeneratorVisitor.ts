@@ -31,7 +31,7 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
     /**
      * Add archetype type definitions before visiting nodes (like V1 does)
      */
-    beforeVisit(): void {
+    override beforeVisit(): void {
         // Import required functions
         const { weaveAllArchetypes, getAllArchetypeSchemas } = require('../../core/ArcheType');
         
@@ -50,6 +50,7 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
 
         // Add default scalars
         this.typeDefs += 'scalar Upload\n';
+        this.typeDefs += 'scalar Date\n';
     }
     
     /**
