@@ -27,7 +27,7 @@ export class SchedulerManager {
     private intervals: Map<string, NodeJS.Timeout> = new Map();
     private isRunning: boolean = false;
     private eventListeners: SchedulerEventCallback[] = [];
-    private config: SchedulerConfig;
+    public config: SchedulerConfig;
     private metrics: SchedulerMetrics = {
         totalTasks: 0,
         runningTasks: 0,
@@ -45,8 +45,8 @@ export class SchedulerManager {
             enabled: true,
             maxConcurrentTasks: 5,
             defaultTimeout: 30000, // 30 seconds
-            enableLogging: true,
-            runOnStart: true
+            enableLogging: false,
+            runOnStart: true,
         };
 
         this.initializeLifecycleIntegration();
@@ -63,7 +63,6 @@ export class SchedulerManager {
         ApplicationLifecycle.addPhaseListener((event) => {
             const phase = event.detail;
             if (phase === ApplicationPhase.APPLICATION_READY) {
-                logger.info("Scheduler initialized and ready");
                 if (this.config.runOnStart) {
                     this.start();
                 }

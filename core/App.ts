@@ -16,6 +16,13 @@ import { preparedStatementCache } from "database/PreparedStatementCache";
 import db from "database";
 import studioEndpoint from "../endpoints";
 
+
+export type AppConfig = {
+    scheduler: {
+        logging: boolean;
+    }
+}
+
 export default class App {
     private name: string = "BunSane Application";
     private version: string = "1.0.0";
@@ -43,6 +50,12 @@ export default class App {
     private studioEnabled: boolean = false;
 
     pubSub = createPubSub();
+
+    public config: AppConfig = {
+        scheduler: {
+            logging: false,
+        },
+    };
 
     constructor(appName?: string, appVersion?: string) {
         if (appName) this.name = appName;
@@ -144,6 +157,7 @@ export default class App {
 
                         // Initialize Scheduler
                         const scheduler = SchedulerManager.getInstance();
+                        scheduler.config.enableLogging = this.config.scheduler.logging;
 
                         // Register scheduled tasks for all services
                         for (const service of services) {

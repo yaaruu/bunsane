@@ -2,7 +2,7 @@ import { GraphVisitor } from "./GraphVisitor";
 import type { TypeNode, OperationNode, FieldNode, InputNode, ScalarNode, SubscriptionNode } from "../graph/GraphNode";
 import { logger as MainLogger } from "core/Logger";
 import * as z from "zod";
-import { ZodWeaver } from "@gqloom/zod";
+import { ZodWeaver, asObjectType } from "@gqloom/zod";
 import { weave } from "@gqloom/core";
 import type { ZodType } from "zod";
 import { GraphQLSchema, printSchema } from "graphql";
@@ -348,7 +348,55 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
             
             // Recursive function to process schemas and handle all Zod wrapper types
             const processSchema = (schema: any, path: string[] = []): any => {
-                if (!schema || !schema._def) return schema;
+                if (!schema) return schema;
+                
+                // Handle the case where _def is missing or empty (can happen with .omit()/.extend())
+                if (!schema._def || (typeof schema._def === 'object' && Object.keys(schema._def).length === 0)) {
+                    // Try to identify the schema type by checking other properties
+                    // In Zod v4, some schemas have a 'parse' method and other identifying features
+                    const hasShape = typeof schema.shape === 'object' || typeof schema.shape === 'function';
+                    const hasElement = typeof schema.element === 'object';
+                    const schemaStr = typeof schema === 'string' ? `"${schema}"` : (typeof schema === 'object' ? JSON.stringify(schema).slice(0, 200) : String(schema));
+                    logger.trace(`Schema at path ${path.join('.')} has empty _def, hasShape=${hasShape}, hasElement=${hasElement}, type=${typeof schema}, value=${schemaStr}`);
+                    
+                    // If the schema is actually a string literal value (not a Zod schema), it's likely a z.literal value
+                    if (typeof schema === 'string') {
+                        logger.trace(`Found string literal at ${path.join('.')}: "${schema}", converting to z.string()`);
+                        return z.string();
+                    }
+                    
+                    // If the schema is an object without _def, it might be the raw element value, not a Zod schema
+                    // For arrays from .extend(), the element type might be lost - use z.any() as fallback
+                    if (typeof schema === 'object' && !schema._def) {
+                        // Check if it's an array-like object (has numeric keys)
+                        const numericKeys = Object.keys(schema).filter(k => !isNaN(Number(k)));
+                        if (numericKeys.length > 0) {
+                            // This might be a tuple or array with positional elements - treat as z.any()
+                            logger.trace(`Found array-like object at ${path.join('.')}, using z.any()`);
+                            return z.any();
+                        }
+                        
+                        // If it looks like an object with a shape, try to process it as an object
+                        if (hasShape) {
+                            const shape = typeof schema.shape === 'function' ? schema.shape() : schema.shape;
+                            if (shape && Object.keys(shape).length > 0) {
+                                const processedShape: any = {};
+                                for (const [key, value] of Object.entries(shape)) {
+                                    processedShape[key] = processSchema(value, [...path, key]);
+                                }
+                                const newSchema = z.object(processedShape);
+                                const nestedTypeName = `${inputName}_${path.join('_')}`;
+                                const registered = newSchema.register(asObjectType, { name: nestedTypeName });
+                                logger.trace(`Recovered broken object schema at ${path.join('.')}, registered as ${nestedTypeName}`);
+                                return registered;
+                            }
+                        }
+                    }
+                    
+                    // Last resort - return z.any() to prevent crashes
+                    logger.trace(`Could not recover schema at ${path.join('.')}, using z.any() as fallback`);
+                    return z.any();
+                }
                 
                 const typeName = schema._def?.typeName || schema._def?.type;
                 
@@ -372,7 +420,11 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
                     return inner;
                 }
                 if (typeName === 'ZodArray' || typeName === 'array') {
-                    const inner = processSchema(schema._def.type, path);
+                    const elementSchema = schema._def.type;
+                    const elementTypeName = elementSchema?._def?.typeName || elementSchema?._def?.type;
+                    logger.trace(`Array at path ${path.join('.')}: element _def = ${JSON.stringify(Object.keys(elementSchema?._def || {}))}, typeName = ${elementTypeName}`);
+                    const inner = processSchema(elementSchema, [...path, '__array_item']);
+                    logger.trace(`Processing array at path ${path.join('.')}, inner type: ${inner._def?.typeName || inner._def?.type}, has _zod: ${!!(inner as any)._zod}`);
                     return z.array(inner);
                 }
                 
@@ -403,15 +455,23 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
                     return schema;
                 }
                 
-                // Handle objects recursively
+                // Handle objects recursively - ALWAYS register nested objects with GQLoom
+                // because after .omit()/.extend() the schema tree loses _zod metadata
                 if (typeName === 'ZodObject' || typeName === 'object') {
                     const shape = typeof schema._def.shape === 'function' ? schema._def.shape() : schema._def.shape;
                     if (shape) {
                         const processedShape: any = {};
                         for (const [key, value] of Object.entries(shape)) {
-                            processedShape[key] = processSchema(value, [...path, key]);
+                            const processed = processSchema(value, [...path, key]);
+                            processedShape[key] = processed;
                         }
-                        return z.object(processedShape);
+                        // Always create new object and register with GQLoom
+                        // This ensures all nested objects have proper _zod metadata
+                        const newSchema = z.object(processedShape);
+                        const nestedTypeName = path.length > 0 ? `${inputName}_${path.join('_')}` : inputName;
+                        const registeredSchema = newSchema.register(asObjectType, { name: nestedTypeName });
+                        logger.trace(`Registered nested object ${nestedTypeName} for input ${inputName}, path: ${path.join('.')}, has _zod: ${!!(registeredSchema as any)._zod}`);
+                        return registeredSchema;
                     }
                 }
                 
@@ -420,7 +480,39 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
             
             innerInput = processSchema(innerInput);
             
-            innerInput = innerInput.extend({ __typename: z.literal(inputName).nullish() });
+            // Debug: log the processed schema structure for problematic inputs
+            if (inputName === 'getFaresInput') {
+                try {
+                    const debugSchema = (s: any, indent: string = ''): string => {
+                        if (!s) return 'null';
+                        const def = s._def || {};
+                        const typeName = def.typeName || def.type || 'unknown';
+                        let result = `${typeName}`;
+                        if (typeName === 'ZodObject' || typeName === 'object') {
+                            const shape = typeof def.shape === 'function' ? def.shape() : def.shape;
+                            if (shape) {
+                                const entries = Object.entries(shape);
+                                result += ` { ${entries.map(([k, v]) => `${k}: ${debugSchema(v, '')}`).join(', ')} }`;
+                            }
+                        } else if (typeName === 'ZodArray' || typeName === 'array') {
+                            const elem = def.type;
+                            result += `[${debugSchema(elem, '')}]`;
+                        } else if (typeName === 'ZodOptional' || typeName === 'optional') {
+                            result = `Optional<${debugSchema(def.innerType, '')}>`;
+                        }
+                        result += `(_zod:${!!(s as any)._zod})`;
+                        return result;
+                    };
+                    logger.trace(`DEBUG getFaresInput structure: ${debugSchema(innerInput)}`);
+                } catch (e) {
+                    logger.trace(`DEBUG getFaresInput error: ${e}`);
+                }
+            }
+            
+            // DO NOT call .extend() or .register() after processSchema - they create new schema instances
+            // and can destroy the _zod metadata on nested objects that we just registered.
+            // The weave() function will handle the root level registration automatically.
+            
             const input = wasOptional ? innerInput.optional() : innerInput;
             
             logger.trace(`Weaving Zod schema for ${inputName}`);
