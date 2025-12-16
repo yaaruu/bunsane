@@ -96,7 +96,12 @@ export const ensureJSONBPathIndex = async (
         await db.unsafe(indexSQL);
         logger.info(`Created ${indexType.toUpperCase()} index ${indexName} on ${tableName}${useConcurrently ? ' (concurrently)' : ' (blocking)'}`);
 
-    } catch (error) {
+    } catch (error: any) {
+        // Check if the error is about duplicate key (index already exists)
+        if (error.message && error.message.includes('duplicate key value violates unique constraint "pg_class_relname_nsp_index"')) {
+            logger.trace(`Index ${indexName} already exists (confirmed by error), skipping creation`);
+            return;
+        }
         logger.error(`Failed to create ${indexType} index on ${tableName} for field ${field}: ${error}`);
         throw error;
     }

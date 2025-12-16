@@ -1,3 +1,4 @@
+import { TypeGenerationStrategy, ZodTypeStrategy } from "../strategies/TypeGenerationStrategy";
 import { GraphVisitor } from "./GraphVisitor";
 import type { TypeNode, OperationNode, FieldNode, InputNode, ScalarNode, SubscriptionNode } from "../graph/GraphNode";
 import { logger as MainLogger } from "core/Logger";
@@ -386,7 +387,8 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
                                     processedShape[key] = processSchema(value, [...path, key]);
                                 }
                                 const newSchema = z.object(processedShape);
-                                const nestedTypeName = `${inputName}_${path.join('_')}`;
+                                const baseInputName = inputName.replace(/Input$/, '');
+                                const nestedTypeName = `${baseInputName}_${path.join('_')}Input`;
                                 const registered = newSchema.register(asObjectType, { name: nestedTypeName });
                                 logger.trace(`Recovered broken object schema at ${path.join('.')}, registered as ${nestedTypeName}`);
                                 return registered;
@@ -421,11 +423,21 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
                     return inner;
                 }
                 if (typeName === 'ZodArray' || typeName === 'array') {
+                    // Arrays with complex nested objects can have broken _def.type
+                    // In such cases, return the original schema and let GQLoom handle it
                     const elementSchema = schema._def.type;
-                    const elementTypeName = elementSchema?._def?.typeName || elementSchema?._def?.type;
-                    logger.trace(`Array at path ${path.join('.')}: element _def = ${JSON.stringify(Object.keys(elementSchema?._def || {}))}, typeName = ${elementTypeName}`);
-                    const inner = processSchema(elementSchema, [...path, '__array_item']);
-                    logger.trace(`Processing array at path ${path.join('.')}, inner type: ${inner._def?.typeName || inner._def?.type}, has _zod: ${!!(inner as any)._zod}`);
+                    if (!elementSchema || !elementSchema._def || Object.keys(elementSchema._def).length === 0) {
+                        logger.trace(`Array at path ${path.join('.')} has broken element schema, returning original to let GQLoom handle it`);
+                        return schema;
+                    }
+                    
+                    const elementTypeName = elementSchema._def.typeName || elementSchema._def.type;
+                    logger.trace(`Array at path ${path.join('.')} (inputName: ${inputName}): element typeName = ${elementTypeName}`);
+                    
+                    // For array elements, process and register nested objects
+                    const arrayElementPath = path.length > 0 ? path : ['Item'];
+                    const inner = processSchema(elementSchema, arrayElementPath);
+                    logger.trace(`Processed array element at path ${path.join('.')}, inner type: ${inner._def?.typeName || inner._def?.type}, has _zod: ${!!(inner as any)._zod}`);
                     return z.array(inner);
                 }
                 
@@ -469,7 +481,9 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
                         // Always create new object and register with GQLoom
                         // This ensures all nested objects have proper _zod metadata
                         const newSchema = z.object(processedShape);
-                        const nestedTypeName = path.length > 0 ? `${inputName}_${path.join('_')}` : inputName;
+                        // Remove 'Input' suffix from inputName to avoid duplication when building nested type name
+                        const baseInputName = inputName.replace(/Input$/, '');
+                        const nestedTypeName = path.length > 0 ? `${baseInputName}_${path.join('_')}Input` : inputName;
                         const registeredSchema = newSchema.register(asObjectType, { name: nestedTypeName });
                         logger.trace(`Registered nested object ${nestedTypeName} for input ${inputName}, path: ${path.join('.')}, has _zod: ${!!(registeredSchema as any)._zod}`);
                         return registeredSchema;
@@ -482,7 +496,7 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
             innerInput = processSchema(innerInput);
             
             // Debug: log the processed schema structure for problematic inputs
-            if (inputName === 'getFaresInput') {
+            if (inputName === 'uploadDriverDocumentInput' || inputName === 'getFaresInput') {
                 try {
                     const debugSchema = (s: any, indent: string = ''): string => {
                         if (!s) return 'null';

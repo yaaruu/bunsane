@@ -243,7 +243,16 @@ export const UpdateComponentIndexes = async (table_name: string, indexedProperti
                 if (!existingIndexes.includes(indexName)) {
                     logger.trace(`Creating missing index ${indexName} for property ${prop}`);
                     await retryWithBackoff(async () => {
-                        await db.unsafe(`CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} IF NOT EXISTS ${indexName} ON ${table_name} USING GIN ((data->'${prop}'))`);
+                        try {
+                            await db.unsafe(`CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} IF NOT EXISTS ${indexName} ON ${table_name} USING GIN ((data->'${prop}'))`);
+                        } catch (error: any) {
+                            // Check if the error is about duplicate key (index already exists)
+                            if (error.message && error.message.includes('duplicate key value violates unique constraint "pg_class_relname_nsp_index"')) {
+                                logger.trace(`Index ${indexName} already exists (confirmed by error), skipping creation`);
+                                return;
+                            }
+                            throw error;
+                        }
                     });
                     addedIndexes.add(indexName);
                 } else {
@@ -259,7 +268,16 @@ export const UpdateComponentIndexes = async (table_name: string, indexedProperti
                 const prop = match[1];
                 if (!indexedProperties.includes(prop) && !addedIndexes.has(index)) {
                     await retryWithBackoff(async () => {
-                        await db.unsafe(`DROP INDEX${useConcurrently ? ' CONCURRENTLY' : ''} IF EXISTS ${index}`);
+                        try {
+                            await db.unsafe(`DROP INDEX${useConcurrently ? ' CONCURRENTLY' : ''} IF EXISTS ${index}`);
+                        } catch (error: any) {
+                            // Check if the error is about relation does not exist
+                            if (error.message && (error.message.includes('does not exist') || error.message.includes('not found'))) {
+                                logger.trace(`Index ${index} does not exist, skipping drop`);
+                                return;
+                            }
+                            throw error;
+                        }
                     });
                     logger.info(`Dropped obsolete index ${index} for property ${prop}`);
                 }
