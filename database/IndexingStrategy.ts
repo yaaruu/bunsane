@@ -33,11 +33,12 @@ export const ensureJSONBPathIndex = async (
     indexType: IndexType = 'gin',
     isDateField: boolean = false
 ): Promise<void> => {
-    try {
-        tableName = validateIdentifier(tableName);
-        field = validateIdentifier(field);
+    tableName = validateIdentifier(tableName);
+    field = validateIdentifier(field);
 
-        const indexName = `idx_${tableName}_${field}_${indexType}${isDateField ? '_date' : ''}`;
+    const indexName = `idx_${tableName}_${field}_${indexType}${isDateField ? '_date' : ''}`;
+
+    try {
 
         logger.trace(`Ensuring ${indexType.toUpperCase()} index ${indexName} on ${tableName} for field ${field}${isDateField ? ' (date field - indexed as text)' : ''}`);
 

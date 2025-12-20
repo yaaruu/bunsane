@@ -718,6 +718,9 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
                 // Sort fields alphabetically (like V1)
                 this.queryFields.sort();
                 this.typeDefs += `type Query {\n${this.queryFields.map(f => `  ${f}`).join('\n')}\n}\n`;
+            } else {
+                // Always add at least an empty Query type for GraphQL schema validity
+                this.typeDefs += `type Query {\n  _empty: String\n}\n`;
             }
             
             if (this.mutationFields.length > 0) {

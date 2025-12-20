@@ -86,7 +86,14 @@ export class ResolverGeneratorVisitor extends GraphVisitor {
     }
 
     getResults(): Record<string, Record<string, Function>> {
-        return this.resolverBuilder.getResolvers();
+        const resolvers = this.resolverBuilder.getResolvers();
+        
+        // Ensure there's always at least one Query resolver for GraphQL schema validity
+        if (Object.keys(resolvers.Query).length === 0) {
+            resolvers.Query._empty = () => null;
+        }
+        
+        return resolvers;
     }
 
     /**

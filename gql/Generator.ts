@@ -1033,6 +1033,11 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
 
     if (queryFields.length > 0) {
         typeDefs += `type Query {\n${queryFields.sort().map(f => `  ${f}`).join('\n')}\n}\n`;
+    } else {
+        // Always add at least an empty Query type for GraphQL schema validity
+        typeDefs += `type Query {\n  _empty: String\n}\n`;
+        resolvers.Query = resolvers.Query || {};
+        resolvers.Query._empty = () => null;
     }
     if (mutationFields.length > 0) {
         typeDefs += `type Mutation {\n${mutationFields.sort().map(f => `  ${f}`).join('\n')}\n}\n`;
@@ -1049,11 +1054,11 @@ export function generateGraphQLSchema(services: any[], options?: { enableArchety
 
     let schema : GraphQLSchema | null = null;
     // Check if typeDefs contains actual schema definitions, not just whitespace
-    if(typeDefs.trim() !== "" && (queryFields.length > 0 || mutationFields.length > 0 || subscriptionFields.length > 0 || scalarTypes.size > 0))  {
+    if(typeDefs.trim() !== "")  {
         logger.trace(`Creating schema with resolvers: ${Object.keys(resolvers).join(', ')}`);
         schema = createSchema({ typeDefs, resolvers });
     } else {
-        logger.warn(`No schema generated - queryFields: ${queryFields.length}, mutationFields: ${mutationFields.length}, subscriptionFields: ${subscriptionFields.length}, scalarTypes: ${scalarTypes.size}`);
+        logger.warn(`No schema generated - typeDefs is empty`);
     }
     return { schema, resolvers };
 }
