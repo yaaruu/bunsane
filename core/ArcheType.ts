@@ -17,7 +17,14 @@ const primitiveTypes = [String, Number, Boolean, Date];
 
 const archetypeFunctionsSymbol = Symbol("archetypeFunctions");
 
-export function ArcheTypeFunction(options?: { returnType?: string }) {
+export function ArcheTypeFunction(options?: { 
+    returnType?: string;
+    args?: Array<{ 
+        name: string; 
+        type: any; 
+        nullable?: boolean;
+    }>;
+}) {
     return function (target: any, propertyKey: string) {
         if (!target[archetypeFunctionsSymbol]) {
             target[archetypeFunctionsSymbol] = [];
@@ -37,6 +44,7 @@ const customTypeNameRegistry = new Map<any, string>();
 const registeredCustomTypes = new Map<string, any>();
 const customTypeSilks = new Map<string, any>(); // Store silk types for unified weaving
 const customTypeResolvers: any[] = []; // Store resolvers for custom types
+const inputTypeRegistry = new Map<any, string>(); // Map from type to input type name (e.g., ST_Point -> ST_PointInput)
 
 // Component-level schema cache
 const componentSchemaCache = new Map<string, ZodObject<any>>(); // componentId -> Zod schema
@@ -53,7 +61,8 @@ const allArchetypeZodObjects = new Map<string, ZodObject<any>>();
 export function registerCustomZodType(
     type: any,
     schema: any,
-    typeName?: string
+    typeName?: string,
+    inputTypeName?: string
 ) {
     // If a type name is provided and it's a ZodObject, add __typename to control GraphQL naming
     if (typeName && schema instanceof ZodObject) {
@@ -68,11 +77,26 @@ export function registerCustomZodType(
             customTypeNameRegistry.set(type, typeName);
             registeredCustomTypes.set(typeName, namedSchema);
         }
+        
+        // Register input type if provided (for use in GraphQL arguments)
+        if (inputTypeName) {
+            // Create input type schema (without __typename, as input types don't have it)
+            const inputSchema = z.object(shape).register(asObjectType, { name: inputTypeName });
+            registeredCustomTypes.set(inputTypeName, inputSchema);
+            inputTypeRegistry.set(type, inputTypeName);
+        }
     } else {
         customTypeRegistry.set(type, schema);
         if (typeName) {
             customTypeNameRegistry.set(type, typeName);
             registeredCustomTypes.set(typeName, schema);
+        }
+        
+        // Register input type if provided
+        if (inputTypeName && schema instanceof ZodObject) {
+            const inputSchema = schema.register(asObjectType, { name: inputTypeName });
+            registeredCustomTypes.set(inputTypeName, inputSchema);
+            inputTypeRegistry.set(type, inputTypeName);
         }
     }
 }
@@ -220,6 +244,58 @@ export function weaveAllArchetypes() {
                 console.log(`[ArcheType] Processing functions for ${archetypeName}:`, archetypeMetadata.functions);
                 for (const { propertyKey, options } of archetypeMetadata.functions) {
                     console.log(`[ArcheType] Function ${propertyKey}, returnType:`, options?.returnType);
+                    
+                    // Add arguments if present
+                    if (options?.args && options.args.length > 0) {
+                        const argDefs: string[] = [];
+                        for (const arg of options.args) {
+                            let argTypeName: string;
+                            
+                            const inputTypeName = inputTypeRegistry.get(arg.type);
+                            if (inputTypeName) {
+                                argTypeName = inputTypeName;
+                            } else {
+                                const registeredTypeName = customTypeNameRegistry.get(arg.type);
+                                if (registeredTypeName) {
+                                    argTypeName = registeredTypeName;
+                                } else if (arg.type === String) {
+                                    argTypeName = 'String';
+                                } else if (arg.type === Number) {
+                                    argTypeName = 'Float';
+                                } else if (arg.type === Boolean) {
+                                    argTypeName = 'Boolean';
+                                } else if (arg.type === Date) {
+                                    argTypeName = 'Date';
+                                } else if (arg.type?.name) {
+                                    argTypeName = arg.type.name;
+                                } else {
+                                    argTypeName = 'String';
+                                }
+                            }
+                            
+                            const nullable = arg.nullable ? '' : '!';
+                            argDefs.push(`${arg.name}: ${argTypeName}${nullable}`);
+                        }
+                        
+                        const argsString = argDefs.join(', ');
+                        const escapedKey = propertyKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                        
+                        // Pattern to add arguments: fieldName: Type -> fieldName(args): Type
+                        const argPattern = new RegExp(
+                            `(\\s+${escapedKey}\\??\\s*:\\s*)([^\\n]+)`,
+                            'g'
+                        );
+                        
+                        schemaString = schemaString.replace(
+                            argPattern,
+                            (match, fieldDef, returnType) => {
+                                return `${fieldDef.trim().replace(':', '')}(${argsString}): ${returnType.trim()}`;
+                            }
+                        );
+                        
+                        console.log(`[ArcheType] Added arguments to ${propertyKey}: ${argsString}`);
+                    }
+                    
                     if (options?.returnType && !['string', 'number', 'boolean'].includes(options.returnType)) {
                         console.log(`[ArcheType] Replacing String with ${options.returnType} for ${propertyKey}`);
                         // Simple pattern that matches the field directly
@@ -1707,12 +1783,107 @@ export class BaseArcheType {
         }
 
         // Generate resolvers for archetype functions
-        for (const { propertyKey } of this.functions) {
+        for (const { propertyKey, options } of this.functions) {
             resolvers.push({
                 typeName: archetypeName,
                 fieldName: propertyKey,
-                resolver: (parent: Entity) => {
-                    return (this as any)[propertyKey](parent);
+                resolver: async (parent: Entity, args: any, context: any) => {
+                    // If function has arguments, extract and convert them
+                    if (options?.args && options.args.length > 0 && args) {
+                        const functionArgs: any[] = [];
+                        
+                        for (const argDef of options.args) {
+                            const argValue = args[argDef.name];
+                            
+                            if (argValue === undefined || argValue === null) {
+                                if (!argDef.nullable) {
+                                    throw new Error(`Required argument '${argDef.name}' is missing for ${archetypeName}.${propertyKey}`);
+                                }
+                                functionArgs.push(null);
+                                continue;
+                            }
+                            
+                            // Convert argument value to the expected type
+                            let convertedValue: any = argValue;
+                            
+                            // Check if it's a custom type that needs instantiation
+                            if (argDef.type && typeof argDef.type === 'function' && argDef.type !== String && argDef.type !== Number && argDef.type !== Boolean && argDef.type !== Date) {
+                                // Check if it's a registered custom type (like ST_Point)
+                                const isCustomType = customTypeRegistry.has(argDef.type) || 
+                                                    customTypeNameRegistry.has(argDef.type) ||
+                                                    (argDef.type?.name && registeredCustomTypes.has(argDef.type.name));
+                                
+                                if (isCustomType && typeof argValue === 'object' && !Array.isArray(argValue)) {
+                                    // Try to instantiate the type if it's a class constructor
+                                    try {
+                                        if (argDef.type.prototype && argDef.type.prototype.constructor) {
+                                            // It's a class, try to instantiate it
+                                            // First, try object assignment (works for most cases)
+                                            convertedValue = Object.assign(Object.create(argDef.type.prototype), argValue);
+                                            
+                                            // Verify the instance was created correctly
+                                            if (!convertedValue || !(convertedValue instanceof argDef.type)) {
+                                                // If object assignment didn't work, try constructor with common patterns
+                                                // This is a fallback for types that require constructor parameters
+                                                const constructor = argDef.type.prototype.constructor;
+                                                const paramCount = constructor.length;
+                                                
+                                                if (paramCount === 2) {
+                                                    // Try common 2-parameter patterns
+                                                    if (argValue.latitude !== undefined && argValue.longitude !== undefined) {
+                                                        convertedValue = new argDef.type(argValue.latitude, argValue.longitude);
+                                                    } else if (argValue.x !== undefined && argValue.y !== undefined) {
+                                                        convertedValue = new argDef.type(argValue.x, argValue.y);
+                                                    } else {
+                                                        // Fallback: use first two object values
+                                                        const values = Object.values(argValue);
+                                                        if (values.length >= 2) {
+                                                            convertedValue = new argDef.type(values[0], values[1]);
+                                                        }
+                                                    }
+                                                } else if (paramCount === 1) {
+                                                    // Single parameter - try first property value
+                                                    const values = Object.values(argValue);
+                                                    if (values.length >= 1) {
+                                                        convertedValue = new argDef.type(values[0]);
+                                                    }
+                                                } else if (paramCount === 0) {
+                                                    // No parameters - object assignment should work
+                                                    convertedValue = Object.assign(Object.create(argDef.type.prototype), argValue);
+                                                }
+                                                
+                                                // Final fallback
+                                                if (!convertedValue || !(convertedValue instanceof argDef.type)) {
+                                                    convertedValue = Object.assign(Object.create(argDef.type.prototype), argValue);
+                                                }
+                                            }
+                                        } else {
+                                            // Not a class, use the value as-is
+                                            convertedValue = argValue;
+                                        }
+                                    } catch (e) {
+                                        // If instantiation fails, try object assignment
+                                        try {
+                                            convertedValue = Object.assign(Object.create(argDef.type.prototype || {}), argValue);
+                                        } catch (e2) {
+                                            // Fallback to plain object
+                                            convertedValue = argValue;
+                                        }
+                                    }
+                                } else {
+                                    convertedValue = argValue;
+                                }
+                            }
+                            
+                            functionArgs.push(convertedValue);
+                        }
+                        
+                        // Call function with entity and arguments
+                        return await (this as any)[propertyKey](parent, ...functionArgs);
+                    } else {
+                        // No arguments, call with just entity
+                        return await (this as any)[propertyKey](parent);
+                    }
                 },
             });
         }
@@ -1946,6 +2117,9 @@ export class BaseArcheType {
         }
 
         // Process archetype functions
+        // Store function input type names for post-processing
+        const functionInputTypes = new Map<string, string>();
+        
         if (!excludeFunctions) {
             for (const { propertyKey, options } of this.functions) {
                 let zodType;
@@ -1970,6 +2144,59 @@ export class BaseArcheType {
                         zodType = z.any();
                     }
                 }
+                
+                // Process function arguments if present
+                if (options?.args && options.args.length > 0) {
+                    const archetypeId = storage.getComponentId(this.constructor.name);
+                    const archetypeName =
+                        storage.archetypes.find((a) => a.typeId === archetypeId)?.name ||
+                        this.constructor.name;
+                    const inputTypeName = `${archetypeName}_${propertyKey}Args`;
+                    
+                    // Create input type schema for arguments
+                    const inputFields: Record<string, any> = {};
+                    for (const arg of options.args) {
+                        let argZodType: any;
+                        
+                        // Check if it's a registered custom type
+                        if (customTypeRegistry.has(arg.type)) {
+                            argZodType = customTypeRegistry.get(arg.type)!;
+                        } else if (arg.type === String || arg.type === String) {
+                            argZodType = z.string();
+                        } else if (arg.type === Number) {
+                            argZodType = z.number();
+                        } else if (arg.type === Boolean) {
+                            argZodType = z.boolean();
+                        } else if (arg.type === Date) {
+                            argZodType = z.date();
+                        } else if (registeredCustomTypes.has(arg.type?.name || '')) {
+                            // Check if it's registered by name
+                            argZodType = registeredCustomTypes.get(arg.type.name);
+                        } else {
+                            // Try to get from customTypeNameRegistry
+                            const typeName = customTypeNameRegistry.get(arg.type);
+                            if (typeName && registeredCustomTypes.has(typeName)) {
+                                argZodType = registeredCustomTypes.get(typeName);
+                            } else {
+                                console.warn(`[ArcheType] Unknown argument type for ${archetypeName}.${propertyKey}.${arg.name}: ${arg.type?.name || arg.type}. Falling back to z.any()`);
+                                argZodType = z.any();
+                            }
+                        }
+                        
+                        // Apply nullable if specified
+                        if (arg.nullable) {
+                            argZodType = argZodType.optional();
+                        }
+                        
+                        inputFields[arg.name] = argZodType;
+                    }
+                    
+                    // Create and register the input type
+                    const inputSchema = z.object(inputFields).register(asObjectType, { name: inputTypeName });
+                    registeredCustomTypes.set(inputTypeName, inputSchema);
+                    functionInputTypes.set(propertyKey, inputTypeName);
+                }
+                
                 zodShapes[propertyKey] = zodType.optional();
             }
         }
@@ -2087,7 +2314,180 @@ export class BaseArcheType {
             }
         }
 
-        // console.log("WeavedSchema:", graphqlSchemaString);
+        // Post-process: Add argument definitions to function fields
+        if (!excludeFunctions) {
+            for (const { propertyKey, options } of this.functions) {
+                if (options?.args && options.args.length > 0) {
+                    // Build individual argument definitions
+                    const argDefs: string[] = [];
+                    for (const arg of options.args) {
+                        let argTypeName: string;
+                        
+                        // Determine GraphQL type name for the argument
+                        // For GraphQL arguments, we prefer input types over object types
+                        // First check if there's a registered input type for this type
+                        const inputTypeName = inputTypeRegistry.get(arg.type);
+                        if (inputTypeName) {
+                            argTypeName = inputTypeName;
+                        } else {
+                            // Fall back to the object type name
+                            const registeredTypeName = customTypeNameRegistry.get(arg.type);
+                            if (registeredTypeName) {
+                                argTypeName = registeredTypeName;
+                            } else if (customTypeRegistry.has(arg.type)) {
+                                // It's registered but without a name, try to find the name
+                                const registeredName = Array.from(registeredCustomTypes.entries())
+                                    .find(([name, schema]) => schema === customTypeRegistry.get(arg.type))?.[0];
+                                argTypeName = registeredName || 'String';
+                            } else if (arg.type === String) {
+                                argTypeName = 'String';
+                            } else if (arg.type === Number) {
+                                argTypeName = 'Float';
+                            } else if (arg.type === Boolean) {
+                                argTypeName = 'Boolean';
+                            } else if (arg.type === Date) {
+                                argTypeName = 'Date';
+                            } else if (arg.type?.name && registeredCustomTypes.has(arg.type.name)) {
+                                // Check if the type name is registered
+                                argTypeName = arg.type.name;
+                            } else if (arg.type?.name) {
+                                // Fallback to the type's name if it exists
+                                argTypeName = arg.type.name;
+                            } else {
+                                argTypeName = 'String';
+                            }
+                        }
+                        
+                        const nullable = arg.nullable ? '' : '!';
+                        argDefs.push(`${arg.name}: ${argTypeName}${nullable}`);
+                    }
+                    
+                    // Find the function field in the schema and add arguments
+                    // The schema format from printSchema is typically:
+                    //   fieldName: ReturnType
+                    // We need to replace it with: fieldName(arg1: Type1, arg2: Type2): ReturnType
+                    
+                    // Escape propertyKey for regex
+                    const escapedKey = propertyKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    const escapedTypeName = nameFromStorage.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    
+                    // Build the replacement string
+                    const argsString = argDefs.join(', ');
+                    
+                    // Debug: Log what we're looking for
+                    console.log(`[ArcheType] Adding arguments to ${nameFromStorage}.${propertyKey}: ${argsString}`);
+                    
+                    // Try to find and replace the field definition
+                    // Look for the field within the type definition
+                    // Make it case-insensitive to handle different casing in GraphQL schema
+                    const typeStartPattern = new RegExp(`type\\s+${escapedTypeName}\\s*\\{`, 'i');
+                    let typeStartMatch = graphqlSchemaString.match(typeStartPattern);
+                    
+                    // If exact match fails, try case-insensitive search for the type name
+                    if (!typeStartMatch) {
+                        // Try to find the type with any casing
+                        const caseInsensitivePattern = new RegExp(`type\\s+([^\\s{]+)\\s*\\{`, 'gi');
+                        const allTypes = [...graphqlSchemaString.matchAll(caseInsensitivePattern)];
+                        const matchingType = allTypes.find(match => 
+                            match[1].toLowerCase() === nameFromStorage.toLowerCase()
+                        );
+                        if (matchingType && matchingType.index !== undefined) {
+                            // Create a fake match object
+                            typeStartMatch = [matchingType[0], matchingType[1]] as RegExpMatchArray;
+                            typeStartMatch.index = matchingType.index;
+                        }
+                    }
+                    
+                    if (typeStartMatch) {
+                        const typeStartIndex = typeStartMatch.index! + typeStartMatch[0].length;
+                        // Find the closing brace of this type
+                        let braceCount = 1;
+                        let typeEndIndex = typeStartIndex;
+                        for (let i = typeStartIndex; i < graphqlSchemaString.length && braceCount > 0; i++) {
+                            if (graphqlSchemaString[i] === '{') braceCount++;
+                            if (graphqlSchemaString[i] === '}') braceCount--;
+                            if (braceCount === 0) {
+                                typeEndIndex = i;
+                                break;
+                            }
+                        }
+                        
+                        // Extract the type definition
+                        const typeDefinition = graphqlSchemaString.substring(typeStartIndex, typeEndIndex);
+                        
+                        // Debug: Log the type definition snippet
+                        console.log(`[ArcheType] Type definition for ${nameFromStorage}:`, typeDefinition.substring(0, 200));
+                        
+                        // Find the field within this type definition
+                        // Pattern: fieldName: ReturnType or fieldName?: ReturnType
+                        const fieldPattern = new RegExp(
+                            `(\\n\\s+)(${escapedKey}\\??\\s*:\\s*)([^\\n]+)`,
+                            'g'
+                        );
+                        
+                        const fieldMatch = fieldPattern.exec(typeDefinition);
+                        if (fieldMatch) {
+                            const returnType = fieldMatch[3].trim();
+                            const indent = fieldMatch[1];
+                            const replacement = `${indent}${propertyKey}(${argsString}): ${returnType}`;
+                            
+                            console.log(`[ArcheType] Found field match: "${fieldMatch[0]}" -> "${replacement}"`);
+                            
+                            // Replace in the full schema string
+                            const fullMatchStart = typeStartIndex + fieldMatch.index!;
+                            const fullMatchEnd = fullMatchStart + fieldMatch[0].length;
+                            graphqlSchemaString = 
+                                graphqlSchemaString.substring(0, fullMatchStart) +
+                                replacement +
+                                graphqlSchemaString.substring(fullMatchEnd);
+                            
+                            console.log(`[ArcheType] Replacement successful for ${nameFromStorage}.${propertyKey}`);
+                        } else {
+                            console.warn(`[ArcheType] Field pattern not found in type definition. Looking for: ${escapedKey}`);
+                            // Fallback: simple replace anywhere
+                            const simplePattern = new RegExp(
+                                `(${escapedKey}\\??\\s*:\\s*)([^\\n]+)`,
+                                'g'
+                            );
+                            const beforeReplace = graphqlSchemaString;
+                            graphqlSchemaString = graphqlSchemaString.replace(
+                                simplePattern,
+                                (match, fieldDef, returnType) => {
+                                    console.log(`[ArcheType] Fallback replacement: "${match}" -> "${propertyKey}(${argsString}): ${returnType.trim()}"`);
+                                    return `${propertyKey}(${argsString}): ${returnType.trim()}`;
+                                }
+                            );
+                            if (beforeReplace === graphqlSchemaString) {
+                                console.warn(`[ArcheType] Fallback replacement also failed for ${nameFromStorage}.${propertyKey}`);
+                            }
+                        }
+                    } else {
+                        console.warn(`[ArcheType] Type pattern not found for ${nameFromStorage}. Schema snippet:`, graphqlSchemaString.substring(0, 300));
+                        // Fallback: simple replace anywhere if type pattern not found
+                        const simplePattern = new RegExp(
+                            `(${escapedKey}\\??\\s*:\\s*)([^\\n]+)`,
+                            'g'
+                        );
+                        const beforeReplace = graphqlSchemaString;
+                        graphqlSchemaString = graphqlSchemaString.replace(
+                            simplePattern,
+                            (match, fieldDef, returnType) => {
+                                console.log(`[ArcheType] Final fallback replacement: "${match}" -> "${propertyKey}(${argsString}): ${returnType.trim()}"`);
+                                return `${propertyKey}(${argsString}): ${returnType.trim()}`;
+                            }
+                        );
+                        if (beforeReplace === graphqlSchemaString) {
+                            console.warn(`[ArcheType] All replacement attempts failed for ${nameFromStorage}.${propertyKey}`);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Debug: Log schema if it contains function arguments
+        if (!excludeFunctions && this.functions.some(f => f.options?.args && f.options.args.length > 0)) {
+            // console.log(`[ArcheType] Schema for ${nameFromStorage} with function args:`, graphqlSchemaString);
+        }
 
         // Cache the schema for this archetype
         const cacheKey = `${nameFromStorage}_${excludeRelations}_${excludeFunctions}`;

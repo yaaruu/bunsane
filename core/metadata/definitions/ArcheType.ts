@@ -7,7 +7,14 @@ export interface ArcheTypeMetadata {
 
 export interface ArcheTypeFunctionMetadata {
     propertyKey: string;
-    options?: { returnType?: string };
+    options?: { 
+        returnType?: string;
+        args?: Array<{ 
+            name: string; 
+            type: any; 
+            nullable?: boolean;
+        }>;
+    };
 }
 
 export interface ArcheTypeFieldOptions {
