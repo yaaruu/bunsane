@@ -4,7 +4,7 @@ import db from "database";
 import EntityManager from "./EntityManager";
 import ComponentRegistry from "./ComponentRegistry";
 import { uuidv7 } from "utils/uuid";
-import { sql } from "bun";
+import { sql, SQL } from "bun";
 // import Query from "./Query"; // Lazy import to avoid cycle
 import { timed } from "./Decorators";
 import EntityHookManager from "./EntityHookManager";
@@ -219,7 +219,7 @@ export class Entity implements IEntity {
     }
 
     @timed("Entity.save")
-    public save() {
+    public save(trx?: SQL) {
         return new Promise<boolean>((resolve, reject) => {
             // Add timeout to prevent hanging
             const timeout = setTimeout(() => {
@@ -227,7 +227,9 @@ export class Entity implements IEntity {
                 reject(new Error(`Entity save timeout for entity ${this.id}`));
             }, 30000); // 30 second timeout
 
-            this.doSave()
+            if (trx) {
+                // Use provided transaction
+                this.doSave(trx)
                 .then(result => {
                     clearTimeout(timeout);
                     resolve(result);
@@ -236,30 +238,44 @@ export class Entity implements IEntity {
                     clearTimeout(timeout);
                     reject(error);
                 });
+            } else {
+                // Create new transaction
+                db.transaction(async (newTrx) => {
+                    return await this.doSave(newTrx);
+                })
+                .then(result => {
+                    clearTimeout(timeout);
+                    resolve(result);
+                })
+                .catch(error => {
+                    clearTimeout(timeout);
+                    reject(error);
+                });
+            }
         });
     }
 
-    public doSave() {
+    public doSave(trx: SQL) {
         return new Promise<boolean>(async resolve => {
             if(!this._dirty) {
                 logger.trace("Entity is not dirty, no need to save.");
-                return resolve(true); 
+                return resolve(true);
             }
 
             const wasNew = !this._persisted;
             const changedComponents = this.getDirtyComponents();
 
-            await db.transaction(async (trx) => {
+            const executeSave = async (saveTrx: SQL) => {
                 if(!this._persisted) {
-                    await trx`INSERT INTO entities (id) VALUES (${this.id}) ON CONFLICT DO NOTHING`;
+                    await saveTrx`INSERT INTO entities (id) VALUES (${this.id}) ON CONFLICT DO NOTHING`;
                     this._persisted = true;
                 }
-                
+
                 // Delete removed components from database
                 if (this.removedComponents.size > 0) {
                     const typeIds = Array.from(this.removedComponents);
-                    await trx`DELETE FROM components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`;
-                    await trx`DELETE FROM entity_components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`;
+                    await saveTrx`DELETE FROM components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`;
+                    await saveTrx`DELETE FROM entity_components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`;
                     this.removedComponents.clear();
                 }
                 
@@ -308,10 +324,10 @@ export class Entity implements IEntity {
                 
                 // Perform batch inserts
                 if(componentsToInsert.length > 0) {
-                    await trx`INSERT INTO components ${sql(componentsToInsert, 'id', 'entity_id', 'name', 'type_id', 'data')}`;
-                    await trx`INSERT INTO entity_components ${sql(entityComponentsToInsert, 'entity_id', 'type_id', 'component_id')} ON CONFLICT DO NOTHING`;
+                    await saveTrx`INSERT INTO components ${sql(componentsToInsert, 'id', 'entity_id', 'name', 'type_id', 'data')}`;
+                    await saveTrx`INSERT INTO entity_components ${sql(entityComponentsToInsert, 'entity_id', 'type_id', 'component_id')} ON CONFLICT DO NOTHING`;
                 }
-                
+
                 // Insert entity_components for existing components if entity is new
                 if(!this._persisted) {
                     const existingEntityComponents = [];
@@ -325,17 +341,19 @@ export class Entity implements IEntity {
                         }
                     }
                     if(existingEntityComponents.length > 0) {
-                        await trx`INSERT INTO entity_components ${sql(existingEntityComponents, 'entity_id', 'type_id', 'component_id')} ON CONFLICT DO NOTHING`;
+                        await saveTrx`INSERT INTO entity_components ${sql(existingEntityComponents, 'entity_id', 'type_id', 'component_id')} ON CONFLICT DO NOTHING`;
                     }
                 }
-                
+
                 // Perform batch updates
                 if(componentsToUpdate.length > 0) {
                     for(const comp of componentsToUpdate) {
-                        await trx`UPDATE components SET data = ${comp.data} WHERE id = ${comp.id}`;
+                        await saveTrx`UPDATE components SET data = ${comp.data} WHERE id = ${comp.id}`;
                     }
                 }
-            });
+            };
+
+            await executeSave(trx);
 
             this._dirty = false;
 
