@@ -17,6 +17,8 @@ export class SourceNode extends QueryNode {
             sql += ` AND id NOT IN (${placeholders})`;
         }
 
+        sql += " ORDER BY id";
+
         if (context.limit !== null) {
             sql += ` LIMIT $${context.addParam(context.limit)}`;
         }
@@ -24,8 +26,6 @@ export class SourceNode extends QueryNode {
         if (context.offsetValue > 0) {
             sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
         }
-
-        sql += " ORDER BY id";
 
         return {
             sql,

@@ -241,9 +241,7 @@ export function weaveAllArchetypes() {
 
             // Process each function field
             if (archetypeMetadata.functions) {
-                console.log(`[ArcheType] Processing functions for ${archetypeName}:`, archetypeMetadata.functions);
                 for (const { propertyKey, options } of archetypeMetadata.functions) {
-                    console.log(`[ArcheType] Function ${propertyKey}, returnType:`, options?.returnType);
                     
                     // Add arguments if present
                     if (options?.args && options.args.length > 0) {
@@ -281,45 +279,50 @@ export function weaveAllArchetypes() {
                         const escapedKey = propertyKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
                         
                         // Pattern to add arguments: fieldName: Type -> fieldName(args): Type
+                        // Capture leading whitespace separately to preserve it
                         const argPattern = new RegExp(
-                            `(\\s+${escapedKey}\\??\\s*:\\s*)([^\\n]+)`,
+                            `(\\s+)(${escapedKey}\\??\\s*:\\s*)([^\\n]+)`,
                             'g'
                         );
                         
                         schemaString = schemaString.replace(
                             argPattern,
-                            (match, fieldDef, returnType) => {
-                                return `${fieldDef.trim().replace(':', '')}(${argsString}): ${returnType.trim()}`;
+                            (match, leadingSpace, fieldDef, returnType) => {
+                                return `${leadingSpace}${fieldDef.trim().replace(':', '')}(${argsString}): ${returnType.trim()}`;
                             }
                         );
-                        
-                        console.log(`[ArcheType] Added arguments to ${propertyKey}: ${argsString}`);
                     }
                     
                     if (options?.returnType && !['string', 'number', 'boolean'].includes(options.returnType)) {
-                        console.log(`[ArcheType] Replacing String with ${options.returnType} for ${propertyKey}`);
-                        // Simple pattern that matches the field directly
-                        const simplePattern = new RegExp(
-                            `(\\s+${propertyKey}:\\s*)String(\\??)`,
-                            "g"
-                        );
+                        // Find the archetype type definition first
+                        const typePattern = new RegExp(`type ${archetypeName}\\s*\\{([\\s\\S]*?)\\n\\}`, 'g');
+                        const typeMatch = typePattern.exec(schemaString);
                         
-                        const beforeReplace = schemaString;
-                        schemaString = schemaString.replace(
-                            simplePattern,
-                            `$1${options.returnType}$2`
-                        );
-                        
-                        if (beforeReplace !== schemaString) {
-                            console.log(`[ArcheType] Successfully replaced ${propertyKey}: String with ${propertyKey}: ${options.returnType}`);
-                        } else {
-                            console.log(`[ArcheType] Pattern did not match for ${propertyKey}`);
+                        if (typeMatch) {
+                            const typeBody = typeMatch[1];
+                            
+                            // Find the field line in the type body
+                            const fieldIndex = typeBody.indexOf(`  ${propertyKey}`);
+                            if (fieldIndex !== -1) {
+                                const lineStart = fieldIndex;
+                                const lineEnd = typeBody.indexOf('\n', fieldIndex);
+                                const fieldLine = typeBody.substring(lineStart, lineEnd !== -1 ? lineEnd : typeBody.length);
+                                
+                                // Replace String with the actual return type in this line
+                                const updatedLine = fieldLine.replace(/:\s*String(\??)(\s*)$/, `: ${options.returnType}$1$2`);
+                                
+                                if (updatedLine !== fieldLine) {
+                                    // Replace in the full schema
+                                    const fullFieldIndex = schemaString.indexOf(typeMatch[0]) + typeMatch[0].indexOf(fieldLine);
+                                    schemaString = schemaString.substring(0, fullFieldIndex) + 
+                                                 updatedLine + 
+                                                 schemaString.substring(fullFieldIndex + fieldLine.length);
+                                }
+                            }
                         }
                     }
                 }
-            } else {
-                console.log(`[ArcheType] No functions found for ${archetypeName}`);
-            }
+                }
         }
 
         return schemaString;
@@ -2481,12 +2484,34 @@ export class BaseArcheType {
                         }
                     }
                 }
+                
+                // Replace String return type with actual GraphQL type if specified
+                if (options?.returnType && !['string', 'number', 'boolean'].includes(options.returnType)) {
+                    // Find the field in the schema
+                    const fieldIndex = graphqlSchemaString.indexOf(`  ${propertyKey}`);
+                    if (fieldIndex !== -1) {
+                        // Extract the line containing this field
+                        const lineStart = fieldIndex;
+                        const lineEnd = graphqlSchemaString.indexOf('\n', fieldIndex);
+                        const fieldLine = graphqlSchemaString.substring(lineStart, lineEnd !== -1 ? lineEnd : graphqlSchemaString.length);
+                        
+                        // Replace String with the actual return type in this line
+                        const updatedLine = fieldLine.replace(/:\s*String(\??)(\s*)$/, `: ${options.returnType}$1$2`);
+                        
+                        if (updatedLine !== fieldLine) {
+                            // Replace the line in the full schema
+                            graphqlSchemaString = graphqlSchemaString.substring(0, lineStart) + 
+                                                 updatedLine + 
+                                                 graphqlSchemaString.substring(lineEnd !== -1 ? lineEnd : graphqlSchemaString.length);
+                        }
+                    }
+                }
             }
         }
 
         // Debug: Log schema if it contains function arguments
         if (!excludeFunctions && this.functions.some(f => f.options?.args && f.options.args.length > 0)) {
-            // console.log(`[ArcheType] Schema for ${nameFromStorage} with function args:`, graphqlSchemaString);
+            // console.log(`[ArcheType] Final schema for ${nameFromStorage} with function args:`, graphqlSchemaString);
         }
 
         // Cache the schema for this archetype

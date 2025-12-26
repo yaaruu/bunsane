@@ -83,6 +83,14 @@ export class ComponentInclusionNode extends QueryNode {
 
             const tableAlias = useCTE ? context.cteName : "ec";
             sql += ` ORDER BY ${tableAlias}.entity_id`;
+            
+            // Add LIMIT and OFFSET
+            if (context.limit !== null) {
+                sql += ` LIMIT $${context.addParam(context.limit)}`;
+            }
+            if (context.offsetValue > 0) {
+                sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
+            }
         } else {
             // Multiple components case
             // Create parameter indices for component IDs to avoid duplicates
@@ -153,6 +161,14 @@ export class ComponentInclusionNode extends QueryNode {
             
             const tableAlias = useCTE ? context.cteName : "ec";
             sql += ` ORDER BY ${tableAlias}.entity_id`;
+            
+            // Add LIMIT and OFFSET
+            if (context.limit !== null) {
+                sql += ` LIMIT $${context.addParam(context.limit)}`;
+            }
+            if (context.offsetValue > 0) {
+                sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
+            }
         }
 
         return {
