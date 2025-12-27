@@ -76,7 +76,7 @@ export class PreparedStatementCache {
             existing.lastUsed = now;
             existing.hitCount++;
             this.stats.hits++;
-            logger.trace(`Cache hit for key: ${key.substring(0, 50)}...`);
+            // logger.trace(`Cache hit for key: ${key.substring(0, 50)}...`);
             return { statement: existing.preparedStatement, isHit: true };
         }
 

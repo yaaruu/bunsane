@@ -16,7 +16,10 @@ export function timed(hint?: string) {
         const start = performance.now();
         const result = await originalMethod.apply(this, args);
         const end = performance.now();
-        logger.trace(`Execution time for ${propertyKey}${hint ? ` (${hint})` : ''}: ${end - start} ms`);
+        if(end - start > 100) {
+          logger.warn(`Execution time for ${propertyKey}${hint ? ` (${hint})` : ''}: ${end - start} ms`);
+        }
+        // logger.trace(`Execution time for ${propertyKey}${hint ? ` (${hint})` : ''}: ${end - start} ms`);
         return result;
       } else {
         return await originalMethod.apply(this, args);

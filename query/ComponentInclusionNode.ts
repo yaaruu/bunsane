@@ -241,8 +241,13 @@ export class ComponentInclusionNode extends QueryNode {
                         // String LIKE comparison - no casting
                         condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
                     } else if (filter.operator === 'IN' || filter.operator === 'NOT IN') {
-                        // IN/NOT IN comparison - no casting
-                        condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
+                        // IN/NOT IN comparison - handle arrays properly
+                        if (Array.isArray(filter.value)) {
+                            const placeholders = Array.from({length: filter.value.length}, (_, i) => `$${context.addParam(filter.value[i])}`).join(', ');
+                            condition = `${jsonPath} ${filter.operator} (${placeholders})`;
+                        } else {
+                            throw new Error(`${filter.operator} operator requires an array of values`);
+                        }
                     } else if (typeof filter.value === 'number') {
                         // Only treat as numeric if the value is actually a number type, not a string
                         condition = `(${jsonPath})::numeric ${filter.operator} $${context.addParam(filter.value)}::numeric`;
