@@ -30,6 +30,7 @@ export class QueryContext {
     public offsetValue: number = 0;
     public hasCTE: boolean = false;
     public cteName: string = "";
+    public eagerComponents: Set<string> = new Set();
 
     public getNextAlias(prefix: string = "t"): string {
         const count = this.tableAliases.size;
@@ -117,6 +118,7 @@ export class QueryContext {
         clone.offsetValue = this.offsetValue;
         clone.hasCTE = this.hasCTE;
         clone.cteName = this.cteName;
+        clone.eagerComponents = new Set(this.eagerComponents);
         return clone;
     }
 }

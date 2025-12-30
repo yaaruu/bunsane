@@ -128,12 +128,13 @@ export class Entity implements IEntity {
         return false;
     }
     /**
-     * Get component from entities. If entity is populated in query the component will get within the entitiy
-     * If not it will fetch from database
-     * @param Component
+     * Get component from entities. If entity is populated in query the component will get within the entity
+     * If not it will fetch from database. Optionally uses DataLoader if context with loaders is provided.
+     * @param ctor Component constructor
+     * @param context Optional context containing DataLoader for batched loading (prevents connection pool exhaustion)
      * @returns `Component | null` *if entity doesn't have the component
      */
-    public async get<T extends BaseComponent>(ctor: new (...args: any[]) => T): Promise<ComponentDataType<T> | null> {
+    public async get<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any } }): Promise<ComponentDataType<T> | null> {
         const comp = Array.from(this.components.values()).find(comp => comp instanceof ctor) as ComponentGetter<T> | undefined;
         if(typeof comp !== "undefined") {
             return comp.data();
@@ -142,12 +143,29 @@ export class Entity implements IEntity {
             const temp = new ctor();
             const typeId = temp.getTypeID();
             try {
-                const rows = await db`SELECT id, data FROM components WHERE entity_id = ${this.id} AND type_id = ${typeId} AND deleted_at IS NULL`;
-                if (rows.length > 0) {
-                    const row = rows[0];
+                let componentData: any = null;
+
+                // Use DataLoader if available (prevents N+1 queries and connection pool exhaustion)
+                if (context?.loaders?.componentsByEntityType) {
+                    const loaderResult = await context.loaders.componentsByEntityType.load({
+                        entityId: this.id,
+                        typeId: typeId
+                    });
+                    if (loaderResult) {
+                        componentData = loaderResult.data;
+                    }
+                } else {
+                    // Fallback to direct DB call
+                    const rows = await db`SELECT id, data FROM components WHERE entity_id = ${this.id} AND type_id = ${typeId} AND deleted_at IS NULL`;
+                    if (rows.length > 0) {
+                        componentData = rows[0].data;
+                    }
+                }
+
+                if (componentData !== null) {
                     const comp = new ctor();
-                    const componentData = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
-                    Object.assign(comp, componentData);
+                    const parsedData = typeof componentData === 'string' ? JSON.parse(componentData) : componentData;
+                    Object.assign(comp, parsedData);
                     // Deserialize Date properties
                     const storage = getMetadataStorage();
                     const props = storage.componentProperties.get(typeId);
@@ -158,7 +176,6 @@ export class Entity implements IEntity {
                             }
                         }
                     }
-                    comp.id = row.id;
                     comp.setPersisted(true);
                     comp.setDirty(false);
                     this.addComponent(comp);
@@ -176,9 +193,10 @@ export class Entity implements IEntity {
     /**
      * Get a component from the entity.
      * @param ctor Constructor of the component to fetch
+     * @param context Optional context containing DataLoader for batched loading (prevents connection pool exhaustion)
      * @returns Component instance or null if not found
      */
-    public async getComponent<T extends BaseComponent>(ctor: new (...args: any[]) => T): Promise<T | null> {
+    public async getComponent<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any } }): Promise<T | null> {
         const comp = Array.from(this.components.values()).find(comp => comp instanceof ctor) as T | undefined;
         if(typeof comp !== "undefined") {
             return comp;
@@ -187,12 +205,29 @@ export class Entity implements IEntity {
             const temp = new ctor();
             const typeId = temp.getTypeID();
             try {
-                const rows = await db`SELECT id, data FROM components WHERE entity_id = ${this.id} AND type_id = ${typeId} AND deleted_at IS NULL`;
-                if (rows.length > 0) {
-                    const row = rows[0];
+                let componentData: any = null;
+
+                // Use DataLoader if available (prevents N+1 queries and connection pool exhaustion)
+                if (context?.loaders?.componentsByEntityType) {
+                    const loaderResult = await context.loaders.componentsByEntityType.load({
+                        entityId: this.id,
+                        typeId: typeId
+                    });
+                    if (loaderResult) {
+                        componentData = loaderResult.data;
+                    }
+                } else {
+                    // Fallback to direct DB call
+                    const rows = await db`SELECT id, data FROM components WHERE entity_id = ${this.id} AND type_id = ${typeId} AND deleted_at IS NULL`;
+                    if (rows.length > 0) {
+                        componentData = rows[0].data;
+                    }
+                }
+
+                if (componentData !== null) {
                     const comp = new ctor();
-                    const componentData = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
-                    Object.assign(comp, componentData);
+                    const parsedData = typeof componentData === 'string' ? JSON.parse(componentData) : componentData;
+                    Object.assign(comp, parsedData);
                     // Deserialize Date properties
                     const storage = getMetadataStorage();
                     const props = storage.componentProperties.get(typeId);
@@ -203,7 +238,6 @@ export class Entity implements IEntity {
                             }
                         }
                     }
-                    comp.id = row.id;
                     comp.setPersisted(true);
                     comp.setDirty(false);
                     this.addComponent(comp);
@@ -483,9 +517,12 @@ export class Entity implements IEntity {
             WHERE c.entity_id IN ${sql(entityIds)} AND c.type_id IN ${sql(componentIds)} AND c.deleted_at IS NULL
         `;
 
+        // Use Map for O(1) lookups instead of O(n) find() - fixes O(n²) performance issue
+        const entityMap = new Map<string, Entity>(entities.map(e => [e.id, e]));
+
         for (const row of components) {
             const { id, entity_id, type_id, data } = row;
-            const entity = entities.find(e => e.id === entity_id);
+            const entity = entityMap.get(entity_id);  // O(1) instead of O(n)
             if (entity) {
                 const ctor = ComponentRegistry.getConstructor(type_id);
                 if (ctor) {

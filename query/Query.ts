@@ -133,6 +133,29 @@ class Query {
         return this;
     }
 
+    /**
+     * Eagerly load specific components after query execution.
+     * This preloads components into entities to avoid N+1 queries when accessing them later.
+     * @param ctors Array of component constructors to eagerly load
+     */
+    public eagerLoadComponents(ctors: Array<new () => BaseComponent>): this {
+        for (const ctor of ctors) {
+            const type_id = this.context.getComponentId(ctor);
+            if (!type_id) {
+                throw new Error(`Component ${ctor.name} is not registered.`);
+            }
+            this.context.eagerComponents.add(type_id);
+        }
+        return this;
+    }
+
+    /**
+     * Alias for eagerLoadComponents for backward compatibility
+     */
+    public eagerLoad<T extends BaseComponent>(ctors: (new (...args: any[]) => T)[]): this {
+        return this.eagerLoadComponents(ctors);
+    }
+
     public take(limit: number): this {
         this.context.limit = limit;
         return this;
@@ -346,6 +369,12 @@ class Query {
         // Populate entities with components if requested
         if (this.shouldPopulate && this.context.componentIds.size > 0) {
             await this.populateComponents(entityMap);
+        }
+
+        // Eagerly load specific components if requested
+        if (this.context.eagerComponents.size > 0) {
+            const entitiesArray = Array.from(entityMap.values());
+            await Entity.LoadComponents(entitiesArray, Array.from(this.context.eagerComponents));
         }
 
         // Return entities in the same order as the query results
