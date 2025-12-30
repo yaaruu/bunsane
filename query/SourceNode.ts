@@ -19,13 +19,11 @@ export class SourceNode extends QueryNode {
 
         sql += " ORDER BY id";
 
+        // Always include OFFSET (even when 0) to ensure consistent SQL structure for prepared statement caching
         if (context.limit !== null) {
             sql += ` LIMIT $${context.addParam(context.limit)}`;
         }
-
-        if (context.offsetValue > 0) {
-            sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
-        }
+        sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
 
         return {
             sql,

@@ -3,6 +3,7 @@ import type { QueryResult } from "./QueryNode";
 import { QueryContext } from "./QueryContext";
 import { shouldUseLateralJoins } from "../core/Config";
 import { FilterBuilderRegistry } from "./FilterBuilderRegistry";
+import ComponentRegistry from "../core/ComponentRegistry";
 
 export class ComponentInclusionNode extends QueryNode {
     public execute(context: QueryContext): QueryResult {
@@ -28,6 +29,9 @@ export class ComponentInclusionNode extends QueryNode {
         // Collect LATERAL join fragments if using LATERAL joins
         const lateralJoins: string[] = [];
         const lateralConditions: string[] = [];
+
+        // Check if we need custom sorting (sortOrders specified)
+        const hasSortOrders = context.sortOrders.length > 0;
 
         if (componentCount === 1) {
             // Single component case
@@ -81,14 +85,19 @@ export class ComponentInclusionNode extends QueryNode {
             // Apply component filters for single component
             sql = this.applyComponentFilters(context, componentIds, useCTE, useLateralJoins, lateralJoins, lateralConditions, sql, new Map());
 
-            const tableAlias = useCTE ? context.cteName : "ec";
-            sql += ` ORDER BY ${tableAlias}.entity_id`;
-            
-            // Add LIMIT and OFFSET
-            if (context.limit !== null) {
-                sql += ` LIMIT $${context.addParam(context.limit)}`;
-            }
-            if (context.offsetValue > 0) {
+            // Apply sorting with component data joins if sortOrders are specified
+            if (hasSortOrders) {
+                sql = this.applySortingWithComponentJoins(sql, context);
+            } else {
+                // Default: order by entity_id
+                const tableAlias = useCTE ? context.cteName : "ec";
+                sql += ` ORDER BY ${tableAlias}.entity_id`;
+                
+                // Add LIMIT and OFFSET
+                // Always include OFFSET (even when 0) to ensure consistent SQL structure for prepared statement caching
+                if (context.limit !== null) {
+                    sql += ` LIMIT $${context.addParam(context.limit)}`;
+                }
                 sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
             }
         } else {
@@ -159,14 +168,19 @@ export class ComponentInclusionNode extends QueryNode {
                 sql += ` GROUP BY ec.entity_id HAVING COUNT(DISTINCT ec.type_id) = $${context.addParam(componentCount)}`;
             }
             
-            const tableAlias = useCTE ? context.cteName : "ec";
-            sql += ` ORDER BY ${tableAlias}.entity_id`;
-            
-            // Add LIMIT and OFFSET
-            if (context.limit !== null) {
-                sql += ` LIMIT $${context.addParam(context.limit)}`;
-            }
-            if (context.offsetValue > 0) {
+            // Apply sorting with component data joins if sortOrders are specified
+            if (hasSortOrders) {
+                sql = this.applySortingWithComponentJoins(sql, context);
+            } else {
+                // Default: order by entity_id
+                const tableAlias = useCTE ? context.cteName : "ec";
+                sql += ` ORDER BY ${tableAlias}.entity_id`;
+                
+                // Add LIMIT and OFFSET
+                // Always include OFFSET (even when 0) to ensure consistent SQL structure for prepared statement caching
+                if (context.limit !== null) {
+                    sql += ` LIMIT $${context.addParam(context.limit)}`;
+                }
                 sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
             }
         }
@@ -176,6 +190,66 @@ export class ComponentInclusionNode extends QueryNode {
             params: context.params,
             context
         };
+    }
+
+    /**
+     * Wrap the base query with sorting joins and apply ORDER BY, LIMIT, OFFSET
+     * This ensures that sorting and pagination work together correctly
+     */
+    private applySortingWithComponentJoins(baseQuery: string, context: QueryContext): string {
+        // Wrap the base query as a subquery to get entity ids
+        let sql = `SELECT base_entities.id FROM (${baseQuery}) AS base_entities`;
+        
+        // Build LEFT JOINs for each sort order to access component data
+        const sortJoins: string[] = [];
+        const orderByClauses: string[] = [];
+        
+        for (let i = 0; i < context.sortOrders.length; i++) {
+            const sortOrder = context.sortOrders[i]!;
+            const sortAlias = `sort_${i}`;
+            const compAlias = `comp_${i}`;
+            
+            // Get the component type ID for this sort order
+            const typeId = ComponentRegistry.getComponentId(sortOrder.component);
+            if (!typeId) {
+                continue; // Skip if component not registered
+            }
+            
+            // LEFT JOIN to entity_components and components to get the sort data
+            sortJoins.push(`
+                LEFT JOIN entity_components ${sortAlias} 
+                    ON ${sortAlias}.entity_id = base_entities.id 
+                    AND ${sortAlias}.type_id = $${context.addParam(typeId)}::text
+                    AND ${sortAlias}.deleted_at IS NULL
+                LEFT JOIN components ${compAlias} 
+                    ON ${compAlias}.id = ${sortAlias}.component_id 
+                    AND ${compAlias}.deleted_at IS NULL`);
+            
+            // Build ORDER BY clause for this sort order
+            // Access the property from JSONB data
+            const nullsClause = sortOrder.nullsFirst ? 'NULLS FIRST' : 'NULLS LAST';
+            orderByClauses.push(`${compAlias}.data->>'${sortOrder.property}' ${sortOrder.direction} ${nullsClause}`);
+        }
+        
+        // Combine joins
+        sql += sortJoins.join('');
+        
+        // Add ORDER BY clause
+        if (orderByClauses.length > 0) {
+            sql += ` ORDER BY ${orderByClauses.join(', ')}`;
+        } else {
+            // Fallback to entity id if no valid sort orders
+            sql += ` ORDER BY base_entities.id`;
+        }
+        
+        // Add LIMIT and OFFSET after the ORDER BY
+        // Always include OFFSET (even when 0) to ensure consistent SQL structure for prepared statement caching
+        if (context.limit !== null) {
+            sql += ` LIMIT $${context.addParam(context.limit)}`;
+        }
+        sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
+        
+        return sql;
     }
 
     /**
