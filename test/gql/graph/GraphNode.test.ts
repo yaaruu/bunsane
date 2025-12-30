@@ -87,8 +87,8 @@ describe('GraphNode Classes', () => {
         it('should create an operation node', () => {
             const node = new OperationNode(
                 'get-user-query',
-                OperationType.QUERY,
                 'getUser',
+                OperationType.QUERY,
                 'getUser(id: ID!): User',
                 'user-input',
                 'user-type',
@@ -108,8 +108,8 @@ describe('GraphNode Classes', () => {
         it('should auto-add input/output dependencies', () => {
             const node = new OperationNode(
                 'test-op',
-                OperationType.MUTATION,
                 'createUser',
+                OperationType.MUTATION,
                 'createUser(input: CreateUserInput!): User',
                 'create-input',
                 'user-type'
@@ -120,7 +120,7 @@ describe('GraphNode Classes', () => {
         });
 
         it('should return correct description', () => {
-            const node = new OperationNode('test', OperationType.MUTATION, 'updateUser', 'updateUser: Boolean');
+            const node = new OperationNode('test', 'updateUser', OperationType.MUTATION, 'updateUser: Boolean');
             expect(node.getDescription()).toBe('MUTATION operation updateUser');
         });
     });

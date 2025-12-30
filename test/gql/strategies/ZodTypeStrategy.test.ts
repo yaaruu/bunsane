@@ -1,6 +1,8 @@
-import { describe, it, expect, beforeEach, jest } from '@jest/globals';
+import { describe, it, expect, beforeEach, mock } from 'bun:test';
 import { ZodTypeStrategy } from '../../../gql/strategies/TypeGenerationStrategy';
 import { z } from 'zod';
+import { ZodWeaver } from '@gqloom/zod';
+import { provideWeaverContext } from '@gqloom/core';
 
 describe('ZodTypeStrategy', () => {
   let strategy: ZodTypeStrategy;
@@ -8,6 +10,11 @@ describe('ZodTypeStrategy', () => {
   let scalarTypes: Set<string>;
 
   beforeEach(() => {
+    // Initialize GQLoom weaver context for Zod
+    provideWeaverContext({
+      vendorWeavers: new Map([['zod', ZodWeaver]])
+    });
+
     strategy = new ZodTypeStrategy();
     definedInputTypes = new Set();
     scalarTypes = new Set(['CustomScalar']);

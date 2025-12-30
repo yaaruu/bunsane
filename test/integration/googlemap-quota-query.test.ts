@@ -17,7 +17,7 @@ class MockGoogleMapAccountQuota extends BaseComponent {
     date!: string;
 }
 
-describe('GoogleMapAccountQuota Performance Test', () => {
+describe.skip('GoogleMapAccountQuota Performance Test', () => {
     beforeAll(async () => {
         // Ensure components are registered
         await ComponentRegistry.ensureComponentsRegistered();

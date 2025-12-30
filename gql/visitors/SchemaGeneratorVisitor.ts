@@ -24,6 +24,8 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
     private subscriptionFields: string[] = [];
     private definedTypes: Set<string> = new Set();
     private finalized: boolean = false;
+    private inputTypes: string = '';
+    private scalarTypes: Set<string> = new Set();
     
     constructor() {
         super();
@@ -144,17 +146,15 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
     visitScalarNode(node: ScalarNode): void {
         if (!this.definedTypes.has(node.id)) {
             this.typeDefs += `scalar ${node.name}\n`;
+            this.scalarTypes.add(node.name);
             this.definedTypes.add(node.id);
             logger.trace(`Added scalar type: ${node.name}`);
         }
     }
     
     visitTypeNode(node: TypeNode): void {
-        if (!this.definedTypes.has(node.id)) {
-            this.typeDefs += node.metadata.typeDef + '\n';
-            this.definedTypes.add(node.id);
-            logger.trace(`Added type definition: ${node.id}`);
-        }
+        // TypeNodes are handled separately by archetype weaving in beforeVisit()
+        logger.trace(`Visited type node: ${node.id}`);
     }
     
     visitOperationNode(node: OperationNode): void {
@@ -191,8 +191,11 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
     }
     
     visitInputNode(node: InputNode): void {
-        // InputNodes are typically handled within operations
-        logger.trace(`Visited input node: ${node.id}`);
+        if (!this.definedTypes.has(node.name)) {
+            this.inputTypes += node.typeDef + '\n';
+            this.definedTypes.add(node.name);
+            logger.trace(`Added input type: ${node.name}`);
+        }
     }
     
     /**
@@ -747,8 +750,8 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
     getResults(): { typeDefs: string; inputTypes?: string; scalarTypes?: string[] } {
         return {
             typeDefs: this.getTypeDefs(),
-            inputTypes: '',
-            scalarTypes: []
+            inputTypes: this.inputTypes,
+            scalarTypes: Array.from(this.scalarTypes)
         };
     }
 }

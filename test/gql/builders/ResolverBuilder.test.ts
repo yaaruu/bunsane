@@ -64,7 +64,9 @@ describe("ResolverBuilder", () => {
 
       const resolvers = builder.getResolvers();
       expect(resolvers.Subscription.userCreated).toBeDefined();
-      expect(typeof resolvers.Subscription.userCreated).toBe("function");
+      expect(typeof resolvers.Subscription.userCreated).toBe("object");
+      expect(resolvers.Subscription.userCreated).toHaveProperty("subscribe");
+      expect(typeof resolvers.Subscription.userCreated.subscribe).toBe("function");
     });
   });
 

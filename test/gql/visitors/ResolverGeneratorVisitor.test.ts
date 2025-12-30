@@ -7,12 +7,13 @@ describe("ResolverGeneratorVisitor", () => {
   let mockService: any;
 
   beforeEach(() => {
-    visitor = new ResolverGeneratorVisitor();
     mockService = {
+      constructor: { name: 'MockUserService' },
       getUser: mock(() => Promise.resolve({ id: 1, name: "John" })),
       createUser: mock(() => Promise.resolve({ id: 2, name: "Jane" })),
       userCreated: mock(() => Promise.resolve({ id: 3, name: "New User" }))
     };
+    visitor = new ResolverGeneratorVisitor([mockService]);
   });
 
   describe("visitOperationNode", () => {
@@ -25,7 +26,7 @@ describe("ResolverGeneratorVisitor", () => {
       );
 
       // Add metadata that would be set by the scanner
-      queryNode.metadata.service = mockService;
+      queryNode.metadata.serviceName = "MockUserService";
       queryNode.metadata.propertyKey = "getUser";
       queryNode.metadata.hasInput = false;
 
@@ -44,7 +45,7 @@ describe("ResolverGeneratorVisitor", () => {
         "createUser(input: CreateUserInput!): User"
       );
 
-      mutationNode.metadata.service = mockService;
+      mutationNode.metadata.serviceName = "MockUserService";
       mutationNode.metadata.propertyKey = "createUser";
       mutationNode.metadata.hasInput = true;
 
@@ -63,7 +64,7 @@ describe("ResolverGeneratorVisitor", () => {
         "userCreated: User"
       );
 
-      subscriptionNode.metadata.service = mockService;
+      subscriptionNode.metadata.serviceName = "MockUserService";
       subscriptionNode.metadata.propertyKey = "userCreated";
       subscriptionNode.metadata.hasInput = false;
 
@@ -93,7 +94,7 @@ describe("ResolverGeneratorVisitor", () => {
         OperationType.QUERY,
         "getUser(id: ID!): User"
       );
-      queryNode.metadata.service = mockService;
+      queryNode.metadata.serviceName = "MockUserService";
       queryNode.metadata.propertyKey = "getUser";
 
       const mutationNode = new OperationNode(
@@ -102,7 +103,7 @@ describe("ResolverGeneratorVisitor", () => {
         OperationType.MUTATION,
         "createUser(input: CreateUserInput!): User"
       );
-      mutationNode.metadata.service = mockService;
+      mutationNode.metadata.serviceName = "MockUserService";
       mutationNode.metadata.propertyKey = "createUser";
 
       visitor.visitOperationNode(queryNode);
@@ -126,7 +127,7 @@ describe("ResolverGeneratorVisitor", () => {
         OperationType.QUERY,
         "getUser(id: ID!): User"
       );
-      queryNode.metadata.service = mockService;
+      queryNode.metadata.serviceName = "MockUserService";
       queryNode.metadata.propertyKey = "getUser";
 
       const mutationNode = new OperationNode(
@@ -135,7 +136,7 @@ describe("ResolverGeneratorVisitor", () => {
         OperationType.MUTATION,
         "createUser(input: CreateUserInput!): User"
       );
-      mutationNode.metadata.service = mockService;
+      mutationNode.metadata.serviceName = "MockUserService";
       mutationNode.metadata.propertyKey = "createUser";
 
       const subscriptionNode = new OperationNode(
@@ -144,7 +145,7 @@ describe("ResolverGeneratorVisitor", () => {
         OperationType.SUBSCRIPTION,
         "userCreated: User"
       );
-      subscriptionNode.metadata.service = mockService;
+      subscriptionNode.metadata.serviceName = "MockUserService";
       subscriptionNode.metadata.propertyKey = "userCreated";
 
       visitor.visitOperationNode(queryNode);
@@ -166,7 +167,7 @@ describe("ResolverGeneratorVisitor", () => {
         OperationType.QUERY,
         "getUser(id: ID!): User"
       );
-      queryNode.metadata.service = mockService;
+      queryNode.metadata.serviceName = "MockUserService";
       queryNode.metadata.propertyKey = "getUser";
 
       visitor.visitOperationNode(queryNode);

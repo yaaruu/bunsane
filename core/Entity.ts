@@ -338,7 +338,7 @@ export class Entity implements IEntity {
                             entity_id: this.id,
                             name: compName,
                             type_id: comp.getTypeID(),
-                            data: comp.data()
+                            data: comp.serializableData()
                         });
                         entityComponentsToInsert.push({
                             entity_id: this.id,
@@ -350,7 +350,7 @@ export class Entity implements IEntity {
                     } else if((comp as any)._dirty) {
                         componentsToUpdate.push({
                             id: comp.id,
-                            data: comp.data()
+                            data: comp.serializableData()
                         });
                         (comp as any).setDirty(false);
                     }

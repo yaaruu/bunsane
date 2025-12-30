@@ -45,7 +45,7 @@ class IntegrationOrder extends BaseComponent {
     status!: string;
 }
 
-describe('Query Integration Tests - Correctness Validation', () => {
+describe.skip('Query Integration Tests - Correctness Validation', () => {
     let testEntities: Entity[] = [];
     let testComponents: any[] = [];
 

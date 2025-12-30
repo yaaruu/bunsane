@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, jest } from '@jest/globals';
+import { describe, it, expect, beforeEach, mock } from 'bun:test';
 import { ArchetypeTypeStrategy } from '../../../gql/strategies/TypeGenerationStrategy';
 import BaseArcheType from '../../../core/ArcheType';
 
@@ -40,10 +40,12 @@ describe('ArchetypeTypeStrategy', () => {
       const mockArchetype = Object.create(BaseArcheType.prototype);
       mockArchetype.constructor = { name: 'TestArcheType' };
 
-      // Mock getArchetypeTypeName
-      const mockGetArchetypeTypeName = jest.fn().mockReturnValue('TestType');
-      jest.doMock('../../../core/ArcheType', () => ({
-        ...jest.requireActual('../../../core/ArcheType'),
+      // Mock getArchetypeTypeName using Bun's module mocking
+      const mockGetArchetypeTypeName = mock(() => 'TestType');
+
+      // Mock the module before importing
+      mock.module('../../../core/ArcheType', () => ({
+        default: class MockArcheType {},
         getArchetypeTypeName: mockGetArchetypeTypeName
       }));
 
@@ -58,9 +60,11 @@ describe('ArchetypeTypeStrategy', () => {
       const mockArchetype = Object.create(BaseArcheType.prototype);
       mockArchetype.constructor = { name: 'TestArcheType' };
 
-      const mockGetArchetypeTypeName = jest.fn().mockReturnValue('TestType');
-      jest.doMock('../../../core/ArcheType', () => ({
-        ...jest.requireActual('../../../core/ArcheType'),
+      // Mock getArchetypeTypeName using Bun's module mocking
+      const mockGetArchetypeTypeName = mock(() => 'TestType');
+
+      mock.module('../../../core/ArcheType', () => ({
+        default: class MockArcheType {},
         getArchetypeTypeName: mockGetArchetypeTypeName
       }));
 
@@ -75,9 +79,11 @@ describe('ArchetypeTypeStrategy', () => {
       const invalidArchetype = Object.create(BaseArcheType.prototype);
       invalidArchetype.constructor = { name: 'TestArcheType' };
 
-      const mockGetArchetypeTypeName = jest.fn().mockReturnValue(null);
-      jest.doMock('../../../core/ArcheType', () => ({
-        ...jest.requireActual('../../../core/ArcheType'),
+      // Mock getArchetypeTypeName using Bun's module mocking
+      const mockGetArchetypeTypeName = mock(() => null);
+
+      mock.module('../../../core/ArcheType', () => ({
+        default: class MockArcheType {},
         getArchetypeTypeName: mockGetArchetypeTypeName
       }));
 
@@ -91,9 +97,11 @@ describe('ArchetypeTypeStrategy', () => {
       const invalidArchetype = Object.create(BaseArcheType.prototype);
       invalidArchetype.constructor = { name: 'TestArcheType' };
 
-      const mockGetArchetypeTypeName = jest.fn().mockReturnValue(null);
-      jest.doMock('../../../core/ArcheType', () => ({
-        ...jest.requireActual('../../../core/ArcheType'),
+      // Mock getArchetypeTypeName using Bun's module mocking
+      const mockGetArchetypeTypeName = mock(() => null);
+
+      mock.module('../../../core/ArcheType', () => ({
+        default: class MockArcheType {},
         getArchetypeTypeName: mockGetArchetypeTypeName
       }));
 
