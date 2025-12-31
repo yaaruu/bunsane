@@ -596,7 +596,7 @@ export class Entity implements IEntity {
             logger.warn(`FindById called with invalid id: "${id}"`);
             return null;
         }
-        const { default: Query } = await import("./Query");
+        const { Query } = await import("../query/Query");
         const entities = await new Query().findById(id).populate().exec()
         if(entities.length === 1) {
             return entities[0]!;
