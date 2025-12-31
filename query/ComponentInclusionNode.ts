@@ -283,6 +283,11 @@ export class ComponentInclusionNode extends QueryNode {
                     // Note: custom builder is responsible for adding parameters via context.addParam()
                 } else {
                     // Default filter logic
+                    // Validate filter value to prevent PostgreSQL UUID parsing errors
+                    if (filter.value === '' || (typeof filter.value === 'string' && filter.value.trim() === '')) {
+                        throw new Error(`Filter value for field "${filter.field}" is an empty string. This would cause PostgreSQL UUID parsing errors.`);
+                    }
+                    
                     // Check if value looks like a UUID (case-insensitive, with or without hyphens)
                     const valueStr = String(filter.value);
                     const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(valueStr);

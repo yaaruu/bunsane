@@ -181,6 +181,10 @@ export class BaseComponent {
         if(this.id === "") {
             this.id = uuidv7();
         }
+        // Validate entity_id to prevent PostgreSQL UUID parsing errors
+        if (!entity_id || entity_id.trim() === '') {
+            throw new Error(`Cannot insert component ${this._comp_name}: entity_id is empty or invalid`);
+        }
         await trx`INSERT INTO components 
         (id, entity_id, name, type_id, data)
         VALUES (${this.id}, ${entity_id}, ${this._comp_name}, ${this._typeId}, ${this.serializableData()})`

@@ -61,11 +61,19 @@ class Query {
     static filterOp = FilterOp;
 
     public findById(id: string) {
+        // Validate ID to prevent PostgreSQL UUID parsing errors
+        if (!id || typeof id !== 'string' || id.trim() === '') {
+            throw new Error(`Query.findById called with invalid id: "${id}"`);
+        }
         this.withId = id;
         return this;
     }
 
     public async findOneById(id: string): Promise<Entity | null> {
+        // Validate ID to prevent PostgreSQL UUID parsing errors
+        if (!id || typeof id !== 'string' || id.trim() === '') {
+            return null;
+        }
         const entities = await this.findById(id).exec();
         return entities.length > 0 ? entities[0]! : null;
     }

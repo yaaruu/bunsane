@@ -63,11 +63,19 @@ class Query {
     }
 
     public findById(id: string) {
+        // Validate ID to prevent PostgreSQL UUID parsing errors
+        if (!id || typeof id !== 'string' || id.trim() === '') {
+            throw new Error(`Query.findById called with invalid id: "${id}"`);
+        }
         this.context.withId = id;
         return this;
     }
 
     public async findOneById(id: string): Promise<Entity | null> {
+        // Validate ID to prevent PostgreSQL UUID parsing errors
+        if (!id || typeof id !== 'string' || id.trim() === '') {
+            return null;
+        }
         const entities = await this.findById(id).exec();
         return entities.length > 0 ? entities[0]! : null;
     }
@@ -269,6 +277,15 @@ class Query {
             console.log('---');
         }
 
+        // Validate params before execution to catch UUID errors early
+        for (let i = 0; i < result.params.length; i++) {
+            const param = result.params[i];
+            if (param === '' || (typeof param === 'string' && param.trim() === '')) {
+                logger.error(`Empty string parameter detected at position ${i + 1} in count query`);
+                throw new Error(`Query count parameter $${i + 1} is an empty string. This will cause PostgreSQL UUID parsing errors.`);
+            }
+        }
+
         // Execute the count query using prepared statement
         const countResult = await preparedStatementCache.execute(statement, result.params, db);
 
@@ -345,6 +362,15 @@ class Query {
             console.log('Params:', result.params);
             console.log('Cache Hit:', isHit);
             console.log('---');
+        }
+
+        // Validate params before execution to catch UUID errors early
+        for (let i = 0; i < result.params.length; i++) {
+            const param = result.params[i];
+            if (param === '' || (typeof param === 'string' && param.trim() === '')) {
+                logger.error(`Empty string parameter detected at position ${i + 1}: SQL=${result.sql.substring(0, 200)}`);
+                throw new Error(`Query parameter $${i + 1} is an empty string. This will cause PostgreSQL UUID parsing errors. SQL: ${result.sql.substring(0, 100)}...`);
+            }
         }
 
         // Execute the query using prepared statement
@@ -508,6 +534,10 @@ class Query {
     static filterOp = FilterOp;
 
     public static filter(field: string, operator: FilterOperator, value: any): QueryFilter {
+        // Validate value to catch empty strings early
+        if (value === '' || (typeof value === 'string' && value.trim() === '')) {
+            throw new Error(`Query.filter: Cannot create filter for field "${field}" with empty string value. This would cause PostgreSQL UUID parsing errors.`);
+        }
         return { field, operator, value };
     }
 

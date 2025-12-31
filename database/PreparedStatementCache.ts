@@ -111,6 +111,17 @@ export class PreparedStatementCache {
      * Execute a prepared statement with parameters
      */
     public async execute(statement: any, params: any[], db: any): Promise<any[]> {
+        // Validate params to catch empty strings that would cause UUID parsing errors
+        for (let i = 0; i < params.length; i++) {
+            const param = params[i];
+            if (param === '' || (typeof param === 'string' && param.trim() === '')) {
+                logger.error(`[PreparedStatementCache] Empty string parameter at position ${i + 1}`);
+                logger.error(`[PreparedStatementCache] SQL: ${statement.sql}`);
+                logger.error(`[PreparedStatementCache] All params: ${JSON.stringify(params)}`);
+                throw new Error(`PreparedStatementCache.execute: Parameter $${i + 1} is an empty string. SQL: ${statement.sql.substring(0, 100)}...`);
+            }
+        }
+        
         // For Bun's SQL, we still use db.unsafe() but with the prepared statement concept
         // In a real implementation, this might use a prepared statement pool
         return await db.unsafe(statement.sql, params);

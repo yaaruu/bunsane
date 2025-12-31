@@ -7,6 +7,7 @@ const logger = MainLogger.child({ module: 'RequestLoaders' });
 import { getMetadataStorage } from './metadata';
 
 export type ComponentData = {
+  id: string;  // Component ID for updates
   typeId: string;
   data: any;
   createdAt: Date;
@@ -24,7 +25,12 @@ export function createRequestLoaders(db: any): RequestLoaders {
   const entityById = new DataLoader<string, Entity | null>(async (ids: readonly string[]) => {
     const startTime = Date.now();
     try {
-      const uniqueIds = [...new Set(ids)];
+      // Filter out empty/invalid IDs to prevent PostgreSQL UUID parsing errors
+      const validIds = ids.filter(id => id && typeof id === 'string' && id.trim() !== '');
+      if (validIds.length === 0) {
+        return ids.map(() => null);
+      }
+      const uniqueIds = [...new Set(validIds)];
       const idList = inList(uniqueIds, 1);
       const rows = await db.unsafe(`
         SELECT id
@@ -45,7 +51,11 @@ export function createRequestLoaders(db: any): RequestLoaders {
         console.warn(`Slow entityById query: ${duration}ms for ${ids.length} entities`);
       }
       
-      return ids.map(id => map.get(id) ?? null);
+      // Return null for invalid IDs
+      return ids.map(id => {
+        if (!id || typeof id !== 'string' || id.trim() === '') return null;
+        return map.get(id) ?? null;
+      });
     } catch (error) {
       console.error(`Error in entityById DataLoader:`, error);
       throw error;
@@ -56,12 +66,17 @@ export function createRequestLoaders(db: any): RequestLoaders {
     async (keys: readonly { entityId: string; typeId: string }[]) => {
       const startTime = Date.now();
       try {
-        const entityIds = [...new Set(keys.map(k => k.entityId))];
-        const typeIds = [...new Set(keys.map(k => k.typeId))];
+        // Filter out keys with empty/invalid entity IDs to prevent PostgreSQL UUID parsing errors
+        const validKeys = keys.filter(k => k.entityId && typeof k.entityId === 'string' && k.entityId.trim() !== '');
+        if (validKeys.length === 0) {
+          return keys.map(() => null);
+        }
+        const entityIds = [...new Set(validKeys.map(k => k.entityId))];
+        const typeIds = [...new Set(validKeys.map(k => k.typeId))];
         const entityIdList = inList(entityIds, 1);
         const typeIdList = inList(typeIds, entityIdList.newParamIndex);
         const rows = await db.unsafe(`
-          SELECT entity_id, type_id, data, created_at, updated_at, deleted_at
+          SELECT id, entity_id, type_id, data, created_at, updated_at, deleted_at
           FROM components
           WHERE entity_id IN ${entityIdList.sql}
             AND type_id IN ${typeIdList.sql}
@@ -71,6 +86,7 @@ export function createRequestLoaders(db: any): RequestLoaders {
         rows.forEach((row: any) => {
           const key = `${row.entity_id}-${row.type_id}`;
           map.set(key, {
+            id: row.id,  // Include component ID for updates
             typeId: row.type_id,
             data: row.data,
             createdAt: row.created_at,
@@ -84,7 +100,11 @@ export function createRequestLoaders(db: any): RequestLoaders {
           console.warn(`Slow componentsByEntityType query: ${duration}ms for ${keys.length} keys`);
         }
         
-        return keys.map(k => map.get(`${k.entityId}-${k.typeId}`) ?? null);
+        // Return null for keys with invalid entity IDs
+        return keys.map(k => {
+          if (!k.entityId || typeof k.entityId !== 'string' || k.entityId.trim() === '') return null;
+          return map.get(`${k.entityId}-${k.typeId}`) ?? null;
+        });
       } catch (error) {
         console.error(`Error in componentsByEntityType DataLoader:`, error);
         throw error;
@@ -102,6 +122,13 @@ export function createRequestLoaders(db: any): RequestLoaders {
         // For each key, find related entities based on foreign key relationships
         for (const key of keys) {
           let relatedEntities: Entity[] = [];
+          
+          // Skip keys with empty/invalid entity IDs to prevent PostgreSQL UUID parsing errors
+          if (!key.entityId || typeof key.entityId !== 'string' || key.entityId.trim() === '') {
+            const mapKey = `${key.entityId}-${key.relationField}-${key.relatedType}`;
+            resultMap.set(mapKey, []);
+            continue;
+          }
           
           try {
             logger.trace(`[RelationLoader] Looking for ${key.relatedType} entities with foreign key ${key.foreignKey || 'auto-detect'} pointing to ${key.entityId} for field ${key.relationField}`);

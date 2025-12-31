@@ -974,6 +974,14 @@ export class BaseArcheType {
      * });
      */
     public async getEntityWithID(id: string, options?: GetEntityOptions): Promise<Entity | null> {
+        // Validate ID to prevent PostgreSQL UUID parsing errors
+        if (!id || typeof id !== 'string' || id.trim() === '') {
+            if (options?.throwOnNotFound) {
+                throw new Error(`Invalid entity ID provided: "${id}"`);
+            }
+            return null;
+        }
+        
         const { Query } = await import("../query");
         
         // Build query with selected components for batch loading

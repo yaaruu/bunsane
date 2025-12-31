@@ -20,7 +20,8 @@ export class Entity implements IEntity {
     protected _dirty: boolean = false;
 
     constructor(id?: string) {
-        this.id = id ?? uuidv7();
+        // Use || instead of ?? to also handle empty strings
+        this.id = (id && id.trim() !== '') ? id : uuidv7();
         this._dirty = true;
     }
 
@@ -139,11 +140,17 @@ export class Entity implements IEntity {
         if(typeof comp !== "undefined") {
             return comp.data();
         } else {
+            // Validate entity ID before database query
+            if (!this.id || this.id.trim() === '') {
+                logger.warn(`Cannot get component ${ctor.name}: entity id is empty`);
+                return null;
+            }
             // fetch from db
             const temp = new ctor();
             const typeId = temp.getTypeID();
             try {
                 let componentData: any = null;
+                let componentId: string | null = null;
 
                 // Use DataLoader if available (prevents N+1 queries and connection pool exhaustion)
                 if (context?.loaders?.componentsByEntityType) {
@@ -153,17 +160,23 @@ export class Entity implements IEntity {
                     });
                     if (loaderResult) {
                         componentData = loaderResult.data;
+                        componentId = loaderResult.id;  // Get component ID from DataLoader result
                     }
                 } else {
                     // Fallback to direct DB call
                     const rows = await db`SELECT id, data FROM components WHERE entity_id = ${this.id} AND type_id = ${typeId} AND deleted_at IS NULL`;
                     if (rows.length > 0) {
                         componentData = rows[0].data;
+                        componentId = rows[0].id;
                     }
                 }
 
                 if (componentData !== null) {
                     const comp = new ctor();
+                    // Set the component ID from the database
+                    if (componentId) {
+                        comp.id = componentId;
+                    }
                     const parsedData = typeof componentData === 'string' ? JSON.parse(componentData) : componentData;
                     Object.assign(comp, parsedData);
                     // Deserialize Date properties
@@ -201,11 +214,17 @@ export class Entity implements IEntity {
         if(typeof comp !== "undefined") {
             return comp;
         } else {
+            // Validate entity ID before database query
+            if (!this.id || this.id.trim() === '') {
+                logger.warn(`Cannot get component ${ctor.name}: entity id is empty`);
+                return null;
+            }
             // fetch from db
             const temp = new ctor();
             const typeId = temp.getTypeID();
             try {
                 let componentData: any = null;
+                let componentId: string | null = null;
 
                 // Use DataLoader if available (prevents N+1 queries and connection pool exhaustion)
                 if (context?.loaders?.componentsByEntityType) {
@@ -215,17 +234,23 @@ export class Entity implements IEntity {
                     });
                     if (loaderResult) {
                         componentData = loaderResult.data;
+                        componentId = loaderResult.id;  // Get component ID from DataLoader result
                     }
                 } else {
                     // Fallback to direct DB call
                     const rows = await db`SELECT id, data FROM components WHERE entity_id = ${this.id} AND type_id = ${typeId} AND deleted_at IS NULL`;
                     if (rows.length > 0) {
                         componentData = rows[0].data;
+                        componentId = rows[0].id;
                     }
                 }
 
                 if (componentData !== null) {
                     const comp = new ctor();
+                    // Set the component ID from the database
+                    if (componentId) {
+                        comp.id = componentId;
+                    }
                     const parsedData = typeof componentData === 'string' ? JSON.parse(componentData) : componentData;
                     Object.assign(comp, parsedData);
                     // Deserialize Date properties
@@ -290,7 +315,13 @@ export class Entity implements IEntity {
     }
 
     public doSave(trx: SQL) {
-        return new Promise<boolean>(async resolve => {
+        return new Promise<boolean>(async (resolve, reject) => {
+            // Validate entity ID to prevent PostgreSQL UUID parsing errors
+            if (!this.id || this.id.trim() === '') {
+                logger.error(`Cannot save entity: id is empty or invalid`);
+                return reject(new Error(`Cannot save entity: id is empty or invalid`));
+            }
+
             if(!this._dirty) {
                 logger.trace("Entity is not dirty, no need to save.");
                 return resolve(true);
@@ -382,6 +413,11 @@ export class Entity implements IEntity {
                 // Perform batch updates
                 if(componentsToUpdate.length > 0) {
                     for(const comp of componentsToUpdate) {
+                        // Validate component ID to prevent PostgreSQL UUID parsing errors
+                        if (!comp.id || comp.id.trim() === '') {
+                            logger.error(`Cannot update component: id is empty or invalid. Component data: ${JSON.stringify(comp.data).substring(0, 200)}`);
+                            throw new Error(`Cannot update component: component id is empty or invalid`);
+                        }
                         await saveTrx`UPDATE components SET data = ${comp.data} WHERE id = ${comp.id}`;
                     }
                 }
@@ -472,16 +508,23 @@ export class Entity implements IEntity {
     @timed("Entity.LoadMultiple")
     public static async LoadMultiple(ids: string[]): Promise<Entity[]> {
         if (ids.length === 0) return [];
+        
+        // Filter out empty/invalid IDs to prevent PostgreSQL UUID parsing errors
+        const validIds = ids.filter(id => id && id.trim() !== '');
+        if (validIds.length === 0) return [];
+        if (validIds.length !== ids.length) {
+            logger.warn(`LoadMultiple: Filtered out ${ids.length - validIds.length} invalid entity IDs`);
+        }
 
         const components = await db`
             SELECT c.id, c.entity_id, c.type_id, c.data
             FROM components c
-            WHERE c.entity_id IN ${sql(ids)} AND c.deleted_at IS NULL
+            WHERE c.entity_id IN ${sql(validIds)} AND c.deleted_at IS NULL
         `;
 
         const entitiesMap = new Map<string, Entity>();
 
-        for (const id of ids) {
+        for (const id of validIds) {
             const entity = new Entity();
             entity.id = id;
             entity.setPersisted(true);
@@ -509,7 +552,11 @@ export class Entity implements IEntity {
     public static async LoadComponents(entities: Entity[], componentIds: string[]): Promise<void> {
         if (entities.length === 0 || componentIds.length === 0) return;
 
-        const entityIds = entities.map(e => e.id);
+        // Filter out entities with empty/invalid IDs to prevent PostgreSQL UUID parsing errors
+        const validEntities = entities.filter(e => e.id && e.id.trim() !== '');
+        if (validEntities.length === 0) return;
+        
+        const entityIds = validEntities.map(e => e.id);
 
         const components = await db`
             SELECT c.id, c.entity_id, c.type_id, c.data
@@ -518,7 +565,7 @@ export class Entity implements IEntity {
         `;
 
         // Use Map for O(1) lookups instead of O(n) find() - fixes O(n²) performance issue
-        const entityMap = new Map<string, Entity>(entities.map(e => [e.id, e]));
+        const entityMap = new Map<string, Entity>(validEntities.map(e => [e.id, e]));
 
         for (const row of components) {
             const { id, entity_id, type_id, data } = row;
@@ -544,6 +591,11 @@ export class Entity implements IEntity {
      * @returns Entity | null
      */
     public static async FindById(id: string): Promise<Entity | null> {
+        // Validate ID to prevent PostgreSQL UUID parsing errors
+        if (!id || typeof id !== 'string' || id.trim() === '') {
+            logger.warn(`FindById called with invalid id: "${id}"`);
+            return null;
+        }
         const { default: Query } = await import("./Query");
         const entities = await new Query().findById(id).populate().exec()
         if(entities.length === 1) {
