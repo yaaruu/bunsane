@@ -474,7 +474,32 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
                 // Handle objects recursively - ALWAYS register nested objects with GQLoom
                 // because after .omit()/.extend() the schema tree loses _zod metadata
                 if (typeName === 'ZodObject' || typeName === 'object') {
-                    const shape = typeof schema._def.shape === 'function' ? schema._def.shape() : schema._def.shape;
+                    let shape;
+                    try {
+                        shape = typeof schema._def.shape === 'function' ? schema._def.shape() : schema._def.shape;
+                    } catch (error) {
+                        // Zod v4 can throw errors when accessing .shape() on schemas modified with .partial().extend()
+                        // In this case, try alternative methods to access the shape
+                        logger.warn(`Failed to access shape at path ${path.join('.')}: ${error instanceof Error ? error.message : String(error)}`);
+                        
+                        // Try alternative: use the schema's shape property directly (without calling _def.shape)
+                        try {
+                            if (schema.shape && typeof schema.shape === 'object') {
+                                shape = schema.shape;
+                            } else if (schema._shape && typeof schema._shape === 'object') {
+                                shape = schema._shape;
+                            }
+                        } catch (altError) {
+                            logger.warn(`Alternative shape access also failed: ${altError instanceof Error ? altError.message : String(altError)}`);
+                        }
+                        
+                        // If all attempts failed, return the original schema and let GQLoom handle it
+                        if (!shape) {
+                            logger.trace(`Could not access shape, returning original schema at path ${path.join('.')}`);
+                            return schema;
+                        }
+                    }
+                    
                     if (shape) {
                         const processedShape: any = {};
                         for (const [key, value] of Object.entries(shape)) {
