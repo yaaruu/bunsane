@@ -1,6 +1,5 @@
 import type BaseService from "./Service";
 import ApplicationLifecycle, {ApplicationPhase} from "core/ApplicationLifecycle";
-import { generateGraphQLSchema } from "gql/Generator";
 import { generateGraphQLSchemaV2 } from "gql";
 import { GraphQLSchema } from "graphql";
 
@@ -21,27 +20,11 @@ class ServiceRegistry {
                 case ApplicationPhase.SYSTEM_REGISTERING: {
                     const servicesArray = Array.from(this.services.values());
                     
-                    // Feature flag to switch between old and new GraphQL schema generation
-                    const useGraphQLV2 = process.env.USE_GRAPHQL_V2 === 'true';
+                    const result = generateGraphQLSchemaV2(servicesArray, { 
+                        enableArchetypeOperations: false 
+                    });
                     
-                    let schema: GraphQLSchema | null = null;
-                    
-                    if (useGraphQLV2) {
-                        console.log('Using GraphQL Schema Generation V2 (graph-based)');
-                        const result = generateGraphQLSchemaV2(servicesArray, { 
-                            enableArchetypeOperations: false 
-                        });
-                        schema = result.schema;
-                    } else {
-                        console.log('Using GraphQL Schema Generation V1 (legacy)');
-                        // Disable auto-generated archetype operations to avoid conflicts with manual operations
-                        const result = generateGraphQLSchema(servicesArray, { 
-                            enableArchetypeOperations: false 
-                        });
-                        schema = result.schema;
-                    }
-                    
-                    this.schema = schema;
+                    this.schema = result.schema;
                     ApplicationLifecycle.setPhase(ApplicationPhase.SYSTEM_READY);
                     break;
                 };

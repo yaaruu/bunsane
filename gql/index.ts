@@ -1,6 +1,6 @@
 import {createSchema, createYoga, type Plugin} from 'graphql-yoga';
 import { GraphQLSchema, GraphQLError } from 'graphql';
-import { GraphQLObjectType, GraphQLField, GraphQLOperation, GraphQLScalarType } from './Generator';
+import { GraphQLObjectType, GraphQLField, GraphQLOperation, GraphQLScalarType, GraphQLSubscription } from './Generator';
 import {GraphQLFieldTypes} from "./types"
 import {logger as MainLogger} from "core/Logger"
 import { isFieldRequested } from './helpers';
@@ -20,6 +20,7 @@ export {
     GraphQLObjectType,
     GraphQLField,
     GraphQLOperation,
+    GraphQLSubscription,
     GraphQLFieldTypes,
     isValidGraphQLType,
     GraphQLScalarType,

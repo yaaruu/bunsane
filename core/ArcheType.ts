@@ -15,7 +15,7 @@ export {asEnumType, asUnionType, asObjectType};
 
 const primitiveTypes = [String, Number, Boolean, Date];
 
-const archetypeFunctionsSymbol = Symbol("archetypeFunctions");
+const archetypeFunctionsSymbol = Symbol.for("bunsane:archetypeFunctions");
 
 export function ArcheTypeFunction(options?: { 
     returnType?: string;
@@ -121,13 +121,9 @@ export function weaveAllArchetypes() {
     const storage = getMetadataStorage();
     const archetypeNames: string[] = [];
     
-    console.log(`[weaveAllArchetypes] Total archetypes in storage: ${storage.archetypes.length}`);
-    
     for (const archetypeMetadata of storage.archetypes) {
         const archetypeName = archetypeMetadata.name;
         archetypeNames.push(archetypeName);
-        console.log(`[weaveAllArchetypes] Processing archetype: ${archetypeName}`);
-        console.log(`[weaveAllArchetypes] Functions metadata:`, archetypeMetadata.functions);
         const fullSchemaCacheKey = `${archetypeName}_false_false`;
         if (!archetypeSchemaCache.has(fullSchemaCacheKey)) {
             try {
@@ -322,7 +318,7 @@ export function weaveAllArchetypes() {
                         }
                     }
                 }
-                }
+            }
         }
 
         return schemaString;
@@ -616,7 +612,7 @@ export function ArcheType<T extends new () => BaseArcheType>(
     };
 }
 
-const archetypeFieldsSymbol = Symbol("archetypeFields");
+const archetypeFieldsSymbol = Symbol.for("bunsane:archetypeFields");
 export function ArcheTypeField<T extends BaseComponent>(
     component: new (...args: any[]) => T,
     options?: ArcheTypeFieldOptions
@@ -629,7 +625,7 @@ export function ArcheTypeField<T extends BaseComponent>(
     };
 }
 
-const archetypeUnionFieldsSymbol = Symbol("archetypeUnionFields");
+const archetypeUnionFieldsSymbol = Symbol.for("bunsane:archetypeUnionFields");
 export function ArcheTypeUnionField(
     components: (new (...args: any[]) => any)[],
     options?: ArcheTypeFieldOptions
@@ -646,7 +642,7 @@ export function ArcheTypeUnionField(
     };
 }
 
-const archetypeRelationsSymbol = Symbol("archetypeRelations");
+const archetypeRelationsSymbol = Symbol.for("bunsane:archetypeRelations");
 
 function createRelationDecorator(
     relationType: "hasMany" | "belongsTo" | "hasOne" | "belongsToMany"
