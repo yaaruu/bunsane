@@ -48,7 +48,7 @@ export function createRequestLoaders(db: any): RequestLoaders {
       
       const duration = Date.now() - startTime;
       if (duration > 1000) { // Log slow queries
-        console.warn(`Slow entityById query: ${duration}ms for ${ids.length} entities`);
+        logger.warn(`Slow entityById query: ${duration}ms for ${ids.length} entities`);
       }
       
       // Return null for invalid IDs
@@ -57,9 +57,11 @@ export function createRequestLoaders(db: any): RequestLoaders {
         return map.get(id) ?? null;
       });
     } catch (error) {
-      console.error(`Error in entityById DataLoader:`, error);
+      logger.error(`Error in entityById DataLoader:`, error);
       throw error;
     }
+  }, {
+    maxBatchSize: 100 // Prevent extremely large batches
   });
 
   const componentsByEntityType = new DataLoader<{ entityId: string; typeId: string }, ComponentData | null>(
@@ -97,7 +99,7 @@ export function createRequestLoaders(db: any): RequestLoaders {
         
         const duration = Date.now() - startTime;
         if (duration > 1000) { // Log slow queries
-          console.warn(`Slow componentsByEntityType query: ${duration}ms for ${keys.length} keys`);
+          logger.warn(`Slow componentsByEntityType query: ${duration}ms for ${keys.length} keys`);
         }
         
         // Return null for keys with invalid entity IDs
@@ -106,9 +108,12 @@ export function createRequestLoaders(db: any): RequestLoaders {
           return map.get(`${k.entityId}-${k.typeId}`) ?? null;
         });
       } catch (error) {
-        console.error(`Error in componentsByEntityType DataLoader:`, error);
+        logger.error(`Error in componentsByEntityType DataLoader:`, error);
         throw error;
       }
+    },
+    {
+      maxBatchSize: 100 // Prevent extremely large batches
     }
   );
 
@@ -116,80 +121,98 @@ export function createRequestLoaders(db: any): RequestLoaders {
     async (keys: readonly { entityId: string; relationField: string; relatedType: string; foreignKey?: string }[]) => {
       const startTime = Date.now();
       try {
-        // Group keys by relation type for efficient querying
-        const resultMap = new Map<string, Entity[]>();
-        
-        // For each key, find related entities based on foreign key relationships
-        for (const key of keys) {
-          let relatedEntities: Entity[] = [];
-          
-          // Skip keys with empty/invalid entity IDs to prevent PostgreSQL UUID parsing errors
-          if (!key.entityId || typeof key.entityId !== 'string' || key.entityId.trim() === '') {
-            const mapKey = `${key.entityId}-${key.relationField}-${key.relatedType}`;
-            resultMap.set(mapKey, []);
-            continue;
+        // Filter valid keys
+        const validKeys = keys.filter(k => k.entityId && typeof k.entityId === 'string' && k.entityId.trim() !== '');
+        if (validKeys.length === 0) {
+          return keys.map(() => []);
+        }
+
+        // Group keys by foreign key for efficient batching
+        const keysByForeignKey = new Map<string, typeof validKeys>();
+        for (const key of validKeys) {
+          const fk = key.foreignKey || 'default';
+          if (!keysByForeignKey.has(fk)) {
+            keysByForeignKey.set(fk, []);
           }
+          keysByForeignKey.get(fk)!.push(key);
+        }
+
+        const resultMap = new Map<string, Entity[]>();
+
+        // OPTIMIZED: Batch query for each foreign key type (instead of N separate queries)
+        for (const [foreignKey, groupedKeys] of keysByForeignKey) {
+          const entityIds = [...new Set(groupedKeys.map(k => k.entityId))];
+          const entityIdList = inList(entityIds, 1);
+
+          let foreignKeyField: string;
+          let whereClause: string;
           
-          try {
-            logger.trace(`[RelationLoader] Looking for ${key.relatedType} entities with foreign key ${key.foreignKey || 'auto-detect'} pointing to ${key.entityId} for field ${key.relationField}`);
+          if (foreignKey !== 'default') {
+            // Use specific foreign key from relation metadata
+            foreignKeyField = foreignKey;
+            whereClause = `c.data->>'${foreignKey}' = ANY($1)`;
+          } else {
+            // Fallback for backward compatibility
+            foreignKeyField = 'user_id'; // Default field for result mapping
+            whereClause = `(c.data->>'user_id' = ANY($1) OR c.data->>'parent_id' = ANY($1))`;
+          }
 
-            let whereClause: string;
-            if (key.foreignKey) {
-              // Use specific foreign key from relation metadata
-              whereClause = `(c.data->>'${key.foreignKey}' = $1)`;
-            } else {
-              // Fallback to common patterns for backward compatibility
-              // TODO: Remove this fallback in future versions
-              whereClause = `(
-                (c.data->>'user_id' = $1) OR
-                (c.data->>'parent_id' = $1)
-              )`;
-            }
-            
-            // Look for entities that have components with foreign keys pointing to our entity
-            const rows = await db.unsafe(`
-              SELECT DISTINCT c.entity_id, c.data, c.type_id
-              FROM components c
-              INNER JOIN entities e ON c.entity_id = e.id
-              WHERE e.deleted_at IS NULL 
-                AND c.deleted_at IS NULL
-                AND ${whereClause}
-            `, [key.entityId]);
+          logger.trace(`[RelationLoader] Batched query for ${groupedKeys.length} keys with foreign key ${foreignKey}`);
 
-            logger.trace(`[RelationLoader] Found ${rows.length} components with foreign keys pointing to ${key.entityId}`);
-            rows.forEach((row: any) => {
-              logger.trace(`[RelationLoader] Component ${row.type_id} on entity ${row.entity_id}:`, row.data);
-            });
-            
-            // Create Entity objects for each related entity
-            const entityIds = [...new Set(rows.map((row: any) => row.entity_id as string))];
-            relatedEntities = entityIds.map((id: string) => {
+          // SINGLE BATCHED QUERY for all entities in this group
+          const rows = await db.unsafe(`
+            SELECT DISTINCT 
+              c.entity_id, 
+              c.data, 
+              c.type_id,
+              c.data->>'${foreignKeyField}' as fk_value,
+              COALESCE(c.data->>'user_id', c.data->>'parent_id') as fallback_fk_value
+            FROM components c
+            INNER JOIN entities e ON c.entity_id = e.id
+            WHERE e.deleted_at IS NULL 
+              AND c.deleted_at IS NULL
+              AND ${whereClause}
+          `, [entityIds]);
+
+          logger.trace(`[RelationLoader] Found ${rows.length} total components for ${entityIds.length} entities`);
+
+          // Map results back to original keys
+          for (const key of groupedKeys) {
+            const relatedEntityIds = rows
+              .filter((row: any) => {
+                // Match by specific foreign key or fallback
+                const fkValue = foreignKey !== 'default' ? row.fk_value : row.fallback_fk_value;
+                return fkValue === key.entityId;
+              })
+              .map((row: any) => row.entity_id);
+
+            const uniqueEntityIds = [...new Set(relatedEntityIds)];
+            const entities = uniqueEntityIds.map(id => {
               const entity = new Entity(id);
               entity.setPersisted(true);
               return entity;
             });
 
-            logger.trace(`[RelationLoader] Created ${relatedEntities.length} related entities for ${key.relationField}`);
-
-          } catch (queryError) {
-            logger.error(`Error querying relations for ${key.entityId}:`);
-            logger.error(queryError);
-            relatedEntities = [];
+            const mapKey = `${key.entityId}-${key.relationField}-${key.relatedType}`;
+            resultMap.set(mapKey, entities);
+            
+            logger.trace(`[RelationLoader] Mapped ${entities.length} entities for ${key.relationField} on ${key.entityId}`);
           }
-          
-          const mapKey = `${key.entityId}-${key.relationField}-${key.relatedType}`;
-          resultMap.set(mapKey, relatedEntities);
         }
-        
+
         const duration = Date.now() - startTime;
         if (duration > 1000) {
           logger.warn(`Slow relationsByEntityField query: ${duration}ms for ${keys.length} keys`);
+        } else {
+          logger.trace(`[RelationLoader] Batched query completed in ${duration}ms for ${keys.length} keys`);
         }
-        
+
         return keys.map(k => {
+          if (!k.entityId || typeof k.entityId !== 'string' || k.entityId.trim() === '') {
+            return [];
+          }
           const mapKey = `${k.entityId}-${k.relationField}-${k.relatedType}`;
           const result = resultMap.get(mapKey) || [];
-          logger.trace(`[RelationLoader] Returning ${result.length} entities for ${k.relationField} on ${k.entityId}`);
           return result;
         });
       } catch (error) {
@@ -198,6 +221,10 @@ export function createRequestLoaders(db: any): RequestLoaders {
         // Return empty arrays for all keys on error
         return keys.map(() => []);
       }
+    },
+    {
+      // Add batch size limit to prevent extremely large queries
+      maxBatchSize: 50
     }
   );
 

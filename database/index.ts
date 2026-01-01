@@ -6,12 +6,18 @@ if(process.env.DB_CONNECTION_URL) {
     connectionUrl = process.env.DB_CONNECTION_URL;
 }
 logger.info(`Database connection URL: ${connectionUrl}`);
+
+// OPTIMIZED: Reduced from 20 to 10 to prevent overwhelming PGBouncer
+// With 5 app instances: 5 × 10 = 50 connections (well under PGBouncer's limit)
+const maxConnections = parseInt(process.env.POSTGRES_MAX_CONNECTIONS ?? '10', 10);
+logger.info(`Connection pool size: ${maxConnections} connections`);
+
 const db = new SQL({
     url: connectionUrl,
-    // Connection pool settings - FIXED
-    max: parseInt(process.env.POSTGRES_MAX_CONNECTIONS ?? '20', 10), // Increased max connections
-    idleTimeout: 30000, // Close idle connections after 30s (was 0)
-    maxLifetime: 600000, // Connection lifetime 10 minutes (was 0 = forever)
+    // Connection pool settings - OPTIMIZED for PGBouncer
+    max: maxConnections,
+    idleTimeout: 30000, // Close idle connections after 30s
+    maxLifetime: 600000, // Connection lifetime 10 minutes
     connectionTimeout: 30, // Timeout when establishing new connections
     onclose: (err) => {
         if (err) {
@@ -22,9 +28,13 @@ const db = new SQL({
                 logger.error(err);
             }
         } else {
-            logger.info("Database connection closed.");
+            logger.trace("Database connection closed gracefully.");
         }   
     },
+    onconnect: () => {
+        // Log when new connections are created
+        logger.trace("New database connection established");
+    }
 });
 
 
