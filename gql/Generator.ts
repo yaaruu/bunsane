@@ -65,6 +65,11 @@ export function GraphQLOperation<T extends BaseArcheType | BaseArcheType[] | str
     };
 }
 
+/**
+ * @deprecated Use ArcheTypeFunction instead
+ * @param meta 
+ * @returns 
+ */
 export function GraphQLField(meta: GraphQLFieldMeta) {
     return function (target: any, propertyKey: string, descriptor: PropertyDescriptor) {
         if (!target.__graphqlFields) target.__graphqlFields = [];
