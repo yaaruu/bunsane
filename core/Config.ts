@@ -8,6 +8,7 @@ export interface BunsaneConfig {
     useLateralJoins: boolean;
     queryCacheSize: number;
     partitionStrategy: 'list' | 'hash';
+    useDirectPartition: boolean;
 
     // Database settings
     databaseUrl?: string;
@@ -28,7 +29,8 @@ export interface BunsaneConfig {
 const DEFAULT_CONFIG: BunsaneConfig = {
     useLateralJoins: true, // Default to true for PG12+
     queryCacheSize: 100,
-    partitionStrategy: 'list',
+    partitionStrategy: 'list', // LIST partitioning - one partition per component type
+    useDirectPartition: true,  // Direct partition access - queries go directly to partition tables
     appPort: 3000,
     nodeEnv: process.env.NODE_ENV || 'development',
     debugMode: false,
@@ -61,6 +63,7 @@ class ConfigManager {
             useLateralJoins: this.parseBoolean(process.env.BUNSANE_USE_LATERAL_JOINS, DEFAULT_CONFIG.useLateralJoins),
             queryCacheSize: this.parseNumber(process.env.BUNSANE_QUERY_CACHE_SIZE, DEFAULT_CONFIG.queryCacheSize),
             partitionStrategy: this.parsePartitionStrategy(process.env.BUNSANE_PARTITION_STRATEGY, DEFAULT_CONFIG.partitionStrategy),
+            useDirectPartition: this.parseBoolean(process.env.BUNSANE_USE_DIRECT_PARTITION, DEFAULT_CONFIG.useDirectPartition),
             databaseUrl: process.env.DATABASE_URL,
             databasePoolSize: this.parseNumber(process.env.DATABASE_POOL_SIZE, 10),
             appPort: this.parseNumber(process.env.APP_PORT, DEFAULT_CONFIG.appPort),
@@ -128,6 +131,20 @@ class ConfigManager {
     public getPartitionStrategy(): 'list' | 'hash' {
         return this.config.partitionStrategy;
     }
+
+    /**
+     * Check if direct partition table access should be used
+     */
+    public shouldUseDirectPartition(): boolean {
+        return this.config.useDirectPartition;
+    }
+
+    /**
+     * Reload configuration from environment variables
+     */
+    public reloadConfig(): void {
+        this.config = this.loadConfig();
+    }
 }
 
 /**
@@ -142,5 +159,6 @@ export const shouldUseLateralJoins = () => config.shouldUseLateralJoins();
 export const isDebugMode = () => config.isDebugMode();
 export const getQueryCacheSize = () => config.getQueryCacheSize();
 export const getPartitionStrategy = () => config.getPartitionStrategy();
+export const shouldUseDirectPartition = () => config.shouldUseDirectPartition();
 
 export default config;

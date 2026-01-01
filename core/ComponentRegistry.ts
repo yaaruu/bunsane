@@ -19,6 +19,7 @@ class ComponentRegistry {
     private componentQueue = new Map<string, ComponentConstructor>();
     private currentTables: string[] = [];
     private componentsMap = new Map<string, string>();
+    private typeIdToName = new Map<string, string>();
     private typeIdToCtor = new Map<string, ComponentConstructor>();
     private instantRegister: boolean = false;
     private readinessPromises = new Map<string, Promise<void>>();
@@ -116,6 +117,16 @@ class ComponentRegistry {
         return this.componentsMap.get(name);
     }
 
+    getComponentName(typeId: string): string | undefined {
+        return this.typeIdToName.get(typeId);
+    }
+
+    getPartitionTableName(typeId: string): string | null {
+        const name = this.typeIdToName.get(typeId);
+        if (!name) return null;
+        return GenerateTableName(name);
+    }
+
     getConstructor(typeId: string) {
         return this.typeIdToCtor.get(typeId);
     }
@@ -181,6 +192,7 @@ class ComponentRegistry {
             }
             // await UpdateComponentIndexes(partitionTableName, indexedProps); // TODO: OLD Logic with indexedProps, remove if not needed
             this.componentsMap.set(name, typeid);
+            this.typeIdToName.set(typeid, name);
             this.typeIdToCtor.set(typeid, ctor);
             resolve(true);
         });

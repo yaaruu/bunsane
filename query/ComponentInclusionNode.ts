@@ -1,11 +1,18 @@
 import { QueryNode } from "./QueryNode";
 import type { QueryResult } from "./QueryNode";
 import { QueryContext } from "./QueryContext";
-import { shouldUseLateralJoins } from "../core/Config";
+import { shouldUseLateralJoins, shouldUseDirectPartition } from "../core/Config";
 import { FilterBuilderRegistry } from "./FilterBuilderRegistry";
 import ComponentRegistry from "../core/ComponentRegistry";
 
 export class ComponentInclusionNode extends QueryNode {
+    private getComponentTableName(compId: string): string {
+        if (shouldUseDirectPartition()) {
+            return ComponentRegistry.getPartitionTableName(compId) || 'components';
+        }
+        return 'components';
+    }
+
     public execute(context: QueryContext): QueryResult {
         const componentIds = Array.from(context.componentIds);
         const excludedIds = Array.from(context.excludedComponentIds);
@@ -197,6 +204,12 @@ export class ComponentInclusionNode extends QueryNode {
      * This ensures that sorting and pagination work together correctly
      */
     private applySortingWithComponentJoins(baseQuery: string, context: QueryContext): string {
+        // Check if we can use the optimized direct partition sort
+        if (shouldUseDirectPartition() && context.sortOrders.length === 1) {
+            const optimized = this.applySortingOptimized(baseQuery, context);
+            if (optimized) return optimized;
+        }
+        
         // Wrap the base query as a subquery to get entity ids
         let sql = `SELECT base_entities.id FROM (${baseQuery}) AS base_entities`;
         
@@ -216,13 +229,14 @@ export class ComponentInclusionNode extends QueryNode {
             }
             
             // LEFT JOIN to entity_components and components to get the sort data
+            const sortComponentTableName = this.getComponentTableName(typeId);
             sortJoins.push(`
-                LEFT JOIN entity_components ${sortAlias} 
-                    ON ${sortAlias}.entity_id = base_entities.id 
+                LEFT JOIN entity_components ${sortAlias}
+                    ON ${sortAlias}.entity_id = base_entities.id
                     AND ${sortAlias}.type_id = $${context.addParam(typeId)}::text
                     AND ${sortAlias}.deleted_at IS NULL
-                LEFT JOIN components ${compAlias} 
-                    ON ${compAlias}.id = ${sortAlias}.component_id 
+                LEFT JOIN ${sortComponentTableName} ${compAlias}
+                    ON ${compAlias}.id = ${sortAlias}.component_id
                     AND ${compAlias}.deleted_at IS NULL`);
             
             // Build ORDER BY clause for this sort order
@@ -244,6 +258,38 @@ export class ComponentInclusionNode extends QueryNode {
         
         // Add LIMIT and OFFSET after the ORDER BY
         // Always include OFFSET (even when 0) to ensure consistent SQL structure for prepared statement caching
+        if (context.limit !== null) {
+            sql += ` LIMIT $${context.addParam(context.limit)}`;
+        }
+        sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
+        
+        return sql;
+    }
+
+    /**
+     * Optimized sorting for direct partition access
+     * Queries the partition table directly without going through entity_components for the sort join
+     */
+    private applySortingOptimized(baseQuery: string, context: QueryContext): string | null {
+        if (context.sortOrders.length !== 1) return null;
+        
+        const sortOrder = context.sortOrders[0]!;
+        const typeId = ComponentRegistry.getComponentId(sortOrder.component);
+        if (!typeId) return null;
+        
+        const partitionTable = ComponentRegistry.getPartitionTableName(typeId);
+        if (!partitionTable) return null;
+        
+        const nullsClause = sortOrder.nullsFirst ? 'NULLS FIRST' : 'NULLS LAST';
+        
+        // Optimized query: Direct join to partition table, skip entity_components for sort
+        // This is faster because we go directly to the partition table
+        let sql = `SELECT base.id FROM (${baseQuery}) AS base
+            JOIN ${partitionTable} c ON c.entity_id = base.id 
+                AND c.type_id = $${context.addParam(typeId)}::text 
+                AND c.deleted_at IS NULL
+            ORDER BY c.data->>'${sortOrder.property}' ${sortOrder.direction} ${nullsClause}`;
+        
         if (context.limit !== null) {
             sql += ` LIMIT $${context.addParam(context.limit)}`;
         }
@@ -352,10 +398,11 @@ export class ComponentInclusionNode extends QueryNode {
                     const fieldShort = filter.field.replace(/\./g, '_').substring(0, 20);
                     const lateralAlias = `lat_${compIdShort}_${fieldShort}_${lateralJoins.length}`;
                     
+                    const componentTableName = this.getComponentTableName(compId);
                     lateralJoins.push(
                         `CROSS JOIN LATERAL (
                             SELECT 1 FROM entity_components ec_f
-                            JOIN components c ON ec_f.component_id = c.id
+                            JOIN ${componentTableName} c ON ec_f.component_id = c.id
                             WHERE ec_f.entity_id = ${tableAlias}.entity_id
                             AND ec_f.type_id = $${componentParamIndices.has(compId) ? componentParamIndices.get(compId) : context.addParam(compId)}::text
                             AND ${condition}
@@ -367,9 +414,10 @@ export class ComponentInclusionNode extends QueryNode {
                     lateralConditions.push(`${lateralAlias} IS NOT NULL`);
                 } else {
                     // Use traditional EXISTS subquery
+                    const componentTableName = this.getComponentTableName(compId);
                     sql += ` ${whereKeyword} EXISTS (
                         SELECT 1 FROM entity_components ec_f
-                        JOIN components c ON ec_f.component_id = c.id
+                        JOIN ${componentTableName} c ON ec_f.component_id = c.id
                         WHERE ec_f.entity_id = ${tableAlias}.entity_id
                         AND ec_f.type_id = $${componentParamIndices.has(compId) ? componentParamIndices.get(compId) : context.addParam(compId)}::text
                         AND ${condition}

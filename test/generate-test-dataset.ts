@@ -467,9 +467,12 @@ async function generateTestDataset() {
         entities.push(entity);
     }
 
-    // Generate components
+    // Generate components and save entities
     let componentCount = 0;
     const batchSize = 1000;
+
+    // Track which entities have been saved to avoid duplicate saves
+    const savedEntities = new Set<string>();
 
     for (let i = 0; i < totalComponents; i++) {
         const entityIndex = Math.floor(Math.random() * entities.length);
@@ -481,9 +484,19 @@ async function generateTestDataset() {
             try {
                 const componentData = generator(entity.id);
 
-                // Create and attach component to entity
-                // Note: In a real implementation, this would use the actual component classes
-                // For now, we'll simulate the component creation
+                // Get the actual component constructor from registry
+                const ComponentCtor = ComponentRegistry.getConstructor(ComponentRegistry.getComponentId(componentType));
+
+                if (ComponentCtor) {
+                    // Create component instance and assign data
+                    const component = new ComponentCtor();
+                    Object.assign(component, componentData);
+
+                    // Add component to entity
+                    entity.addComponent(component);
+                } else {
+                    console.warn(`⚠️ Component constructor not found for ${componentType}`);
+                }
 
                 componentCount++;
 
@@ -495,6 +508,21 @@ async function generateTestDataset() {
             }
         }
     }
+
+    // Save all entities with their components
+    console.log('💾 Saving entities to database...');
+    const saveBatchSize = 50;
+
+    for (let i = 0; i < entities.length; i += saveBatchSize) {
+        const batch = entities.slice(i, i + saveBatchSize);
+        await Promise.all(batch.map(entity => entity.save()));
+
+        if ((i + saveBatchSize) % (saveBatchSize * 10) === 0) {
+            console.log(`✅ Saved ${Math.min(i + saveBatchSize, entities.length)}/${entities.length} entities`);
+        }
+    }
+
+    console.log('✅ All entities saved');
 
     console.log(`🎉 Dataset generation complete!`);
     console.log(`📈 Summary:`);

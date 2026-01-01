@@ -10,6 +10,7 @@ import { OrQuery } from "./OrQuery";
 import { OrNode } from "./OrNode";
 import { preparedStatementCache } from "../database/PreparedStatementCache";
 import { getMetadataStorage } from "../core/metadata";
+import { shouldUseDirectPartition } from "../core/Config";
 
 export type FilterOperator = "=" | ">" | "<" | ">=" | "<=" | "!=" | "LIKE" | "IN" | "NOT IN" | string;
 
@@ -316,6 +317,9 @@ class Query {
     }
 
     private async doExec(): Promise<Entity[]> {
+        // Reset context for fresh execution
+        this.context.reset();
+
         // Build the DAG
         const dag = new QueryDAG();
 
@@ -351,16 +355,12 @@ class Query {
         // Execute the DAG
         const result = dag.execute(this.context);
 
-        // Check prepared statement cache
-        const cacheKey = this.context.generateCacheKey();
-        const { statement, isHit } = await preparedStatementCache.getOrCreate(result.sql, cacheKey, db);
-
         // Debug logging
         if (this.debug) {
             console.log('🔍 Query Debug:');
             console.log('SQL:', result.sql);
             console.log('Params:', result.params);
-            console.log('Cache Hit:', isHit);
+            console.log('OR Query:', !!this.orQuery);
             console.log('---');
         }
 
@@ -373,8 +373,28 @@ class Query {
             }
         }
 
-        // Execute the query using prepared statement
-        const entities = await preparedStatementCache.execute(statement, result.params, db);
+        // Validate parameters before execution
+        for (let i = 0; i < result.params.length; i++) {
+            if (result.params[i] === undefined || result.params[i] === null) {
+                console.error(`❌ Query parameter $${i + 1} is undefined/null`);
+                console.error(`SQL: ${result.sql}`);
+                console.error(`All params: ${JSON.stringify(result.params)}`);
+                throw new Error(`Query parameter $${i + 1} is undefined/null. SQL: ${result.sql.substring(0, 100)}...`);
+            }
+        }
+
+        let entities: any[];
+
+        if (this.orQuery) {
+            // For OR queries, bypass prepared statement cache and execute directly
+            // This avoids potential parameter type inference issues with Bun's SQL
+            entities = await db.unsafe(result.sql, result.params);
+        } else {
+            // Check prepared statement cache for regular queries
+            const cacheKey = this.context.generateCacheKey();
+            const { statement, isHit } = await preparedStatementCache.getOrCreate(result.sql, cacheKey, db);
+            entities = await preparedStatementCache.execute(statement, result.params, db);
+        }
 
         // Convert to Entity objects
         const entityIds: string[] = entities.map((row: any) => row.id);
@@ -422,14 +442,39 @@ class Query {
         // Bulk fetch all components for all entities and all requested component types
         const entityIdList = inList(entityIds, 1);
         const typeIdList = inList(componentTypeIds, entityIdList.newParamIndex);
-        
-        const components = await db.unsafe(`
-            SELECT id, entity_id, type_id, data 
-            FROM components 
-            WHERE entity_id IN ${entityIdList.sql}
-            AND type_id IN ${typeIdList.sql}
-            AND deleted_at IS NULL
-        `, [...entityIdList.params, ...typeIdList.params]);
+
+        let components: any[];
+        if (shouldUseDirectPartition() && componentTypeIds.length === 1) {
+            // Single component type - use direct partition if available
+            const partitionTableName = ComponentRegistry.getPartitionTableName(componentTypeIds[0]!);
+            if (partitionTableName) {
+                components = await db.unsafe(`
+                    SELECT id, entity_id, type_id, data
+                    FROM ${partitionTableName}
+                    WHERE entity_id IN ${entityIdList.sql}
+                    AND type_id IN ${typeIdList.sql}
+                    AND deleted_at IS NULL
+                `, [...entityIdList.params, ...typeIdList.params]);
+            } else {
+                // Fallback to parent table
+                components = await db.unsafe(`
+                    SELECT id, entity_id, type_id, data
+                    FROM components
+                    WHERE entity_id IN ${entityIdList.sql}
+                    AND type_id IN ${typeIdList.sql}
+                    AND deleted_at IS NULL
+                `, [...entityIdList.params, ...typeIdList.params]);
+            }
+        } else {
+            // Multiple types or direct partition disabled - use parent table
+            components = await db.unsafe(`
+                SELECT id, entity_id, type_id, data
+                FROM components
+                WHERE entity_id IN ${entityIdList.sql}
+                AND type_id IN ${typeIdList.sql}
+                AND deleted_at IS NULL
+            `, [...entityIdList.params, ...typeIdList.params]);
+        }
 
         // Get metadata storage for Date deserialization
         const storage = getMetadataStorage();
@@ -478,6 +523,9 @@ class Query {
      * Returns the query plan and execution statistics
      */
     public async explainAnalyze(buffers: boolean = true): Promise<string> {
+        // Reset context for fresh execution
+        this.context.reset();
+
         // Build the DAG (same as exec)
         const dag = new QueryDAG();
 

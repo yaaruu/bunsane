@@ -44,6 +44,16 @@ export class QueryContext {
         return this.paramIndex++;
     }
 
+    /**
+     * Reset the context for reuse (clears params and resets paramIndex)
+     */
+    public reset(): void {
+        this.params = [];
+        this.paramIndex = 1;
+        this.tableAliases.clear();
+        this.sqlFragments = [];
+    }
+
     public addParams(values: any[]): number[] {
         const indices: number[] = [];
         for (const value of values) {

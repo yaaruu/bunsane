@@ -106,8 +106,36 @@ export const CreateEntityTable = async () => {
 }
 
 export const CreateComponentTable = async () => {
-    const partitionStrategy = process.env.BUNSANE_PARTITION_STRATEGY === 'list' ? 'list' : 'hash'; // Default to hash, use list only if explicitly set
-    
+    const partitionStrategy = process.env.BUNSANE_PARTITION_STRATEGY === 'hash' ? 'hash' : 'list'; // Default to list (LIST+Direct is the recommended strategy)
+
+    // Check if the table already exists and what partitioning strategy it uses
+    const existingStrategy = await GetPartitionStrategy();
+    const tableExists = await db.unsafe(`
+        SELECT 1 FROM information_schema.tables
+        WHERE table_name = 'components'
+        AND table_schema = 'public'
+    `);
+
+    // If the table exists but has a different partitioning strategy, we need to recreate it
+    if (tableExists.length > 0 && existingStrategy !== partitionStrategy) {
+        logger.info(`Partitioning strategy changed from ${existingStrategy} to ${partitionStrategy}. Recreating components table...`);
+
+        // Drop the existing table and all its partitions
+        await db.unsafe(`DROP TABLE IF EXISTS components CASCADE`);
+
+        // Also clean up any orphaned partition tables
+        const orphanedPartitions = await db.unsafe(`
+            SELECT tablename
+            FROM pg_tables
+            WHERE tablename LIKE 'components_%'
+            AND schemaname = 'public'
+        `);
+
+        for (const partition of orphanedPartitions) {
+            await db.unsafe(`DROP TABLE IF EXISTS ${partition.tablename} CASCADE`);
+        }
+    }
+
     if (partitionStrategy === 'hash') {
         // Clean up any existing LIST partition tables before creating HASH partitions
         await cleanupOldListPartitions();
