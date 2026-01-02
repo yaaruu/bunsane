@@ -17,7 +17,7 @@ import { Entity } from "./Entity";
 import { CronParser } from "../utils/cronParser";
 import type { ComponentTargetConfig } from "./EntityHookManager";
 import ArcheType from "./ArcheType";
-import { BaseComponent } from "./Components";
+import { BaseComponent } from "./components";
 
 const loggerInstance = logger.child({ scope: "SchedulerManager" });
 
@@ -139,6 +139,13 @@ export class SchedulerManager {
 
     private scheduleIntervalTask(taskInfo: ScheduledTaskInfo): void {
         const intervalMs = this.getIntervalMilliseconds(taskInfo.interval);
+
+        // Clear any existing interval for this task before creating a new one
+        const existingInterval = this.intervals.get(taskInfo.id);
+        if (existingInterval) {
+            clearInterval(existingInterval);
+            this.intervals.delete(taskInfo.id);
+        }
 
         // For very long intervals (monthly), use a different approach
         if (intervalMs > 24 * 60 * 60 * 1000) { // More than 24 hours

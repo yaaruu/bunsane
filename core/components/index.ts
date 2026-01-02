@@ -1,4 +1,5 @@
 import ComponentRegistry from "./ComponentRegistry";
-export {BaseComponent, CompData, Component, type ComponentGetter} from "./Decorators";
+export { CompData, Component, type ComponentGetter} from "./Decorators";
+export { BaseComponent } from "./BaseComponent";
 export {type ComponentDataType} from "./Interfaces";
 export {ComponentRegistry};

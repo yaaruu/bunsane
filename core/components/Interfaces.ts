@@ -1,6 +1,4 @@
-interface BaseComponent {
-
-}
+import type BaseComponent from './BaseComponent';
 export type ComponentDataType<T extends BaseComponent> = {
     [K in keyof T as T[K] extends Function ? never : 
                     K extends `_${string}` ? never : 
