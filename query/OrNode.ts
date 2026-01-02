@@ -2,7 +2,7 @@ import { QueryNode } from "./QueryNode";
 import type { QueryResult } from "./QueryNode";
 import { QueryContext } from "./QueryContext";
 import { OrQuery } from "./OrQuery";
-import ComponentRegistry from "../core/ComponentRegistry";
+import { ComponentRegistry } from "@/core/components";
 import { shouldUseDirectPartition } from "../core/Config";
 
 export class OrNode extends QueryNode {
@@ -188,6 +188,9 @@ export class OrNode extends QueryNode {
 
         // Get the single component info
         const branch = this.orQuery.branches[0];
+        if(!branch) {
+            throw new Error("OrNode: No branches found in OrQuery");
+        }
         const componentId = ComponentRegistry.getComponentId(branch.component.name);
         if (!componentId) {
             throw new Error(`Component ${branch.component.name} is not registered`);

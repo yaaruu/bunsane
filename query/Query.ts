@@ -1,6 +1,5 @@
-import type { BaseComponent, ComponentDataType } from "../core/Components";
+import {ComponentRegistry , type BaseComponent, type ComponentDataType } from "@/core/components";
 import { Entity } from "../core/Entity";
-import ComponentRegistry from "../core/ComponentRegistry";
 import { logger } from "../core/Logger";
 import db from "../database";
 import { timed } from "../core/Decorators";

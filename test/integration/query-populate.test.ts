@@ -1,8 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
 import { Query } from '../../query/Query';
 import { Entity } from '../../core/Entity';
-import ComponentRegistry from '../../core/ComponentRegistry';
-import { BaseComponent, CompData, Component } from '../../core/Components';
+import { Component, CompData, ComponentRegistry, BaseComponent, type ComponentDataType } from "@/core/components";
 import db from '../../database';
 
 // Test components

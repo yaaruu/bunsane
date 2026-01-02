@@ -1,7 +1,6 @@
 import { Query, or } from '../../query/Query';
-import ComponentRegistry from '../../core/ComponentRegistry';
 import { PrepareDatabase, GetPartitionStrategy } from '../../database/DatabaseHelper';
-import { BaseComponent, CompData, Component } from '../../core/Components';
+import { Component, CompData, ComponentRegistry, BaseComponent, type ComponentDataType } from "@/core/components";
 import { Entity } from '../../core/Entity';
 import db from '../../database';
 import { config } from '../../core/Config';

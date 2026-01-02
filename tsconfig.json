@@ -30,6 +30,10 @@
 
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,
-    "typeRoots": ["./types", "./node_modules/@types"]
+    "typeRoots": ["./types", "./node_modules/@types"],
+
+    "paths": {
+      "@/*": ["./*"]
+    }
   }
 }

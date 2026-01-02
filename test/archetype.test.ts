@@ -7,7 +7,7 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { Entity } from '../core/Entity';
 import { BaseArcheType, ArcheTypeField } from '../core/ArcheType';
-import { Component, CompData, BaseComponent } from '../core/Components';
+import { Component, CompData, ComponentRegistry, BaseComponent, type ComponentDataType } from "@/core/components";
 
 // Test components
 @Component

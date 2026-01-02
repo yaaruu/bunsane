@@ -1,8 +1,8 @@
-import type { ComponentDataType, ComponentGetter, BaseComponent } from "./Components";
+import type { ComponentDataType, ComponentGetter, BaseComponent } from "@/core/components";
 import { logger } from "./Logger";
 import db from "database";
 import EntityManager from "./EntityManager";
-import ComponentRegistry from "./ComponentRegistry";
+import ComponentRegistry from "@/core/components/ComponentRegistry";
 import { uuidv7 } from "utils/uuid";
 import { sql, SQL } from "bun";
 // import Query from "./Query"; // Lazy import to avoid cycle
@@ -172,7 +172,7 @@ export class Entity implements IEntity {
                 }
 
                 if (componentData !== null) {
-                    const comp = new ctor();
+                    const comp: any = new ctor();
                     // Set the component ID from the database
                     if (componentId) {
                         comp.id = componentId;
@@ -246,7 +246,7 @@ export class Entity implements IEntity {
                 }
 
                 if (componentData !== null) {
-                    const comp = new ctor();
+                    const comp: any = new ctor();
                     // Set the component ID from the database
                     if (componentId) {
                         comp.id = componentId;

@@ -1,9 +1,10 @@
 import { createHash } from 'crypto';
 import "reflect-metadata";
-import { logger as MainLogger } from "./Logger";
+import { logger as MainLogger } from "@/core/Logger";
 import ComponentRegistry from "./ComponentRegistry";
+import { type ComponentDataType } from './Interfaces';
 import { uuidv7 } from 'utils/uuid';
-import { getMetadataStorage } from './metadata';
+import { getMetadataStorage } from '@/core/metadata';
 const logger = MainLogger.child({ scope: "Components" });
 
 export function generateTypeId(name: string): string {
@@ -12,7 +13,6 @@ export function generateTypeId(name: string): string {
 
 const primitiveTypes = [String, Number, Boolean, Symbol, BigInt, Date];
 
-//TODO: Continue here
 export function CompData(options?: { indexed?: boolean; nullable?: boolean; arrayOf?: any }) {
     return (target: any, propertyKey: string) => {
         const storage = getMetadataStorage();
@@ -65,30 +65,6 @@ export function CompData(options?: { indexed?: boolean; nullable?: boolean; arra
         // Reflect.metadata("compData", { isData: true, indexed: options?.indexed ?? false })(target, propertyKey);
     };
 }
-
-// TODO: Component Property Casting
-// export enum CompCastingType {
-//     STRING = "string",
-//     NUMBER = "number",
-//     BOOLEAN = "boolean",
-//     DATE = "date",
-// }
-// /**
-//  * Cast property to specific type when loading from database
-//  * @param type Casting type for the property
-//  * @returns 
-//  */
-// export function Cast(type: CompCastingType) {
-//     return Reflect.metadata("compCast", { type });
-// }
-
-// Type helper to extract only data properties (excludes methods and private properties)
-export type ComponentDataType<T extends BaseComponent> = {
-    [K in keyof T as T[K] extends Function ? never : 
-                    K extends `_${string}` ? never : 
-                    K extends 'id' | 'getTypeID' | 'properties' | 'data' | 'save' | 'insert' | 'update' ? never : 
-                    K]: T[K];
-};
 
 export function Component<T extends new () => BaseComponent>(target: T): T {
     const storage = getMetadataStorage();

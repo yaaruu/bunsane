@@ -1,5 +1,5 @@
-import { UploadManager } from "../core/UploadManager";
-import { UploadComponent, ImageMetadataComponent } from "../core/components/UploadComponent";
+import { UploadManager } from "@/upload";
+import { UploadComponent, ImageMetadataComponent } from "../upload/UploadComponent";
 import { Entity } from "../core/Entity";
 import type { UploadConfiguration, UploadResult, BatchUploadResult } from "../types/upload.types";
 import { logger as MainLogger } from "../core/Logger";

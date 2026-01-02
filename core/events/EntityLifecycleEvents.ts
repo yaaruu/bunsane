@@ -1,5 +1,5 @@
 import type { Entity } from "../Entity";
-import type { BaseComponent } from "../Components";
+import type { BaseComponent } from "@/core/components/Decorators";
 
 /**
  * Base class for all entity lifecycle events

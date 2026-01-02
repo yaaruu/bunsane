@@ -1,4 +1,4 @@
-import type { BaseComponent, ComponentDataType } from "./Components";
+import type { BaseComponent, ComponentDataType } from "@/core/components";
 import type { ComponentPropertyMetadata } from "./metadata/definitions/Component";
 import type { ArcheTypeFieldOptions, ArcheTypeFunctionMetadata } from "./metadata/definitions/ArcheType";
 import type { GetEntityOptions } from "../types/archetype.types";
@@ -295,7 +295,7 @@ export function weaveAllArchetypes() {
                         const typeMatch = typePattern.exec(schemaString);
                         
                         if (typeMatch) {
-                            const typeBody = typeMatch[1];
+                            const typeBody = typeMatch[1]!;
                             
                             // Find the field line in the type body
                             const fieldIndex = typeBody.indexOf(`  ${propertyKey}`);
@@ -1075,11 +1075,11 @@ export class BaseArcheType {
                     // Get foreign key value from entity's components
                     if (foreignKey.includes('.')) {
                         const [fieldName, propName] = foreignKey.split('.');
-                        const compCtor = this.componentMap[fieldName];
+                        const compCtor = this.componentMap[fieldName!];
                         if (compCtor) {
                             const componentInstance = await entity.get(compCtor as any);
-                            if (componentInstance && (componentInstance as any)[propName] !== undefined) {
-                                foreignId = (componentInstance as any)[propName];
+                            if (componentInstance && (componentInstance as any)[propName!] !== undefined) {
+                                foreignId = (componentInstance as any)[propName!];
                             }
                         }
                     } else {

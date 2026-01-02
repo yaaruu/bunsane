@@ -20,10 +20,12 @@
         "dev": "tsc --watch"
     },
     "devDependencies": {
-        "@types/bun": "latest"
+        "@types/bun": "latest",
+        "@types/node": "^25.0.3",
+        "knip": "^5.78.0"
     },
     "peerDependencies": {
-        "typescript": "^5"
+        "typescript": "^5.9.3"
     },
     "dependencies": {
         "@gqloom/core": "^0.12.0",

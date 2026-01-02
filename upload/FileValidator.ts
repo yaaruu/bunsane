@@ -1,5 +1,5 @@
 import type { UploadConfiguration, ValidationResult } from "../types/upload.types";
-import { logger as MainLogger } from "./Logger";
+import { logger as MainLogger } from "../core/Logger";
 
 const logger = MainLogger.child({ scope: "FileValidator" });
 

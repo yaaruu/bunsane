@@ -1,4 +1,4 @@
-import type { UploadConfiguration, StorageResult, FileMetadata } from "../../types/upload.types";
+import type { UploadConfiguration, StorageResult, FileMetadata } from "../types/upload.types";
 
 /**
  * Abstract Storage Provider Interface

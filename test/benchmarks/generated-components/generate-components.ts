@@ -96,7 +96,7 @@ function generateComponentCode(index: number, prefix: string): string {
         }
     }
     
-    return `import { BaseComponent, CompData, Component } from '../../../core/Components';
+    return `import { Component, CompData, ComponentRegistry, BaseComponent, type ComponentDataType } from "@/core/components";';
 
 @Component
 export class ${className} extends BaseComponent {

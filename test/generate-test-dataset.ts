@@ -10,8 +10,7 @@
  */
 
 import { Entity } from '../core/Entity';
-import { BaseComponent, CompData, Component } from '../core/Components';
-import ComponentRegistry from '../core/ComponentRegistry';
+import { Component, CompData, ComponentRegistry, BaseComponent, type ComponentDataType } from "@/core/components";
 import db from '../database';
 
 // Test component definitions

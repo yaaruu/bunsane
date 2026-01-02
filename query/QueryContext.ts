@@ -1,5 +1,4 @@
-import type { BaseComponent, ComponentDataType } from "../core/Components";
-import ComponentRegistry from "../core/ComponentRegistry";
+import { ComponentRegistry, type BaseComponent, type ComponentDataType } from "@/core/components";
 import { FilterBuilderRegistry } from "./FilterBuilderRegistry";
 
 export interface QueryFilter {

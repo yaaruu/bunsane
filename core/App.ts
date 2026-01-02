@@ -1,6 +1,14 @@
-import ApplicationLifecycle, {ApplicationPhase} from "core/ApplicationLifecycle";
-import { GenerateTableName, HasValidBaseTable, PrepareDatabase, UpdateComponentIndexes, EnsureDatabaseMigrations } from "database/DatabaseHelper";
-import ComponentRegistry from "core/ComponentRegistry";
+import ApplicationLifecycle, {
+    ApplicationPhase,
+} from "core/ApplicationLifecycle";
+import {
+    GenerateTableName,
+    HasValidBaseTable,
+    PrepareDatabase,
+    UpdateComponentIndexes,
+    EnsureDatabaseMigrations,
+} from "database/DatabaseHelper";
+import { ComponentRegistry } from "@/core/components";
 import { logger as MainLogger } from "core/Logger";
 import { getSerializedMetadataStorage } from "core/metadata";
 const logger = MainLogger.child({ scope: "App" });
@@ -16,12 +24,11 @@ import { preparedStatementCache } from "database/PreparedStatementCache";
 import db from "database";
 import studioEndpoint from "../endpoints";
 
-
 export type AppConfig = {
     scheduler: {
         logging: boolean;
-    }
-}
+    };
+};
 
 export default class App {
     private name: string = "BunSane Application";
@@ -128,14 +135,14 @@ export default class App {
                         // Wrap user's context factory to automatically spread Yoga context
                         const wrappedContextFactory = this.contextFactory
                             ? (yogaContext: any) => {
-                                const userContext =
-                                    this.contextFactory!(yogaContext);
-                                // Merge Yoga's context with user's context, preserving Yoga properties
-                                return {
-                                    ...yogaContext, // Yoga context (request, params, etc.)
-                                    ...userContext, // User's additional context
-                                };
-                            }
+                                  const userContext =
+                                      this.contextFactory!(yogaContext);
+                                  // Merge Yoga's context with user's context, preserving Yoga properties
+                                  return {
+                                      ...yogaContext, // Yoga context (request, params, etc.)
+                                      ...userContext, // User's additional context
+                                  };
+                              }
                             : undefined;
 
                         if (schema) {
@@ -157,7 +164,8 @@ export default class App {
 
                         // Initialize Scheduler
                         const scheduler = SchedulerManager.getInstance();
-                        scheduler.config.enableLogging = this.config.scheduler.logging;
+                        scheduler.config.enableLogging =
+                            this.config.scheduler.logging;
 
                         // Register scheduled tasks for all services
                         for (const service of services) {
@@ -431,7 +439,7 @@ export default class App {
             // Studio API endpoints
             if (this.studioEnabled && url.pathname.startsWith("/studio/api/")) {
                 clearTimeout(timeoutId);
-            
+
                 // Studio tables endpoint
                 if (url.pathname === "/studio/api/tables") {
                     return studioEndpoint.getTables();
@@ -445,7 +453,10 @@ export default class App {
 
                     if (method === "DELETE") {
                         const body = await req.json();
-                        return studioEndpoint.handleStudioTableDeleteRequest(tableName, body);
+                        return studioEndpoint.handleStudioTableDeleteRequest(
+                            tableName,
+                            body
+                        );
                     }
 
                     const limit = url.searchParams.get("limit");
@@ -464,18 +475,24 @@ export default class App {
 
                     if (method === "DELETE") {
                         const body = await req.json();
-                        return studioEndpoint.handleStudioArcheTypeDeleteRequest(archeTypeName, body);
+                        return studioEndpoint.handleStudioArcheTypeDeleteRequest(
+                            archeTypeName,
+                            body
+                        );
                     }
 
                     const limit = url.searchParams.get("limit");
                     const offset = url.searchParams.get("offset");
                     const search = url.searchParams.get("search");
 
-                    return studioEndpoint.handleStudioArcheTypeRecordsRequest(archeTypeName, {
-                        limit: limit ? parseInt(limit, 10) : undefined,
-                        offset: offset ? parseInt(offset, 10) : undefined,
-                        search: search ?? undefined,
-                    });
+                    return studioEndpoint.handleStudioArcheTypeRecordsRequest(
+                        archeTypeName,
+                        {
+                            limit: limit ? parseInt(limit, 10) : undefined,
+                            offset: offset ? parseInt(offset, 10) : undefined,
+                            search: search ?? undefined,
+                        }
+                    );
                 }
 
                 return new Response(
@@ -487,22 +504,26 @@ export default class App {
                 );
             }
 
-
             // Studio endpoint - handle both root and all sub-routes
-            if (url.pathname === "/studio" || url.pathname.startsWith("/studio/")) {
+            if (
+                url.pathname === "/studio" ||
+                url.pathname.startsWith("/studio/")
+            ) {
                 clearTimeout(timeoutId);
-                
+
                 // Skip API routes - they're handled by the API handler above
                 if (url.pathname.startsWith("/studio/api/")) {
                     return new Response(
-                        JSON.stringify({ error: "Studio API endpoint not found" }),
+                        JSON.stringify({
+                            error: "Studio API endpoint not found",
+                        }),
                         {
                             status: 404,
                             headers: { "Content-Type": "application/json" },
                         }
                     );
                 }
-                
+
                 // Check if this is a request for static assets (CSS, JS, etc.)
                 if (url.pathname.startsWith("/studio/assets/")) {
                     // Let the static assets handler below handle this

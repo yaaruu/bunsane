@@ -1,8 +1,8 @@
 import fs from "fs";
 import path from "path";
 import { StorageProvider } from "./StorageProvider";
-import type { UploadConfiguration, StorageResult, FileMetadata } from "../../types/upload.types";
-import { logger as MainLogger } from "../Logger";
+import type { UploadConfiguration, StorageResult, FileMetadata } from "../types/upload.types";
+import { logger as MainLogger } from "../core/Logger";
 
 const logger = MainLogger.child({ scope: "LocalStorageProvider" });
 

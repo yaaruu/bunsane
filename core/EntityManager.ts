@@ -15,18 +15,6 @@ class EntityManager {
         });
     }
 
-    public saveEntity(entity: IEntity) {
-        return new Promise<boolean>(async resolve => {
-            if(!this.dbReady) {
-                this.entityQueue.push(entity);
-                return resolve(true);
-            } else {
-                const result = await entity.doSave();
-                resolve(result);
-            }
-        })
-    }
-
     public deleteEntity(entity: IEntity, force: boolean = false) {
         return new Promise<boolean>(async resolve => {
             if(!this.dbReady) {
@@ -40,7 +28,7 @@ class EntityManager {
     private async savePendingEntities() {
         const promiseWait = [];
         for(const entity of this.entityQueue) {
-           promiseWait.push(entity.doSave()); 
+           promiseWait.push(entity.save()); 
         }
         return await Promise.all(promiseWait);
     }

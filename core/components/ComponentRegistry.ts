@@ -1,13 +1,19 @@
-import { generateTypeId, type BaseComponent } from "./Components";
-import ApplicationLifecycle, { ApplicationPhase } from "./ApplicationLifecycle";
-import { CreateComponentPartitionTable, GenerateTableName, UpdateComponentIndexes, AnalyzeAllComponentTables, GetPartitionStrategy } from "database/DatabaseHelper";
+import { generateTypeId, type BaseComponent } from "./Decorators";
+import ApplicationLifecycle, { ApplicationPhase } from "@/core/ApplicationLifecycle";
+import {
+    CreateComponentPartitionTable,
+    GenerateTableName,
+    UpdateComponentIndexes,
+    AnalyzeAllComponentTables,
+    GetPartitionStrategy,
+} from "@/database/DatabaseHelper";
 import { ensureMultipleJSONBPathIndexes } from "database/IndexingStrategy";
 import { GetSchema } from "database/DatabaseHelper";
-import { logger as MainLogger } from "./Logger";
-import { getMetadataStorage } from "./metadata";
-import { registerDecoratedHooks } from "./decorators/EntityHooks";
-import ServiceRegistry from "service/ServiceRegistry";
-import { preparedStatementCache } from "../database/PreparedStatementCache";
+import { logger as MainLogger } from "@/core/Logger";
+import { getMetadataStorage } from "@/core/metadata";
+import { registerDecoratedHooks } from "@/core/decorators/EntityHooks";
+import ServiceRegistry from "@/service/ServiceRegistry";
+import { preparedStatementCache } from "@/database/PreparedStatementCache";
 const logger = MainLogger.child({ scope: "ComponentRegistry" });
 
 type ComponentConstructor = new () => BaseComponent;
@@ -26,9 +32,7 @@ class ComponentRegistry {
     private readinessResolvers = new Map<string, () => void>();
     private componentsRegistered: boolean = false;
 
-    constructor() {
-        
-    }
+    constructor() {}
 
     public init() {
         // Listener removed to make component registration sequential
@@ -50,27 +54,27 @@ class ComponentRegistry {
         }
     }
 
-    define(
-        name: string,
-        ctor: ComponentConstructor
-    ) {
-        if(!this.instantRegister) {
-            if(!this.componentQueue.has(name)) {
+    define(name: string, ctor: ComponentConstructor) {
+        if (!this.instantRegister) {
+            if (!this.componentQueue.has(name)) {
                 this.componentQueue.set(name, ctor);
-                this.readinessPromises.set(name, new Promise<void>(resolve => {
-                    this.readinessResolvers.set(name, resolve);
-                }));
+                this.readinessPromises.set(
+                    name,
+                    new Promise<void>((resolve) => {
+                        this.readinessResolvers.set(name, resolve);
+                    })
+                );
                 return;
             }
         }
-        if(this.instantRegister) {
-            if(this.componentsMap.has(name)) {
+        if (this.instantRegister) {
+            if (this.componentsMap.has(name)) {
                 logger.trace(`Component already registered: ${name}`);
                 return;
             }
             this.register(name, generateTypeId(name), ctor).then(() => {
                 const resolve = this.readinessResolvers.get(name);
-                if(resolve) resolve();
+                if (resolve) resolve();
             });
         }
     }
@@ -87,16 +91,16 @@ class ComponentRegistry {
         if (this.isComponentReady(name)) {
             return Promise.resolve();
         }
-        
+
         // Ensure components are registered before trying to find the component
         await this.ensureComponentsRegistered();
-        
+
         if (this.isComponentReady(name)) {
             return Promise.resolve();
         }
-        
+
         const storage = getMetadataStorage();
-        const component = storage.components.find(c => c.name === name);
+        const component = storage.components.find((c) => c.name === name);
         if (component) {
             // Component exists in metadata but not registered yet, register it
             return this.registerComponentFromMetadata(component);
@@ -150,42 +154,47 @@ class ComponentRegistry {
         if (this.componentsRegistered) {
             return; // Already registered
         }
-        
+
         logger.trace("Registering Components...");
         ApplicationLifecycle.setPhase(ApplicationPhase.COMPONENTS_REGISTERING);
-        
+
         await this.populateCurrentTables();
         const storage = getMetadataStorage();
-        const promises = storage.components.map(async metadata => {
+        const promises = storage.components.map(async (metadata) => {
             const { name, target: ctor, typeId } = metadata;
-            if(this.componentsMap.has(name)) {
+            if (this.componentsMap.has(name)) {
                 logger.trace(`Component already registered: ${name}`);
                 return;
             }
-            this.readinessPromises.set(name, new Promise<void>(resolve => {
-                this.readinessResolvers.set(name, resolve);
-            }));
+            this.readinessPromises.set(
+                name,
+                new Promise<void>((resolve) => {
+                    this.readinessResolvers.set(name, resolve);
+                })
+            );
             await this.register(name, typeId, ctor as ComponentConstructor);
             const resolve = this.readinessResolvers.get(name);
-            if(resolve) resolve();
+            if (resolve) resolve();
         });
         await Promise.all(promises);
         this.componentsRegistered = true;
-        
+
         // Handle component-related setup that was previously in App.init()
         await this.setupComponentFeatures();
-        
+
         ApplicationLifecycle.setPhase(ApplicationPhase.COMPONENTS_READY);
     }
 
     register(name: string, typeid: string, ctor: ComponentConstructor) {
-        return new Promise<boolean>(async resolve => {
+        return new Promise<boolean>(async (resolve) => {
             const partitionTableName = GenerateTableName(name);
             // await this.populateCurrentTables();
             // const instance = new ctor();
             // const indexedProps = instance.indexedProperties();
             if (!this.currentTables.includes(partitionTableName)) {
-                logger.trace(`Partition table ${partitionTableName} does not exist. Creating... name: ${name}, typeId: ${typeid}`);
+                logger.trace(
+                    `Partition table ${partitionTableName} does not exist. Creating... name: ${name}, typeId: ${typeid}`
+                );
                 // await CreateComponentPartitionTable(name, typeid, indexedProps); // TODO: OLD Logic with indexedProps, remove if not needed
                 await CreateComponentPartitionTable(name, typeid);
                 // await this.populateCurrentTables();
@@ -203,9 +212,12 @@ class ComponentRegistry {
         if (this.componentsMap.has(name)) {
             return; // Already registered
         }
-        this.readinessPromises.set(name, new Promise<void>(resolve => {
-            this.readinessResolvers.set(name, resolve);
-        }));
+        this.readinessPromises.set(
+            name,
+            new Promise<void>((resolve) => {
+                this.readinessResolvers.set(name, resolve);
+            })
+        );
         await this.register(name, typeId, ctor as ComponentConstructor);
         const resolve = this.readinessResolvers.get(name);
         if (resolve) resolve();
@@ -214,21 +226,23 @@ class ComponentRegistry {
     private async registerComponentDynamically(name: string): Promise<void> {
         // Try to find the component in global metadata storage
         const storage = getMetadataStorage();
-        const component = storage.components.find(c => c.name === name);
+        const component = storage.components.find((c) => c.name === name);
         if (component) {
             return this.registerComponentFromMetadata(component);
         }
 
         // If still not found, this is an error - component was never decorated
-        throw new Error(`Component ${name} not found in metadata storage. Make sure it's decorated with @Component`);
+        throw new Error(
+            `Component ${name} not found in metadata storage. Make sure it's decorated with @Component`
+        );
     }
 
     getComponents() {
         // returns array of { name, ctor }
-        const components: { name: string, ctor: ComponentConstructor }[] = [];
+        const components: { name: string; ctor: ComponentConstructor }[] = [];
         for (const [name, typeid] of this.componentsMap) {
             const ctor = this.typeIdToCtor.get(typeid);
-            if(ctor) {
+            if (ctor) {
                 components.push({ name, ctor });
             }
         }
@@ -252,40 +266,54 @@ class ComponentRegistry {
 
     private async setupComponentFeatures(): Promise<void> {
         const components = this.getComponents();
-        
+
         // Invalidate prepared statement cache when component schemas change
         preparedStatementCache.clear();
-        logger.trace("Cleared prepared statement cache due to component schema changes");
-        
+        logger.trace(
+            "Cleared prepared statement cache due to component schema changes"
+        );
+
         // Check partitioning strategy for index creation
         const partitionStrategy = await GetPartitionStrategy();
-        
+
         // Update component indexes for components that have indexed properties
-        for(const {name, ctor} of components) {
+        for (const { name, ctor } of components) {
             const instance = new ctor();
             const table_name = GenerateTableName(name);
-            
+
             // Handle legacy @CompData(indexed: true) properties
-            if(instance.indexedProperties().length > 0) {
+            if (instance.indexedProperties().length > 0) {
                 // For HASH partitioning, redirect index operations to parent table
-                const indexTableName = partitionStrategy === 'hash' ? 'components' : table_name;
-                UpdateComponentIndexes(indexTableName, instance.indexedProperties());
-                logger.trace(`Updated legacy indexes for component: ${name} on table: ${indexTableName}`);
+                const indexTableName =
+                    partitionStrategy === "hash" ? "components" : table_name;
+                UpdateComponentIndexes(
+                    indexTableName,
+                    instance.indexedProperties()
+                );
+                logger.trace(
+                    `Updated legacy indexes for component: ${name} on table: ${indexTableName}`
+                );
             }
-            
+
             // Handle new @IndexedField decorators
             const indexedFields = this.getIndexedFieldsForComponent(name);
-            if(indexedFields.length > 0) {
+            if (indexedFields.length > 0) {
                 // For HASH partitioning, create indexes on parent table
-                const indexTableName = partitionStrategy === 'hash' ? 'components' : table_name;
-                const indexDefinitions = indexedFields.map(field => ({
+                const indexTableName =
+                    partitionStrategy === "hash" ? "components" : table_name;
+                const indexDefinitions = indexedFields.map((field) => ({
                     tableName: indexTableName,
                     field: field.propertyKey,
                     indexType: field.indexType,
-                    isDateField: field.isDateField
+                    isDateField: field.isDateField,
                 }));
-                await ensureMultipleJSONBPathIndexes(indexTableName, indexDefinitions);
-                logger.trace(`Created specialized indexes for component: ${name} on table: ${indexTableName}`);
+                await ensureMultipleJSONBPathIndexes(
+                    indexTableName,
+                    indexDefinitions
+                );
+                logger.trace(
+                    `Created specialized indexes for component: ${name} on table: ${indexTableName}`
+                );
             }
         }
 
@@ -295,7 +323,9 @@ class ComponentRegistry {
             try {
                 registerDecoratedHooks(service);
             } catch (error) {
-                logger.warn(`Failed to register hooks for service ${service.constructor.name}`);
+                logger.warn(
+                    `Failed to register hooks for service ${service.constructor.name}`
+                );
                 logger.warn(error);
             }
         }

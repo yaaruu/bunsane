@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeEach } from 'bun:test';
 import { CTENode } from '../CTENode';
 import { QueryContext } from '../QueryContext';
-import ComponentRegistry from '../../core/ComponentRegistry';
-import { BaseComponent, CompData, Component } from '../../core/Components';
+
+import { Component, CompData, ComponentRegistry, BaseComponent, type ComponentDataType } from "@/core/components";
+
 
 // Mock components for testing
 @Component

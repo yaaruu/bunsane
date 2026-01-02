@@ -6,8 +6,8 @@ import { SourceNode } from '../SourceNode';
 import { OrNode } from '../OrNode';
 import { QueryDAG } from '../QueryDAG';
 import { CTENode } from '../CTENode';
-import ComponentRegistry from '../../core/ComponentRegistry';
-import { BaseComponent, CompData, Component } from '../../core/Components';
+import { Component, CompData, ComponentRegistry, BaseComponent, type ComponentDataType } from "@/core/components";
+
 
 // Mock components for testing
 @Component

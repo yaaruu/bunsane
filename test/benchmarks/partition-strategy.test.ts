@@ -1,8 +1,7 @@
 import { describe, it, expect, beforeAll, beforeEach } from 'bun:test';
 import { Query } from '../../query/Query';
-import ComponentRegistry from '../../core/ComponentRegistry';
+import { Component, CompData, ComponentRegistry, BaseComponent, type ComponentDataType } from "@/core/components";
 import { PrepareDatabase, GetPartitionStrategy } from '../../database/DatabaseHelper';
-import { BaseComponent, CompData, Component } from '../../core/Components';
 import { Entity } from '../../core/Entity';
 import {
     runBenchmarkSuite,

@@ -4,19 +4,18 @@
  */
 
 // Core Upload System
-export { UploadManager } from "../core/UploadManager";
-export { FileValidator } from "../core/FileValidator";
+export { UploadManager } from "@/upload/UploadManager";
+export { FileValidator } from "@/upload/FileValidator";
 
 // Storage Providers
-export { StorageProvider } from "../core/storage/StorageProvider";
-export { LocalStorageProvider } from "../core/storage/LocalStorageProvider";
+export { StorageProvider } from "@/storage/StorageProvider";
+export { LocalStorageProvider } from "@/storage/LocalStorageProvider";
 
 // Components
-export { UploadComponent, ImageMetadataComponent } from "../core/components/UploadComponent";
-
+export { UploadComponent, ImageMetadataComponent } from "@/upload/UploadComponent";
 
 // Utilities
-export { UploadHelper } from "../utils/UploadHelper";
+export { UploadHelper } from "@/utils/UploadHelper";
 
 // GraphQL Decorators
 export {
@@ -56,8 +55,8 @@ export type {
 } from "../types/upload.types";
 
 // Imports for internal use
-import { UploadManager } from "../core/UploadManager";
-import type { UploadConfiguration } from "../types/upload.types";
+import { UploadManager } from "@/upload/UploadManager";
+import type { UploadConfiguration } from "@/types/upload.types";
 
 /**
  * Initialize the upload system with default configuration

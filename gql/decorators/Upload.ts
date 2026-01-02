@@ -1,6 +1,6 @@
 import "reflect-metadata";
 import type { UploadDecoratorConfig } from "../../types/upload.types";
-import { UploadManager } from "../../core/UploadManager";
+import { UploadManager } from "@/upload";
 import { logger as MainLogger } from "../../core/Logger";
 
 const logger = MainLogger.child({ scope: "UploadDecorator" });
