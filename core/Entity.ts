@@ -129,151 +129,87 @@ export class Entity implements IEntity {
         return false;
     }
     /**
-     * Get component from entities. If entity is populated in query the component will get within the entity
-     * If not it will fetch from database. Optionally uses DataLoader if context with loaders is provided.
+     * Get component data from entity. Loads from DB if not cached.
      * @param ctor Component constructor
-     * @param context Optional context containing DataLoader for batched loading (prevents connection pool exhaustion)
-     * @returns `Component | null` *if entity doesn't have the component
+     * @param context Optional DataLoader context
+     * @returns Component data or null
      */
     public async get<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any } }): Promise<ComponentDataType<T> | null> {
-        const comp = Array.from(this.components.values()).find(comp => comp instanceof ctor) as ComponentGetter<T> | undefined;
-        if(typeof comp !== "undefined") {
-            return comp.data();
-        } else {
-            // Validate entity ID before database query
-            if (!this.id || this.id.trim() === '') {
-                logger.warn(`Cannot get component ${ctor.name}: entity id is empty`);
-                return null;
-            }
-            // fetch from db
-            const temp = new ctor();
-            const typeId = temp.getTypeID();
-            try {
-                let componentData: any = null;
-                let componentId: string | null = null;
-
-                // Use DataLoader if available (prevents N+1 queries and connection pool exhaustion)
-                if (context?.loaders?.componentsByEntityType) {
-                    const loaderResult = await context.loaders.componentsByEntityType.load({
-                        entityId: this.id,
-                        typeId: typeId
-                    });
-                    if (loaderResult) {
-                        componentData = loaderResult.data;
-                        componentId = loaderResult.id;  // Get component ID from DataLoader result
-                    }
-                } else {
-                    // Fallback to direct DB call
-                    const rows = await db`SELECT id, data FROM components WHERE entity_id = ${this.id} AND type_id = ${typeId} AND deleted_at IS NULL`;
-                    if (rows.length > 0) {
-                        componentData = rows[0].data;
-                        componentId = rows[0].id;
-                    }
-                }
-
-                if (componentData !== null) {
-                    const comp: any = new ctor();
-                    // Set the component ID from the database
-                    if (componentId) {
-                        comp.id = componentId;
-                    }
-                    const parsedData = typeof componentData === 'string' ? JSON.parse(componentData) : componentData;
-                    Object.assign(comp, parsedData);
-                    // Deserialize Date properties
-                    const storage = getMetadataStorage();
-                    const props = storage.componentProperties.get(typeId);
-                    if (props) {
-                        for (const prop of props) {
-                            if (prop.propertyType === Date && typeof comp[prop.propertyKey] === 'string') {
-                                comp[prop.propertyKey] = new Date(comp[prop.propertyKey]);
-                            }
-                        }
-                    }
-                    comp.setPersisted(true);
-                    comp.setDirty(false);
-                    this.addComponent(comp);
-                    return comp.data();
-                } else {
-                    return null;
-                }
-            } catch (error) {
-                logger.error(`Failed to fetch component: ${error}`);
-                return null;
-            }
-        }
+        const comp = await this._loadComponent(ctor, context);
+        return comp ? (comp as ComponentGetter<T>).data() : null;
     }
 
     /**
-     * Get a component from the entity.
+     * Get component instance from entity. Loads from DB if not cached.
      * @param ctor Constructor of the component to fetch
-     * @param context Optional context containing DataLoader for batched loading (prevents connection pool exhaustion)
-     * @returns Component instance or null if not found
+     * @param context Optional DataLoader context
+     * @returns Component instance or null
      */
-    public async getComponent<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any } }): Promise<T | null> {
+    public async getInstanceOf<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any } }): Promise<T | null> {
+        return this._loadComponent(ctor, context);
+    }
+
+    private async _loadComponent<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any } }): Promise<T | null> {
         const comp = Array.from(this.components.values()).find(comp => comp instanceof ctor) as T | undefined;
-        if(typeof comp !== "undefined") {
+        if (typeof comp !== "undefined") {
             return comp;
-        } else {
-            // Validate entity ID before database query
-            if (!this.id || this.id.trim() === '') {
-                logger.warn(`Cannot get component ${ctor.name}: entity id is empty`);
-                return null;
-            }
-            // fetch from db
-            const temp = new ctor();
-            const typeId = temp.getTypeID();
-            try {
-                let componentData: any = null;
-                let componentId: string | null = null;
+        }
 
-                // Use DataLoader if available (prevents N+1 queries and connection pool exhaustion)
-                if (context?.loaders?.componentsByEntityType) {
-                    const loaderResult = await context.loaders.componentsByEntityType.load({
-                        entityId: this.id,
-                        typeId: typeId
-                    });
-                    if (loaderResult) {
-                        componentData = loaderResult.data;
-                        componentId = loaderResult.id;  // Get component ID from DataLoader result
-                    }
-                } else {
-                    // Fallback to direct DB call
-                    const rows = await db`SELECT id, data FROM components WHERE entity_id = ${this.id} AND type_id = ${typeId} AND deleted_at IS NULL`;
-                    if (rows.length > 0) {
-                        componentData = rows[0].data;
-                        componentId = rows[0].id;
-                    }
+        // Validate entity ID before database query
+        if (!this.id || this.id.trim() === '') {
+            logger.warn(`Cannot load component ${ctor.name}: entity id is empty`);
+            return null;
+        }
+
+        const temp = new ctor();
+        const typeId = temp.getTypeID();
+        try {
+            let componentData: any = null;
+            let componentId: string | null = null;
+
+            if (context?.loaders?.componentsByEntityType) {
+                const loaderResult = await context.loaders.componentsByEntityType.load({
+                    entityId: this.id,
+                    typeId: typeId
+                });
+                if (loaderResult) {
+                    componentData = loaderResult.data;
+                    componentId = loaderResult.id;
                 }
+            } else {
+                const rows = await db`SELECT id, data FROM components WHERE entity_id = ${this.id} AND type_id = ${typeId} AND deleted_at IS NULL`;
+                if (rows.length > 0) {
+                    componentData = rows[0].data;
+                    componentId = rows[0].id;
+                }
+            }
 
-                if (componentData !== null) {
-                    const comp: any = new ctor();
-                    // Set the component ID from the database
-                    if (componentId) {
-                        comp.id = componentId;
-                    }
-                    const parsedData = typeof componentData === 'string' ? JSON.parse(componentData) : componentData;
-                    Object.assign(comp, parsedData);
-                    // Deserialize Date properties
-                    const storage = getMetadataStorage();
-                    const props = storage.componentProperties.get(typeId);
-                    if (props) {
-                        for (const prop of props) {
-                            if (prop.propertyType === Date && typeof comp[prop.propertyKey] === 'string') {
-                                comp[prop.propertyKey] = new Date(comp[prop.propertyKey]);
-                            }
+            if (componentData !== null) {
+                const comp: any = new ctor();
+                if (componentId) {
+                    comp.id = componentId;
+                }
+                const parsedData = typeof componentData === 'string' ? JSON.parse(componentData) : componentData;
+                Object.assign(comp, parsedData);
+                const storage = getMetadataStorage();
+                const props = storage.componentProperties.get(typeId);
+                if (props) {
+                    for (const prop of props) {
+                        if (prop.propertyType === Date && typeof comp[prop.propertyKey] === 'string') {
+                            comp[prop.propertyKey] = new Date(comp[prop.propertyKey]);
                         }
                     }
-                    comp.setPersisted(true);
-                    comp.setDirty(false);
-                    this.addComponent(comp);
-                    return comp;
-                } else {
-                    return null;
                 }
-            } catch (error) {
-                logger.error(`Failed to fetch component: ${error}`);
+                comp.setPersisted(true);
+                comp.setDirty(false);
+                this.addComponent(comp);
+                return comp as T;
+            } else {
                 return null;
             }
+        } catch (error) {
+            logger.error(`Failed to fetch component ${ctor.name}: ${error}`);
+            return null;
         }
     }
 

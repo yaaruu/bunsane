@@ -109,7 +109,7 @@ describe('Entity.get() with DataLoader Integration', () => {
         const entity = entities[0]!;
 
         // Call with context (DataLoader)
-        const email = await entity.getComponent(DataLoaderTestEmail, { loaders });
+        const email = await entity.getInstanceOf(DataLoaderTestEmail, { loaders });
         expect(email).toBeDefined();
         expect(email?.email).toMatch(/loader\d+@test\.com/);
     });
@@ -124,7 +124,7 @@ describe('Entity.get() with DataLoader Integration', () => {
         const entity = entities[0]!;
 
         // Call without context
-        const email = await entity.getComponent(DataLoaderTestEmail);
+        const email = await entity.getInstanceOf(DataLoaderTestEmail);
         expect(email).toBeDefined();
         expect(email?.email).toMatch(/loader\d+@test\.com/);
     });
