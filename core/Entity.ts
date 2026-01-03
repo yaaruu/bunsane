@@ -526,14 +526,14 @@ export class Entity implements IEntity {
      * @param id Entity ID
      * @returns Entity | null
      */
-    public static async FindById(id: string): Promise<Entity | null> {
+    public static async FindById(id: string, trx?: SQL): Promise<Entity | null> {
         // Validate ID to prevent PostgreSQL UUID parsing errors
         if (!id || typeof id !== 'string' || id.trim() === '') {
             logger.warn(`FindById called with invalid id: "${id}"`);
             return null;
         }
         const { Query } = await import("../query/Query");
-        const entities = await new Query().findById(id).populate().exec()
+        const entities = await new Query(trx).findById(id).populate().exec()
         if(entities.length === 1) {
             return entities[0]!;
         }

@@ -1,5 +1,8 @@
-import { generateTypeId, type BaseComponent } from "./Decorators";
-import ApplicationLifecycle, { ApplicationPhase } from "@/core/ApplicationLifecycle";
+import { generateTypeId } from "./Decorators";
+import { type BaseComponent } from "./BaseComponent";
+import ApplicationLifecycle, {
+    ApplicationPhase,
+} from "@/core/ApplicationLifecycle";
 import {
     CreateComponentPartitionTable,
     GenerateTableName,

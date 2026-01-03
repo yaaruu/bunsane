@@ -701,7 +701,7 @@ export class BaseArcheType {
     public unionMap: Record<string, (new (...args: any[]) => BaseComponent)[]> =
         {};
     protected unionOptions: Record<string, ArcheTypeFieldOptions> = {};
-    public functions: Array<{ propertyKey: string; options?: { returnType?: string } }> = [];
+    public functions: Array<{ propertyKey: string; options?: { returnType?: string, args?: [{name: string, type: any, nullable: boolean}] } }> = [];
 
     public resolver?: {
         fields: Record<string, ArcheTypeResolver>;
@@ -2396,7 +2396,7 @@ export class BaseArcheType {
                         const caseInsensitivePattern = new RegExp(`type\\s+([^\\s{]+)\\s*\\{`, 'gi');
                         const allTypes = [...graphqlSchemaString.matchAll(caseInsensitivePattern)];
                         const matchingType = allTypes.find(match => 
-                            match[1].toLowerCase() === nameFromStorage.toLowerCase()
+                            match[1]!.toLowerCase() === nameFromStorage.toLowerCase()
                         );
                         if (matchingType && matchingType.index !== undefined) {
                             // Create a fake match object
@@ -2434,7 +2434,7 @@ export class BaseArcheType {
                         
                         const fieldMatch = fieldPattern.exec(typeDefinition);
                         if (fieldMatch) {
-                            const returnType = fieldMatch[3].trim();
+                            const returnType = fieldMatch[3]!.trim();
                             const indent = fieldMatch[1];
                             const replacement = `${indent}${propertyKey}(${argsString}): ${returnType}`;
                             

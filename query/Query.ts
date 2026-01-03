@@ -10,6 +10,7 @@ import { OrNode } from "./OrNode";
 import { preparedStatementCache } from "../database/PreparedStatementCache";
 import { getMetadataStorage } from "../core/metadata";
 import { shouldUseDirectPartition } from "../core/Config";
+import type { SQL } from "bun";
 
 export type FilterOperator = "=" | ">" | "<" | ">=" | "<=" | "!=" | "LIKE" | "IN" | "NOT IN" | string;
 
@@ -57,9 +58,18 @@ class Query {
     private debug: boolean = false;
     private orQuery: OrQuery | null = null;
     private shouldPopulate: boolean = false;
+    private trx: SQL | undefined;
 
-    constructor() {
-        this.context = new QueryContext();
+    constructor(trx?: SQL) {
+        this.trx = trx;
+        this.context = new QueryContext(trx);
+    }
+
+    /**
+     * Get the database connection to use (transaction or default db)
+     */
+    private getDb(): SQL {
+        return this.trx ?? db;
     }
 
     public findById(id: string) {
@@ -264,9 +274,12 @@ class Query {
         // Modify SQL for count
         const countSql = `SELECT COUNT(*) as count FROM (${result.sql}) AS subquery`;
 
+        // Get the database connection (transaction or default)
+        const dbConn = this.getDb();
+
         // Check prepared statement cache
         const cacheKey = this.context.generateCacheKey();
-        const { statement, isHit } = await preparedStatementCache.getOrCreate(countSql, cacheKey, db);
+        const { statement, isHit } = await preparedStatementCache.getOrCreate(countSql, cacheKey, dbConn);
 
         // Debug logging
         if (this.debug) {
@@ -274,6 +287,7 @@ class Query {
             console.log('SQL:', countSql);
             console.log('Params:', result.params);
             console.log('Cache Hit:', isHit);
+            console.log('Using Transaction:', !!this.trx);
             console.log('---');
         }
 
@@ -287,7 +301,7 @@ class Query {
         }
 
         // Execute the count query using prepared statement
-        const countResult = await preparedStatementCache.execute(statement, result.params, db);
+        const countResult = await preparedStatementCache.execute(statement, result.params, dbConn);
 
         // Ensure count is returned as a number (PostgreSQL may return as string)
         const count = countResult[0].count;
@@ -354,12 +368,16 @@ class Query {
         // Execute the DAG
         const result = dag.execute(this.context);
 
+        // Get the database connection (transaction or default)
+        const dbConn = this.getDb();
+
         // Debug logging
         if (this.debug) {
             console.log('🔍 Query Debug:');
             console.log('SQL:', result.sql);
             console.log('Params:', result.params);
             console.log('OR Query:', !!this.orQuery);
+            console.log('Using Transaction:', !!this.trx);
             console.log('---');
         }
 
@@ -387,12 +405,12 @@ class Query {
         if (this.orQuery) {
             // For OR queries, bypass prepared statement cache and execute directly
             // This avoids potential parameter type inference issues with Bun's SQL
-            entities = await db.unsafe(result.sql, result.params);
+            entities = await dbConn.unsafe(result.sql, result.params);
         } else {
             // Check prepared statement cache for regular queries
             const cacheKey = this.context.generateCacheKey();
-            const { statement, isHit } = await preparedStatementCache.getOrCreate(result.sql, cacheKey, db);
-            entities = await preparedStatementCache.execute(statement, result.params, db);
+            const { statement, isHit } = await preparedStatementCache.getOrCreate(result.sql, cacheKey, dbConn);
+            entities = await preparedStatementCache.execute(statement, result.params, dbConn);
         }
 
         // Convert to Entity objects
@@ -442,12 +460,15 @@ class Query {
         const entityIdList = inList(entityIds, 1);
         const typeIdList = inList(componentTypeIds, entityIdList.newParamIndex);
 
+        // Get the database connection (transaction or default)
+        const dbConn = this.getDb();
+
         let components: any[];
         if (shouldUseDirectPartition() && componentTypeIds.length === 1) {
             // Single component type - use direct partition if available
             const partitionTableName = ComponentRegistry.getPartitionTableName(componentTypeIds[0]!);
             if (partitionTableName) {
-                components = await db.unsafe(`
+                components = await dbConn.unsafe(`
                     SELECT id, entity_id, type_id, data
                     FROM ${partitionTableName}
                     WHERE entity_id IN ${entityIdList.sql}
@@ -456,7 +477,7 @@ class Query {
                 `, [...entityIdList.params, ...typeIdList.params]);
             } else {
                 // Fallback to parent table
-                components = await db.unsafe(`
+                components = await dbConn.unsafe(`
                     SELECT id, entity_id, type_id, data
                     FROM components
                     WHERE entity_id IN ${entityIdList.sql}
@@ -466,7 +487,7 @@ class Query {
             }
         } else {
             // Multiple types or direct partition disabled - use parent table
-            components = await db.unsafe(`
+            components = await dbConn.unsafe(`
                 SELECT id, entity_id, type_id, data
                 FROM components
                 WHERE entity_id IN ${entityIdList.sql}
@@ -556,16 +577,20 @@ class Query {
         // Create EXPLAIN ANALYZE query
         const explainSql = `EXPLAIN (ANALYZE${buffers ? ', BUFFERS' : ''}) ${result.sql}`;
 
+        // Get the database connection (transaction or default)
+        const dbConn = this.getDb();
+
         // Debug logging
         if (this.debug) {
             console.log('🔍 Query EXPLAIN ANALYZE Debug:');
             console.log('SQL:', explainSql);
             console.log('Params:', result.params);
+            console.log('Using Transaction:', !!this.trx);
             console.log('---');
         }
 
         // Execute the EXPLAIN ANALYZE query
-        const explainResult = await db.unsafe(explainSql, result.params);
+        const explainResult = await dbConn.unsafe(explainSql, result.params);
 
         // Format the result
         return explainResult.map((row: any) => row['QUERY PLAN']).join('\n');

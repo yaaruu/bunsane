@@ -1,5 +1,6 @@
 import { ComponentRegistry, type BaseComponent, type ComponentDataType } from "@/core/components";
 import { FilterBuilderRegistry } from "./FilterBuilderRegistry";
+import type { SQL } from "bun";
 
 export interface QueryFilter {
     field: string;
@@ -30,6 +31,18 @@ export class QueryContext {
     public hasCTE: boolean = false;
     public cteName: string = "";
     public eagerComponents: Set<string> = new Set();
+
+    private trx: SQL | undefined;
+    constructor(trx?: SQL) {
+        this.trx = trx;
+    }
+
+    /**
+     * Get the database connection (transaction or default db)
+     */
+    public getDb(): SQL | undefined {
+        return this.trx;
+    }
 
     public getNextAlias(prefix: string = "t"): string {
         const count = this.tableAliases.size;
