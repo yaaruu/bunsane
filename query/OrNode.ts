@@ -2,7 +2,7 @@ import { QueryNode } from "./QueryNode";
 import type { QueryResult } from "./QueryNode";
 import { QueryContext } from "./QueryContext";
 import { OrQuery } from "./OrQuery";
-import { ComponentRegistry } from "@/core/components";
+import { ComponentRegistry } from "../core/components";
 import { shouldUseDirectPartition } from "../core/Config";
 
 export class OrNode extends QueryNode {

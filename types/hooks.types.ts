@@ -3,7 +3,7 @@
  */
 
 import type { Entity } from "../core/Entity";
-import type { BaseComponent } from "@/core/components";
+import type { BaseComponent } from "../core/components";
 import type {
     EntityEvent,
     ComponentEvent,

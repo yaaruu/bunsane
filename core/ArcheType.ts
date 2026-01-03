@@ -1,4 +1,4 @@
-import type { BaseComponent, ComponentDataType } from "@/core/components";
+import type { BaseComponent, ComponentDataType } from "./components";
 import type { ComponentPropertyMetadata } from "./metadata/definitions/Component";
 import type { ArcheTypeFieldOptions, ArcheTypeFunctionMetadata } from "./metadata/definitions/ArcheType";
 import type { GetEntityOptions } from "../types/archetype.types";

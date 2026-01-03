@@ -1,4 +1,4 @@
-import { UploadManager } from "@/upload";
+import { UploadManager } from "../upload";
 import { UploadComponent, ImageMetadataComponent } from "../upload/UploadComponent";
 import { Entity } from "../core/Entity";
 import type { UploadConfiguration, UploadResult, BatchUploadResult } from "../types/upload.types";

@@ -1,4 +1,4 @@
-import {ComponentRegistry , type BaseComponent, type ComponentDataType } from "@/core/components";
+import {ComponentRegistry , type BaseComponent, type ComponentDataType } from "../core/components";
 import { Entity } from "../core/Entity";
 import { logger } from "../core/Logger";
 import db from "../database";

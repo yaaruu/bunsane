@@ -8,7 +8,7 @@ import {
     UpdateComponentIndexes,
     EnsureDatabaseMigrations,
 } from "database/DatabaseHelper";
-import { ComponentRegistry } from "@/core/components";
+import { ComponentRegistry } from "./components";
 import { logger as MainLogger } from "core/Logger";
 import { getSerializedMetadataStorage } from "core/metadata";
 const logger = MainLogger.child({ scope: "App" });

@@ -1,5 +1,5 @@
-import { BaseComponent, Component, CompData } from "@/core/components";
-import type { UploadResult } from "@/types/upload.types";
+import { BaseComponent, Component, CompData } from "../core/components";
+import type { UploadResult } from "../types/upload.types";
 
 /**
  * UploadComponent - Stores file upload metadata in entities

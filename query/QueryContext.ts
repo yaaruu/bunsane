@@ -1,4 +1,4 @@
-import { ComponentRegistry, type BaseComponent, type ComponentDataType } from "@/core/components";
+import { ComponentRegistry, type BaseComponent, type ComponentDataType } from "../core/components";
 import { FilterBuilderRegistry } from "./FilterBuilderRegistry";
 import type { SQL } from "bun";
 

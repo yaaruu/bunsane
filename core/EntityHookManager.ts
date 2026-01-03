@@ -1,5 +1,5 @@
 import type { Entity } from "./Entity";
-import { type BaseComponent } from "@/core/components";
+import { type BaseComponent } from "./components";
 import ArcheType from "./ArcheType";
 import {
     EntityLifecycleEvent,

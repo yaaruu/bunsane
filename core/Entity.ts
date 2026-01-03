@@ -1,8 +1,8 @@
-import type { ComponentDataType, ComponentGetter, BaseComponent } from "@/core/components";
+import type { ComponentDataType, ComponentGetter, BaseComponent } from "./components";
 import { logger } from "./Logger";
 import db from "database";
 import EntityManager from "./EntityManager";
-import ComponentRegistry from "@/core/components/ComponentRegistry";
+import ComponentRegistry from "./components/ComponentRegistry";
 import { uuidv7 } from "utils/uuid";
 import { sql, SQL } from "bun";
 // import Query from "./Query"; // Lazy import to avoid cycle
@@ -128,13 +128,14 @@ export class Entity implements IEntity {
         
         return false;
     }
+
     /**
      * Get component data from entity. Loads from DB if not cached.
      * @param ctor Component constructor
-     * @param context Optional DataLoader context
+     * @param context Optional DataLoader context and/or transaction
      * @returns Component data or null
      */
-    public async get<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any } }): Promise<ComponentDataType<T> | null> {
+    public async get<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }): Promise<ComponentDataType<T> | null> {
         const comp = await this._loadComponent(ctor, context);
         return comp ? (comp as ComponentGetter<T>).data() : null;
     }
@@ -142,14 +143,14 @@ export class Entity implements IEntity {
     /**
      * Get component instance from entity. Loads from DB if not cached.
      * @param ctor Constructor of the component to fetch
-     * @param context Optional DataLoader context
+     * @param context Optional DataLoader context and/or transaction
      * @returns Component instance or null
      */
-    public async getInstanceOf<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any } }): Promise<T | null> {
+    public async getInstanceOf<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }): Promise<T | null> {
         return this._loadComponent(ctor, context);
     }
 
-    private async _loadComponent<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any } }): Promise<T | null> {
+    private async _loadComponent<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }): Promise<T | null> {
         const comp = Array.from(this.components.values()).find(comp => comp instanceof ctor) as T | undefined;
         if (typeof comp !== "undefined") {
             return comp;
@@ -163,6 +164,10 @@ export class Entity implements IEntity {
 
         const temp = new ctor();
         const typeId = temp.getTypeID();
+        
+        // Use transaction if provided, otherwise use default db
+        const dbConn = context?.trx ?? db;
+        
         try {
             let componentData: any = null;
             let componentId: string | null = null;
@@ -177,7 +182,7 @@ export class Entity implements IEntity {
                     componentId = loaderResult.id;
                 }
             } else {
-                const rows = await db`SELECT id, data FROM components WHERE entity_id = ${this.id} AND type_id = ${typeId} AND deleted_at IS NULL`;
+                const rows = await dbConn`SELECT id, data FROM components WHERE entity_id = ${this.id} AND type_id = ${typeId} AND deleted_at IS NULL`;
                 if (rows.length > 0) {
                     componentData = rows[0].data;
                     componentId = rows[0].id;

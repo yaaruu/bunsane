@@ -2,21 +2,21 @@ import { generateTypeId } from "./Decorators";
 import { type BaseComponent } from "./BaseComponent";
 import ApplicationLifecycle, {
     ApplicationPhase,
-} from "@/core/ApplicationLifecycle";
+} from "../ApplicationLifecycle";
 import {
     CreateComponentPartitionTable,
     GenerateTableName,
     UpdateComponentIndexes,
     AnalyzeAllComponentTables,
     GetPartitionStrategy,
-} from "@/database/DatabaseHelper";
+} from "../../database/DatabaseHelper";
 import { ensureMultipleJSONBPathIndexes } from "database/IndexingStrategy";
 import { GetSchema } from "database/DatabaseHelper";
-import { logger as MainLogger } from "@/core/Logger";
-import { getMetadataStorage } from "@/core/metadata";
-import { registerDecoratedHooks } from "@/core/decorators/EntityHooks";
-import ServiceRegistry from "@/service/ServiceRegistry";
-import { preparedStatementCache } from "@/database/PreparedStatementCache";
+import { logger as MainLogger } from "../Logger";
+import { getMetadataStorage } from "../metadata";
+import { registerDecoratedHooks } from "../decorators/EntityHooks";
+import ServiceRegistry from "../../service/ServiceRegistry";
+import { preparedStatementCache } from "../../database/PreparedStatementCache";
 const logger = MainLogger.child({ scope: "ComponentRegistry" });
 
 type ComponentConstructor = new () => BaseComponent;

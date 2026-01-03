@@ -1,7 +1,7 @@
 import { logger as MainLogger } from "../core/Logger";
-import { uuidv7 } from "@/utils/uuid";
-import type { StorageProvider } from "@/storage/StorageProvider";
-import { LocalStorageProvider } from "@/storage/LocalStorageProvider";
+import { uuidv7 } from "../utils/uuid";
+import type { StorageProvider } from "../storage/StorageProvider";
+import { LocalStorageProvider } from "../storage/LocalStorageProvider";
 import type { UploadConfiguration, UploadResult, UploadError, FileMetadata } from "../types/upload.types";
 import { FileValidator } from "./FileValidator";
 

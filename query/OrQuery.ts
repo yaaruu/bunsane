@@ -1,4 +1,4 @@
-import type { BaseComponent } from "@/core/components";
+import type { BaseComponent } from "../core/components";
 import type { QueryFilter } from "./Query";
 
 export interface OrBranch {

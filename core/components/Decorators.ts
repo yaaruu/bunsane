@@ -1,10 +1,10 @@
 import { createHash } from 'crypto';
 import "reflect-metadata";
-import { logger as MainLogger } from "@/core/Logger";
+import { logger as MainLogger } from "../Logger";
 import ComponentRegistry from "./ComponentRegistry";
 import { type ComponentDataType } from './Interfaces';
 import { uuidv7 } from 'utils/uuid';
-import { getMetadataStorage } from '@/core/metadata';
+import { getMetadataStorage } from '../metadata';
 const logger = MainLogger.child({ scope: "Components" });
 import BaseComponent from './BaseComponent';
 

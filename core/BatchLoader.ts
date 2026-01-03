@@ -1,5 +1,5 @@
 import { Entity } from "core/Entity";
-import { BaseComponent } from "@/core/components";
+import { BaseComponent } from "./components";
 import { timed } from "./Decorators";
 import db from "../database";
 import { sql } from "bun";

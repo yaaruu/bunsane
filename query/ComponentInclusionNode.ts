@@ -3,7 +3,7 @@ import type { QueryResult } from "./QueryNode";
 import { QueryContext } from "./QueryContext";
 import { shouldUseLateralJoins, shouldUseDirectPartition } from "../core/Config";
 import { FilterBuilderRegistry } from "./FilterBuilderRegistry";
-import {ComponentRegistry} from "@/core/components";
+import {ComponentRegistry} from "../core/components";
 
 export class ComponentInclusionNode extends QueryNode {
     private getComponentTableName(compId: string): string {
