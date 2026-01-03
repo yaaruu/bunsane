@@ -399,8 +399,24 @@ export class ComponentInclusionNode extends QueryNode {
                     const lateralAlias = `lat_${compIdShort}_${fieldShort}_${lateralJoins.length}`;
                     
                     const componentTableName = this.getComponentTableName(compId);
-                    lateralJoins.push(
-                        `CROSS JOIN LATERAL (
+                    const useDirectPartition = shouldUseDirectPartition() && componentTableName !== 'components';
+                    
+                    if (useDirectPartition) {
+                        // Direct partition access - query partition table directly by entity_id
+                        lateralJoins.push(
+                            `CROSS JOIN LATERAL (
+                            SELECT 1 FROM ${componentTableName} c
+                            WHERE c.entity_id = ${tableAlias}.entity_id
+                            AND c.type_id = $${componentParamIndices.has(compId) ? componentParamIndices.get(compId) : context.addParam(compId)}::text
+                            AND ${condition}
+                            AND c.deleted_at IS NULL
+                            LIMIT 1
+                        ) AS ${lateralAlias}`
+                        );
+                    } else {
+                        // Use entity_components junction table
+                        lateralJoins.push(
+                            `CROSS JOIN LATERAL (
                             SELECT 1 FROM entity_components ec_f
                             JOIN ${componentTableName} c ON ec_f.component_id = c.id
                             WHERE ec_f.entity_id = ${tableAlias}.entity_id
@@ -410,12 +426,26 @@ export class ComponentInclusionNode extends QueryNode {
                             AND c.deleted_at IS NULL
                             LIMIT 1
                         ) AS ${lateralAlias}`
-                    );
+                        );
+                    }
                     lateralConditions.push(`${lateralAlias} IS NOT NULL`);
                 } else {
                     // Use traditional EXISTS subquery
                     const componentTableName = this.getComponentTableName(compId);
-                    sql += ` ${whereKeyword} EXISTS (
+                    const useDirectPartition = shouldUseDirectPartition() && componentTableName !== 'components';
+                    
+                    if (useDirectPartition) {
+                        // Direct partition access - query partition table directly by entity_id
+                        sql += ` ${whereKeyword} EXISTS (
+                        SELECT 1 FROM ${componentTableName} c
+                        WHERE c.entity_id = ${tableAlias}.entity_id
+                        AND c.type_id = $${componentParamIndices.has(compId) ? componentParamIndices.get(compId) : context.addParam(compId)}::text
+                        AND ${condition}
+                        AND c.deleted_at IS NULL
+                    )`;
+                    } else {
+                        // Use entity_components junction table
+                        sql += ` ${whereKeyword} EXISTS (
                         SELECT 1 FROM entity_components ec_f
                         JOIN ${componentTableName} c ON ec_f.component_id = c.id
                         WHERE ec_f.entity_id = ${tableAlias}.entity_id
@@ -424,6 +454,7 @@ export class ComponentInclusionNode extends QueryNode {
                         AND ec_f.deleted_at IS NULL
                         AND c.deleted_at IS NULL
                     )`;
+                    }
                 }
             }
         }
