@@ -474,6 +474,22 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
                 // Handle objects recursively - ALWAYS register nested objects with GQLoom
                 // because after .omit()/.extend() the schema tree loses _zod metadata
                 if (typeName === 'ZodObject' || typeName === 'object') {
+                    // Only check for matching registered types on NESTED objects (path.length > 0)
+                    // Root-level input types should always use their own generated name
+                    // This prevents operations like reverseGeocoding({ latitude, longitude }) from
+                    // incorrectly matching ST_PointInput
+                    if (path.length > 0) {
+                        const { findMatchingInputType } = require('../../core/ArcheType');
+                        const matchingTypeName = findMatchingInputType(schema);
+                        
+                        if (matchingTypeName) {
+                            // Reuse the registered type - register with the existing type name
+                            const registeredSchema = schema.register(asObjectType, { name: matchingTypeName });
+                            logger.trace(`Matched nested object to registered type: ${matchingTypeName} at path ${path.join('.')}`);
+                            return registeredSchema;
+                        }
+                    }
+                    
                     let shape;
                     try {
                         shape = typeof schema._def.shape === 'function' ? schema._def.shape() : schema._def.shape;
@@ -509,6 +525,19 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
                         // Always create new object and register with GQLoom
                         // This ensures all nested objects have proper _zod metadata
                         const newSchema = z.object(processedShape);
+                        
+                        // Check again after processing children - the processed schema might match a registered type
+                        // Only for nested objects (path.length > 0), not root-level inputs
+                        if (path.length > 0) {
+                            const { findMatchingInputType } = require('../../core/ArcheType');
+                            const processedMatchingTypeName = findMatchingInputType(newSchema);
+                            if (processedMatchingTypeName) {
+                                const registeredSchema = newSchema.register(asObjectType, { name: processedMatchingTypeName });
+                                logger.trace(`Matched processed nested object to registered type: ${processedMatchingTypeName} at path ${path.join('.')}`);
+                                return registeredSchema;
+                            }
+                        }
+                        
                         // Remove 'Input' suffix from inputName to avoid duplication when building nested type name
                         const baseInputName = inputName.replace(/Input$/, '');
                         const nestedTypeName = path.length > 0 ? `${baseInputName}_${path.join('_')}Input` : inputName;

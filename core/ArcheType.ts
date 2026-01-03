@@ -46,6 +46,21 @@ const customTypeSilks = new Map<string, any>(); // Store silk types for unified 
 const customTypeResolvers: any[] = []; // Store resolvers for custom types
 const inputTypeRegistry = new Map<any, string>(); // Map from type to input type name (e.g., ST_Point -> ST_PointInput)
 
+// Structural signature registry for input type deduplication
+// Maps structural signature -> registered input type name
+const structuralSignatureRegistry = new Map<string, string>();
+
+// Import will be done lazily to avoid circular dependencies
+let _generateZodStructuralSignature: ((schema: any) => string) | null = null;
+
+function getSignatureGenerator(): (schema: any) => string {
+    if (!_generateZodStructuralSignature) {
+        const { generateZodStructuralSignature } = require('../gql/utils/TypeSignature');
+        _generateZodStructuralSignature = generateZodStructuralSignature;
+    }
+    return _generateZodStructuralSignature!;
+}
+
 // Component-level schema cache
 const componentSchemaCache = new Map<string, ZodObject<any>>(); // componentId -> Zod schema
 
@@ -84,6 +99,15 @@ export function registerCustomZodType(
             const inputSchema = z.object(shape).register(asObjectType, { name: inputTypeName });
             registeredCustomTypes.set(inputTypeName, inputSchema);
             inputTypeRegistry.set(type, inputTypeName);
+            
+            // Register structural signature for input type deduplication
+            try {
+                const generateSignature = getSignatureGenerator();
+                const signature = generateSignature(z.object(shape));
+                structuralSignatureRegistry.set(signature, inputTypeName);
+            } catch (e) {
+                // Signature registration is optional, don't fail if it errors
+            }
         }
     } else {
         customTypeRegistry.set(type, schema);
@@ -97,6 +121,15 @@ export function registerCustomZodType(
             const inputSchema = schema.register(asObjectType, { name: inputTypeName });
             registeredCustomTypes.set(inputTypeName, inputSchema);
             inputTypeRegistry.set(type, inputTypeName);
+            
+            // Register structural signature for input type deduplication
+            try {
+                const generateSignature = getSignatureGenerator();
+                const signature = generateSignature(schema);
+                structuralSignatureRegistry.set(signature, inputTypeName);
+            } catch (e) {
+                // Signature registration is optional, don't fail if it errors
+            }
         }
     }
 }
@@ -114,6 +147,33 @@ export function getAllArchetypeSchemas() {
 
 export function getRegisteredCustomTypes() {
     return registeredCustomTypes;
+}
+
+/**
+ * Find a matching registered input type for a given Zod schema based on structural equivalence.
+ * This enables deduplication of input types that have the same structure but were created
+ * through different transformations (.omit(), .extend(), etc.)
+ * 
+ * @param schema - The Zod schema to find a match for
+ * @returns The registered input type name if found, null otherwise
+ */
+export function findMatchingInputType(schema: any): string | null {
+    if (!schema) return null;
+    
+    try {
+        const generateSignature = getSignatureGenerator();
+        const signature = generateSignature(schema);
+        return structuralSignatureRegistry.get(signature) || null;
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * Get the structural signature registry (for debugging/testing purposes)
+ */
+export function getStructuralSignatureRegistry(): Map<string, string> {
+    return structuralSignatureRegistry;
 }
 
 export function weaveAllArchetypes() {
