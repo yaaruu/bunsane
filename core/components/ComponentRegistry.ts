@@ -128,6 +128,17 @@ class ComponentRegistry {
         return this.typeIdToName.get(typeId);
     }
 
+    /**
+     * Get component constructor by component name
+     * @param name Component class name
+     * @returns Component constructor or undefined
+     */
+    getConstructorByName(name: string): ComponentConstructor | undefined {
+        const typeId = this.componentsMap.get(name);
+        if (!typeId) return undefined;
+        return this.typeIdToCtor.get(typeId);
+    }
+
     getPartitionTableName(typeId: string): string | null {
         const name = this.typeIdToName.get(typeId);
         if (!name) return null;

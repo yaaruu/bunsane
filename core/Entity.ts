@@ -88,6 +88,27 @@ export class Entity implements IEntity {
                 logger.error(`Error firing component updated hook for ${component.getTypeID()}: ${error}`);
                 // Don't fail the set operation if hooks fail
             }
+            
+            // Handle cache operations for component update
+            setImmediate(async () => {
+                try {
+                    const { CacheManager } = await import('./cache/CacheManager');
+                    const cacheManager = CacheManager.getInstance();
+                    const config = cacheManager.getConfig();
+                    
+                    if (config.enabled && config.component?.enabled) {
+                        if (config.strategy === 'write-through') {
+                            // Write-through: update cache with new component data
+                            await cacheManager.setComponentWriteThrough(this.id, [component], component.getTypeID(), config.component.ttl);
+                        } else {
+                            // Write-invalidate: remove from cache
+                            await cacheManager.invalidateComponent(this.id, component.getTypeID());
+                        }
+                    }
+                } catch (error) {
+                    logger.warn({ scope: 'cache', component: 'Entity', msg: 'Cache operation failed after set', error });
+                }
+            });
         } else {
             // Add new component
             this.add(ctor, data);
@@ -108,20 +129,37 @@ export class Entity implements IEntity {
         const component = Array.from(this.components.values()).find(comp => comp instanceof ctor) as T;
         
         if (component) {
+            const typeId = component.getTypeID();
+            
             // Track the component type for database deletion
-            this.removedComponents.add(component.getTypeID());
+            this.removedComponents.add(typeId);
             
             // Remove the component from the map
-            this.components.delete(component.getTypeID());
+            this.components.delete(typeId);
             this._dirty = true;
             
             // Fire component removed event
             try {
                 EntityHookManager.executeHooks(new ComponentRemovedEvent(this, component));
             } catch (error) {
-                logger.error(`Error firing component removed hook for ${component.getTypeID()}: ${error}`);
+                logger.error(`Error firing component removed hook for ${typeId}: ${error}`);
                 // Don't fail the remove operation if hooks fail
             }
+            
+            // Invalidate cache for removed component
+            setImmediate(async () => {
+                try {
+                    const { CacheManager } = await import('./cache/CacheManager');
+                    const cacheManager = CacheManager.getInstance();
+                    const config = cacheManager.getConfig();
+                    
+                    if (config.enabled && config.component?.enabled) {
+                        await cacheManager.invalidateComponent(this.id, typeId);
+                    }
+                } catch (error) {
+                    logger.warn({ scope: 'cache', component: 'Entity', msg: 'Cache invalidation failed after remove', error });
+                }
+            });
             
             return true;
         }
@@ -227,11 +265,16 @@ export class Entity implements IEntity {
                 reject(new Error(`Entity save timeout for entity ${this.id}`));
             }, 30000); // 30 second timeout
 
+            // Capture dirty components BEFORE doSave clears the dirty flags
+            const changedComponentTypeIds = this.getDirtyComponents();
+            const removedComponentTypeIds = Array.from(this.removedComponents);
+
             if (trx) {
                 // Use provided transaction
                 this.doSave(trx)
                 .then(result => {
                     clearTimeout(timeout);
+                    this.handleCacheAfterSave(changedComponentTypeIds, removedComponentTypeIds);
                     resolve(result);
                 })
                 .catch(error => {
@@ -245,6 +288,7 @@ export class Entity implements IEntity {
                 })
                 .then(result => {
                     clearTimeout(timeout);
+                    this.handleCacheAfterSave(changedComponentTypeIds, removedComponentTypeIds);
                     resolve(result);
                 })
                 .catch(error => {
@@ -253,6 +297,55 @@ export class Entity implements IEntity {
                 });
             }
         });
+    }
+
+    /**
+     * Handle cache operations after successful save
+     * @param changedComponentTypeIds - Component type IDs that were dirty before save (captured before doSave clears flags)
+     * @param removedComponentTypeIds - Component type IDs that were removed (captured before doSave clears the set)
+     */
+    private async handleCacheAfterSave(changedComponentTypeIds: string[], removedComponentTypeIds: string[]): Promise<void> {
+        try {
+            // Import CacheManager dynamically to avoid circular dependency
+            const { CacheManager } = await import('./cache/CacheManager');
+            const cacheManager = CacheManager.getInstance();
+            const config = cacheManager.getConfig();
+
+            if (config.enabled && config.entity?.enabled) {
+                // Always update entity existence cache
+                if (config.strategy === 'write-through') {
+                    await cacheManager.setEntityWriteThrough(this, config.entity.ttl);
+                } else {
+                    await cacheManager.invalidateEntity(this.id);
+                }
+            }
+
+            // Handle component cache invalidation with granular approach
+            if (config.enabled && config.component?.enabled) {
+                // Use the pre-captured lists instead of re-querying (dirty flags are already cleared by doSave)
+
+                // Invalidate cache for changed components
+                for (const typeId of changedComponentTypeIds) {
+                    if (config.strategy === 'write-through') {
+                        // Update component cache with new data
+                        const component = this.components.get(typeId);
+                        if (component) {
+                            await cacheManager.setComponentWriteThrough(this.id, [component], typeId, config.component.ttl);
+                        }
+                    } else {
+                        // Invalidate component cache
+                        await cacheManager.invalidateComponent(this.id, typeId);
+                    }
+                }
+
+                // Invalidate cache for removed components
+                for (const typeId of removedComponentTypeIds) {
+                    await cacheManager.invalidateComponent(this.id, typeId);
+                }
+            }
+        } catch (error) {
+            logger.warn({ scope: 'cache', component: 'Entity', msg: 'Cache operation failed after save', error });
+        }
     }
 
     public doSave(trx: SQL) {
@@ -456,6 +549,22 @@ export class Entity implements IEntity {
                     // Don't fail the delete operation if hooks fail
                 }
 
+                // Invalidate cache after successful deletion
+                try {
+                    const { CacheManager } = await import('./cache/CacheManager');
+                    const cacheManager = CacheManager.getInstance();
+                    const config = cacheManager.getConfig();
+
+                    if (config.enabled && config.entity?.enabled) {
+                        await cacheManager.invalidateEntity(this.id);
+                    }
+                    if (config.enabled && config.component?.enabled) {
+                        await cacheManager.invalidateAllEntityComponents(this.id);
+                    }
+                } catch (error) {
+                    logger.warn({ scope: 'cache', component: 'Entity', msg: 'Cache invalidation failed after delete', error });
+                }
+
                 resolve(true);
             } catch (error) {
                 logger.error(`Failed to delete entity: ${error}`);
@@ -478,7 +587,9 @@ export class Entity implements IEntity {
     private getDirtyComponents(): string[] {
         const dirtyComponents: string[] = [];
         for (const component of this.components.values()) {
-            if ((component as any)._dirty) {
+            // Include both dirty (modified) components AND new (not persisted) components
+            // New components need to be cached after save, not just modified ones
+            if ((component as any)._dirty || !(component as any)._persisted) {
                 dirtyComponents.push(component.getTypeID());
             }
         }
@@ -626,6 +737,57 @@ export class Entity implements IEntity {
             id: this.id,
             components
         };
+    }
+
+    /**
+     * Deserialize/reconstitute an Entity from cached/serialized data.
+     * Handles both serialized format { id, components } and raw Entity-like objects.
+     * @param data Serialized entity data or Entity-like plain object
+     * @returns Reconstituted Entity instance
+     */
+    public static deserialize(data: any): Entity {
+        if (data instanceof Entity) {
+            return data;
+        }
+
+        const entity = new Entity(data.id);
+        entity._persisted = true;
+        entity._dirty = false;
+
+        // Handle serialized format: { id, components: { ComponentName: {...data} } }
+        if (data.components && typeof data.components === 'object') {
+            const storage = getMetadataStorage();
+            
+            for (const [componentName, componentData] of Object.entries(data.components)) {
+                // Find the component constructor by name
+                const ComponentCtor = ComponentRegistry.getConstructorByName(componentName);
+                if (!ComponentCtor) {
+                    logger.warn(`Cannot deserialize component: constructor not found for ${componentName}`);
+                    continue;
+                }
+
+                const comp = new ComponentCtor();
+                const parsedData = typeof componentData === 'string' ? JSON.parse(componentData) : componentData;
+                Object.assign(comp, parsedData);
+
+                // Restore Date objects
+                const typeId = comp.getTypeID();
+                const props = storage.componentProperties.get(typeId);
+                if (props) {
+                    for (const prop of props) {
+                        if (prop.propertyType === Date && typeof (comp as any)[prop.propertyKey] === 'string') {
+                            (comp as any)[prop.propertyKey] = new Date((comp as any)[prop.propertyKey]);
+                        }
+                    }
+                }
+
+                comp.setPersisted(true);
+                comp.setDirty(false);
+                entity.addComponent(comp);
+            }
+        }
+
+        return entity;
     }
 
 

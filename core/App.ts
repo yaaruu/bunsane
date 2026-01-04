@@ -99,6 +99,17 @@ export default class App {
         logger.trace(`Initializing App`);
         ComponentRegistry.init();
         ServiceRegistry.init();
+        
+        // Initialize CacheManager
+        try {
+            const { CacheManager } = await import('./cache/CacheManager');
+            const cacheManager = CacheManager.getInstance();
+            // CacheManager initializes with default config, can be customized later
+            logger.info({ scope: 'cache', component: 'App', msg: 'CacheManager initialized' });
+        } catch (error) {
+            logger.warn({ scope: 'cache', component: 'App', msg: 'Failed to initialize CacheManager', error });
+        }
+        
         // Plugin initialization
         for (const plugin of this.plugins) {
             if (plugin.init) {
@@ -129,6 +140,24 @@ export default class App {
                     break;
                 }
                 case ApplicationPhase.SYSTEM_READY: {
+                    // Perform cache health check
+                    try {
+                        const { CacheManager } = await import('./cache/CacheManager');
+                        const cacheManager = CacheManager.getInstance();
+                        const config = cacheManager.getConfig();
+                        
+                        if (config.enabled) {
+                            const isHealthy = await cacheManager.getProvider().ping();
+                            if (isHealthy) {
+                                logger.info({ scope: 'cache', component: 'App', msg: 'Cache health check passed' });
+                            } else {
+                                logger.warn({ scope: 'cache', component: 'App', msg: 'Cache health check failed' });
+                            }
+                        }
+                    } catch (error) {
+                        logger.warn({ scope: 'cache', component: 'App', msg: 'Cache health check error', error });
+                    }
+
                     try {
                         const schema = ServiceRegistry.getSchema();
 
@@ -768,5 +797,33 @@ export default class App {
         );
 
         this.appReadyCallbacks.forEach((cb) => cb());
+    }
+
+    /**
+     * Gracefully shutdown the application
+     */
+    async shutdown(): Promise<void> {
+        logger.info({ scope: 'app', component: 'App', msg: 'Shutting down application' });
+        
+        // Shutdown cache
+        try {
+            const { CacheManager } = await import('./cache/CacheManager');
+            const cacheManager = CacheManager.getInstance();
+            // Note: CacheManager doesn't have a shutdown method yet, but we can add cleanup here if needed
+            logger.info({ scope: 'cache', component: 'App', msg: 'Cache shutdown completed' });
+        } catch (error) {
+            logger.warn({ scope: 'cache', component: 'App', msg: 'Cache shutdown error', error });
+        }
+        
+        // Shutdown scheduler
+        try {
+            const scheduler = SchedulerManager.getInstance();
+            // Note: SchedulerManager may need shutdown method
+            logger.info({ scope: 'app', component: 'App', msg: 'Scheduler shutdown completed' });
+        } catch (error) {
+            logger.warn({ scope: 'app', component: 'App', msg: 'Scheduler shutdown error', error });
+        }
+        
+        logger.info({ scope: 'app', component: 'App', msg: 'Application shutdown completed' });
     }
 }

@@ -441,7 +441,9 @@ class Query {
         }
 
         // Return entities in the same order as the query results
-        return entityIds.map(id => entityMap.get(id)!);
+        const finalEntities = entityIds.map(id => entityMap.get(id)!);
+
+        return finalEntities;
     }
 
     /**

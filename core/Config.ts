@@ -6,7 +6,6 @@
 export interface BunsaneConfig {
     // Query optimization settings
     useLateralJoins: boolean;
-    queryCacheSize: number;
     partitionStrategy: 'list' | 'hash';
     useDirectPartition: boolean;
 
@@ -28,7 +27,6 @@ export interface BunsaneConfig {
  */
 const DEFAULT_CONFIG: BunsaneConfig = {
     useLateralJoins: true, // Default to true for PG12+
-    queryCacheSize: 100,
     partitionStrategy: 'list', // LIST partitioning - one partition per component type
     useDirectPartition: true,  // Direct partition access - queries go directly to partition tables
     appPort: 3000,
@@ -61,7 +59,6 @@ class ConfigManager {
     private loadConfig(): BunsaneConfig {
         return {
             useLateralJoins: this.parseBoolean(process.env.BUNSANE_USE_LATERAL_JOINS, DEFAULT_CONFIG.useLateralJoins),
-            queryCacheSize: this.parseNumber(process.env.BUNSANE_QUERY_CACHE_SIZE, DEFAULT_CONFIG.queryCacheSize),
             partitionStrategy: this.parsePartitionStrategy(process.env.BUNSANE_PARTITION_STRATEGY, DEFAULT_CONFIG.partitionStrategy),
             useDirectPartition: this.parseBoolean(process.env.BUNSANE_USE_DIRECT_PARTITION, DEFAULT_CONFIG.useDirectPartition),
             databaseUrl: process.env.DATABASE_URL,
@@ -119,13 +116,6 @@ class ConfigManager {
     }
 
     /**
-     * Get query cache size
-     */
-    public getQueryCacheSize(): number {
-        return this.config.queryCacheSize;
-    }
-
-    /**
      * Get partition strategy
      */
     public getPartitionStrategy(): 'list' | 'hash' {
@@ -157,7 +147,6 @@ export const config = ConfigManager.getInstance();
  */
 export const shouldUseLateralJoins = () => config.shouldUseLateralJoins();
 export const isDebugMode = () => config.isDebugMode();
-export const getQueryCacheSize = () => config.getQueryCacheSize();
 export const getPartitionStrategy = () => config.getPartitionStrategy();
 export const shouldUseDirectPartition = () => config.shouldUseDirectPartition();
 
