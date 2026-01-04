@@ -264,7 +264,47 @@ export class Entity implements IEntity {
             }
 
             if(!this._dirty) {
-                logger.trace("Entity is not dirty, no need to save.");
+                let dirtyComponents: string[] = [];
+                try {
+                    dirtyComponents = this.getDirtyComponents();
+                } catch {
+                    // best-effort diagnostics only
+                }
+
+                const removedTypeIds = Array.from(this.removedComponents);
+                const entityType = (this as any)?.constructor?.name ?? "Entity";
+                const dirtyComponentPreview = dirtyComponents.slice(0, 10).map((component) => {
+                    const anyComponent = component as any;
+                    return {
+                        type: anyComponent?.constructor?.name ?? "Component",
+                        typeId: typeof anyComponent?.getTypeID === "function" ? anyComponent.getTypeID() : undefined,
+                        id: anyComponent?.id,
+                        persisted: anyComponent?._persisted,
+                        dirty: anyComponent?._dirty,
+                    };
+                });
+
+                logger.trace(
+                    {
+                        component: "Entity",
+                        entity: {
+                            type: entityType,
+                            id: this.id,
+                            persisted: this._persisted,
+                            dirty: this._dirty,
+                        },
+                        components: {
+                            total: this.components.size,
+                            dirtyCount: dirtyComponents.length,
+                            dirtyPreview: dirtyComponentPreview,
+                        },
+                        removedComponents: {
+                            count: removedTypeIds.length,
+                            typeIdsPreview: removedTypeIds.slice(0, 10),
+                        },
+                    },
+                    "[Entity.doSave] Skipping save because entity is not dirty"
+                );
                 return resolve(true);
             }
 
