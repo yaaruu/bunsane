@@ -492,6 +492,7 @@ export class Entity implements IEntity {
                             logger.error(`Cannot update component: id is empty or invalid. Component data: ${JSON.stringify(comp.data).substring(0, 200)}`);
                             throw new Error(`Cannot update component: component id is empty or invalid`);
                         }
+                        logger.trace({ componentId: comp.id, data: comp.data }, `[Entity.doSave] Updating component`);
                         await saveTrx`UPDATE components SET data = ${comp.data} WHERE id = ${comp.id}`;
                     }
                 }
