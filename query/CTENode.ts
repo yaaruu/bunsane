@@ -40,11 +40,33 @@ export class CTENode extends QueryNode {
             cteSql += `    AND ec.entity_id NOT IN (${entityPlaceholders})\n`;
         }
 
+        // Group by entity_id to count distinct component types
+        // This ensures entities have ALL required components
+        cteSql += `    GROUP BY ec.entity_id\n`;
+        cteSql += `    HAVING COUNT(DISTINCT ec.type_id) >= $${context.addParam(componentIds.length)}\n`;
+
+        // Add ORDER BY for deterministic pagination results
+        // Must be before LIMIT/OFFSET for consistent page results
+        cteSql += `    ORDER BY ec.entity_id\n`;
+
+        // Add LIMIT/OFFSET at CTE level for proper pagination
+        // This ensures only the needed page of entity IDs is materialized
+        if (context.limit !== null) {
+            cteSql += `    LIMIT $${context.addParam(context.limit)}\n`;
+        }
+        if (context.offsetValue > 0 || context.limit !== null) {
+            // Always include OFFSET when pagination is used for consistent SQL structure
+            cteSql += `    OFFSET $${context.addParam(context.offsetValue)}\n`;
+        }
+
         cteSql += ")";
 
         // Mark CTE as available in context
         context.hasCTE = true;
         context.cteName = "base_entities";
+        
+        // Mark pagination as handled at CTE level to prevent double application
+        context.paginationAppliedInCTE = true;
 
         return {
             sql: cteSql,

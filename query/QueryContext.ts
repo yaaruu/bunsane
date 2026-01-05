@@ -31,6 +31,7 @@ export class QueryContext {
     public hasCTE: boolean = false;
     public cteName: string = "";
     public eagerComponents: Set<string> = new Set();
+    public paginationAppliedInCTE: boolean = false;
 
     private trx: SQL | undefined;
     constructor(trx?: SQL) {
@@ -141,6 +142,7 @@ export class QueryContext {
         clone.hasCTE = this.hasCTE;
         clone.cteName = this.cteName;
         clone.eagerComponents = new Set(this.eagerComponents);
+        clone.paginationAppliedInCTE = this.paginationAppliedInCTE;
         return clone;
     }
 }

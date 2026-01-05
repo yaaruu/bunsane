@@ -100,12 +100,14 @@ export class ComponentInclusionNode extends QueryNode {
                 const tableAlias = useCTE ? context.cteName : "ec";
                 sql += ` ORDER BY ${tableAlias}.entity_id`;
                 
-                // Add LIMIT and OFFSET
-                // Always include OFFSET (even when 0) to ensure consistent SQL structure for prepared statement caching
-                if (context.limit !== null) {
-                    sql += ` LIMIT $${context.addParam(context.limit)}`;
+                // Add LIMIT and OFFSET only if not already applied in CTE
+                // When pagination is applied at CTE level, skip it here to avoid double pagination
+                if (!context.paginationAppliedInCTE) {
+                    if (context.limit !== null) {
+                        sql += ` LIMIT $${context.addParam(context.limit)}`;
+                    }
+                    sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
                 }
-                sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
             }
         } else {
             // Multiple components case
@@ -183,12 +185,14 @@ export class ComponentInclusionNode extends QueryNode {
                 const tableAlias = useCTE ? context.cteName : "ec";
                 sql += ` ORDER BY ${tableAlias}.entity_id`;
                 
-                // Add LIMIT and OFFSET
-                // Always include OFFSET (even when 0) to ensure consistent SQL structure for prepared statement caching
-                if (context.limit !== null) {
-                    sql += ` LIMIT $${context.addParam(context.limit)}`;
+                // Add LIMIT and OFFSET only if not already applied in CTE
+                // When pagination is applied at CTE level, skip it here to avoid double pagination
+                if (!context.paginationAppliedInCTE) {
+                    if (context.limit !== null) {
+                        sql += ` LIMIT $${context.addParam(context.limit)}`;
+                    }
+                    sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
                 }
-                sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
             }
         }
 
@@ -256,12 +260,14 @@ export class ComponentInclusionNode extends QueryNode {
             sql += ` ORDER BY base_entities.id`;
         }
         
-        // Add LIMIT and OFFSET after the ORDER BY
-        // Always include OFFSET (even when 0) to ensure consistent SQL structure for prepared statement caching
-        if (context.limit !== null) {
-            sql += ` LIMIT $${context.addParam(context.limit)}`;
+        // Add LIMIT and OFFSET only if not already applied in CTE
+        // When pagination is applied at CTE level, skip it here to avoid double pagination
+        if (!context.paginationAppliedInCTE) {
+            if (context.limit !== null) {
+                sql += ` LIMIT $${context.addParam(context.limit)}`;
+            }
+            sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
         }
-        sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
         
         return sql;
     }
@@ -290,10 +296,14 @@ export class ComponentInclusionNode extends QueryNode {
                 AND c.deleted_at IS NULL
             ORDER BY c.data->>'${sortOrder.property}' ${sortOrder.direction} ${nullsClause}`;
         
-        if (context.limit !== null) {
-            sql += ` LIMIT $${context.addParam(context.limit)}`;
+        // Add LIMIT and OFFSET only if not already applied in CTE
+        // When pagination is applied at CTE level, skip it here to avoid double pagination
+        if (!context.paginationAppliedInCTE) {
+            if (context.limit !== null) {
+                sql += ` LIMIT $${context.addParam(context.limit)}`;
+            }
+            sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
         }
-        sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
         
         return sql;
     }
