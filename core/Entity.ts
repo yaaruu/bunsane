@@ -642,7 +642,7 @@ export class Entity implements IEntity {
         return Array.from(entitiesMap.values());
     }
 
-    public static async LoadComponents(entities: Entity[], componentIds: string[]): Promise<void> {
+    public static async LoadComponents(entities: Entity[], componentIds: string[], skipCache: boolean = false): Promise<void> {
         if (entities.length === 0 || componentIds.length === 0) return;
 
         // Filter out entities with empty/invalid IDs to prevent PostgreSQL UUID parsing errors

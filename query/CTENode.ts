@@ -49,14 +49,25 @@ export class CTENode extends QueryNode {
         // Must be before LIMIT/OFFSET for consistent page results
         cteSql += `    ORDER BY ec.entity_id\n`;
 
-        // Add LIMIT/OFFSET at CTE level for proper pagination
-        // This ensures only the needed page of entity IDs is materialized
-        if (context.limit !== null) {
-            cteSql += `    LIMIT $${context.addParam(context.limit)}\n`;
-        }
-        if (context.offsetValue > 0 || context.limit !== null) {
-            // Always include OFFSET when pagination is used for consistent SQL structure
-            cteSql += `    OFFSET $${context.addParam(context.offsetValue)}\n`;
+        // Check if there are component filters - if so, pagination must happen AFTER filtering
+        // Otherwise we'd limit results before applying filters, causing incorrect results
+        const hasComponentFilters = context.componentFilters.size > 0;
+
+        // Add LIMIT/OFFSET at CTE level ONLY when there are no component filters
+        // When filters exist, pagination must be applied after LATERAL joins filter the results
+        if (!hasComponentFilters) {
+            if (context.limit !== null) {
+                cteSql += `    LIMIT $${context.addParam(context.limit)}\n`;
+            }
+            if (context.offsetValue > 0 || context.limit !== null) {
+                // Always include OFFSET when pagination is used for consistent SQL structure
+                cteSql += `    OFFSET $${context.addParam(context.offsetValue)}\n`;
+            }
+            // Mark pagination as handled at CTE level to prevent double application
+            context.paginationAppliedInCTE = true;
+        } else {
+            // Pagination will be applied later, after filters
+            context.paginationAppliedInCTE = false;
         }
 
         cteSql += ")";
@@ -64,9 +75,6 @@ export class CTENode extends QueryNode {
         // Mark CTE as available in context
         context.hasCTE = true;
         context.cteName = "base_entities";
-        
-        // Mark pagination as handled at CTE level to prevent double application
-        context.paginationAppliedInCTE = true;
 
         return {
             sql: cteSql,

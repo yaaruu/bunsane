@@ -91,7 +91,15 @@ export class QueryContext {
         const components = Array.from(this.componentIds).sort().join(',');
         const excludedComponents = Array.from(this.excludedComponentIds).sort().join(',');
         const filters = Array.from(this.componentFilters.entries())
-            .map(([typeId, filters]) => `${typeId}:${filters.map(f => `${f.field}${f.operator}`).sort().join('|')}`)
+            .map(([typeId, filters]) => `${typeId}:${filters.map(f => {
+                // For IN/NOT IN operators, include array length in cache key
+                // This ensures different array lengths produce different cache keys
+                // preventing prepared statement parameter count mismatches
+                if ((f.operator === 'IN' || f.operator === 'NOT IN') && Array.isArray(f.value)) {
+                    return `${f.field}${f.operator}[${f.value.length}]`;
+                }
+                return `${f.field}${f.operator}`;
+            }).sort().join('|')}`)
             .sort()
             .join(';');
         const sorts = this.sortOrders

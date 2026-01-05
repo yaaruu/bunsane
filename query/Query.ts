@@ -50,6 +50,11 @@ export interface ComponentWithFilters {
     filters?: QueryFilter[];
 }
 
+export interface QueryCacheOptions {
+    preparedStatement?: boolean;
+    component?: boolean;
+}
+
 /**
  * New Query class that uses DAG internally for better modularity and extensibility
  */
@@ -59,6 +64,8 @@ class Query {
     private orQuery: OrQuery | null = null;
     private shouldPopulate: boolean = false;
     private trx: SQL | undefined;
+    private skipPreparedCache: boolean = false;
+    private skipComponentCache: boolean = false;
 
     constructor(trx?: SQL) {
         this.trx = trx;
@@ -217,6 +224,27 @@ class Query {
         return this;
     }
 
+    /**
+     * Bypass cache for this query.
+     * @param options Cache options to bypass. If not provided, bypasses prepared statement cache.
+     */
+    public noCache(): this;
+    public noCache(options: QueryCacheOptions): this;
+    public noCache(options?: QueryCacheOptions): this {
+        if (!options) {
+            // Default behavior: bypass prepared statement cache
+            this.skipPreparedCache = true;
+        } else {
+            if (options.preparedStatement === true) {
+                this.skipPreparedCache = true;
+            }
+            if (options.component === true) {
+                this.skipComponentCache = true;
+            }
+        }
+        return this;
+    }
+
     public count(): Promise<number> {
         return new Promise<number>((resolve, reject) => {
             const timeout = setTimeout(() => {
@@ -277,16 +305,25 @@ class Query {
         // Get the database connection (transaction or default)
         const dbConn = this.getDb();
 
-        // Check prepared statement cache
-        const cacheKey = this.context.generateCacheKey();
-        const { statement, isHit } = await preparedStatementCache.getOrCreate(countSql, cacheKey, dbConn);
+        let countResult: any[];
+
+        if (this.skipPreparedCache) {
+            // Bypass cache - execute directly
+            countResult = await dbConn.unsafe(countSql, result.params);
+        } else {
+            // Check prepared statement cache
+            const cacheKey = this.context.generateCacheKey();
+            const { statement, isHit } = await preparedStatementCache.getOrCreate(countSql, cacheKey, dbConn);
+            countResult = await preparedStatementCache.execute(statement, result.params, dbConn);
+        }
 
         // Debug logging
         if (this.debug) {
             console.log('🔍 Query Count Debug:');
             console.log('SQL:', countSql);
             console.log('Params:', result.params);
-            console.log('Cache Hit:', isHit);
+            console.log('Prepared Cache Bypass:', this.skipPreparedCache);
+            console.log('Component Cache Bypass:', this.skipComponentCache);
             console.log('Using Transaction:', !!this.trx);
             console.log('---');
         }
@@ -300,8 +337,8 @@ class Query {
             }
         }
 
-        // Execute the count query using prepared statement
-        const countResult = await preparedStatementCache.execute(statement, result.params, dbConn);
+        // Execute the count query (already executed above based on cache bypass setting)
+        // countResult is already set from the cache bypass/direct execution logic above
 
         // Ensure count is returned as a number (PostgreSQL may return as string)
         const count = countResult[0].count;
@@ -377,6 +414,8 @@ class Query {
             console.log('SQL:', result.sql);
             console.log('Params:', result.params);
             console.log('OR Query:', !!this.orQuery);
+            console.log('Prepared Cache Bypass:', this.skipPreparedCache);
+            console.log('Component Cache Bypass:', this.skipComponentCache);
             console.log('Using Transaction:', !!this.trx);
             console.log('---');
         }
@@ -402,8 +441,8 @@ class Query {
 
         let entities: any[];
 
-        if (this.orQuery) {
-            // For OR queries, bypass prepared statement cache and execute directly
+        if (this.orQuery || this.skipPreparedCache) {
+            // For OR queries or explicit cache bypass, execute directly
             // This avoids potential parameter type inference issues with Bun's SQL
             entities = await dbConn.unsafe(result.sql, result.params);
         } else {
@@ -437,7 +476,7 @@ class Query {
         // Eagerly load specific components if requested
         if (this.context.eagerComponents.size > 0) {
             const entitiesArray = Array.from(entityMap.values());
-            await Entity.LoadComponents(entitiesArray, Array.from(this.context.eagerComponents));
+            await Entity.LoadComponents(entitiesArray, Array.from(this.context.eagerComponents), this.skipComponentCache);
         }
 
         // Return entities in the same order as the query results
