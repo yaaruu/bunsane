@@ -17,6 +17,9 @@ export class Entity implements IEntity {
     public _persisted: boolean = false;
     private components: Map<string, BaseComponent> = new Map<string, BaseComponent>();
     private removedComponents: Set<string> = new Set<string>();
+    // Track components that were removed and already saved to DB
+    // This persists after save() so resolvers can detect removed components
+    private savedRemovedComponents: Set<string> = new Set<string>();
     protected _dirty: boolean = false;
 
     constructor(id?: string) {
@@ -36,6 +39,38 @@ export class Entity implements IEntity {
 
     public componentList(): BaseComponent[] {
         return Array.from(this.components.values());
+    }
+
+    /**
+     * Synchronously check if a component is already loaded in memory.
+     * This does NOT trigger a database fetch - use get() for that.
+     * @param ctor Component constructor
+     * @returns Component instance if already in memory, undefined otherwise
+     */
+    public getInMemory<T extends BaseComponent>(ctor: new (...args: any[]) => T): T | undefined {
+        return Array.from(this.components.values()).find(comp => comp instanceof ctor) as T | undefined;
+    }
+
+    /**
+     * Check if a component exists in memory (synchronous, no DB fetch).
+     * @param ctor Component constructor
+     * @returns true if component is already loaded in memory
+     */
+    public hasInMemory<T extends BaseComponent>(ctor: new (...args: any[]) => T): boolean {
+        return Array.from(this.components.values()).some(comp => comp instanceof ctor);
+    }
+
+    /**
+     * Check if a component was explicitly removed from this entity (pending or already saved deletion).
+     * Useful in resolvers to avoid returning stale cached data for removed components.
+     * @param ctor Component constructor
+     * @returns true if component was removed (pending or saved)
+     */
+    public wasRemoved<T extends BaseComponent>(ctor: new (...args: any[]) => T): boolean {
+        const temp = new ctor();
+        const typeId = temp.getTypeID();
+        // Check both pending removals and already-saved removals
+        return this.removedComponents.has(typeId) || this.savedRemovedComponents.has(typeId);
     }
 
     /**
@@ -415,6 +450,11 @@ export class Entity implements IEntity {
                     const typeIds = Array.from(this.removedComponents);
                     await saveTrx`DELETE FROM components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`;
                     await saveTrx`DELETE FROM entity_components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`;
+                    // Move to savedRemovedComponents so resolvers can still detect removed components
+                    // This is needed because DataLoader may have stale cached data for this request
+                    for (const typeId of typeIds) {
+                        this.savedRemovedComponents.add(typeId);
+                    }
                     this.removedComponents.clear();
                 }
                 

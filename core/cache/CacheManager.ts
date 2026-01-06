@@ -215,6 +215,11 @@ export class CacheManager {
         }
 
         try {
+            logger.trace({
+                msg: 'Invalidating component from cache',
+                entityId,
+                typeId
+            })
             const key = `component:${entityId}:${typeId}`;
             await this.provider.delete(key);
         } catch (error) {

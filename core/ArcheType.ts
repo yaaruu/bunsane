@@ -1417,6 +1417,18 @@ export class BaseArcheType {
                         const entityId = parent?.id;
                         if (!entityId) return (parent as any)[field];
 
+                        // Check if parent is an Entity with component state
+                        if (parent instanceof Entity) {
+                            // If component was explicitly removed, return null immediately
+                            if (parent.wasRemoved(ctor)) {
+                                return null;
+                            }
+                            const inMemoryComp = parent.getInMemory(ctor);
+                            if (inMemoryComp) {
+                                return (inMemoryComp as any)?.value;
+                            }
+                        }
+
                         // Use DataLoader if available
                         if (context?.loaders?.componentsByEntityType) {
                             const componentData =
@@ -1452,8 +1464,14 @@ export class BaseArcheType {
 
                         // Check if parent is an Entity with the component already loaded in memory
                         // This avoids cache/DataLoader issues for freshly created entities
+                        // Use synchronous getInMemory() to avoid triggering unnecessary DB queries
                         if (parent instanceof Entity) {
-                            const inMemoryComp = await parent.getInstanceOf(ctor);
+                            // If component was explicitly removed, return null immediately
+                            // This prevents stale DataLoader cache from returning old data
+                            if (parent.wasRemoved(ctor)) {
+                                return null;
+                            }
+                            const inMemoryComp = parent.getInMemory(ctor);
                             if (inMemoryComp) {
                                 return inMemoryComp;
                             }
@@ -1505,6 +1523,21 @@ export class BaseArcheType {
                     // Try to find which component in the union is present on the entity
                     for (const component of components) {
                         const typeId = storage.getComponentId(component.name);
+
+                        // Check if parent is an Entity with component state
+                        if (parent instanceof Entity) {
+                            // If component was explicitly removed, skip it
+                            if (parent.wasRemoved(component)) {
+                                continue;
+                            }
+                            const inMemoryComp = parent.getInMemory(component);
+                            if (inMemoryComp) {
+                                return {
+                                    __typename: compNameToFieldName(component.name),
+                                    ...(inMemoryComp as any).data?.() ?? inMemoryComp,
+                                };
+                            }
+                        }
 
                         if (context?.loaders?.componentsByEntityType) {
                             const componentData =
