@@ -1450,6 +1450,15 @@ export class BaseArcheType {
                         const entityId = parent?.id;
                         if (!entityId) return (parent as any)[field];
 
+                        // Check if parent is an Entity with the component already loaded in memory
+                        // This avoids cache/DataLoader issues for freshly created entities
+                        if (parent instanceof Entity) {
+                            const inMemoryComp = await parent.getInstanceOf(ctor);
+                            if (inMemoryComp) {
+                                return inMemoryComp;
+                            }
+                        }
+
                         // Use DataLoader if available
                         if (context?.loaders?.componentsByEntityType) {
                             const componentData =

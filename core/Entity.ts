@@ -272,9 +272,9 @@ export class Entity implements IEntity {
             if (trx) {
                 // Use provided transaction
                 this.doSave(trx)
-                .then(result => {
+                .then(async result => {
                     clearTimeout(timeout);
-                    this.handleCacheAfterSave(changedComponentTypeIds, removedComponentTypeIds);
+                    await this.handleCacheAfterSave(changedComponentTypeIds, removedComponentTypeIds);
                     resolve(result);
                 })
                 .catch(error => {
@@ -286,9 +286,9 @@ export class Entity implements IEntity {
                 db.transaction(async (newTrx) => {
                     return await this.doSave(newTrx);
                 })
-                .then(result => {
+                .then(async result => {
                     clearTimeout(timeout);
-                    this.handleCacheAfterSave(changedComponentTypeIds, removedComponentTypeIds);
+                    await this.handleCacheAfterSave(changedComponentTypeIds, removedComponentTypeIds);
                     resolve(result);
                 })
                 .catch(error => {
