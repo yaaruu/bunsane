@@ -103,8 +103,8 @@ export class Entity implements IEntity {
      * If it doesn't exist, it adds a new component.
      * Use like: entity.set(Component, { value: "Test" })
      */
-    public async set<T extends BaseComponent>(ctor: new (...args: any[]) => T, data: Partial<ComponentDataType<T>>): Promise<this> {
-        await this.get(ctor);
+    public async set<T extends BaseComponent>(ctor: new (...args: any[]) => T, data: Partial<ComponentDataType<T>>, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }): Promise<this> {
+        await this.get(ctor, context);
         
         const component = Array.from(this.components.values()).find(comp => comp instanceof ctor) as T;
         if (component) {
@@ -122,6 +122,14 @@ export class Entity implements IEntity {
             } catch (error) {
                 logger.error(`Error firing component updated hook for ${component.getTypeID()}: ${error}`);
                 // Don't fail the set operation if hooks fail
+            }
+            
+            // Invalidate DataLoader cache if context is provided
+            if (context?.loaders?.componentsByEntityType) {
+                context.loaders.componentsByEntityType.clear({
+                    entityId: this.id,
+                    typeId: component.getTypeID()
+                });
             }
             
             // Handle cache operations for component update
@@ -160,7 +168,7 @@ export class Entity implements IEntity {
      * If you want to keep the component in the database but just remove it from the entity instance,
      * consider implementing a different method.
      */
-    public remove<T extends BaseComponent>(ctor: new (...args: any[]) => T): boolean {
+    public remove<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }): boolean {
         const component = Array.from(this.components.values()).find(comp => comp instanceof ctor) as T;
         
         if (component) {
@@ -179,6 +187,14 @@ export class Entity implements IEntity {
             } catch (error) {
                 logger.error(`Error firing component removed hook for ${typeId}: ${error}`);
                 // Don't fail the remove operation if hooks fail
+            }
+            
+            // Invalidate DataLoader cache if context is provided
+            if (context?.loaders?.componentsByEntityType) {
+                context.loaders.componentsByEntityType.clear({
+                    entityId: this.id,
+                    typeId: typeId
+                });
             }
             
             // Invalidate cache for removed component
@@ -292,7 +308,7 @@ export class Entity implements IEntity {
     }
 
     @timed("Entity.save")
-    public save(trx?: SQL) {
+    public save(trx?: SQL, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }) {
         return new Promise<boolean>((resolve, reject) => {
             // Add timeout to prevent hanging
             const timeout = setTimeout(() => {
@@ -309,7 +325,7 @@ export class Entity implements IEntity {
                 this.doSave(trx)
                 .then(async result => {
                     clearTimeout(timeout);
-                    await this.handleCacheAfterSave(changedComponentTypeIds, removedComponentTypeIds);
+                    await this.handleCacheAfterSave(changedComponentTypeIds, removedComponentTypeIds, context);
                     resolve(result);
                 })
                 .catch(error => {
@@ -323,7 +339,7 @@ export class Entity implements IEntity {
                 })
                 .then(async result => {
                     clearTimeout(timeout);
-                    await this.handleCacheAfterSave(changedComponentTypeIds, removedComponentTypeIds);
+                    await this.handleCacheAfterSave(changedComponentTypeIds, removedComponentTypeIds, context);
                     resolve(result);
                 })
                 .catch(error => {
@@ -339,7 +355,7 @@ export class Entity implements IEntity {
      * @param changedComponentTypeIds - Component type IDs that were dirty before save (captured before doSave clears flags)
      * @param removedComponentTypeIds - Component type IDs that were removed (captured before doSave clears the set)
      */
-    private async handleCacheAfterSave(changedComponentTypeIds: string[], removedComponentTypeIds: string[]): Promise<void> {
+    private async handleCacheAfterSave(changedComponentTypeIds: string[], removedComponentTypeIds: string[], context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }): Promise<void> {
         try {
             // Import CacheManager dynamically to avoid circular dependency
             const { CacheManager } = await import('./cache/CacheManager');
@@ -371,11 +387,27 @@ export class Entity implements IEntity {
                         // Invalidate component cache
                         await cacheManager.invalidateComponent(this.id, typeId);
                     }
+                    
+                    // Invalidate DataLoader cache for changed component
+                    if (context?.loaders?.componentsByEntityType) {
+                        context.loaders.componentsByEntityType.clear({
+                            entityId: this.id,
+                            typeId: typeId
+                        });
+                    }
                 }
 
                 // Invalidate cache for removed components
                 for (const typeId of removedComponentTypeIds) {
                     await cacheManager.invalidateComponent(this.id, typeId);
+                    
+                    // Invalidate DataLoader cache for removed component
+                    if (context?.loaders?.componentsByEntityType) {
+                        context.loaders.componentsByEntityType.clear({
+                            entityId: this.id,
+                            typeId: typeId
+                        });
+                    }
                 }
             }
         } catch (error) {

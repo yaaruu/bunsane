@@ -60,7 +60,7 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
         // Cache the loaded entities if cache is enabled
         if (cacheManager && cacheManager.getConfig().enabled && cacheManager.getConfig().entity?.enabled) {
           try {
-            await cacheManager.setEntitiesWriteThrough(entities, cacheManager.getConfig().entity.ttl);
+            await cacheManager.setEntitiesWriteThrough(entities, cacheManager.getConfig().entity!.ttl);
           } catch (error) {
             logger.warn({ scope: 'cache', component: 'RequestLoaders', msg: 'Cache write failed for entities', error });
           }
@@ -79,7 +79,7 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
         if (!id || typeof id !== 'string' || id.trim() === '') return null;
         return results.get(id) ?? null;
       });
-    } catch (error) {
+    } catch (error: any) {
       logger.error(`Error in entityById DataLoader:`, error);
       throw error;
     }
@@ -107,14 +107,14 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
             const cachedComponents = await cacheManager.getComponents(validKeys);
             cachedComponents.forEach((component, index) => {
               if (component) {
-                const key = `${validKeys[index].entityId}-${validKeys[index].typeId}`;
+                const key = `${validKeys[index]!.entityId}-${validKeys[index]!.typeId}`;
                 results.set(key, component);
                 cacheHits++;
               } else {
                 cacheMisses++;
               }
             });
-          } catch (error) {
+          } catch (error: any) {
             logger.warn({ scope: 'cache', component: 'RequestLoaders', msg: 'Cache read failed for components, falling back to database', error });
             cacheMisses += validKeys.length;
           }
@@ -165,8 +165,8 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
           // Cache the loaded components if cache is enabled
           if (cacheManager && cacheManager.getConfig().enabled && cacheManager.getConfig().component?.enabled) {
             try {
-              await cacheManager.setComponentsWriteThrough(components, cacheManager.getConfig().component.ttl);
-            } catch (error) {
+              await cacheManager.setComponentsWriteThrough(components, cacheManager.getConfig().component!.ttl);
+            } catch (error: any) {
               logger.warn({ scope: 'cache', component: 'RequestLoaders', msg: 'Cache write failed for components', error });
             }
           }
@@ -187,7 +187,7 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
           if (!k.entityId || typeof k.entityId !== 'string' || k.entityId.trim() === '') return null;
           return results.get(`${k.entityId}-${k.typeId}`) ?? null;
         });
-      } catch (error) {
+      } catch (error: any) {
         logger.error(`Error in componentsByEntityType DataLoader:`, error);
         throw error;
       }
@@ -268,7 +268,7 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
 
             const uniqueEntityIds = [...new Set(relatedEntityIds)];
             const entities = uniqueEntityIds.map(id => {
-              const entity = new Entity(id);
+              const entity = new Entity(id as string);
               entity.setPersisted(true);
               return entity;
             });
