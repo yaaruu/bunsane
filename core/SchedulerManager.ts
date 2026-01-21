@@ -18,6 +18,7 @@ import { CronParser } from "../utils/cronParser";
 import type { ComponentTargetConfig } from "./EntityHookManager";
 import ArcheType from "./ArcheType";
 import { BaseComponent } from "./components";
+import { DistributedLock, type DistributedLockConfig } from "./scheduler/DistributedLock";
 
 const loggerInstance = logger.child({ scope: "SchedulerManager" });
 
@@ -28,6 +29,7 @@ export class SchedulerManager {
     private isRunning: boolean = false;
     private eventListeners: SchedulerEventCallback[] = [];
     public config: SchedulerConfig;
+    private distributedLock: DistributedLock;
     private metrics: SchedulerMetrics = {
         totalTasks: 0,
         runningTasks: 0,
@@ -37,7 +39,10 @@ export class SchedulerManager {
         totalExecutionTime: 0,
         timedOutTasks: 0,
         retriedTasks: 0,
-        taskMetrics: {}
+        taskMetrics: {},
+        skippedExecutions: 0,
+        lockAttempts: 0,
+        locksAcquired: 0
     };
 
     private constructor() {
@@ -47,7 +52,18 @@ export class SchedulerManager {
             defaultTimeout: 30000, // 30 seconds
             enableLogging: false,
             runOnStart: true,
+            distributedLocking: true, // Enable by default for multi-instance safety
+            lockTimeout: 0, // No retry by default - skip if can't acquire
+            lockRetryInterval: 100,
         };
+
+        // Initialize distributed lock with config
+        this.distributedLock = new DistributedLock({
+            enabled: this.config.distributedLocking ?? true,
+            enableLogging: this.config.enableLogging,
+            lockTimeout: this.config.lockTimeout ?? 0,
+            retryInterval: this.config.lockRetryInterval ?? 100,
+        });
 
         this.initializeLifecycleIntegration();
     }
@@ -251,6 +267,38 @@ export class SchedulerManager {
             return;
         }
 
+        // Try to acquire distributed lock before executing
+        this.metrics.lockAttempts++;
+        const lockResult = await this.distributedLock.tryAcquire(taskId);
+
+        if (!lockResult.acquired) {
+            // Another instance is executing this task
+            this.metrics.skippedExecutions++;
+
+            if (this.config.enableLogging) {
+                loggerInstance.debug(`Task ${taskInfo.name} skipped - another instance is executing (lock key: ${lockResult.lockKey})`);
+            }
+
+            this.emitEvent({
+                type: 'task.skipped',
+                taskId: taskInfo.id,
+                timestamp: new Date(),
+                data: { reason: 'lock_unavailable', lockKey: lockResult.lockKey.toString() }
+            });
+
+            return;
+        }
+
+        // Lock acquired successfully
+        this.metrics.locksAcquired++;
+
+        this.emitEvent({
+            type: 'task.lock.acquired',
+            taskId: taskInfo.id,
+            timestamp: new Date(),
+            data: { lockKey: lockResult.lockKey.toString() }
+        });
+
         taskInfo.isRunning = true;
         taskInfo.lastExecution = new Date();
         this.metrics.runningTasks++;
@@ -343,6 +391,16 @@ export class SchedulerManager {
         } finally {
             taskInfo.isRunning = false;
             this.metrics.runningTasks--;
+
+            // Release the distributed lock
+            await this.distributedLock.release(taskId);
+
+            this.emitEvent({
+                type: 'task.lock.released',
+                taskId: taskInfo.id,
+                timestamp: new Date(),
+                data: { lockKey: lockResult.lockKey.toString() }
+            });
         }
     }
 
@@ -368,18 +426,19 @@ export class SchedulerManager {
             this.scheduleTask(taskInfo);
         }
 
+        const lockStatus = this.config.distributedLocking !== false ? 'enabled' : 'disabled';
         if (this.config.enableLogging) {
-            loggerInstance.info(`Scheduler started with ${this.tasks.size} tasks (sorted by priority)`);
+            loggerInstance.info(`Scheduler started with ${this.tasks.size} tasks (sorted by priority, distributed locking: ${lockStatus})`);
         }
 
         this.emitEvent({
             type: 'scheduler.started',
             timestamp: new Date(),
-            data: { taskCount: this.tasks.size }
+            data: { taskCount: this.tasks.size, distributedLocking: this.config.distributedLocking !== false }
         });
     }
 
-    public stop(): void {
+    public async stop(): Promise<void> {
         if (!this.isRunning) {
             loggerInstance.warn("Scheduler is not running");
             return;
@@ -393,6 +452,9 @@ export class SchedulerManager {
             clearTimeout(intervalId as any);
         }
         this.intervals.clear();
+
+        // Release all distributed locks held by this instance
+        await this.distributedLock.releaseAll();
 
         if (this.config.enableLogging) {
             loggerInstance.info("Scheduler stopped");
@@ -464,6 +526,15 @@ export class SchedulerManager {
 
     public updateConfig(config: Partial<SchedulerConfig>): void {
         this.config = { ...this.config, ...config };
+
+        // Sync distributed lock configuration
+        this.distributedLock.updateConfig({
+            enabled: this.config.distributedLocking ?? true,
+            enableLogging: this.config.enableLogging,
+            lockTimeout: this.config.lockTimeout ?? 0,
+            retryInterval: this.config.lockRetryInterval ?? 100,
+        });
+
         if (this.config.enableLogging) {
             loggerInstance.info(`Scheduler configuration updated: ${JSON.stringify(config)}`);
         }
@@ -471,6 +542,28 @@ export class SchedulerManager {
 
     public getConfig(): SchedulerConfig {
         return { ...this.config };
+    }
+
+    /**
+     * Get distributed lock configuration and status
+     */
+    public getDistributedLockInfo(): {
+        enabled: boolean;
+        heldLocks: number;
+        config: DistributedLockConfig;
+    } {
+        return {
+            enabled: this.config.distributedLocking !== false,
+            heldLocks: this.distributedLock.getHeldLockCount(),
+            config: this.distributedLock.getConfig(),
+        };
+    }
+
+    /**
+     * Check if distributed locking is enabled
+     */
+    public isDistributedLockingEnabled(): boolean {
+        return this.config.distributedLocking !== false;
     }
 
     /**

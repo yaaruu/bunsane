@@ -122,6 +122,12 @@ export interface SchedulerMetrics {
     retriedTasks: number;
     /** Task-specific metrics */
     taskMetrics: Record<string, TaskMetrics>;
+    /** Number of task executions skipped due to distributed lock unavailability */
+    skippedExecutions: number;
+    /** Total lock acquisition attempts */
+    lockAttempts: number;
+    /** Successful lock acquisitions */
+    locksAcquired: number;
 }
 
 export interface TaskMetrics {
@@ -162,7 +168,7 @@ export interface TaskExecutionResult {
 
 export interface SchedulerEvent {
     /** Event type */
-    type: 'task.registered' | 'task.executed' | 'task.failed' | 'task.timeout' | 'task.retry' | 'scheduler.started' | 'scheduler.stopped';
+    type: 'task.registered' | 'task.executed' | 'task.failed' | 'task.timeout' | 'task.retry' | 'task.skipped' | 'task.lock.acquired' | 'task.lock.released' | 'task.lock.failed' | 'scheduler.started' | 'scheduler.stopped';
     /** Task ID if applicable */
     taskId?: string;
     /** Event timestamp */
@@ -184,4 +190,37 @@ export interface SchedulerConfig {
     enableLogging: boolean;
     /** Whether to run tasks on startup */
     runOnStart: boolean;
+    /**
+     * Enable distributed locking using PostgreSQL advisory locks.
+     * When enabled, only one instance can execute a task at a time.
+     * This is essential for multi-instance deployments.
+     * @default true
+     */
+    distributedLocking?: boolean;
+    /**
+     * Lock acquisition timeout in milliseconds.
+     * If > 0, will retry acquiring the lock until timeout.
+     * If 0, immediately skips if lock is not available.
+     * @default 0
+     */
+    lockTimeout?: number;
+    /**
+     * Retry interval when attempting to acquire locks (ms).
+     * Only used when lockTimeout > 0.
+     * @default 100
+     */
+    lockRetryInterval?: number;
+}
+
+export interface DistributedLockMetrics {
+    /** Total lock acquisition attempts */
+    lockAttempts: number;
+    /** Successful lock acquisitions */
+    locksAcquired: number;
+    /** Failed lock acquisitions (another instance holds lock) */
+    locksFailed: number;
+    /** Lock acquisition timeouts */
+    lockTimeouts: number;
+    /** Tasks skipped due to lock unavailability */
+    tasksSkipped: number;
 }
