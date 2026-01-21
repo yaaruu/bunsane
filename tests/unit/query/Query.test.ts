@@ -250,4 +250,56 @@ describe('Query', () => {
             expect(query).toBeDefined();
         });
     });
+
+    describe('sum()', () => {
+        test('throws if component not in query', async () => {
+            const query = new Query();
+            // TestProduct not added via .with()
+            await expect(query.sum(TestProduct, 'price')).rejects.toThrow(
+                /not included in the query/
+            );
+        });
+
+        test('throws if component is not registered', async () => {
+            class UnregisteredComponent {
+                value!: number;
+            }
+            const query = new Query();
+            await expect(query.sum(UnregisteredComponent as any, 'value')).rejects.toThrow(
+                /not registered/
+            );
+        });
+
+        test('returns a Promise', () => {
+            const query = new Query().with(TestProduct);
+            const result = query.sum(TestProduct, 'price');
+            expect(result).toBeInstanceOf(Promise);
+        });
+    });
+
+    describe('average()', () => {
+        test('throws if component not in query', async () => {
+            const query = new Query();
+            // TestProduct not added via .with()
+            await expect(query.average(TestProduct, 'price')).rejects.toThrow(
+                /not included in the query/
+            );
+        });
+
+        test('throws if component is not registered', async () => {
+            class UnregisteredComponent {
+                value!: number;
+            }
+            const query = new Query();
+            await expect(query.average(UnregisteredComponent as any, 'value')).rejects.toThrow(
+                /not registered/
+            );
+        });
+
+        test('returns a Promise', () => {
+            const query = new Query().with(TestProduct);
+            const result = query.average(TestProduct, 'price');
+            expect(result).toBeInstanceOf(Promise);
+        });
+    });
 });

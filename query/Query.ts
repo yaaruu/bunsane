@@ -351,6 +351,191 @@ class Query {
         return typeof count === 'string' ? parseInt(count, 10) : Number(count);
     }
 
+    /**
+     * Calculate the sum of a numeric field across all matching entities.
+     * The component must be included in the query via .with().
+     * @param componentCtor The component class containing the field
+     * @param field The field name to sum (must be numeric)
+     * @returns Promise resolving to the sum, or 0 if no matches
+     */
+    public sum<T extends BaseComponent>(
+        componentCtor: new (...args: any[]) => T,
+        field: keyof ComponentDataType<T>
+    ): Promise<number> {
+        return new Promise<number>((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                logger.error(`Query sum execution timeout`);
+                reject(new Error(`Query sum execution timeout after 30 seconds`));
+            }, 30000);
+            this.doAggregate('SUM', componentCtor, field as string)
+                .then(result => {
+                    clearTimeout(timeout);
+                    resolve(result);
+                })
+                .catch(error => {
+                    clearTimeout(timeout);
+                    reject(error);
+                });
+        });
+    }
+
+    /**
+     * Calculate the average of a numeric field across all matching entities.
+     * The component must be included in the query via .with().
+     * @param componentCtor The component class containing the field
+     * @param field The field name to average (must be numeric)
+     * @returns Promise resolving to the average, or 0 if no matches
+     */
+    public average<T extends BaseComponent>(
+        componentCtor: new (...args: any[]) => T,
+        field: keyof ComponentDataType<T>
+    ): Promise<number> {
+        return new Promise<number>((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                logger.error(`Query average execution timeout`);
+                reject(new Error(`Query average execution timeout after 30 seconds`));
+            }, 30000);
+            this.doAggregate('AVG', componentCtor, field as string)
+                .then(result => {
+                    clearTimeout(timeout);
+                    resolve(result);
+                })
+                .catch(error => {
+                    clearTimeout(timeout);
+                    reject(error);
+                });
+        });
+    }
+
+    /**
+     * Internal method to perform aggregate operations (SUM, AVG) on component fields.
+     * Uses an optimized single-pass approach by joining to the component table
+     * directly within the CTE-based query.
+     */
+    private async doAggregate(
+        aggregateType: 'SUM' | 'AVG',
+        componentCtor: new (...args: any[]) => BaseComponent,
+        field: string
+    ): Promise<number> {
+        // Get the component type ID
+        const typeId = this.context.getComponentId(componentCtor);
+        if (!typeId) {
+            throw new Error(`Component ${componentCtor.name} is not registered.`);
+        }
+
+        // Validate that the component is in the query
+        if (!this.context.componentIds.has(typeId)) {
+            throw new Error(
+                `Cannot aggregate on component ${componentCtor.name} that is not included in the query. ` +
+                `Use .with(${componentCtor.name}) first.`
+            );
+        }
+
+        // Reset context for fresh execution
+        this.context.reset();
+
+        // Build the DAG
+        const dag = new QueryDAG();
+
+        // Check if we have an OR query
+        if (this.orQuery) {
+            if (this.context.componentIds.size > 0) {
+                const componentNode = new ComponentInclusionNode();
+                dag.setRootNode(componentNode);
+
+                const orNode = new OrNode(this.orQuery);
+                orNode.addDependency(componentNode);
+                dag.addNode(orNode);
+            } else {
+                const orNode = new OrNode(this.orQuery);
+                dag.setRootNode(orNode);
+            }
+        } else {
+            const optimizedDag = QueryDAG.buildBasicQuery(this.context);
+            for (const node of optimizedDag.getNodes()) {
+                dag.addNode(node);
+            }
+            if (optimizedDag.getRootNode()) {
+                dag.setRootNode(optimizedDag.getRootNode()!);
+            }
+        }
+
+        // Execute the DAG to get the base query
+        const result = dag.execute(this.context);
+
+        // Determine the component table name
+        const componentTableName = shouldUseDirectPartition()
+            ? (ComponentRegistry.getPartitionTableName(typeId) || 'components')
+            : 'components';
+
+        // Build the JSON path for the field
+        let jsonPath: string;
+        if (field.includes('.')) {
+            const parts = field.split('.');
+            const lastPart = parts.pop()!;
+            const nestedPath = parts.map(p => `'${p}'`).join('->');
+            jsonPath = `c.data->${nestedPath}->>'${lastPart}'`;
+        } else {
+            jsonPath = `c.data->>'${field}'`;
+        }
+
+        // Add the type_id parameter for the JOIN condition
+        const typeIdParamIndex = this.context.addParam(typeId);
+
+        // Build aggregate SQL by wrapping the entity query as a subquery
+        // This approach works consistently regardless of CTE usage
+        // The base query returns entity_id (aliased as 'id'), which we join to components
+        const aggregateSql = `
+SELECT ${aggregateType}((${jsonPath})::numeric) as result
+FROM (${result.sql}) AS entity_subq
+JOIN ${componentTableName} c ON c.entity_id = entity_subq.id
+WHERE c.type_id = $${typeIdParamIndex}
+AND c.deleted_at IS NULL`;
+
+        // Get the database connection
+        const dbConn = this.getDb();
+
+        let aggregateResult: any[];
+
+        if (this.skipPreparedCache) {
+            aggregateResult = await dbConn.unsafe(aggregateSql, result.params);
+        } else {
+            const cacheKey = `${aggregateType.toLowerCase()}:${typeId}:${field}:` + this.context.generateCacheKey();
+            const { statement } = await preparedStatementCache.getOrCreate(aggregateSql, cacheKey, dbConn);
+            aggregateResult = await preparedStatementCache.execute(statement, result.params, dbConn);
+        }
+
+        // Debug logging
+        if (this.debug) {
+            console.log(`🔍 Query ${aggregateType} Debug:`);
+            console.log('SQL:', aggregateSql);
+            console.log('Params:', result.params);
+            console.log('Component:', componentCtor.name);
+            console.log('Field:', field);
+            console.log('---');
+        }
+
+        // Validate params
+        for (let i = 0; i < result.params.length; i++) {
+            const param = result.params[i];
+            if (param === '' || (typeof param === 'string' && param.trim() === '')) {
+                logger.error(`Empty string parameter detected at position ${i + 1} in ${aggregateType} query`);
+                throw new Error(`Query ${aggregateType} parameter $${i + 1} is an empty string.`);
+            }
+        }
+
+        // Extract result
+        if (!aggregateResult || aggregateResult.length === 0 || aggregateResult[0] === undefined) {
+            return 0;
+        }
+
+        const value = aggregateResult[0].result;
+        if (value === undefined || value === null) {
+            return 0;
+        }
+        return typeof value === 'string' ? parseFloat(value) : Number(value);
+    }
+
     @timed("Query.exec")
     public async exec(): Promise<Entity[]> {
         return new Promise<Entity[]>((resolve, reject) => {

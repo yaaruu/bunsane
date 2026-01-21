@@ -356,4 +356,168 @@ describe('Query Execution', () => {
             expect(found?.hasInMemory(TestProduct)).toBe(true);
         });
     });
+
+    describe('sum()', () => {
+        test('returns correct sum of numeric field', async () => {
+            // Create entities with known prices
+            const prices = [10, 20, 30, 40];
+            const expectedSum = prices.reduce((a, b) => a + b, 0); // 100
+
+            for (let i = 0; i < prices.length; i++) {
+                const entity = ctx.tracker.create();
+                entity.add(TestProduct, {
+                    sku: `SUM_TEST_${i}_${Date.now()}`,
+                    name: `Sum Product ${i}`,
+                    price: prices[i]!,
+                    inStock: true
+                });
+                await entity.save();
+            }
+
+            const sum = await new Query()
+                .with(TestProduct, {
+                    filters: [Query.filter('sku', FilterOp.LIKE, 'SUM_TEST_%')]
+                })
+                .sum(TestProduct, 'price');
+
+            expect(sum).toBe(expectedSum);
+        });
+
+        test('returns 0 when no entities match', async () => {
+            const sum = await new Query()
+                .with(TestProduct, {
+                    filters: [Query.filter('sku', FilterOp.EQ, 'NONEXISTENT_SKU_12345')]
+                })
+                .sum(TestProduct, 'price');
+
+            expect(sum).toBe(0);
+        });
+
+        test('sum works with filters', async () => {
+            // Create entities - some in stock, some not
+            const entity1 = ctx.tracker.create();
+            entity1.add(TestProduct, {
+                sku: `SUM_FILTER_1_${Date.now()}`,
+                name: 'In Stock',
+                price: 50,
+                inStock: true
+            });
+            await entity1.save();
+
+            const entity2 = ctx.tracker.create();
+            entity2.add(TestProduct, {
+                sku: `SUM_FILTER_2_${Date.now()}`,
+                name: 'Out of Stock',
+                price: 100,
+                inStock: false
+            });
+            await entity2.save();
+
+            // Sum only in-stock items
+            const sum = await new Query()
+                .with(TestProduct, {
+                    filters: [
+                        Query.filter('sku', FilterOp.LIKE, 'SUM_FILTER_%'),
+                        Query.filter('inStock', FilterOp.EQ, true)
+                    ]
+                })
+                .sum(TestProduct, 'price');
+
+            expect(sum).toBe(50);
+        });
+    });
+
+    describe('average()', () => {
+        test('returns correct average of numeric field', async () => {
+            // Create entities with known prices
+            const prices = [10, 20, 30, 40];
+            const expectedAvg = prices.reduce((a, b) => a + b, 0) / prices.length; // 25
+
+            for (let i = 0; i < prices.length; i++) {
+                const entity = ctx.tracker.create();
+                entity.add(TestProduct, {
+                    sku: `AVG_TEST_${i}_${Date.now()}`,
+                    name: `Avg Product ${i}`,
+                    price: prices[i]!,
+                    inStock: true
+                });
+                await entity.save();
+            }
+
+            const avg = await new Query()
+                .with(TestProduct, {
+                    filters: [Query.filter('sku', FilterOp.LIKE, 'AVG_TEST_%')]
+                })
+                .average(TestProduct, 'price');
+
+            expect(avg).toBe(expectedAvg);
+        });
+
+        test('returns 0 when no entities match', async () => {
+            const avg = await new Query()
+                .with(TestProduct, {
+                    filters: [Query.filter('sku', FilterOp.EQ, 'NONEXISTENT_SKU_67890')]
+                })
+                .average(TestProduct, 'price');
+
+            expect(avg).toBe(0);
+        });
+
+        test('average handles decimal results', async () => {
+            // Create entities with prices that result in decimal average
+            const prices = [10, 20, 30]; // avg = 20
+
+            for (let i = 0; i < prices.length; i++) {
+                const entity = ctx.tracker.create();
+                entity.add(TestProduct, {
+                    sku: `AVG_DEC_${i}_${Date.now()}`,
+                    name: `Decimal Avg ${i}`,
+                    price: prices[i]!,
+                    inStock: true
+                });
+                await entity.save();
+            }
+
+            const avg = await new Query()
+                .with(TestProduct, {
+                    filters: [Query.filter('sku', FilterOp.LIKE, 'AVG_DEC_%')]
+                })
+                .average(TestProduct, 'price');
+
+            expect(avg).toBe(20);
+        });
+
+        test('average works with filters', async () => {
+            // Create entities - some expensive, some cheap
+            const entity1 = ctx.tracker.create();
+            entity1.add(TestProduct, {
+                sku: `AVG_FILTER_CHEAP_${Date.now()}`,
+                name: 'Cheap Product',
+                price: 10,
+                inStock: true
+            });
+            await entity1.save();
+
+            const entity2 = ctx.tracker.create();
+            entity2.add(TestProduct, {
+                sku: `AVG_FILTER_EXPENSIVE_${Date.now()}`,
+                name: 'Expensive Product',
+                price: 1000,
+                inStock: true
+            });
+            await entity2.save();
+
+            // Average only cheap items (price < 100)
+            const avg = await new Query()
+                .with(TestProduct, {
+                    filters: [
+                        Query.filter('sku', FilterOp.LIKE, 'AVG_FILTER_%'),
+                        Query.filter('price', FilterOp.LT, 100)
+                    ]
+                })
+                .average(TestProduct, 'price');
+
+            expect(avg).toBe(10);
+        });
+    });
 });
