@@ -105,8 +105,12 @@ export class ComponentInclusionNode extends QueryNode {
                 if (!context.paginationAppliedInCTE) {
                     if (context.limit !== null) {
                         sql += ` LIMIT $${context.addParam(context.limit)}`;
+                        // Always add OFFSET with LIMIT for consistent SQL structure
+                        sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
+                    } else if (context.offsetValue > 0) {
+                        // Only add OFFSET without LIMIT if offset is explicitly set
+                        sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
                     }
-                    sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
                 }
             }
         } else {
@@ -190,8 +194,12 @@ export class ComponentInclusionNode extends QueryNode {
                 if (!context.paginationAppliedInCTE) {
                     if (context.limit !== null) {
                         sql += ` LIMIT $${context.addParam(context.limit)}`;
+                        // Always add OFFSET with LIMIT for consistent SQL structure
+                        sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
+                    } else if (context.offsetValue > 0) {
+                        // Only add OFFSET without LIMIT if offset is explicitly set
+                        sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
                     }
-                    sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
                 }
             }
         }

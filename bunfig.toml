@@ -1,0 +1,10 @@
+[test]
+# Preload the test setup file before running tests
+preload = ["./tests/setup.ts"]
+
+# Increase timeout for integration tests (30 seconds)
+timeout = 30000
+
+# Limit parallel test execution to avoid database connection pool exhaustion
+# Each Bun test worker creates its own connection pool
+smol = true

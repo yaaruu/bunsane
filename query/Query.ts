@@ -312,7 +312,8 @@ class Query {
             countResult = await dbConn.unsafe(countSql, result.params);
         } else {
             // Check prepared statement cache
-            const cacheKey = this.context.generateCacheKey();
+            // Add 'count:' prefix to differentiate count queries from exec queries
+            const cacheKey = 'count:' + this.context.generateCacheKey();
             const { statement, isHit } = await preparedStatementCache.getOrCreate(countSql, cacheKey, dbConn);
             countResult = await preparedStatementCache.execute(statement, result.params, dbConn);
         }
@@ -337,12 +338,17 @@ class Query {
             }
         }
 
-        // Execute the count query (already executed above based on cache bypass setting)
-        // countResult is already set from the cache bypass/direct execution logic above
+        // Safely extract count from result - handle undefined/null cases
+        if (!countResult || countResult.length === 0 || countResult[0] === undefined) {
+            return 0;
+        }
 
-        // Ensure count is returned as a number (PostgreSQL may return as string)
+        // PostgreSQL COUNT(*) returns a value, handle both string and number
         const count = countResult[0].count;
-        return typeof count === 'string' ? parseInt(count, 10) : count;
+        if (count === undefined || count === null) {
+            return 0;
+        }
+        return typeof count === 'string' ? parseInt(count, 10) : Number(count);
     }
 
     @timed("Query.exec")

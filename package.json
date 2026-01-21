@@ -17,7 +17,11 @@
     "scripts": {
         "build": "bun run build:studio && tsc",
         "build:studio": "cd studio && bun install && bun run build",
-        "dev": "tsc --watch"
+        "dev": "tsc --watch",
+        "test": "bun test tests/",
+        "test:unit": "bun test tests/unit/",
+        "test:integration": "bun test tests/integration/",
+        "test:graphql": "bun test tests/graphql/"
     },
     "devDependencies": {
         "@types/bun": "latest",

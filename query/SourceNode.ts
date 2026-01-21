@@ -13,17 +13,24 @@ export class SourceNode extends QueryNode {
         // Add entity exclusions if any
         if (context.excludedEntityIds.size > 0) {
             const excludedIds = Array.from(context.excludedEntityIds);
-            const placeholders = excludedIds.map(() => `$${context.addParam(excludedIds.shift())}`).join(', ');
+            // Fix: Use the id directly instead of shift() which mutates the array
+            const placeholders = excludedIds.map((id) => `$${context.addParam(id)}`).join(', ');
             sql += ` AND id NOT IN (${placeholders})`;
         }
 
         sql += " ORDER BY id";
 
-        // Always include OFFSET (even when 0) to ensure consistent SQL structure for prepared statement caching
-        if (context.limit !== null) {
-            sql += ` LIMIT $${context.addParam(context.limit)}`;
+        // Only apply pagination if CTENode hasn't already applied it
+        // This prevents double parameter addition and incorrect SQL
+        if (!context.paginationAppliedInCTE) {
+            if (context.limit !== null) {
+                sql += ` LIMIT $${context.addParam(context.limit)}`;
+            }
+            // Always include OFFSET when pagination is used for consistent SQL structure
+            if (context.offsetValue > 0 || context.limit !== null) {
+                sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
+            }
         }
-        sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
 
         return {
             sql,

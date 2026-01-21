@@ -111,7 +111,15 @@ export class QueryContext {
         const customOperators = this.extractCustomOperators();
         const customOps = customOperators.length > 0 ? `customOps:${customOperators.sort().join(',')}` : '';
 
-        const key = `${components}|${excludedComponents}|${filters}|${sorts}|${this.hasCTE}|${this.cteName}|${customOps}`;
+        // Include pagination in cache key to prevent prepared statement collision
+        // when same query is executed with different pagination settings
+        const paginationKey = `limit:${this.limit !== null ? 'yes' : 'no'}|offset:${this.offsetValue > 0 ? 'yes' : 'no'}`;
+
+        // Include excluded entity IDs count for cache key differentiation
+        const excludedEntityCount = this.excludedEntityIds.size;
+        const excludedEntitiesKey = excludedEntityCount > 0 ? `|excludedEntities:${excludedEntityCount}` : '';
+
+        const key = `${components}|${excludedComponents}|${filters}|${sorts}|${this.hasCTE}|${this.cteName}|${customOps}|${paginationKey}${excludedEntitiesKey}`;
         return key;
     }
 
