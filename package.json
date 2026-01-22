@@ -21,7 +21,11 @@
         "test": "bun test tests/",
         "test:unit": "bun test tests/unit/",
         "test:integration": "bun test tests/integration/",
-        "test:graphql": "bun test tests/graphql/"
+        "test:graphql": "bun test tests/graphql/",
+        "test:stress": "bun test tests/stress --timeout 600000",
+        "test:stress:smoke": "STRESS_RECORD_COUNT=10000 bun test tests/stress --timeout 300000",
+        "test:stress:standard": "STRESS_RECORD_COUNT=100000 bun test tests/stress --timeout 600000",
+        "test:stress:full": "STRESS_RECORD_COUNT=1000000 bun test tests/stress --timeout 1800000"
     },
     "devDependencies": {
         "@types/bun": "latest",

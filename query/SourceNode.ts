@@ -18,7 +18,15 @@ export class SourceNode extends QueryNode {
             sql += ` AND id NOT IN (${placeholders})`;
         }
 
-        sql += " ORDER BY id";
+        // Apply cursor-based pagination (more efficient than OFFSET)
+        if (context.cursorId !== null) {
+            const operator = context.cursorDirection === 'after' ? '>' : '<';
+            sql += ` AND id ${operator} $${context.addParam(context.cursorId)}`;
+        }
+
+        // Order by id - reverse for 'before' cursor direction
+        const orderDirection = context.cursorDirection === 'before' ? 'DESC' : 'ASC';
+        sql += ` ORDER BY id ${orderDirection}`;
 
         // Only apply pagination if CTENode hasn't already applied it
         // This prevents double parameter addition and incorrect SQL
@@ -26,8 +34,8 @@ export class SourceNode extends QueryNode {
             if (context.limit !== null) {
                 sql += ` LIMIT $${context.addParam(context.limit)}`;
             }
-            // Always include OFFSET when pagination is used for consistent SQL structure
-            if (context.offsetValue > 0 || context.limit !== null) {
+            // Only include OFFSET when not using cursor-based pagination
+            if (context.cursorId === null && (context.offsetValue > 0 || context.limit !== null)) {
                 sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
             }
         }

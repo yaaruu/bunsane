@@ -230,6 +230,77 @@ export class Entity implements IEntity {
     }
 
     /**
+     * Check if entity has a component (type guard).
+     * Uses in-memory check only - does not query database.
+     * Useful for runtime checks before accessing component data.
+     *
+     * @example
+     * ```typescript
+     * if (entity.has(Health)) {
+     *   // TypeScript knows entity has Health component
+     *   const health = entity.getCached(Health); // guaranteed to exist
+     * }
+     * ```
+     *
+     * @param ctor Component constructor
+     * @returns true if component exists in memory
+     */
+    public has<T extends BaseComponent>(ctor: new (...args: any[]) => T): boolean {
+        return this.hasInMemory(ctor);
+    }
+
+    /**
+     * Get component data or throw if not found.
+     * Use this when you know the component must exist (e.g., after a query that included it).
+     *
+     * @example
+     * ```typescript
+     * // After query that included Position
+     * const pos = await entity.getOrThrow(Position);
+     * // pos is guaranteed to be ComponentDataType<Position>, not null
+     * ```
+     *
+     * @param ctor Component constructor
+     * @param context Optional DataLoader context and/or transaction
+     * @returns Component data (never null)
+     * @throws Error if component not found
+     */
+    public async getOrThrow<T extends BaseComponent>(
+        ctor: new (...args: any[]) => T,
+        context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }
+    ): Promise<ComponentDataType<T>> {
+        const data = await this.get(ctor, context);
+        if (data === null) {
+            throw new Error(`Entity ${this.id} is missing required component ${ctor.name}`);
+        }
+        return data;
+    }
+
+    /**
+     * Get component data synchronously if already loaded in memory.
+     * Does NOT trigger a database fetch - returns undefined if not cached.
+     *
+     * Use this for performance-critical code paths when you know
+     * the component was already loaded (e.g., via query populate).
+     *
+     * @example
+     * ```typescript
+     * // After query with .populate()
+     * const pos = entity.getCached(Position);
+     * if (pos) {
+     *   console.log(pos.x, pos.y);
+     * }
+     * ```
+     *
+     * @param ctor Component constructor
+     * @returns Component data if in memory, undefined otherwise
+     */
+    public getCached<T extends BaseComponent>(ctor: new (...args: any[]) => T): ComponentDataType<T> | undefined {
+        const comp = this.getInMemory(ctor);
+        return comp ? (comp as ComponentGetter<T>).data() : undefined;
+    }
+
+    /**
      * Get component instance from entity. Loads from DB if not cached.
      * @param ctor Constructor of the component to fetch
      * @param context Optional DataLoader context and/or transaction

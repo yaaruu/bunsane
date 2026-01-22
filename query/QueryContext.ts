@@ -28,6 +28,10 @@ export class QueryContext {
     public withId: string | null = null;
     public limit: number | null = null;
     public offsetValue: number = 0;
+
+    // Cursor-based pagination (more efficient than OFFSET for large datasets)
+    public cursorId: string | null = null;
+    public cursorDirection: 'after' | 'before' = 'after';
     public hasCTE: boolean = false;
     public cteName: string = "";
     public eagerComponents: Set<string> = new Set();
@@ -113,7 +117,7 @@ export class QueryContext {
 
         // Include pagination in cache key to prevent prepared statement collision
         // when same query is executed with different pagination settings
-        const paginationKey = `limit:${this.limit !== null ? 'yes' : 'no'}|offset:${this.offsetValue > 0 ? 'yes' : 'no'}`;
+        const paginationKey = `limit:${this.limit !== null ? 'yes' : 'no'}|offset:${this.offsetValue > 0 ? 'yes' : 'no'}|cursor:${this.cursorId !== null ? this.cursorDirection : 'no'}`;
 
         // Include excluded entity IDs count for cache key differentiation
         const excludedEntityCount = this.excludedEntityIds.size;
@@ -155,6 +159,8 @@ export class QueryContext {
         clone.withId = this.withId;
         clone.limit = this.limit;
         clone.offsetValue = this.offsetValue;
+        clone.cursorId = this.cursorId;
+        clone.cursorDirection = this.cursorDirection;
         clone.hasCTE = this.hasCTE;
         clone.cteName = this.cteName;
         clone.eagerComponents = new Set(this.eagerComponents);

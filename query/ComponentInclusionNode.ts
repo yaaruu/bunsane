@@ -31,7 +31,7 @@ export class ComponentInclusionNode extends QueryNode {
         const useLateralJoins = Boolean(shouldUseLateralJoins());
 
         // Check if CTE is available and use it to avoid redundant entity_components scans
-        const useCTE = context.hasCTE && context.cteName;
+        const useCTE = Boolean(context.hasCTE && context.cteName);
 
         // Collect LATERAL join fragments if using LATERAL joins
         const lateralJoins: string[] = [];
@@ -43,11 +43,29 @@ export class ComponentInclusionNode extends QueryNode {
         if (componentCount === 1) {
             // Single component case
             const componentId = componentIds[0]!;
-            
+
+            // Check if we can use single-pass optimization (filter + sort on same component)
+            // This must be checked BEFORE adding any params to avoid orphan params
+            const canUseSinglePass = hasSortOrders &&
+                context.sortOrders.length === 1 &&
+                context.componentFilters.size > 0 &&
+                !context.withId &&
+                excludedIds.length === 0 &&
+                context.excludedEntityIds.size === 0 &&
+                !useCTE;
+
+            if (canUseSinglePass) {
+                const singlePass = this.applySinglePassFilterSort(context);
+                if (singlePass) {
+                    // Single-pass handles filters, sort, and pagination all in one query
+                    return { sql: singlePass, params: context.params, context };
+                }
+            }
+
             if (useCTE) {
                 // Use CTE for base entity filtering
                 sql = `SELECT DISTINCT ${context.cteName}.entity_id as id FROM ${context.cteName}`;
-                
+
                 // Filter by the specific component type if not already in CTE
                 if (!componentIds.some(id => context.componentIds.has(id))) {
                     sql += ` WHERE EXISTS (
@@ -89,7 +107,7 @@ export class ComponentInclusionNode extends QueryNode {
                 sql += ` ${whereKeyword} ${tableAlias}.entity_id NOT IN (${entityPlaceholders})`;
             }
 
-            // Apply component filters for single component
+            // Apply component filters for single component (normal path)
             sql = this.applyComponentFilters(context, componentIds, useCTE, useLateralJoins, lateralJoins, lateralConditions, sql, new Map());
 
             // Apply sorting with component data joins if sortOrders are specified
@@ -98,17 +116,27 @@ export class ComponentInclusionNode extends QueryNode {
             } else {
                 // Default: order by entity_id
                 const tableAlias = useCTE ? context.cteName : "ec";
-                sql += ` ORDER BY ${tableAlias}.entity_id`;
-                
+                const idColumn = useCTE ? `${context.cteName}.entity_id` : `${tableAlias}.entity_id`;
+
+                // Apply cursor-based pagination if cursor is set (more efficient than OFFSET)
+                if (context.cursorId !== null && !context.paginationAppliedInCTE) {
+                    const operator = context.cursorDirection === 'after' ? '>' : '<';
+                    const whereKeyword = sql.includes('WHERE') ? 'AND' : 'WHERE';
+                    sql += ` ${whereKeyword} ${idColumn} ${operator} $${context.addParam(context.cursorId)}`;
+                }
+
+                // Order direction depends on cursor direction
+                const orderDirection = context.cursorDirection === 'before' ? 'DESC' : 'ASC';
+                sql += ` ORDER BY ${idColumn} ${orderDirection}`;
+
                 // Add LIMIT and OFFSET only if not already applied in CTE
                 // When pagination is applied at CTE level, skip it here to avoid double pagination
                 if (!context.paginationAppliedInCTE) {
                     if (context.limit !== null) {
                         sql += ` LIMIT $${context.addParam(context.limit)}`;
-                        // Always add OFFSET with LIMIT for consistent SQL structure
-                        sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
-                    } else if (context.offsetValue > 0) {
-                        // Only add OFFSET without LIMIT if offset is explicitly set
+                    }
+                    // Only add OFFSET when not using cursor-based pagination
+                    if (context.cursorId === null && (context.offsetValue > 0 || context.limit !== null)) {
                         sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
                     }
                 }
@@ -187,17 +215,27 @@ export class ComponentInclusionNode extends QueryNode {
             } else {
                 // Default: order by entity_id
                 const tableAlias = useCTE ? context.cteName : "ec";
-                sql += ` ORDER BY ${tableAlias}.entity_id`;
-                
+                const idColumn = useCTE ? `${context.cteName}.entity_id` : `${tableAlias}.entity_id`;
+
+                // Apply cursor-based pagination if cursor is set (more efficient than OFFSET)
+                if (context.cursorId !== null && !context.paginationAppliedInCTE) {
+                    const operator = context.cursorDirection === 'after' ? '>' : '<';
+                    const whereKeyword = sql.includes('WHERE') ? 'AND' : 'WHERE';
+                    sql += ` ${whereKeyword} ${idColumn} ${operator} $${context.addParam(context.cursorId)}`;
+                }
+
+                // Order direction depends on cursor direction
+                const orderDirection = context.cursorDirection === 'before' ? 'DESC' : 'ASC';
+                sql += ` ORDER BY ${idColumn} ${orderDirection}`;
+
                 // Add LIMIT and OFFSET only if not already applied in CTE
                 // When pagination is applied at CTE level, skip it here to avoid double pagination
                 if (!context.paginationAppliedInCTE) {
                     if (context.limit !== null) {
                         sql += ` LIMIT $${context.addParam(context.limit)}`;
-                        // Always add OFFSET with LIMIT for consistent SQL structure
-                        sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
-                    } else if (context.offsetValue > 0) {
-                        // Only add OFFSET without LIMIT if offset is explicitly set
+                    }
+                    // Only add OFFSET when not using cursor-based pagination
+                    if (context.cursorId === null && (context.offsetValue > 0 || context.limit !== null)) {
                         sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
                     }
                 }
@@ -221,7 +259,13 @@ export class ComponentInclusionNode extends QueryNode {
             const optimized = this.applySortingOptimized(baseQuery, context);
             if (optimized) return optimized;
         }
-        
+
+        // Try single-pass optimization when filters and sort are on the same component
+        if (context.sortOrders.length === 1) {
+            const singlePass = this.applySinglePassFilterSort(context);
+            if (singlePass) return singlePass;
+        }
+
         // Wrap the base query as a subquery to get entity ids
         let sql = `SELECT base_entities.id FROM (${baseQuery}) AS base_entities`;
         
@@ -274,9 +318,111 @@ export class ComponentInclusionNode extends QueryNode {
             if (context.limit !== null) {
                 sql += ` LIMIT $${context.addParam(context.limit)}`;
             }
-            sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
+            // Only add OFFSET when not using cursor-based pagination
+            if (context.cursorId === null && (context.offsetValue > 0 || context.limit !== null)) {
+                sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
+            }
         }
-        
+
+        return sql;
+    }
+
+    /**
+     * Single-pass optimization when all filters and sort are on the same component.
+     * Instead of: CTE -> EXISTS filters -> subquery -> JOIN for sort -> LIMIT
+     * We do: JOIN once -> filter + sort in same query -> LIMIT
+     *
+     * This is dramatically faster because PostgreSQL can use indexes to find
+     * the top N matching rows directly instead of finding ALL matches first.
+     */
+    private applySinglePassFilterSort(context: QueryContext): string | null {
+        if (context.sortOrders.length !== 1) return null;
+
+        const sortOrder = context.sortOrders[0]!;
+        const sortTypeId = ComponentRegistry.getComponentId(sortOrder.component);
+        if (!sortTypeId) return null;
+
+        // Check if all filters are on the same component as the sort
+        const filterComponentIds = Array.from(context.componentFilters.keys());
+        if (filterComponentIds.length === 0) return null;
+        if (filterComponentIds.length > 1) return null; // Multiple components - can't optimize
+        if (filterComponentIds[0] !== sortTypeId) return null; // Filter and sort on different components
+
+        // All filters and sort are on the same component - use single-pass optimization
+        const filters = context.componentFilters.get(sortTypeId) || [];
+        if (filters.length === 0) return null;
+
+        const componentTableName = this.getComponentTableName(sortTypeId);
+        const useDirectPartition = shouldUseDirectPartition() && componentTableName !== 'components';
+
+        // Build filter conditions
+        const filterConditions: string[] = [];
+        for (const filter of filters) {
+            // Build JSON path
+            let jsonPath: string;
+            if (filter.field.includes('.')) {
+                const parts = filter.field.split('.');
+                const lastPart = parts.pop()!;
+                const nestedPath = parts.map(p => `'${p}'`).join('->');
+                jsonPath = `c.data->${nestedPath}->>'${lastPart}'`;
+            } else {
+                jsonPath = `c.data->>'${filter.field}'`;
+            }
+
+            // Build condition based on type
+            let condition: string;
+            if (typeof filter.value === 'number') {
+                condition = `(${jsonPath})::numeric ${filter.operator} $${context.addParam(filter.value)}::numeric`;
+            } else if (typeof filter.value === 'boolean') {
+                condition = `(${jsonPath})::boolean ${filter.operator} $${context.addParam(filter.value)}`;
+            } else if (filter.operator === 'IN' || filter.operator === 'NOT IN') {
+                if (Array.isArray(filter.value)) {
+                    const placeholders = filter.value.map((v: any) => `$${context.addParam(v)}`).join(', ');
+                    condition = `${jsonPath} ${filter.operator} (${placeholders})`;
+                } else {
+                    return null; // Invalid - fall back to normal path
+                }
+            } else if (filter.operator === 'LIKE' || filter.operator === 'NOT LIKE') {
+                condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}::text`;
+            } else {
+                condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}::text`;
+            }
+
+            filterConditions.push(condition);
+        }
+
+        const nullsClause = sortOrder.nullsFirst ? 'NULLS FIRST' : 'NULLS LAST';
+
+        let sql: string;
+        if (useDirectPartition) {
+            // Direct partition access - most efficient
+            // No DISTINCT needed since each entity has one component of this type
+            sql = `SELECT c.entity_id as id FROM ${componentTableName} c
+                WHERE c.type_id = $${context.addParam(sortTypeId)}::text
+                AND c.deleted_at IS NULL
+                AND ${filterConditions.join(' AND ')}
+                ORDER BY c.data->>'${sortOrder.property}' ${sortOrder.direction} ${nullsClause}`;
+        } else {
+            // Use entity_components junction
+            // No DISTINCT needed since each entity has one component of this type
+            sql = `SELECT ec.entity_id as id FROM entity_components ec
+                JOIN ${componentTableName} c ON c.id = ec.component_id AND c.deleted_at IS NULL
+                WHERE ec.type_id = $${context.addParam(sortTypeId)}::text
+                AND ec.deleted_at IS NULL
+                AND ${filterConditions.join(' AND ')}
+                ORDER BY c.data->>'${sortOrder.property}' ${sortOrder.direction} ${nullsClause}`;
+        }
+
+        // Add pagination
+        if (!context.paginationAppliedInCTE) {
+            if (context.limit !== null) {
+                sql += ` LIMIT $${context.addParam(context.limit)}`;
+            }
+            if (context.cursorId === null && (context.offsetValue > 0 || context.limit !== null)) {
+                sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
+            }
+        }
+
         return sql;
     }
 
@@ -310,9 +456,12 @@ export class ComponentInclusionNode extends QueryNode {
             if (context.limit !== null) {
                 sql += ` LIMIT $${context.addParam(context.limit)}`;
             }
-            sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
+            // Only add OFFSET when not using cursor-based pagination
+            if (context.cursorId === null && (context.offsetValue > 0 || context.limit !== null)) {
+                sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
+            }
         }
-        
+
         return sql;
     }
 

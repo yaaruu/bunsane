@@ -58,7 +58,7 @@ export interface ScheduledTaskOptions {
      *         .without(AuthenticatedTag);
      * }
      */
-    query?: () => Query;
+    query?: () => Query<any>;
     /** Cron expression (when interval is CRON) */
     cronExpression?: string;
 }

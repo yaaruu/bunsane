@@ -744,6 +744,185 @@ export type ArcheTypeCreateInfo = {
 
 export type ArcheTypeOwnProperties<T extends BaseArcheType> = Omit<T, keyof BaseArcheType>;
 
+/**
+ * Result type that provides direct typed access to archetype fields.
+ * Wraps an entity with its archetype's component data exposed as properties.
+ */
+export type ArcheTypeResult<T extends BaseArcheType> = {
+    /** The underlying entity */
+    entity: Entity;
+    /** Entity ID shorthand */
+    id: string;
+    /** Save changes to the entity */
+    save(): Promise<void>;
+} & {
+    [K in keyof T as T[K] extends BaseComponent ? K : never]:
+        T[K] extends BaseComponent ? ComponentDataType<T[K]> : never;
+};
+
+/**
+ * Query builder for ArcheTypes that returns fully-typed results.
+ * Auto-includes all archetype components and provides typed filter methods.
+ *
+ * @example
+ * ```typescript
+ * const players = await Player.query()
+ *   .filter('health', 'gt', { current: 50 })
+ *   .exec();
+ *
+ * for (const player of players) {
+ *   console.log(player.position.x, player.health.current);
+ * }
+ * ```
+ */
+export class ArcheTypeQuery<T extends BaseArcheType> {
+    private innerQuery: Query<any>;
+    private archetypeInstance: T;
+    private archetypeCtor: new () => T;
+
+    constructor(archetypeCtor: new () => T) {
+        this.archetypeCtor = archetypeCtor;
+        this.archetypeInstance = new archetypeCtor();
+        this.innerQuery = new Query();
+
+        // Auto-add all archetype components to the query
+        for (const [_, componentCtor] of Object.entries(this.archetypeInstance.componentMap)) {
+            this.innerQuery = this.innerQuery.with(componentCtor as any);
+        }
+    }
+
+    /**
+     * Add a filter on an archetype field.
+     * @param field The archetype field name (maps to a component)
+     * @param operator Filter operator: eq, neq, gt, gte, lt, lte, in, like
+     * @param value The value to filter by (partial component data)
+     */
+    public filter<K extends keyof ArcheTypeOwnProperties<T>>(
+        field: K,
+        operator: 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte' | 'in' | 'notIn' | 'like',
+        value: Partial<T[K] extends BaseComponent ? ComponentDataType<T[K]> : never>
+    ): this {
+        const componentCtor = this.archetypeInstance.componentMap[field as string];
+        if (!componentCtor) {
+            throw new Error(`Field '${String(field)}' is not a component field on this archetype`);
+        }
+
+        // Map operator to FilterOp
+        const opMap: Record<string, string> = {
+            'eq': '=', 'neq': '!=', 'gt': '>', 'gte': '>=',
+            'lt': '<', 'lte': '<=', 'in': 'IN', 'notIn': 'NOT IN', 'like': 'LIKE'
+        };
+        const filterOp = opMap[operator] || '=';
+
+        // Build filters from the partial value
+        const filters = Object.entries(value as object).map(([propKey, propValue]) => ({
+            field: propKey,
+            operator: filterOp,
+            value: propValue
+        }));
+
+        // Re-add the component with filters
+        this.innerQuery = this.innerQuery.with(componentCtor as any, { filters });
+
+        return this;
+    }
+
+    /**
+     * Limit the number of results
+     */
+    public take(limit: number): this {
+        this.innerQuery = this.innerQuery.take(limit);
+        return this;
+    }
+
+    /**
+     * Skip a number of results (for pagination)
+     */
+    public offset(offset: number): this {
+        this.innerQuery = this.innerQuery.offset(offset);
+        return this;
+    }
+
+    /**
+     * Sort results by a component field
+     */
+    public sortBy<K extends keyof ArcheTypeOwnProperties<T>>(
+        field: K,
+        property: T[K] extends BaseComponent ? keyof ComponentDataType<T[K]> : never,
+        direction: 'ASC' | 'DESC' = 'ASC'
+    ): this {
+        const componentCtor = this.archetypeInstance.componentMap[field as string];
+        if (!componentCtor) {
+            throw new Error(`Field '${String(field)}' is not a component field on this archetype`);
+        }
+        // Cast needed because innerQuery has dynamic component types
+        (this.innerQuery as any).sortBy(componentCtor, property, direction);
+        return this;
+    }
+
+    /**
+     * Enable populate mode to load all component data
+     */
+    public populate(): this {
+        this.innerQuery = this.innerQuery.populate();
+        return this;
+    }
+
+    /**
+     * Bypass cache for this query
+     */
+    public noCache(): this {
+        this.innerQuery = this.innerQuery.noCache();
+        return this;
+    }
+
+    /**
+     * Execute the query and return typed archetype results
+     */
+    public async exec(): Promise<ArcheTypeResult<T>[]> {
+        const entities = await this.innerQuery.populate().exec();
+        return entities.map(entity => this.wrapAsArchetype(entity as Entity));
+    }
+
+    /**
+     * Execute the query and return the first result (or null)
+     */
+    public async first(): Promise<ArcheTypeResult<T> | null> {
+        const results = await this.innerQuery.take(1).populate().exec();
+        return results[0] ? this.wrapAsArchetype(results[0] as Entity) : null;
+    }
+
+    /**
+     * Get the count of matching entities
+     */
+    public count(): Promise<number> {
+        return this.innerQuery.count();
+    }
+
+    /**
+     * Wrap an entity as an ArcheTypeResult with direct property access
+     */
+    private wrapAsArchetype(entity: Entity): ArcheTypeResult<T> {
+        const result: any = {
+            entity,
+            id: entity.id,
+            save: async () => {
+                await entity.save();
+            }
+        };
+
+        // Add component data as direct properties
+        for (const [fieldName, componentCtor] of Object.entries(this.archetypeInstance.componentMap)) {
+            const comp = entity.getInMemory(componentCtor as any);
+            if (comp) {
+                result[fieldName] = (comp as any).data();
+            }
+        }
+
+        return result as ArcheTypeResult<T>;
+    }
+}
+
 export class BaseArcheType {
     protected components: Set<{
         ctor: new (...args: any[]) => BaseComponent;
@@ -1039,13 +1218,14 @@ export class BaseArcheType {
         }
         
         const { Query } = await import("../query");
-        
+
         // Build query with selected components for batch loading
-        let query = new Query().findById(id);
-        
+        // Use `any` since components are dynamically added in loop
+        let query: any = new Query().findById(id);
+
         // Determine which components to load
         const componentsToLoad = this.getComponentsToLoad(options);
-        
+
         for (const componentCtor of componentsToLoad) {
             query = query.with(componentCtor as any);
         }
@@ -1254,6 +1434,38 @@ export class BaseArcheType {
     ): Promise<Entity | null> {
         const instance = new archetypeClass();
         return instance.getEntityWithID(id, options);
+    }
+
+    /**
+     * Create a typed query builder for this archetype.
+     * Auto-includes all archetype components and returns typed results.
+     *
+     * @example
+     * ```typescript
+     * // Subclass usage (most common)
+     * class Player extends BaseArcheType {
+     *   @ArcheTypeField(Position) position!: Position;
+     *   @ArcheTypeField(Health) health!: Health;
+     * }
+     *
+     * const players = await Player.query()
+     *   .filter('health', 'gt', { current: 50 })
+     *   .sortBy('position', 'x', 'ASC')
+     *   .take(10)
+     *   .exec();
+     *
+     * for (const player of players) {
+     *   // Direct typed access - no async, no null checks
+     *   console.log(player.position.x, player.health.current);
+     *   // Access underlying entity when needed
+     *   await player.save();
+     * }
+     * ```
+     */
+    static query<T extends BaseArcheType>(
+        this: new () => T
+    ): ArcheTypeQuery<T> {
+        return new ArcheTypeQuery<T>(this);
     }
 
     /**

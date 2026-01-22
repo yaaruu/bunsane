@@ -47,13 +47,14 @@ describe('Query', () => {
         test('adds component requirement to query', () => {
             const query = new Query();
             const result = query.with(TestUser);
-            expect(result).toBe(query); // Returns this for chaining
+            // with() returns same instance for chaining (type changes for type accumulation)
+            expect(result as any).toBe(query as any);
         });
 
         test('allows chaining multiple with() calls', () => {
             const query = new Query();
             const result = query.with(TestUser).with(TestProduct);
-            expect(result).toBe(query);
+            expect(result as any).toBe(query as any);
         });
 
         test('accepts component with filters', () => {
@@ -61,7 +62,7 @@ describe('Query', () => {
             const result = query.with(TestUser, {
                 filters: [{ field: 'name', operator: FilterOp.EQ, value: 'John' }]
             });
-            expect(result).toBe(query);
+            expect(result as any).toBe(query as any);
         });
 
         test('accepts array of components with filters', () => {
@@ -78,7 +79,7 @@ describe('Query', () => {
         test('excludes entities with specified component', () => {
             const query = new Query();
             const result = query.with(TestUser).without(TestProduct);
-            expect(result).toBe(query);
+            expect(result as any).toBe(query as any);
         });
     });
 
@@ -94,7 +95,7 @@ describe('Query', () => {
         test('enables component population', () => {
             const query = new Query();
             const result = query.with(TestUser).populate();
-            expect(result).toBe(query);
+            expect(result as any).toBe(query as any);
         });
     });
 
@@ -102,7 +103,7 @@ describe('Query', () => {
         test('sets up eager loading for components', () => {
             const query = new Query();
             const result = query.with(TestUser).eagerLoadComponents([TestUser, TestProduct]);
-            expect(result).toBe(query);
+            expect(result as any).toBe(query as any);
         });
     });
 
@@ -110,7 +111,7 @@ describe('Query', () => {
         test('is an alias for eagerLoadComponents', () => {
             const query = new Query();
             const result = query.with(TestUser).eagerLoad([TestUser]);
-            expect(result).toBe(query);
+            expect(result as any).toBe(query as any);
         });
     });
 
@@ -118,7 +119,7 @@ describe('Query', () => {
         test('sets limit on query results', () => {
             const query = new Query();
             const result = query.with(TestUser).take(10);
-            expect(result).toBe(query);
+            expect(result as any).toBe(query as any);
         });
     });
 
@@ -126,7 +127,7 @@ describe('Query', () => {
         test('sets offset for pagination', () => {
             const query = new Query();
             const result = query.with(TestUser).offset(20);
-            expect(result).toBe(query);
+            expect(result as any).toBe(query as any);
         });
     });
 
@@ -134,19 +135,19 @@ describe('Query', () => {
         test('sets sort order', () => {
             const query = new Query();
             const result = query.with(TestUser).sortBy(TestUser, 'name', 'ASC');
-            expect(result).toBe(query);
+            expect(result as any).toBe(query as any);
         });
 
         test('accepts DESC direction', () => {
             const query = new Query();
             const result = query.with(TestUser).sortBy(TestUser, 'age', 'DESC');
-            expect(result).toBe(query);
+            expect(result as any).toBe(query as any);
         });
 
         test('accepts nullsFirst option', () => {
             const query = new Query();
             const result = query.with(TestUser).sortBy(TestUser, 'bio', 'ASC', true);
-            expect(result).toBe(query);
+            expect(result as any).toBe(query as any);
         });
 
         test('throws if component not in query', () => {
@@ -265,7 +266,8 @@ describe('Query', () => {
                 value!: number;
             }
             const query = new Query();
-            await expect(query.sum(UnregisteredComponent as any, 'value')).rejects.toThrow(
+            // @ts-expect-error - Testing with unregistered component
+            await expect(query.sum(UnregisteredComponent, 'value')).rejects.toThrow(
                 /not registered/
             );
         });
@@ -291,7 +293,8 @@ describe('Query', () => {
                 value!: number;
             }
             const query = new Query();
-            await expect(query.average(UnregisteredComponent as any, 'value')).rejects.toThrow(
+            // @ts-expect-error - Testing with unregistered component
+            await expect(query.average(UnregisteredComponent, 'value')).rejects.toThrow(
                 /not registered/
             );
         });

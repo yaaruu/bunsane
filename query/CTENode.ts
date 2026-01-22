@@ -22,6 +22,12 @@ export class CTENode extends QueryNode {
         cteSql += typePlaceholders + ")\n";
         cteSql += "    AND ec.deleted_at IS NULL\n";
 
+        // Add cursor-based pagination filter in CTE (more efficient than OFFSET)
+        if (context.cursorId !== null) {
+            const operator = context.cursorDirection === 'after' ? '>' : '<';
+            cteSql += `    AND ec.entity_id ${operator} $${context.addParam(context.cursorId)}\n`;
+        }
+
         // Add exclusions if any
         if (excludedIds.length > 0) {
             const excludedPlaceholders = excludedIds.map((id) => `$${context.addParam(id)}`).join(', ');
@@ -47,7 +53,9 @@ export class CTENode extends QueryNode {
 
         // Add ORDER BY for deterministic pagination results
         // Must be before LIMIT/OFFSET for consistent page results
-        cteSql += `    ORDER BY ec.entity_id\n`;
+        // Reverse order for 'before' cursor direction
+        const orderDirection = context.cursorDirection === 'before' ? 'DESC' : 'ASC';
+        cteSql += `    ORDER BY ec.entity_id ${orderDirection}\n`;
 
         // Check if there are component filters - if so, pagination must happen AFTER filtering
         // Otherwise we'd limit results before applying filters, causing incorrect results
@@ -59,8 +67,8 @@ export class CTENode extends QueryNode {
             if (context.limit !== null) {
                 cteSql += `    LIMIT $${context.addParam(context.limit)}\n`;
             }
-            if (context.offsetValue > 0 || context.limit !== null) {
-                // Always include OFFSET when pagination is used for consistent SQL structure
+            // Only include OFFSET when not using cursor-based pagination
+            if (context.cursorId === null && (context.offsetValue > 0 || context.limit !== null)) {
                 cteSql += `    OFFSET $${context.addParam(context.offsetValue)}\n`;
             }
             // Mark pagination as handled at CTE level to prevent double application

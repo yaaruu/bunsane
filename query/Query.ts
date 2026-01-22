@@ -11,6 +11,7 @@ import { preparedStatementCache } from "../database/PreparedStatementCache";
 import { getMetadataStorage } from "../core/metadata";
 import { shouldUseDirectPartition } from "../core/Config";
 import type { SQL } from "bun";
+import type { ComponentConstructor, TypedEntity, ComponentRecord } from "../types/query.types";
 
 export type FilterOperator = "=" | ">" | "<" | ">=" | "<=" | "!=" | "LIKE" | "IN" | "NOT IN" | string;
 
@@ -56,9 +57,21 @@ export interface QueryCacheOptions {
 }
 
 /**
- * New Query class that uses DAG internally for better modularity and extensibility
+ * New Query class that uses DAG internally for better modularity and extensibility.
+ *
+ * Generic type parameter `TComponents` tracks component types added via `.with()`,
+ * enabling type-safe access to component data after query execution.
+ *
+ * @example
+ * ```typescript
+ * const entities = await new Query()
+ *   .with(Position)
+ *   .with(Velocity)
+ *   .exec();
+ * // entities is TypedEntity<[typeof Position, typeof Velocity]>[]
+ * ```
  */
-class Query {
+class Query<TComponents extends readonly ComponentConstructor[] = []> {
     private context: QueryContext;
     private debug: boolean = false;
     private orQuery: OrQuery | null = null;
@@ -66,6 +79,9 @@ class Query {
     private trx: SQL | undefined;
     private skipPreparedCache: boolean = false;
     private skipComponentCache: boolean = false;
+
+    /** Component constructors added to this query for type-safe access */
+    private _componentCtors: ComponentConstructor[] = [];
 
     constructor(trx?: SQL) {
         this.trx = trx;
@@ -88,7 +104,7 @@ class Query {
         return this;
     }
 
-    public async findOneById(id: string): Promise<Entity | null> {
+    public async findOneById(id: string): Promise<TypedEntity<TComponents> | null> {
         // Validate ID to prevent PostgreSQL UUID parsing errors
         if (!id || typeof id !== 'string' || id.trim() === '') {
             return null;
@@ -97,13 +113,20 @@ class Query {
         return entities.length > 0 ? entities[0]! : null;
     }
 
-    public with<T extends BaseComponent>(componentCtor: new (...args: any[]) => T, options?: QueryFilterOptions): this;
+    /**
+     * Add a component requirement to the query with type accumulation.
+     * The returned Query tracks all component types for type-safe access after exec().
+     */
+    public with<T extends BaseComponent>(
+        componentCtor: new (...args: any[]) => T,
+        options?: QueryFilterOptions
+    ): Query<readonly [...TComponents, new (...args: any[]) => T]>;
     public with(components: ComponentWithFilters[]): this;
     public with(orQuery: OrQuery): this;
     public with<T extends BaseComponent>(
         componentCtorOrComponentsOrOrQuery: (new (...args: any[]) => T) | ComponentWithFilters[] | OrQuery,
         options?: QueryFilterOptions
-    ): this {
+    ): Query<readonly [...TComponents, new (...args: any[]) => T]> | this {
         if (componentCtorOrComponentsOrOrQuery instanceof OrQuery) {
             // Handle OR query
             this.orQuery = componentCtorOrComponentsOrOrQuery;
@@ -118,6 +141,7 @@ class Query {
                     throw new Error(`Component ${item.component.name} is not registered.`);
                 }
                 this.context.componentIds.add(typeId);
+                this._componentCtors.push(item.component);
 
                 if (item.filters && item.filters.length > 0) {
                     this.context.componentFilters.set(typeId, item.filters);
@@ -130,13 +154,14 @@ class Query {
                 throw new Error(`Component ${componentCtorOrComponentsOrOrQuery.name} is not registered.`);
             }
             this.context.componentIds.add(typeId);
+            this._componentCtors.push(componentCtorOrComponentsOrOrQuery);
 
             if (options?.filters && options.filters.length > 0) {
                 this.context.componentFilters.set(typeId, options.filters);
             }
         }
 
-        return this;
+        return this as unknown as Query<readonly [...TComponents, new (...args: any[]) => T]>;
     }
 
     public without<T extends BaseComponent>(ctor: new (...args: any[]) => T) {
@@ -188,6 +213,30 @@ class Query {
 
     public offset(offset: number): this {
         this.context.offsetValue = offset;
+        return this;
+    }
+
+    /**
+     * Use cursor-based pagination instead of OFFSET.
+     * Much more efficient for large datasets - O(1) instead of O(offset).
+     * 
+     * @param cursorId - The entity ID to paginate from (exclusive)
+     * @param direction - 'after' for next page (default), 'before' for previous page
+     * @returns this for chaining
+     * 
+     * @example
+     * // Get first page
+     * const page1 = await new Query().with(User).take(100).exec();
+     * 
+     * // Get next page using cursor
+     * const lastId = page1[page1.length - 1].id;
+     * const page2 = await new Query().with(User).take(100).cursor(lastId).exec();
+     */
+    public cursor(cursorId: string, direction: 'after' | 'before' = 'after'): this {
+        this.context.cursorId = cursorId;
+        this.context.cursorDirection = direction;
+        // Clear offset when using cursor-based pagination
+        this.context.offsetValue = 0;
         return this;
     }
 
@@ -261,6 +310,46 @@ class Query {
                     reject(error);
                 });
         });
+    }
+
+    /**
+     * Get an estimated count using PostgreSQL statistics.
+     * Much faster than exact count() for large tables - O(1) instead of O(n).
+     * 
+     * Note: Returns approximate count based on PostgreSQL's statistics.
+     * Run ANALYZE on the table for more accurate estimates.
+     * 
+     * @param component - The component class to count (uses its partition table)
+     * @returns Estimated count (may be up to 10% off for recently modified tables)
+     * 
+     * @example
+     * // Fast approximate count
+     * const approxCount = await new Query().with(User).estimatedCount(User);
+     * console.log(`Approximately ${approxCount} users`);
+     */
+    public async estimatedCount(component: new (...args: any[]) => BaseComponent): Promise<number> {
+        const typeId = ComponentRegistry.getComponentId(component.name);
+        if (!typeId) {
+            throw new Error(`Component ${component.name} not registered`);
+        }
+
+        const tableName = ComponentRegistry.getPartitionTableName(typeId);
+        const dbConn = this.getDb();
+
+        // Use PostgreSQL's statistics for fast count estimate
+        // This queries pg_class which is O(1) instead of scanning the table
+        const sql = tableName && tableName !== 'components'
+            ? `SELECT reltuples::bigint AS estimate FROM pg_class WHERE relname = $1`
+            : `SELECT reltuples::bigint AS estimate FROM pg_class WHERE relname = 'entity_components'`;
+
+        const result = await dbConn.unsafe(sql, [tableName || 'entity_components']);
+
+        if (!result || result.length === 0 || result[0].estimate === null) {
+            // Fallback to exact count if statistics not available
+            return this.count();
+        }
+
+        return Number(result[0].estimate);
     }
 
     private async doCount(): Promise<number> {
@@ -536,9 +625,18 @@ AND c.deleted_at IS NULL`;
         return typeof value === 'string' ? parseFloat(value) : Number(value);
     }
 
+    /**
+     * Execute the query and return typed entities.
+     *
+     * When components are added via `.with()`, the returned entities have:
+     * - `getTyped(Ctor)`: Type-safe async getter (returns non-null since query guarantees existence)
+     * - `componentData`: Synchronous access to already-loaded component data
+     *
+     * @returns Promise resolving to array of TypedEntity with accumulated component types
+     */
     @timed("Query.exec")
-    public async exec(): Promise<Entity[]> {
-        return new Promise<Entity[]>((resolve, reject) => {
+    public async exec(): Promise<TypedEntity<TComponents>[]> {
+        return new Promise<TypedEntity<TComponents>[]>((resolve, reject) => {
             // Add timeout to prevent hanging queries
             const timeout = setTimeout(() => {
                 logger.error(`Query execution timeout`);
@@ -548,13 +646,66 @@ AND c.deleted_at IS NULL`;
             this.doExec()
                 .then(result => {
                     clearTimeout(timeout);
-                    resolve(result);
+                    // Wrap entities with typed accessors
+                    const typedEntities = result.map(e => this.wrapTypedEntity(e));
+                    resolve(typedEntities);
                 })
                 .catch(error => {
                     clearTimeout(timeout);
                     reject(error);
                 });
         });
+    }
+
+    /**
+     * Wrap an entity with typed accessors for components in this query.
+     * Provides both async getTyped() and synchronous componentData access.
+     */
+    private wrapTypedEntity(entity: Entity): TypedEntity<TComponents> {
+        const componentCtors = this._componentCtors;
+
+        // Build synchronous component data record from already-loaded components
+        const componentData: Record<string, any> = {};
+        for (const ctor of componentCtors) {
+            const comp = entity.getInMemory(ctor);
+            if (comp) {
+                componentData[ctor.name] = (comp as any).data();
+            }
+        }
+
+        // Create typed entity wrapper
+        const typedEntity = entity as TypedEntity<TComponents>;
+
+        // Define componentData property
+        Object.defineProperty(typedEntity, 'componentData', {
+            value: componentData as ComponentRecord<TComponents>,
+            writable: false,
+            enumerable: true
+        });
+
+        // Define _queriedComponents property for runtime reflection
+        Object.defineProperty(typedEntity, '_queriedComponents', {
+            value: componentCtors as unknown as TComponents,
+            writable: false,
+            enumerable: false
+        });
+
+        // Define getTyped method
+        Object.defineProperty(typedEntity, 'getTyped', {
+            value: async function<T extends TComponents[number]>(
+                ctor: T
+            ): Promise<T extends ComponentConstructor<infer C> ? C extends BaseComponent ? ComponentDataType<C> : never : never> {
+                const data = await entity.get(ctor as any);
+                if (!data) {
+                    throw new Error(`Component ${(ctor as any).name} not found on entity ${entity.id}, but it was expected from query`);
+                }
+                return data as any;
+            },
+            writable: false,
+            enumerable: false
+        });
+
+        return typedEntity;
     }
 
     private async doExec(): Promise<Entity[]> {
