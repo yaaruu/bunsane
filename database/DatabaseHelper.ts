@@ -23,10 +23,15 @@ const retryWithBackoff = async (fn: () => Promise<void>, maxRetries: number = 3,
         try {
             await fn();
             return;
-        } catch (error) {
+        } catch (error: any) {
+            const isDeadlock = error?.code === '40P01' || error?.message?.includes('deadlock');
             if (i === maxRetries - 1) throw error;
             const delay = baseDelay * Math.pow(2, i);
-            logger.warn(`Operation failed, retrying in ${delay}ms: ${error}`);
+            if (isDeadlock) {
+                logger.warn(`Deadlock detected, retrying in ${delay}ms (attempt ${i + 1}/${maxRetries})`);
+            } else {
+                logger.warn(`Operation failed, retrying in ${delay}ms: ${error}`);
+            }
             await sleep(delay);
         }
     }

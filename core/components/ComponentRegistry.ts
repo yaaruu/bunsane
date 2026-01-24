@@ -291,6 +291,7 @@ class ComponentRegistry {
         const partitionStrategy = await GetPartitionStrategy();
 
         // Update component indexes for components that have indexed properties
+        // NOTE: Index operations are serialized to prevent deadlocks with ANALYZE
         for (const { name, ctor } of components) {
             const instance = new ctor();
             const table_name = GenerateTableName(name);
@@ -300,7 +301,7 @@ class ComponentRegistry {
                 // For HASH partitioning, redirect index operations to parent table
                 const indexTableName =
                     partitionStrategy === "hash" ? "components" : table_name;
-                UpdateComponentIndexes(
+                await UpdateComponentIndexes(
                     indexTableName,
                     instance.indexedProperties()
                 );
