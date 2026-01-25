@@ -1,5 +1,5 @@
-import { GraphQLType } from "../helpers";
-import { ZodType } from "zod";
+import type { GraphQLType } from "../helpers";
+import type { ZodType } from "zod";
 import BaseArcheType from "../../core/ArcheType";
 import { logger } from "../../core/Logger";
 
@@ -37,14 +37,16 @@ export class ZodTypeStrategy implements TypeGenerationStrategy {
     let originalInput = meta;
 
     // Handle optional schemas
-    let innerInput = meta;
-    const wasOptional = meta instanceof (require('zod')).ZodOptional;
-    if (wasOptional) {
-      innerInput = meta.unwrap();
+    let innerInput: any = meta;
+    const ZodOptional = (require('zod')).ZodOptional;
+    const wasOptional = meta instanceof ZodOptional;
+    if (wasOptional && 'unwrap' in (meta as any)) {
+      innerInput = (meta as any).unwrap();
     }
 
     // Preprocess schema for unions with scalar literals
-    const shape = typeof innerInput._def.shape === 'function' ? innerInput._def.shape() : innerInput._def.shape;
+    const innerDef = (innerInput as any)._def;
+    const shape = innerDef && (typeof innerDef.shape === 'function' ? innerDef.shape() : innerDef.shape);
     if (shape) {
       const processedShape: any = {};
       for (const [key, value] of Object.entries(shape)) {
@@ -75,7 +77,11 @@ export class ZodTypeStrategy implements TypeGenerationStrategy {
       innerInput = (require('zod')).object(processedShape);
     }
 
-    innerInput = innerInput.extend({ __typename: (require('zod')).literal(inputName).nullish() });
+    // Add __typename field if extend is available
+    const z = require('zod');
+    if (innerInput && typeof (innerInput as any).extend === 'function') {
+      innerInput = (innerInput as any).extend({ __typename: z.literal(inputName).nullish() });
+    }
     if (wasOptional) {
       meta = innerInput.optional();
     } else {
@@ -88,13 +94,13 @@ export class ZodTypeStrategy implements TypeGenerationStrategy {
     const schemaString = printSchema(gqlInputSchema);
 
     const typeNames: string[] = [];
-    schemaString.replace(/type (\w+)/g, (match, name) => {
+    schemaString.replace(/type (\w+)/g, (_match: string, name: string) => {
       typeNames.push(name);
-      return match;
+      return _match;
     });
 
     let inputTypeDefs = schemaString.replace(/\btype\b/g, 'input');
-    inputTypeDefs = inputTypeDefs.replace(/input (\w+)/g, (match, name) => {
+    inputTypeDefs = inputTypeDefs.replace(/input (\w+)/g, (_match: string, name: string) => {
       if (name.endsWith('Input')) {
         return `input ${name}`;
       } else {
@@ -102,11 +108,11 @@ export class ZodTypeStrategy implements TypeGenerationStrategy {
       }
     });
 
-    inputTypeDefs = inputTypeDefs.replace(/: (\[?)(\w+)([!\[\]]*)(\s|$)/g, (match, bracketStart, type, suffix, end) => {
+    inputTypeDefs = inputTypeDefs.replace(/: (\[?)(\w+)([!\[\]]*)(\s|$)/g, (_match: string, bracketStart: string, type: string, suffix: string, end: string) => {
       if (typeNames.includes(type)) {
         return `: ${bracketStart}${type.endsWith('Input') ? type : type + 'Input'}${suffix}${end}`;
       } else {
-        return match;
+        return _match;
       }
     });
 
@@ -129,6 +135,9 @@ export class ZodTypeStrategy implements TypeGenerationStrategy {
       typeDef = typeDef.replace(new RegExp(`(\\s+${fieldName}:\\s+)String!`, 'g'), `$1${scalarName}!`);
     }
 
+    // Determine nullability based on whether the input was optional
+    const inputNullability = wasOptional ? '' : '!';
+
     return {
       typeDef,
       fieldType: `(input: ${inputName}${inputNullability})`,
@@ -146,7 +155,7 @@ export class ZodTypeStrategy implements TypeGenerationStrategy {
 
     for (const line of lines) {
       if (line.startsWith('input ')) {
-        currentTypeName = line.split(' ')[1];
+        currentTypeName = line.split(' ')[1] ?? '';
         if (definedTypes.has(currentTypeName)) {
           inTypeDefinition = false;
           currentType = '';

@@ -127,9 +127,10 @@ export class CacheWarmer {
     const startTime = Date.now();
 
     // Warm entities
-    const entityResults = config.entities ?
-      await this.warmEntityCache(config.entities[0].entityIds, config.entities[0].entityType) :
-      { success: true, warmed: 0, failed: 0, duration: 0 };
+    const firstEntity = config.entities?.[0];
+    const entityResults = firstEntity
+      ? await this.warmEntityCache(firstEntity.entityIds, firstEntity.entityType)
+      : { success: true, warmed: 0, failed: 0, duration: 0 };
 
     const totalDuration = Date.now() - startTime;
 

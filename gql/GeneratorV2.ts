@@ -31,7 +31,7 @@ export function generateGraphQLSchemaV2(
         return { schema, resolvers };
 
     } catch (error) {
-        logger.error("Failed to generate GraphQL schema with V2 implementation", { error });
+        logger.error(`Failed to generate GraphQL schema with V2 implementation: ${error instanceof Error ? error.message : String(error)}`);
         throw error;
     }
 }

@@ -1,4 +1,4 @@
-import { CacheProvider } from './CacheProvider.js';
+import type { CacheProvider, CacheStats } from './CacheProvider.js';
 
 /**
  * TTLStrategy implements dynamic TTL management based on data access patterns.
@@ -182,12 +182,8 @@ export class AdaptiveTTLProvider implements CacheProvider {
     await this.cache.set(key, value, effectiveTTL);
   }
 
-  async delete(key: string): Promise<boolean> {
-    return await this.cache.delete(key);
-  }
-
-  async has(key: string): Promise<boolean> {
-    return await this.cache.has(key);
+  async delete(key: string | string[]): Promise<void> {
+    await this.cache.delete(key);
   }
 
   async clear(): Promise<void> {
@@ -195,46 +191,44 @@ export class AdaptiveTTLProvider implements CacheProvider {
     this.ttlStrategy.reset();
   }
 
-  async getMany(keys: string[]): Promise<Map<string, any>> {
-    const result = await this.cache.getMany(keys);
+  async getMany<T>(keys: string[]): Promise<(T | null)[]> {
+    const results = await this.cache.getMany<T>(keys);
 
     // Record access for found keys
-    for (const key of keys) {
-      if (result.has(key)) {
+    for (let i = 0; i < keys.length; i++) {
+      const key = keys[i];
+      if (results[i] !== null && key !== undefined) {
         this.ttlStrategy.recordAccess(key);
       }
     }
 
-    return result;
+    return results;
   }
 
-  async setMany(entries: Map<string, any>, ttl?: number): Promise<void> {
-    const entriesWithTTL = new Map<string, any>();
+  async setMany<T>(entries: Array<{key: string, value: T, ttl?: number}>): Promise<void> {
+    // Apply adaptive TTL to entries without explicit TTL
+    const entriesWithTTL = entries.map(entry => ({
+      ...entry,
+      ttl: entry.ttl || this.ttlStrategy.recordAccess(entry.key)
+    }));
 
-    for (const [key] of entries) {
-      const effectiveTTL = ttl || this.ttlStrategy.recordAccess(key);
-      entriesWithTTL.set(key, { value: entries.get(key), ttl: effectiveTTL });
-    }
-
-    // Note: This assumes the underlying cache supports per-entry TTL
-    // If not, we fall back to the provided TTL or base TTL
-    await this.cache.setMany(entries, ttl);
+    await this.cache.setMany(entriesWithTTL);
   }
 
-  async deleteMany(keys: string[]): Promise<boolean[]> {
-    return await this.cache.deleteMany(keys);
+  async deleteMany(keys: string[]): Promise<void> {
+    await this.cache.deleteMany(keys);
   }
 
   async invalidatePattern(pattern: string): Promise<void> {
     await this.cache.invalidatePattern(pattern);
   }
 
-  async healthCheck(): Promise<{ status: 'healthy' | 'unhealthy'; latency: number; details?: any }> {
-    return await this.cache.healthCheck();
+  async ping(): Promise<boolean> {
+    return await this.cache.ping();
   }
 
-  getStats(): Promise<{ hits: number; misses: number; hitRate: number; totalRequests: number }> | undefined {
-    return this.cache.getStats?.();
+  async getStats(): Promise<CacheStats> {
+    return await this.cache.getStats();
   }
 
   /**

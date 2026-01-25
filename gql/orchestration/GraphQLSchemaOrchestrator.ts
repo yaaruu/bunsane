@@ -55,7 +55,7 @@ export class GraphQLSchemaOrchestrator {
             return schema;
 
         } catch (error) {
-            logger.error("Failed to generate GraphQL schema", { error });
+            logger.error(`Failed to generate GraphQL schema: ${error instanceof Error ? error.message : String(error)}`);
             throw new Error(`Schema generation failed: ${error instanceof Error ? error.message : String(error)}`);
         }
     }
@@ -158,7 +158,7 @@ export class GraphQLSchemaOrchestrator {
                     try {
                         return await service[propertyKey](parent, args, context, info);
                     } catch (error) {
-                        logger.error(`Error in field resolver ${type}.${field}:`, error);
+                        logger.error(`Error in field resolver ${type}.${field}: ${error instanceof Error ? error.message : String(error)}`);
                         throw error;
                     }
                 };

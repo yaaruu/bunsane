@@ -52,7 +52,7 @@ async function init() {
         defaultTTL: 3600000,
         entity: { enabled: true, ttl: 3600000 },
         component: { enabled: true, ttl: 1800000 },
-        query: { enabled: false, ttl: 300000 }
+        query: { enabled: false, ttl: 300000, maxSize: 10000 }
     });
 
     // Ensure StressUser component is registered

@@ -123,13 +123,32 @@ const maskError = (error: any, message: string): GraphQLError => {
     return error instanceof GraphQLError ? error : new GraphQLError(message, { originalError: error });
 };
 
-export function createYogaInstance(schema?: GraphQLSchema, plugins: Plugin[] = [], contextFactory?: (context: any) => any) {
+export interface YogaInstanceOptions {
+    cors?: {
+        origin?: string | string[] | ((origin: string) => boolean);
+        credentials?: boolean;
+        allowedHeaders?: string[];
+        methods?: string[];
+    };
+}
+
+export function createYogaInstance(
+    schema?: GraphQLSchema,
+    plugins: Plugin[] = [],
+    contextFactory?: (context: any) => any,
+    options?: YogaInstanceOptions
+) {
     const yogaConfig: any = {
         plugins,
         maskedErrors: {
             maskError,
         },
     };
+
+    // Add CORS if provided
+    if (options?.cors) {
+        yogaConfig.cors = options.cors;
+    }
 
     // Add context factory if provided
     if (contextFactory) {

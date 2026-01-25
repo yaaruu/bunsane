@@ -42,7 +42,7 @@ describe('Entity', () => {
 
         test('sets dirty flag to true initially', () => {
             const entity = new Entity();
-            expect(entity._dirty).toBe(true);
+            expect((entity as any)._dirty).toBe(true);
         });
 
         test('sets persisted flag to false initially', () => {
@@ -84,7 +84,7 @@ describe('Entity', () => {
             const entity = new Entity();
             entity.setDirty(false);
             entity.add(TestUser, { name: 'Test', email: 'test@test.com', age: 20 });
-            expect(entity._dirty).toBe(true);
+            expect((entity as any)._dirty).toBe(true);
         });
 
         test('allows adding multiple different components', () => {
@@ -170,7 +170,7 @@ describe('Entity', () => {
             entity.setDirty(false);
 
             entity.remove(TestUser);
-            expect(entity._dirty).toBe(true);
+            expect((entity as any)._dirty).toBe(true);
         });
 
         test('tracks removed component for wasRemoved check', () => {
@@ -228,9 +228,9 @@ describe('Entity', () => {
 
         test('setDirty updates _dirty flag', () => {
             const entity = new Entity();
-            expect(entity._dirty).toBe(true);
+            expect((entity as any)._dirty).toBe(true);
             entity.setDirty(false);
-            expect(entity._dirty).toBe(false);
+            expect((entity as any)._dirty).toBe(false);
         });
     });
 
@@ -279,7 +279,7 @@ describe('Entity', () => {
 
             expect(deserialized.id).toBe(entity.id);
             expect(deserialized._persisted).toBe(true);
-            expect(deserialized._dirty).toBe(false);
+            expect((deserialized as any)._dirty).toBe(false);
         });
 
         test('returns same entity if already an Entity instance', () => {
@@ -309,7 +309,7 @@ describe('Entity', () => {
 
             expect(clone.id).not.toBe(entity.id);
             expect(clone._persisted).toBe(false);
-            expect(clone._dirty).toBe(true);
+            expect((clone as any)._dirty).toBe(true);
         });
 
         test('clones component data', () => {

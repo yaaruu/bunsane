@@ -10,7 +10,7 @@ export class ArchetypePreprocessorVisitor extends GraphVisitor {
     private processedArchetypes: Set<string> = new Set();
     private archetypeSchemas: any[] = [];
 
-    beforeVisit(): void {
+    override beforeVisit(): void {
         // Pre-weave all archetypes to ensure schemas are generated
         try {
             const schema = weaveAllArchetypes();

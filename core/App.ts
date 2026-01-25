@@ -24,10 +24,18 @@ import { preparedStatementCache } from "database/PreparedStatementCache";
 import db from "database";
 import studioEndpoint from "../endpoints";
 
+export type CorsConfig = {
+    origin?: string | string[] | ((origin: string) => boolean);
+    credentials?: boolean;
+    allowedHeaders?: string[];
+    methods?: string[];
+};
+
 export type AppConfig = {
     scheduler: {
         logging: boolean;
     };
+    cors?: CorsConfig;
 };
 
 export default class App {
@@ -174,17 +182,23 @@ export default class App {
                               }
                             : undefined;
 
+                        const yogaOptions = {
+                            cors: this.config.cors,
+                        };
+
                         if (schema) {
                             this.yoga = createYogaInstance(
                                 schema,
                                 this.yogaPlugins,
-                                wrappedContextFactory
+                                wrappedContextFactory,
+                                yogaOptions
                             );
                         } else {
                             this.yoga = createYogaInstance(
                                 undefined,
                                 this.yogaPlugins,
-                                wrappedContextFactory
+                                wrappedContextFactory,
+                                yogaOptions
                             );
                         }
 
@@ -387,10 +401,49 @@ export default class App {
         this.staticAssets.set(route, resolvedFolder);
     }
 
+    private getCorsHeaders(): Record<string, string> {
+        if (!this.config.cors) return {};
+
+        const origin = this.config.cors.origin;
+        const originValue = typeof origin === 'string' ? origin :
+                           Array.isArray(origin) ? origin.join(', ') : '*';
+
+        return {
+            'Access-Control-Allow-Origin': originValue,
+            'Access-Control-Allow-Credentials': this.config.cors.credentials ? 'true' : 'false',
+            'Access-Control-Allow-Methods': this.config.cors.methods?.join(', ') || 'GET, POST, PUT, DELETE, OPTIONS',
+            'Access-Control-Allow-Headers': this.config.cors.allowedHeaders?.join(', ') || 'Content-Type, Authorization',
+        };
+    }
+
+    private addCorsHeaders(response: Response): Response {
+        const corsHeaders = this.getCorsHeaders();
+        if (Object.keys(corsHeaders).length === 0) return response;
+
+        const newHeaders = new Headers(response.headers);
+        for (const [key, value] of Object.entries(corsHeaders)) {
+            newHeaders.set(key, value);
+        }
+
+        return new Response(response.body, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: newHeaders,
+        });
+    }
+
     private async handleRequest(req: Request): Promise<Response> {
         const url = new URL(req.url);
         const method = req.method;
         const startTime = Date.now();
+
+        // Handle CORS preflight requests
+        if (method === 'OPTIONS') {
+            return new Response(null, {
+                status: 204,
+                headers: this.getCorsHeaders(),
+            });
+        }
 
         // Add request timeout
         const controller = new AbortController();
@@ -622,7 +675,22 @@ export default class App {
 
             // Lookup REST endpoint using map for O(1) performance
             const endpointKey = `${method}:${url.pathname}`;
-            const endpoint = this.restEndpointMap.get(endpointKey);
+            let endpoint = this.restEndpointMap.get(endpointKey);
+
+            // If exact match not found, try pattern matching for parameterized routes
+            if (!endpoint) {
+                for (const ep of this.restEndpoints) {
+                    if (ep.method !== method) continue;
+                    // Convert route pattern to regex (e.g., /api/v1/users/:id -> /api/v1/users/[^/]+)
+                    const pattern = ep.path.replace(/:[^/]+/g, '[^/]+');
+                    const regex = new RegExp(`^${pattern}$`);
+                    if (regex.test(url.pathname)) {
+                        endpoint = ep;
+                        break;
+                    }
+                }
+            }
+
             if (endpoint) {
                 try {
                     const result = await endpoint.handler(req);
@@ -633,11 +701,11 @@ export default class App {
 
                     clearTimeout(timeoutId);
                     if (result instanceof Response) {
-                        return result;
+                        return this.addCorsHeaders(result);
                     } else {
-                        return new Response(JSON.stringify(result), {
+                        return this.addCorsHeaders(new Response(JSON.stringify(result), {
                             headers: { "Content-Type": "application/json" },
-                        });
+                        }));
                     }
                 } catch (error) {
                     const duration = Date.now() - startTime;
@@ -646,13 +714,13 @@ export default class App {
                         error as any
                     );
                     clearTimeout(timeoutId);
-                    return new Response(
+                    return this.addCorsHeaders(new Response(
                         JSON.stringify({ error: "Internal server error" }),
                         {
                             status: 500,
                             headers: { "Content-Type": "application/json" },
                         }
-                    );
+                    ));
                 }
             }
 

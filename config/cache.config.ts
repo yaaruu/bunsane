@@ -4,7 +4,7 @@
 
 export interface CacheConfig {
     enabled: boolean;
-    provider: 'memory' | 'redis' | 'noop';
+    provider: 'memory' | 'redis' | 'multilevel' | 'noop';
     defaultTTL: number; // milliseconds
     maxMemory?: number; // bytes for MemoryCache
 
@@ -27,6 +27,12 @@ export interface CacheConfig {
         ttl: number;
     };
 
+    query?: {
+        enabled: boolean;
+        ttl: number;
+        maxSize: number;
+    };
+
     strategy: 'write-through' | 'write-invalidate';
 }
 
@@ -35,7 +41,7 @@ export interface CacheConfig {
  */
 export const defaultCacheConfig: CacheConfig = {
     enabled: process.env.CACHE_ENABLED === 'true' || false,
-    provider: (process.env.CACHE_PROVIDER as 'memory' | 'redis' | 'noop') || 'memory',
+    provider: (process.env.CACHE_PROVIDER as 'memory' | 'redis' | 'multilevel' | 'noop') || 'memory',
     defaultTTL: parseInt(process.env.CACHE_DEFAULT_TTL || '3600000'), // 1 hour
     maxMemory: parseInt(process.env.CACHE_MAX_MEMORY || '104857600'), // 100MB
 
@@ -59,6 +65,12 @@ export const defaultCacheConfig: CacheConfig = {
     component: {
         enabled: process.env.CACHE_COMPONENT_ENABLED !== 'false', // Default true
         ttl: parseInt(process.env.CACHE_COMPONENT_TTL || '1800000') // 30 minutes
+    },
+
+    query: {
+        enabled: process.env.CACHE_QUERY_ENABLED !== 'false', // Default true
+        ttl: parseInt(process.env.CACHE_QUERY_TTL || '1800000'), // 30 minutes
+        maxSize: parseInt(process.env.CACHE_QUERY_MAX_SIZE || '10000')
     },
 
     strategy: (process.env.CACHE_STRATEGY as 'write-through' | 'write-invalidate') || 'write-invalidate'

@@ -40,8 +40,8 @@ export class InputTypeBuilder {
       counter++;
     }
 
-    // Mark this name as used
-    this.deduplicationMap.set(deduplicatedName, true);
+    // Mark this name as used (store original name for reference)
+    this.deduplicationMap.set(deduplicatedName, originalName);
     return deduplicatedName;
   }
 

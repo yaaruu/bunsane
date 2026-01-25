@@ -132,7 +132,7 @@ export class DataSeeder {
             const entityComponentsToInsert: { entity_id: string; type_id: string; component_id: string; created_at: Date; updated_at: Date }[] = [];
 
             for (let j = 0; j < batchEntityIds.length; j++) {
-                const entityId = batchEntityIds[j];
+                const entityId = batchEntityIds[j]!;
                 const componentId = uuidv7();
                 const data = dataGenerator(i + j, entityId);
 

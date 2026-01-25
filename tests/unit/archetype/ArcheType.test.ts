@@ -40,9 +40,7 @@ describe('ArcheType', () => {
     describe('createEntity()', () => {
         test('creates entity with id', () => {
             const archetype = new TestUserArchetype();
-            const entity = archetype.createEntity({
-                user: { name: 'Test', email: 'test@test.com', age: 25 }
-            });
+            const entity = archetype.createEntity();
 
             expect(entity).toBeDefined();
             expect(entity.id).toBeDefined();
@@ -51,18 +49,14 @@ describe('ArcheType', () => {
 
         test('entity is dirty after creation', () => {
             const archetype = new TestUserArchetype();
-            const entity = archetype.createEntity({
-                user: { name: 'Test', email: 'test@test.com', age: 25 }
-            });
+            const entity = archetype.createEntity();
 
-            expect(entity._dirty).toBe(true);
+            expect((entity as any)._dirty).toBe(true);
         });
 
         test('entity is not persisted after creation', () => {
             const archetype = new TestUserArchetype();
-            const entity = archetype.createEntity({
-                user: { name: 'Test', email: 'test@test.com', age: 25 }
-            });
+            const entity = archetype.createEntity();
 
             expect(entity._persisted).toBe(false);
         });
@@ -89,7 +83,7 @@ describe('ArcheType', () => {
     describe('getComponentsToLoad()', () => {
         test('returns components array', () => {
             const archetype = new TestUserArchetype();
-            const components = archetype.getComponentsToLoad();
+            const components = (archetype as any).getComponentsToLoad();
 
             expect(components).toBeDefined();
             expect(Array.isArray(components)).toBe(true);

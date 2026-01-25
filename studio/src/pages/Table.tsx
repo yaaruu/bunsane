@@ -39,8 +39,8 @@ export function Table() {
 
   // Generate columns from the first data record
   useEffect(() => {
-    if (data.length > 0 && columns.length === 0) {
-      const sampleRecord = data[0]
+    const sampleRecord = data[0]
+    if (sampleRecord && columns.length === 0) {
       const newColumns: ColumnDef<TableRecord>[] = [
         createSelectColumn<TableRecord>(),
         ...Object.keys(sampleRecord).map(key =>

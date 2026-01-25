@@ -81,12 +81,12 @@ export class BenchmarkRunner {
         const sortedTimes = [...times].sort((a, b) => a - b);
 
         const timings = {
-            min: sortedTimes[0],
-            max: sortedTimes[sortedTimes.length - 1],
-            mean: times.reduce((a, b) => a + b) / times.length,
-            median: sortedTimes[Math.floor(sortedTimes.length / 2)],
-            p95: sortedTimes[Math.floor(sortedTimes.length * 0.95)] ?? sortedTimes[sortedTimes.length - 1],
-            p99: sortedTimes[Math.floor(sortedTimes.length * 0.99)] ?? sortedTimes[sortedTimes.length - 1],
+            min: sortedTimes[0] ?? 0,
+            max: sortedTimes[sortedTimes.length - 1] ?? 0,
+            mean: times.reduce((a, b) => a + b, 0) / (times.length || 1),
+            median: sortedTimes[Math.floor(sortedTimes.length / 2)] ?? 0,
+            p95: sortedTimes[Math.floor(sortedTimes.length * 0.95)] ?? sortedTimes[sortedTimes.length - 1] ?? 0,
+            p99: sortedTimes[Math.floor(sortedTimes.length * 0.99)] ?? sortedTimes[sortedTimes.length - 1] ?? 0,
             stdDev: this.calculateStdDev(times)
         };
 
@@ -96,9 +96,9 @@ export class BenchmarkRunner {
             totalRecords: await this.getRecordCount(),
             timings,
             rowsReturned: rowCount,
-            queriesPerSecond: 1000 / timings.mean,
+            queriesPerSecond: 1000 / (timings.mean || 1),
             memoryUsedMB: collectMemory ? (memAfter - memBefore) / 1024 / 1024 : 0,
-            passed: targetP95 ? timings.p95 <= targetP95 : true,
+            passed: targetP95 ? (timings.p95 ?? 0) <= targetP95 : true,
             target: targetP95
         };
 

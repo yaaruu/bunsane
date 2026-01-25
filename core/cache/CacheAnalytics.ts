@@ -1,4 +1,4 @@
-import { CacheProvider } from './CacheProvider.js';
+import type { CacheProvider, CacheStats } from './CacheProvider.js';
 
 /**
  * CacheReport provides comprehensive analytics about cache performance
@@ -101,7 +101,7 @@ export class CacheAnalytics {
   /**
    * Records operation latency
    */
-  private recordLatency(operation: string, latency?: number): void {
+  recordLatency(operation: string, latency?: number): void {
     if (latency !== undefined) {
       this.metrics.latencies.push(latency);
 
@@ -314,17 +314,12 @@ export class AnalyticsCacheProvider implements CacheProvider {
     this.analytics.recordLatency('set', latency);
   }
 
-  async delete(key: string): Promise<boolean> {
+  async delete(key: string | string[]): Promise<void> {
     const startTime = Date.now();
-    const result = await this.cache.delete(key);
+    await this.cache.delete(key);
     const latency = Date.now() - startTime;
 
     this.analytics.recordLatency('delete', latency);
-    return result;
-  }
-
-  async has(key: string): Promise<boolean> {
-    return await this.cache.has(key);
   }
 
   async clear(): Promise<void> {
@@ -332,17 +327,17 @@ export class AnalyticsCacheProvider implements CacheProvider {
     this.analytics.reset();
   }
 
-  async getMany(keys: string[]): Promise<Map<string, any>> {
+  async getMany<T>(keys: string[]): Promise<(T | null)[]> {
     const startTime = Date.now();
-    const result = await this.cache.getMany(keys);
+    const results = await this.cache.getMany<T>(keys);
     const latency = Date.now() - startTime;
 
     // Count hits and misses
     let hits = 0;
     let misses = 0;
 
-    for (const key of keys) {
-      if (result.has(key)) {
+    for (const result of results) {
+      if (result !== null) {
         hits++;
       } else {
         misses++;
@@ -357,36 +352,35 @@ export class AnalyticsCacheProvider implements CacheProvider {
       this.analytics.recordMiss('get', latency / keys.length);
     }
 
-    return result;
+    return results;
   }
 
-  async setMany(entries: Map<string, any>, ttl?: number): Promise<void> {
+  async setMany<T>(entries: Array<{key: string, value: T, ttl?: number}>): Promise<void> {
     const startTime = Date.now();
-    await this.cache.setMany(entries, ttl);
+    await this.cache.setMany(entries);
     const latency = Date.now() - startTime;
 
     this.analytics.recordLatency('set', latency);
   }
 
-  async deleteMany(keys: string[]): Promise<boolean[]> {
+  async deleteMany(keys: string[]): Promise<void> {
     const startTime = Date.now();
-    const result = await this.cache.deleteMany(keys);
+    await this.cache.deleteMany(keys);
     const latency = Date.now() - startTime;
 
     this.analytics.recordLatency('delete', latency);
-    return result;
   }
 
   async invalidatePattern(pattern: string): Promise<void> {
     await this.cache.invalidatePattern(pattern);
   }
 
-  async healthCheck(): Promise<{ status: 'healthy' | 'unhealthy'; latency: number; details?: any }> {
-    return await this.cache.healthCheck();
+  async ping(): Promise<boolean> {
+    return await this.cache.ping();
   }
 
-  getStats(): Promise<{ hits: number; misses: number; hitRate: number; totalRequests: number }> | undefined {
-    return this.cache.getStats?.();
+  async getStats(): Promise<CacheStats> {
+    return await this.cache.getStats();
   }
 
   /**

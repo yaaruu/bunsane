@@ -94,8 +94,9 @@ export class MetadataStorage {
         );
         if (existingIndex !== -1) {
             // Update existing metadata
-            if (metadata.functions) {
-                this.archetypes[existingIndex].functions = metadata.functions;
+            const existing = this.archetypes[existingIndex];
+            if (existing && metadata.functions) {
+                existing.functions = metadata.functions;
             }
         } else {
             // Add new metadata

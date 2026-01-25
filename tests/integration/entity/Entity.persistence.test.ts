@@ -23,7 +23,7 @@ describe('Entity Persistence', () => {
             await entity.save();
 
             expect(entity._persisted).toBe(true);
-            expect(entity._dirty).toBe(false);
+            expect((entity as any)._dirty).toBe(false);
         });
 
         test('persists multiple components', async () => {

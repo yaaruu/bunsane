@@ -163,7 +163,7 @@ describe('RedisCache', () => {
 
             expect(await cache.get('dm-a')).toBeNull();
             expect(await cache.get('dm-b')).toBeNull();
-            expect(await cache.get('dm-c')).toBe(3);
+            expect(await cache.get<number>('dm-c')).toBe(3);
         });
 
         test('handles empty array', async () => {
@@ -207,9 +207,9 @@ describe('RedisCache', () => {
                 { key: 'sm-c', value: 3, ttl: 3600000 }
             ]);
 
-            expect(await cache.get('sm-a')).toBe(1);
-            expect(await cache.get('sm-b')).toBe(2);
-            expect(await cache.get('sm-c')).toBe(3);
+            expect(await cache.get<number>('sm-a')).toBe(1);
+            expect(await cache.get<number>('sm-b')).toBe(2);
+            expect(await cache.get<number>('sm-c')).toBe(3);
         });
 
         test('sets entries with different TTLs', async () => {
@@ -220,14 +220,14 @@ describe('RedisCache', () => {
             ]);
 
             // Both should exist initially
-            expect(await cache.get('sm-short')).toBe('short-lived');
-            expect(await cache.get('sm-long')).toBe('long-lived');
+            expect(await cache.get<string>('sm-short')).toBe('short-lived');
+            expect(await cache.get<string>('sm-long')).toBe('long-lived');
 
             // Wait for short TTL to expire
             await new Promise(resolve => setTimeout(resolve, 1500));
 
             expect(await cache.get('sm-short')).toBeNull();
-            expect(await cache.get('sm-long')).toBe('long-lived');
+            expect(await cache.get<string>('sm-long')).toBe('long-lived');
         });
 
         test('handles empty array', async () => {
@@ -258,7 +258,7 @@ describe('RedisCache', () => {
 
             expect(await cache.get('prefix:1')).toBeNull();
             expect(await cache.get('prefix:2')).toBeNull();
-            expect(await cache.get('other:1')).toBe('o1');
+            expect(await cache.get<string>('other:1')).toBe('o1');
         });
 
         test('handles complex patterns', async () => {
@@ -270,7 +270,7 @@ describe('RedisCache', () => {
 
             expect(await cache.get('component:entity1:type1')).toBeNull();
             expect(await cache.get('component:entity1:type2')).toBeNull();
-            expect(await cache.get('component:entity2:type1')).toBe('c3');
+            expect(await cache.get<string>('component:entity2:type1')).toBe('c3');
         });
 
         test('handles pattern with no matches', async () => {
@@ -278,7 +278,7 @@ describe('RedisCache', () => {
 
             await cache.invalidatePattern('nomatch:*');
 
-            expect(await cache.get('keep-this')).toBe('value');
+            expect(await cache.get<string>('keep-this')).toBe('value');
         });
     });
 

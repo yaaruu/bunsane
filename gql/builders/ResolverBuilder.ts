@@ -39,6 +39,10 @@ export class ResolverBuilder {
         : this.createResolverWithoutInput(service, propertyKey);
     }
 
+    // Ensure the resolver category exists (should always exist due to initialization)
+    if (!this.resolvers[type]) {
+      this.resolvers[type] = {};
+    }
     this.resolvers[type][name] = resolver;
     logger.trace(`Added ${type} resolver: ${name}`);
   }
@@ -211,24 +215,13 @@ export class ResolverBuilder {
   }
 
   /**
-   * Clear all resolvers
-   */
-  clear(): void {
-    this.resolvers = {
-      Query: {},
-      Mutation: {},
-      Subscription: {}
-    };
-  }
-
-  /**
    * Get statistics
    */
   getStats(): { queries: number; mutations: number; subscriptions: number } {
     return {
-      queries: Object.keys(this.resolvers.Query).length,
-      mutations: Object.keys(this.resolvers.Mutation).length,
-      subscriptions: Object.keys(this.resolvers.Subscription).length
+      queries: Object.keys(this.resolvers.Query ?? {}).length,
+      mutations: Object.keys(this.resolvers.Mutation ?? {}).length,
+      subscriptions: Object.keys(this.resolvers.Subscription ?? {}).length
     };
   }
 }

@@ -120,7 +120,7 @@ describe('MemoryCache', () => {
 
             expect(await cache.get('a')).toBeNull();
             expect(await cache.get('b')).toBeNull();
-            expect(await cache.get('c')).toBe(3);
+            expect(await cache.get<number>('c')).toBe(3);
         });
     });
 
@@ -154,9 +154,9 @@ describe('MemoryCache', () => {
                 { key: 'c', value: 3, ttl: 3600000 }
             ]);
 
-            expect(await cache.get('a')).toBe(1);
-            expect(await cache.get('b')).toBe(2);
-            expect(await cache.get('c')).toBe(3);
+            expect(await cache.get<number>('a')).toBe(1);
+            expect(await cache.get<number>('b')).toBe(2);
+            expect(await cache.get<number>('c')).toBe(3);
         });
     });
 
@@ -181,7 +181,7 @@ describe('MemoryCache', () => {
 
             expect(await cache.get('prefix:1')).toBeNull();
             expect(await cache.get('prefix:2')).toBeNull();
-            expect(await cache.get('other:1')).toBe('o1');
+            expect(await cache.get<string>('other:1')).toBe('o1');
         });
 
         test('handles complex patterns', async () => {
@@ -193,7 +193,7 @@ describe('MemoryCache', () => {
 
             expect(await cache.get('component:entity1:type1')).toBeNull();
             expect(await cache.get('component:entity1:type2')).toBeNull();
-            expect(await cache.get('component:entity2:type1')).toBe('c3');
+            expect(await cache.get<string>('component:entity2:type1')).toBe('c3');
         });
     });
 

@@ -17,9 +17,12 @@ bunsane/
 │   ├── ApplicationLifecycle.ts  # App state management
 │   ├── cache/              # Caching system
 │   │   ├── CacheManager.ts     # Main cache orchestration
+│   │   ├── CacheProvider.ts    # Standard interface (all providers implement this)
 │   │   ├── MemoryCache.ts      # In-memory cache provider
 │   │   ├── RedisCache.ts       # Redis cache provider
-│   │   ├── MultiLevelCache.ts  # L1/L2 cache strategy
+│   │   ├── MultiLevelCache.ts  # L1/L2 cache strategy (wrapper)
+│   │   ├── CacheAnalytics.ts   # Analytics wrapper provider
+│   │   ├── TTLStrategy.ts      # Adaptive TTL wrapper provider
 │   │   └── ...
 │   ├── components/         # Component system
 │   │   ├── BaseComponent.ts    # Base class for components
@@ -72,6 +75,38 @@ bunsane/
 5. **Query** builder retrieves entities with filters and component population
 6. **Services** define business logic and auto-generate GraphQL resolvers
 7. **CacheManager** handles caching at entity/component/query levels
+
+## Cache System Architecture
+
+All cache providers implement the standardized `CacheProvider` interface:
+
+```typescript
+interface CacheProvider {
+    get<T>(key: string): Promise<T | null>;
+    set<T>(key: string, value: T, ttl?: number): Promise<void>;
+    delete(key: string | string[]): Promise<void>;  // Supports single or multiple
+    clear(): Promise<void>;
+    getMany<T>(keys: string[]): Promise<(T | null)[]>;  // Returns ordered array
+    setMany<T>(entries: Array<{key, value, ttl?}>): Promise<void>;  // Per-entry TTL
+    deleteMany(keys: string[]): Promise<void>;
+    invalidatePattern(pattern: string): Promise<void>;
+    ping(): Promise<boolean>;  // Health check
+    getStats(): Promise<CacheStats>;  // Metrics
+}
+```
+
+**Cache Providers**:
+- **MemoryCache**: In-memory LRU cache (base implementation)
+- **RedisCache**: Redis-backed cache (base implementation)
+- **MultiLevelCacheProvider**: L1 (memory) + L2 (Redis) wrapper
+- **AnalyticsCacheProvider**: Metrics and latency tracking wrapper
+- **AdaptiveTTLProvider**: Dynamic TTL adjustment wrapper
+
+**Key Design Decisions** (as of 2026-01-24):
+- Batch operations use arrays instead of Maps for ordering and flexibility
+- `delete()` accepts both single string and string array for convenience
+- `ping()` replaces `healthCheck()` for conventional naming
+- All wrappers maintain full interface compliance
 
 ## Data Model
 

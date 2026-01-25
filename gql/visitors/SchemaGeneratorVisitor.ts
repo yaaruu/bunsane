@@ -1,6 +1,7 @@
-import { TypeGenerationStrategy, ZodTypeStrategy } from "../strategies/TypeGenerationStrategy";
+import type { TypeGenerationStrategy } from "../strategies/TypeGenerationStrategy";
+import { ZodTypeStrategy } from "../strategies/TypeGenerationStrategy";
 import { GraphVisitor } from "./GraphVisitor";
-import type { TypeNode, OperationNode, FieldNode, InputNode, ScalarNode, SubscriptionNode } from "../graph/GraphNode";
+import type { TypeNode, OperationNode, FieldNode, InputNode, ScalarNode } from "../graph/GraphNode";
 import { logger as MainLogger } from "core/Logger";
 import * as z from "zod";
 import { ZodWeaver, asObjectType } from "@gqloom/zod";
@@ -177,7 +178,7 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
         }
     }
     
-    visitSubscriptionNode(node: SubscriptionNode): void {
+    visitSubscriptionNode(node: OperationNode): void {
         // Build proper field definition from metadata (V1 style)
         const fieldDef = this.buildFieldDefinition(node);
         
@@ -202,7 +203,7 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
      * Build a complete GraphQL field definition exactly like V1.
      * Format: "fieldName(input: InputType!): OutputType"
      */
-    private buildFieldDefinition(node: OperationNode | SubscriptionNode): string {
+    private buildFieldDefinition(node: OperationNode): string {
         const name = node.name;
         const { input, output, scalarTypes } = node.metadata;
         let fieldDef = name;

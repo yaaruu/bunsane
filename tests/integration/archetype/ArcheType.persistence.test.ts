@@ -67,7 +67,7 @@ describe('ArcheType Persistence', () => {
 
             expect(entity).toBeInstanceOf(Entity);
             expect(entity.id).toBeDefined();
-            expect(entity._dirty).toBe(true);
+            expect((entity as any)._dirty).toBe(true);
             expect(entity._persisted).toBe(false);
 
             // Component should be in memory after createEntity
@@ -84,7 +84,7 @@ describe('ArcheType Persistence', () => {
             await entity.save();
 
             expect(entity._persisted).toBe(true);
-            expect(entity._dirty).toBe(false);
+            expect((entity as any)._dirty).toBe(false);
         });
     });
 
@@ -232,7 +232,7 @@ describe('ArcheType Persistence', () => {
     describe('component properties', () => {
         test('getComponentsToLoad returns component constructors', () => {
             const archetype = new TestUserArchetype();
-            const components = archetype.getComponentsToLoad();
+            const components = (archetype as any).getComponentsToLoad();
 
             expect(Array.isArray(components)).toBe(true);
             expect(components.length).toBeGreaterThan(0);

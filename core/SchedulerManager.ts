@@ -140,6 +140,59 @@ export class SchedulerManager {
         }
     }
 
+    /**
+     * Schedule a simple job with a cron expression and callback.
+     * This is a simpler alternative to registerTask for jobs that don't need
+     * entity-component system integration.
+     */
+    public scheduleJob(name: string, cronExpression: string, callback: () => Promise<void> | void): { cancel: () => void } {
+        const jobId = `job_${name}_${Date.now()}`;
+
+        // Validate cron expression
+        const validation = CronParser.validate(cronExpression);
+        if (!validation.isValid) {
+            throw new Error(`Invalid cron expression for job "${name}": ${validation.error}`);
+        }
+
+        let timeoutId: ReturnType<typeof setTimeout> | null = null;
+        let cancelled = false;
+
+        const scheduleNextExecution = () => {
+            if (cancelled) return;
+
+            const nextExecution = CronParser.getNextExecution(validation.fields!, new Date());
+            if (!nextExecution) {
+                loggerInstance.warn(`Unable to calculate next execution for job "${name}"`);
+                return;
+            }
+
+            const delay = nextExecution.getTime() - Date.now();
+            timeoutId = setTimeout(async () => {
+                if (cancelled) return;
+                try {
+                    await callback();
+                } catch (error) {
+                    loggerInstance.error(`Job "${name}" failed: ${error instanceof Error ? error.message : String(error)}`);
+                }
+                scheduleNextExecution();
+            }, delay);
+
+            this.intervals.set(jobId, timeoutId as any);
+        };
+
+        scheduleNextExecution();
+
+        return {
+            cancel: () => {
+                cancelled = true;
+                if (timeoutId) {
+                    clearTimeout(timeoutId);
+                    this.intervals.delete(jobId);
+                }
+            }
+        };
+    }
+
     private scheduleTask(taskInfo: ScheduledTaskInfo): void {
         try {
             if (taskInfo.interval === ScheduleInterval.CRON) {
@@ -308,7 +361,8 @@ export class SchedulerManager {
 
         try {
             // Create query based on targeting configuration
-            let query: Query;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            let query: Query<any>;
 
             if (taskInfo.options?.query) {
                 // Use custom query function (preferred approach)
@@ -727,8 +781,10 @@ export class SchedulerManager {
      * @param componentTarget The component targeting configuration
      * @returns A Query object configured with the component targeting
      */
-    private buildQueryFromComponentTarget(componentTarget: ComponentTargetConfig): Query {
-        let query = new Query();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    private buildQueryFromComponentTarget(componentTarget: ComponentTargetConfig): Query<any> {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let query: Query<any> = new Query();
 
         // Handle archetype matching first (most specific)
         if (componentTarget.archetype) {

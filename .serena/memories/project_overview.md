@@ -32,5 +32,12 @@ Database configuration via environment variables:
 - `POSTGRES_MAX_CONNECTIONS`
 - `LOG_LEVEL`, `LOG_PRETTY`
 
+## Cache Configuration
+Cache system supports multiple providers (configured in `config/cache.config.ts`):
+- **Providers**: `memory`, `redis`, `multilevel`
+- **Query cache**: Can be enabled with configurable TTL and max size
+- All providers implement standardized `CacheProvider` interface
+- Wrapper providers available: Analytics, MultiLevel, AdaptiveTTL
+
 ## Repository
 https://github.com/yaaruu/bunsane

@@ -26,7 +26,10 @@
       "Bash(npx tsc:*)",
       "Bash(STRESS_RECORD_COUNT=10000 bun test:*)",
       "Bash(STRESS_RECORD_COUNT=1000 bun test:*)",
-      "mcp__serena__find_referencing_symbols"
+      "mcp__serena__find_referencing_symbols",
+      "Bash(bun tsc:*)",
+      "mcp__serena__edit_memory",
+      "Bash(bunx tsc:*)"
     ]
   },
   "statusLine": {

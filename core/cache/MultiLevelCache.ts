@@ -1,5 +1,5 @@
-import { CacheProvider } from './CacheProvider.js';
-import { CacheConfig } from '../config/cache.config.js';
+import type { CacheProvider, CacheStats } from './CacheProvider.js';
+import type { CacheConfig } from '../../config/cache.config.js';
 
 /**
  * MultiLevelCache implements a two-tier caching strategy with L1 in-memory cache
@@ -56,32 +56,14 @@ export class MultiLevelCache implements CacheProvider {
     }
   }
 
-  async delete(key: string): Promise<boolean> {
-    let deleted = false;
-
+  async delete(key: string | string[]): Promise<void> {
     // Delete from L1 cache
-    deleted = await this.l1Cache.delete(key) || deleted;
+    await this.l1Cache.delete(key);
 
     // Delete from L2 cache if available
     if (this.l2Cache) {
-      deleted = await this.l2Cache.delete(key) || deleted;
+      await this.l2Cache.delete(key);
     }
-
-    return deleted;
-  }
-
-  async has(key: string): Promise<boolean> {
-    // Check L1 first
-    if (await this.l1Cache.has(key)) {
-      return true;
-    }
-
-    // Check L2 if L1 miss
-    if (this.l2Cache) {
-      return await this.l2Cache.has(key);
-    }
-
-    return false;
   }
 
   async clear(): Promise<void> {
@@ -91,54 +73,63 @@ export class MultiLevelCache implements CacheProvider {
     }
   }
 
-  async getMany(keys: string[]): Promise<Map<string, any>> {
-    const result = new Map<string, any>();
+  async getMany<T>(keys: string[]): Promise<(T | null)[]> {
+    const results: (T | null)[] = new Array(keys.length).fill(null);
+    const missingIndices: number[] = [];
     const missingKeys: string[] = [];
 
     // Try L1 cache first
-    const l1Results = await this.l1Cache.getMany(keys);
-    for (const key of keys) {
-      const value = l1Results.get(key);
-      if (value !== null) {
-        result.set(key, value);
-      } else {
+    const l1Results = await this.l1Cache.getMany<T>(keys);
+    for (let i = 0; i < keys.length; i++) {
+      const l1Value = l1Results[i];
+      const key = keys[i];
+      if (l1Value !== null && l1Value !== undefined) {
+        results[i] = l1Value;
+      } else if (key !== undefined) {
+        missingIndices.push(i);
         missingKeys.push(key);
       }
     }
 
     // If L2 exists and we have missing keys, try L2
     if (this.l2Cache && missingKeys.length > 0) {
-      const l2Results = await this.l2Cache.getMany(missingKeys);
-      for (const [key, value] of l2Results) {
-        if (value !== null) {
-          result.set(key, value);
+      const l2Results = await this.l2Cache.getMany<T>(missingKeys);
+      for (let i = 0; i < missingKeys.length; i++) {
+        const value = l2Results[i];
+        const originalIndex = missingIndices[i];
+        const missingKey = missingKeys[i];
+        if (value !== null && value !== undefined && originalIndex !== undefined && missingKey !== undefined) {
+          results[originalIndex] = value;
           // Promote to L1 cache
-          await this.l1Cache.set(key, value, this.config.defaultTTL);
+          await this.l1Cache.set(missingKey, value, this.config.defaultTTL);
         }
       }
     }
 
-    return result;
+    return results;
   }
 
-  async setMany(entries: Map<string, any>, ttl?: number): Promise<void> {
-    const effectiveTTL = ttl || this.config.defaultTTL;
+  async setMany<T>(entries: Array<{key: string, value: T, ttl?: number}>): Promise<void> {
+    // Apply default TTL to entries without one
+    const entriesWithTTL = entries.map(e => ({
+      ...e,
+      ttl: e.ttl || this.config.defaultTTL
+    }));
 
     // Set in L1 cache
-    await this.l1Cache.setMany(entries, effectiveTTL);
+    await this.l1Cache.setMany(entriesWithTTL);
 
     // Set in L2 cache if available
     if (this.l2Cache) {
-      await this.l2Cache.setMany(entries, effectiveTTL);
+      await this.l2Cache.setMany(entriesWithTTL);
     }
   }
 
-  async deleteMany(keys: string[]): Promise<boolean[]> {
-    const l1Results = await this.l1Cache.deleteMany(keys);
-    const l2Results = this.l2Cache ? await this.l2Cache.deleteMany(keys) : keys.map(() => false);
-
-    // Return true if deleted from either level
-    return keys.map((_, index) => l1Results[index] || l2Results[index]);
+  async deleteMany(keys: string[]): Promise<void> {
+    await this.l1Cache.deleteMany(keys);
+    if (this.l2Cache) {
+      await this.l2Cache.deleteMany(keys);
+    }
   }
 
   async invalidatePattern(pattern: string): Promise<void> {
@@ -148,39 +139,22 @@ export class MultiLevelCache implements CacheProvider {
     }
   }
 
-  async healthCheck(): Promise<{ status: 'healthy' | 'unhealthy'; latency: number; details?: any }> {
-    const l1Health = await this.l1Cache.healthCheck();
+  async ping(): Promise<boolean> {
+    const l1Ping = await this.l1Cache.ping();
 
     if (!this.l2Cache) {
-      return l1Health;
+      return l1Ping;
     }
 
-    const l2Health = await this.l2Cache.healthCheck();
+    const l2Ping = await this.l2Cache.ping();
 
     // Multi-level cache is healthy if both levels are healthy
-    const overallStatus = l1Health.status === 'healthy' && l2Health.status === 'healthy' ? 'healthy' : 'unhealthy';
-    const avgLatency = (l1Health.latency + l2Health.latency) / 2;
-
-    return {
-      status: overallStatus,
-      latency: avgLatency,
-      details: {
-        l1: l1Health,
-        l2: l2Health
-      }
-    };
+    return l1Ping && l2Ping;
   }
 
-  async getStats(): Promise<{
-    hits: number;
-    misses: number;
-    hitRate: number;
-    totalRequests: number;
-    l1Stats?: any;
-    l2Stats?: any;
-  }> {
-    const l1Stats = await this.l1Cache.getStats?.() || { hits: 0, misses: 0, hitRate: 0, totalRequests: 0 };
-    const l2Stats = this.l2Cache ? await this.l2Cache.getStats?.() || { hits: 0, misses: 0, hitRate: 0, totalRequests: 0 } : null;
+  async getStats(): Promise<CacheStats> {
+    const l1Stats = await this.l1Cache.getStats();
+    const l2Stats = this.l2Cache ? await this.l2Cache.getStats() : null;
 
     const totalHits = l1Stats.hits + (l2Stats?.hits || 0);
     const totalMisses = l1Stats.misses + (l2Stats?.misses || 0);
@@ -191,9 +165,8 @@ export class MultiLevelCache implements CacheProvider {
       hits: totalHits,
       misses: totalMisses,
       hitRate,
-      totalRequests,
-      l1Stats,
-      l2Stats
+      size: l1Stats.size + (l2Stats?.size || 0),
+      memoryUsage: (l1Stats.memoryUsage || 0) + (l2Stats?.memoryUsage || 0)
     };
   }
 }

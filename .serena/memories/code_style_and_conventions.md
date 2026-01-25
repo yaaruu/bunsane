@@ -43,6 +43,11 @@ class MyArcheType extends BaseArcheType {
 - Use relative imports for internal modules
 - Use `@/` path alias for project root imports
 - Group imports: external packages first, then internal modules
+- **Type-only imports**: Use `import type` for interface/type imports when only used for type checking:
+  ```typescript
+  import type { CacheProvider } from './CacheProvider';
+  ```
+  Benefits: Clearer intent, reduced runtime dependencies, better tree-shaking
 
 ## Testing Conventions
 - Test files: `*.test.ts`

@@ -88,7 +88,7 @@ describe('ResolverBuilder', () => {
             });
 
             const resolvers = builder.getResolvers();
-            expect(resolvers.Query.getUser).toBeDefined();
+            expect(resolvers.Query!.getUser).toBeDefined();
         });
 
         test('returns Mutation resolvers', () => {
@@ -102,7 +102,7 @@ describe('ResolverBuilder', () => {
             });
 
             const resolvers = builder.getResolvers();
-            expect(resolvers.Mutation.createUser).toBeDefined();
+            expect(resolvers.Mutation!.createUser).toBeDefined();
         });
     });
 
@@ -140,7 +140,7 @@ describe('ResolverBuilder', () => {
                 getUser: async () => ({ id: '1', name: 'Test' })
             };
 
-            const resolver = builder.createResolverWithoutInput(mockService, 'getUser');
+            const resolver = (builder as any).createResolverWithoutInput(mockService, 'getUser');
             expect(typeof resolver).toBe('function');
         });
 
@@ -153,7 +153,7 @@ describe('ResolverBuilder', () => {
                 }
             };
 
-            const resolver = builder.createResolverWithoutInput(mockService, 'getUser');
+            const resolver = (builder as any).createResolverWithoutInput(mockService, 'getUser');
             await resolver({}, {}, {}, {} as any);
             expect(called).toBe(true);
         });
@@ -165,7 +165,7 @@ describe('ResolverBuilder', () => {
                 createUser: async (input: any) => ({ id: '1', ...input })
             };
 
-            const resolver = builder.createResolverWithInput(mockService, 'createUser');
+            const resolver = (builder as any).createResolverWithInput(mockService, 'createUser');
             expect(typeof resolver).toBe('function');
         });
 
@@ -178,7 +178,7 @@ describe('ResolverBuilder', () => {
                 }
             };
 
-            const resolver = builder.createResolverWithInput(mockService, 'createUser');
+            const resolver = (builder as any).createResolverWithInput(mockService, 'createUser');
             await resolver({}, { input: { name: 'Test' } }, {}, {} as any);
             expect(receivedInput).toEqual({ name: 'Test' });
         });
