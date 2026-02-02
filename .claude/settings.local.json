@@ -29,7 +29,8 @@
       "mcp__serena__find_referencing_symbols",
       "Bash(bun tsc:*)",
       "mcp__serena__edit_memory",
-      "Bash(bunx tsc:*)"
+      "Bash(bunx tsc:*)",
+      "Bash(wc:*)"
     ]
   },
   "statusLine": {

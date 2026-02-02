@@ -28,7 +28,9 @@ export type CorsConfig = {
     origin?: string | string[] | ((origin: string) => boolean);
     credentials?: boolean;
     allowedHeaders?: string[];
+    exposedHeaders?: string[];
     methods?: string[];
+    maxAge?: number;
 };
 
 export type AppConfig = {
@@ -101,6 +103,14 @@ export default class App {
         }
 
         return this;
+    }
+
+    public setCors(cors: CorsConfig) {
+        this.config.cors = cors;
+        // Warn about invalid configuration
+        if (cors.credentials && cors.origin === '*') {
+            console.warn('[CORS] Warning: credentials=true with origin="*" is invalid per spec. Origin will be reflected from request.');
+        }
     }
 
     async init() {
@@ -401,23 +411,68 @@ export default class App {
         this.staticAssets.set(route, resolvedFolder);
     }
 
-    private getCorsHeaders(): Record<string, string> {
-        if (!this.config.cors) return {};
+    private validateOrigin(requestOrigin: string | null | undefined): string | null {
+        if (!this.config.cors || !requestOrigin) return null;
 
-        const origin = this.config.cors.origin;
-        const originValue = typeof origin === 'string' ? origin :
-                           Array.isArray(origin) ? origin.join(', ') : '*';
+        const configOrigin = this.config.cors.origin;
 
-        return {
-            'Access-Control-Allow-Origin': originValue,
-            'Access-Control-Allow-Credentials': this.config.cors.credentials ? 'true' : 'false',
-            'Access-Control-Allow-Methods': this.config.cors.methods?.join(', ') || 'GET, POST, PUT, DELETE, OPTIONS',
-            'Access-Control-Allow-Headers': this.config.cors.allowedHeaders?.join(', ') || 'Content-Type, Authorization',
-        };
+        // Wildcard allows all
+        if (configOrigin === '*' || configOrigin === undefined) {
+            // If credentials enabled, cannot use wildcard - return actual origin
+            return this.config.cors.credentials ? requestOrigin : '*';
+        }
+
+        // String match
+        if (typeof configOrigin === 'string') {
+            return requestOrigin === configOrigin ? configOrigin : null;
+        }
+
+        // Array - check if origin is in list
+        if (Array.isArray(configOrigin)) {
+            return configOrigin.includes(requestOrigin) ? requestOrigin : null;
+        }
+
+        // Function validator
+        if (typeof configOrigin === 'function') {
+            return configOrigin(requestOrigin) ? requestOrigin : null;
+        }
+
+        return null;
     }
 
-    private addCorsHeaders(response: Response): Response {
-        const corsHeaders = this.getCorsHeaders();
+    private getCorsHeaders(req?: Request): Record<string, string> {
+        if (!this.config.cors) return {};
+
+        const requestOrigin = req?.headers.get('Origin');
+        const allowedOrigin = this.validateOrigin(requestOrigin);
+
+        // If origin not allowed, return empty (no CORS headers)
+        if (requestOrigin && !allowedOrigin) return {};
+
+        const headers: Record<string, string> = {
+            'Access-Control-Allow-Origin': allowedOrigin || '*',
+            'Access-Control-Allow-Methods': this.config.cors.methods?.join(', ') || 'GET, POST, PUT, DELETE, OPTIONS',
+            'Access-Control-Allow-Headers': this.config.cors.allowedHeaders?.join(', ') || 'Content-Type, Authorization',
+            'Vary': 'Origin',
+        };
+
+        if (this.config.cors.credentials) {
+            headers['Access-Control-Allow-Credentials'] = 'true';
+        }
+
+        if (this.config.cors.exposedHeaders?.length) {
+            headers['Access-Control-Expose-Headers'] = this.config.cors.exposedHeaders.join(', ');
+        }
+
+        if (this.config.cors.maxAge !== undefined) {
+            headers['Access-Control-Max-Age'] = String(this.config.cors.maxAge);
+        }
+
+        return headers;
+    }
+
+    private addCorsHeaders(response: Response, req?: Request): Response {
+        const corsHeaders = this.getCorsHeaders(req);
         if (Object.keys(corsHeaders).length === 0) return response;
 
         const newHeaders = new Headers(response.headers);
@@ -441,7 +496,7 @@ export default class App {
         if (method === 'OPTIONS') {
             return new Response(null, {
                 status: 204,
-                headers: this.getCorsHeaders(),
+                headers: this.getCorsHeaders(req),
             });
         }
 
@@ -456,7 +511,7 @@ export default class App {
             // Health check endpoint
             if (url.pathname === "/health") {
                 clearTimeout(timeoutId);
-                return new Response(
+                return this.addCorsHeaders(new Response(
                     JSON.stringify({
                         status: "ok",
                         timestamp: new Date().toISOString(),
@@ -465,15 +520,15 @@ export default class App {
                     {
                         headers: { "Content-Type": "application/json" },
                     }
-                );
+                ), req);
             }
 
             // OpenAPI spec endpoint
             if (url.pathname === "/openapi.json") {
                 clearTimeout(timeoutId);
-                return new Response(this.openAPISpecGenerator!.toJSON(), {
+                return this.addCorsHeaders(new Response(this.openAPISpecGenerator!.toJSON(), {
                     headers: { "Content-Type": "application/json" },
-                });
+                }), req);
             }
 
             // Swagger UI endpoint
@@ -513,9 +568,9 @@ export default class App {
     </script>
 </body>
 </html>`;
-                return new Response(swaggerUIHTML, {
+                return this.addCorsHeaders(new Response(swaggerUIHTML, {
                     headers: { "Content-Type": "text/html" },
-                });
+                }), req);
             }
 
             // Studio API endpoints
@@ -524,7 +579,7 @@ export default class App {
 
                 // Studio tables endpoint
                 if (url.pathname === "/studio/api/tables") {
-                    return studioEndpoint.getTables();
+                    return this.addCorsHeaders(await studioEndpoint.getTables(), req);
                 }
 
                 const studioApiPath = url.pathname.replace("/studio/api/", "");
@@ -535,21 +590,21 @@ export default class App {
 
                     if (method === "DELETE") {
                         const body = await req.json();
-                        return studioEndpoint.handleStudioTableDeleteRequest(
+                        return this.addCorsHeaders(await studioEndpoint.handleStudioTableDeleteRequest(
                             tableName,
                             body
-                        );
+                        ), req);
                     }
 
                     const limit = url.searchParams.get("limit");
                     const offset = url.searchParams.get("offset");
                     const search = url.searchParams.get("search");
 
-                    return studioEndpoint.handleStudioTableRequest(tableName, {
+                    return this.addCorsHeaders(await studioEndpoint.handleStudioTableRequest(tableName, {
                         limit: limit ? parseInt(limit, 10) : undefined,
                         offset: offset ? parseInt(offset, 10) : undefined,
                         search: search ?? undefined,
-                    });
+                    }), req);
                 }
 
                 if (pathSegments[0] === "arche-type" && pathSegments[1]) {
@@ -557,33 +612,33 @@ export default class App {
 
                     if (method === "DELETE") {
                         const body = await req.json();
-                        return studioEndpoint.handleStudioArcheTypeDeleteRequest(
+                        return this.addCorsHeaders(await studioEndpoint.handleStudioArcheTypeDeleteRequest(
                             archeTypeName,
                             body
-                        );
+                        ), req);
                     }
 
                     const limit = url.searchParams.get("limit");
                     const offset = url.searchParams.get("offset");
                     const search = url.searchParams.get("search");
 
-                    return studioEndpoint.handleStudioArcheTypeRecordsRequest(
+                    return this.addCorsHeaders(await studioEndpoint.handleStudioArcheTypeRecordsRequest(
                         archeTypeName,
                         {
                             limit: limit ? parseInt(limit, 10) : undefined,
                             offset: offset ? parseInt(offset, 10) : undefined,
                             search: search ?? undefined,
                         }
-                    );
+                    ), req);
                 }
 
-                return new Response(
+                return this.addCorsHeaders(new Response(
                     JSON.stringify({ error: "Studio API endpoint not found" }),
                     {
                         status: 404,
                         headers: { "Content-Type": "application/json" },
                     }
-                );
+                ), req);
             }
 
             // Studio endpoint - handle both root and all sub-routes
@@ -595,7 +650,7 @@ export default class App {
 
                 // Skip API routes - they're handled by the API handler above
                 if (url.pathname.startsWith("/studio/api/")) {
-                    return new Response(
+                    return this.addCorsHeaders(new Response(
                         JSON.stringify({
                             error: "Studio API endpoint not found",
                         }),
@@ -603,7 +658,7 @@ export default class App {
                             status: 404,
                             headers: { "Content-Type": "application/json" },
                         }
-                    );
+                    ), req);
                 }
 
                 // Check if this is a request for static assets (CSS, JS, etc.)
@@ -633,24 +688,24 @@ export default class App {
                                 "</head>",
                                 `${metadataScript}</head>`
                             );
-                            return new Response(html, {
+                            return this.addCorsHeaders(new Response(html, {
                                 headers: { "Content-Type": "text/html" },
-                            });
+                            }), req);
                         } else {
-                            return new Response(
+                            return this.addCorsHeaders(new Response(
                                 "Studio not built. Run `bun run build:studio` to build the studio.",
                                 {
                                     status: 404,
                                     headers: { "Content-Type": "text/plain" },
                                 }
-                            );
+                            ), req);
                         }
                     } catch (error) {
                         console.log("Error loading studio index.html:", error);
-                        return new Response("Studio not available", {
+                        return this.addCorsHeaders(new Response("Studio not available", {
                             status: 404,
                             headers: { "Content-Type": "text/plain" },
-                        });
+                        }), req);
                     }
                 }
             }
@@ -662,7 +717,7 @@ export default class App {
                         const file = Bun.file(filePath);
                         if (await file.exists()) {
                             clearTimeout(timeoutId);
-                            return new Response(file);
+                            return this.addCorsHeaders(new Response(file), req);
                         }
                     } catch (error) {
                         logger.error(
@@ -701,11 +756,11 @@ export default class App {
 
                     clearTimeout(timeoutId);
                     if (result instanceof Response) {
-                        return this.addCorsHeaders(result);
+                        return this.addCorsHeaders(result, req);
                     } else {
                         return this.addCorsHeaders(new Response(JSON.stringify(result), {
                             headers: { "Content-Type": "application/json" },
-                        }));
+                        }), req);
                     }
                 } catch (error) {
                     const duration = Date.now() - startTime;
@@ -720,7 +775,7 @@ export default class App {
                             status: 500,
                             headers: { "Content-Type": "application/json" },
                         }
-                    ));
+                    ), req);
                 }
             }
 
@@ -733,7 +788,7 @@ export default class App {
             }
 
             clearTimeout(timeoutId);
-            return new Response("Not Found", { status: 404 });
+            return this.addCorsHeaders(new Response("Not Found", { status: 404 }), req);
         } catch (error) {
             const duration = Date.now() - startTime;
             logger.error(
@@ -743,22 +798,22 @@ export default class App {
             clearTimeout(timeoutId);
 
             if ((error as Error).name === "AbortError") {
-                return new Response(
+                return this.addCorsHeaders(new Response(
                     JSON.stringify({ error: "Request timeout" }),
                     {
                         status: 408,
                         headers: { "Content-Type": "application/json" },
                     }
-                );
+                ), req);
             }
 
-            return new Response(
+            return this.addCorsHeaders(new Response(
                 JSON.stringify({ error: "Internal server error" }),
                 {
                     status: 500,
                     headers: { "Content-Type": "application/json" },
                 }
-            );
+            ), req);
         }
     }
 
