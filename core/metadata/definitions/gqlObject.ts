@@ -2,7 +2,7 @@ import {
     GraphQLScalar,
     type GraphQLObject,
     type GraphQLField
-} from "gql/types"
+} from "../../../gql/types"
 
 export interface GQLObjectMetaData {
     name: string;

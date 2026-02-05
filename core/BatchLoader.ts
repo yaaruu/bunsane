@@ -1,4 +1,4 @@
-import { Entity } from "core/Entity";
+import { Entity } from "./Entity";
 import { BaseComponent } from "./components";
 import { timed } from "./Decorators";
 import db from "../database";

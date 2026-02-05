@@ -1,7 +1,7 @@
-import { logger as MainLogger } from "core/Logger";
+import { logger as MainLogger } from "../core/Logger";
 import type { GraphQLType } from "./helpers";
 import BaseArcheType from "../core/ArcheType";
-import type { BaseService } from "service";
+import type { BaseService } from "../service";
 
 const logger = MainLogger.child({ scope: "GraphQLGenerator" });
 

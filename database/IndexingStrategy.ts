@@ -1,4 +1,4 @@
-import db from "database";
+import db from "./index";
 import { logger } from "../core/Logger";
 
 const validateIdentifier = (str: string, maxLength: number = 64): string => {

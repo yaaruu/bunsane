@@ -1,5 +1,5 @@
 import type { SwaggerEndpointMetadata } from "./decorators";
-import {logger as MainLogger}  from "core/Logger";
+import {logger as MainLogger}  from "../core/Logger";
 const logger = MainLogger.child({ scope: "OpenAPISpecGenerator" });
 export interface OpenAPISpec {
     openapi: string;

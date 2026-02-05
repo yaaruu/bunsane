@@ -1,5 +1,5 @@
 import {SQL} from "bun";
-import { logger } from "core/Logger";
+import { logger } from "../core/Logger";
 
 let connectionUrl = `postgres://${process.env.POSTGRES_USER}:${process.env.POSTGRES_PASSWORD}@${process.env.POSTGRES_HOST}:${process.env.POSTGRES_PORT ?? "5432"}/${process.env.POSTGRES_DB}`;
 if(process.env.DB_CONNECTION_URL) {

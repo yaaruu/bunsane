@@ -1,4 +1,4 @@
-import type { GraphQLObjectTypeMeta, GraphQLOperationMeta, GraphQLSubscriptionMeta } from "gql/Generator";
+import type { GraphQLObjectTypeMeta, GraphQLOperationMeta, GraphQLSubscriptionMeta } from "../gql/Generator";
 
 class BaseService {
     public __graphqlObjectType?: GraphQLObjectTypeMeta[];

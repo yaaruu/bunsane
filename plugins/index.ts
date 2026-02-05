@@ -1,5 +1,5 @@
-import type App from "core/App";
-import type { ApplicationPhase } from "core/ApplicationLifecycle";
+import type App from "../core/App";
+import type { ApplicationPhase } from "../core/ApplicationLifecycle";
 
 abstract class BasePlugin {
     name!: string;

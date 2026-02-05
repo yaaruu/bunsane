@@ -1,6 +1,6 @@
 import type BaseService from "./Service";
-import ApplicationLifecycle, {ApplicationPhase} from "core/ApplicationLifecycle";
-import { generateGraphQLSchemaV2 } from "gql";
+import ApplicationLifecycle, {ApplicationPhase} from "../core/ApplicationLifecycle";
+import { generateGraphQLSchemaV2 } from "../gql";
 import { GraphQLSchema } from "graphql";
 
 class ServiceRegistry {

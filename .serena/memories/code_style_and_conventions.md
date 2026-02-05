@@ -40,8 +40,9 @@ class MyArcheType extends BaseArcheType {
 ```
 
 ## Import Style
-- Use relative imports for internal modules
-- Use `@/` path alias for project root imports
+- **ALWAYS use relative imports** (`./`, `../`) for all internal modules
+- Do NOT use bare imports like `from "core/Logger"` - they rely on `baseUrl` and break consumer typechecking
+- The `@/` path alias is configured but not used in practice; prefer relative imports
 - Group imports: external packages first, then internal modules
 - **Type-only imports**: Use `import type` for interface/type imports when only used for type checking:
   ```typescript

@@ -1,27 +1,27 @@
 import ApplicationLifecycle, {
     ApplicationPhase,
-} from "core/ApplicationLifecycle";
+} from "./ApplicationLifecycle";
 import {
     GenerateTableName,
     HasValidBaseTable,
     PrepareDatabase,
     UpdateComponentIndexes,
     EnsureDatabaseMigrations,
-} from "database/DatabaseHelper";
+} from "../database/DatabaseHelper";
 import { ComponentRegistry } from "./components";
-import { logger as MainLogger } from "core/Logger";
-import { getSerializedMetadataStorage } from "core/metadata";
+import { logger as MainLogger } from "./Logger";
+import { getSerializedMetadataStorage } from "./metadata";
 const logger = MainLogger.child({ scope: "App" });
-import { createYogaInstance } from "gql";
-import ServiceRegistry from "service/ServiceRegistry";
+import { createYogaInstance } from "../gql";
+import ServiceRegistry from "../service/ServiceRegistry";
 import { type Plugin, createPubSub } from "graphql-yoga";
 import * as path from "path";
-import { SchedulerManager } from "core/SchedulerManager";
+import { SchedulerManager } from "./SchedulerManager";
 import { registerScheduledTasks } from "../scheduler";
-import { OpenAPISpecGenerator, type SwaggerEndpointMetadata } from "swagger";
-import type BasePlugin from "plugins";
-import { preparedStatementCache } from "database/PreparedStatementCache";
-import db from "database";
+import { OpenAPISpecGenerator, type SwaggerEndpointMetadata } from "../swagger";
+import type BasePlugin from "../plugins";
+import { preparedStatementCache } from "../database/PreparedStatementCache";
+import db from "../database";
 import studioEndpoint from "../endpoints";
 
 export type CorsConfig = {

@@ -1,9 +1,9 @@
 import type { ComponentDataType, ComponentGetter, BaseComponent } from "./components";
 import { logger } from "./Logger";
-import db from "database";
+import db from "../database";
 import EntityManager from "./EntityManager";
 import ComponentRegistry from "./components/ComponentRegistry";
-import { uuidv7 } from "utils/uuid";
+import { uuidv7 } from "../utils/uuid";
 import { sql, SQL } from "bun";
 // import Query from "./Query"; // Lazy import to avoid cycle
 import { timed } from "./Decorators";

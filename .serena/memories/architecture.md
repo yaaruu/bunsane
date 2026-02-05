@@ -108,9 +108,47 @@ interface CacheProvider {
 - `ping()` replaces `healthCheck()` for conventional naming
 - All wrappers maintain full interface compliance
 
+## Import Resolution (as of 2026-02-05)
+
+All internal imports use **relative paths** (`./`, `../`). Bare imports like `from "core/Logger"` that rely on `baseUrl` are NOT allowed because they break TypeScript type checking for consumers who install bunsane as a dependency (their tsconfig does not have baseUrl pointing to bunsane root).
+
 ## Data Model
 
 - **Entity**: UUID-identified record in `entities` table
 - **Component**: JSONB data in `components` table, linked to entity
 - Components are identified by `entity_id` + `component_type`
 - Supports indexing specific component fields for queries
+
+## CORS System (as of 2026-02-04)
+
+The App class (`core/App.ts`) provides comprehensive CORS support with proper spec compliance.
+
+**CorsConfig Type**:
+```typescript
+type CorsConfig = {
+    origin?: string | string[] | ((origin: string) => boolean);
+    credentials?: boolean;
+    allowedHeaders?: string[];
+    exposedHeaders?: string[];  // For Access-Control-Expose-Headers
+    methods?: string[];
+    maxAge?: number;  // Preflight cache duration in seconds
+};
+```
+
+**Key Features**:
+- **Origin Validation**: Validates request Origin header against configured origins
+- **Array Origins**: Returns the matching origin (not comma-joined) per spec
+- **Function Origins**: Supports `(origin: string) => boolean` for dynamic validation
+- **Credentials + Wildcard**: When credentials=true with origin="*", reflects actual origin instead of wildcard
+- **Vary Header**: Always includes `Vary: Origin` for proper caching
+- **All Endpoints**: CORS headers applied to all response paths (health, docs, openapi, studio, errors)
+
+**Usage**:
+```typescript
+app.setCors({
+    origin: ["http://localhost:3000", "https://myapp.com"],
+    credentials: true,
+    maxAge: 86400,
+    exposedHeaders: ["X-Custom-Header"]
+});
+```

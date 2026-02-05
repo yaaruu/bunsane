@@ -2,7 +2,7 @@ import type { TypeGenerationStrategy } from "../strategies/TypeGenerationStrateg
 import { ZodTypeStrategy } from "../strategies/TypeGenerationStrategy";
 import { GraphVisitor } from "./GraphVisitor";
 import type { TypeNode, OperationNode, FieldNode, InputNode, ScalarNode } from "../graph/GraphNode";
-import { logger as MainLogger } from "core/Logger";
+import { logger as MainLogger } from "../../core/Logger";
 import * as z from "zod";
 import { ZodWeaver, asObjectType } from "@gqloom/zod";
 import { weave } from "@gqloom/core";

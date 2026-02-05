@@ -10,8 +10,8 @@ import {
     AnalyzeAllComponentTables,
     GetPartitionStrategy,
 } from "../../database/DatabaseHelper";
-import { ensureMultipleJSONBPathIndexes } from "database/IndexingStrategy";
-import { GetSchema } from "database/DatabaseHelper";
+import { ensureMultipleJSONBPathIndexes } from "../../database/IndexingStrategy";
+import { GetSchema } from "../../database/DatabaseHelper";
 import { logger as MainLogger } from "../Logger";
 import { getMetadataStorage } from "../metadata";
 import { registerDecoratedHooks } from "../decorators/EntityHooks";

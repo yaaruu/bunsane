@@ -1,6 +1,6 @@
-import db from "database";
-import { logger as MainLogger } from "core/Logger";
-import { getMetadataStorage } from "core/metadata";
+import db from "./index";
+import { logger as MainLogger } from "../core/Logger";
+import { getMetadataStorage } from "../core/metadata";
 import { ensureMultipleJSONBPathIndexes } from "./IndexingStrategy";
 const logger = MainLogger.child({ scope: "DatabaseHelper" });
 

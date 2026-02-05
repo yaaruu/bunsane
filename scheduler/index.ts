@@ -1,8 +1,8 @@
 import { ScheduleInterval } from "../types/scheduler.types";
 import type { ScheduledTaskOptions } from "../types/scheduler.types";
-import { SchedulerManager } from "core/SchedulerManager";
-import { logger } from "core/Logger";
-import type { ComponentTargetConfig } from "core/EntityHookManager";
+import { SchedulerManager } from "../core/SchedulerManager";
+import { logger } from "../core/Logger";
+import type { ComponentTargetConfig } from "../core/EntityHookManager";
 const loggerInstance = logger.child({ scope: "ScheduledTaskDecorator" });
 
 /**
