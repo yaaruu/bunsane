@@ -30,7 +30,10 @@
       "Bash(bun tsc:*)",
       "mcp__serena__edit_memory",
       "Bash(bunx tsc:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(bun run:*)",
+      "Bash(BUN_CONFIG_FILE=/dev/null bun test:*)",
+      "Bash(echo:*)"
     ]
   },
   "statusLine": {

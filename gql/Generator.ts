@@ -1,5 +1,6 @@
 import { logger as MainLogger } from "../core/Logger";
 import type { GraphQLType } from "./helpers";
+import type { SchemaType } from "./schema";
 import BaseArcheType from "../core/ArcheType";
 import type { BaseService } from "../service";
 
@@ -14,14 +15,14 @@ export interface GraphQLOperationMeta<T extends BaseArcheType | BaseArcheType[] 
     type: "Query" | "Mutation";
     propertyKey?: string;
     name?: string;
-    input?: Record<string, GraphQLType> | any;
+    input?: Record<string, SchemaType> | Record<string, GraphQLType> | any;
     output: GraphQLType | Record<string, GraphQLType> | T;
 }
 
 export interface GraphQLSubscriptionMeta<T extends BaseArcheType | BaseArcheType[] | string = string> {
     propertyKey?: string;
     name?: string;
-    input?: Record<string, GraphQLType> | any;
+    input?: Record<string, SchemaType> | Record<string, GraphQLType> | any;
     output: GraphQLType | Record<string, GraphQLType> | T;
 }
 

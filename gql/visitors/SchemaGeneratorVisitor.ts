@@ -11,6 +11,7 @@ import { GraphQLSchema, printSchema } from "graphql";
 import BaseArcheType from "../../core/ArcheType";
 import { getMetadataStorage } from "../../core/metadata";
 import { getArchetypeSchema } from "../../core/ArcheType";
+import { isSchemaInput, collectNestedTypeDefs, type SchemaType } from "../schema";
 
 const logger = MainLogger.child({ scope: 'SchemaGeneratorVisitor' });
 
@@ -208,21 +209,26 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
         const { input, output, scalarTypes } = node.metadata;
         let fieldDef = name;
         
-        // Handle input exactly like V1
+        // Handle input: Schema DSL → Zod (legacy) → Record (fallback)
         if (input) {
             const inputTypeName = `${name}Input`;
-            
-            // Check if input is a Zod schema
-            if (input && typeof input === 'object' && '_def' in input) {
-                // Generate input type from Zod schema using V1's logic
-                // Note: generateInputTypeFromZod handles deduplication internally via this.definedTypes
+
+            if (isSchemaInput(input)) {
+                // Schema DSL path
+                const result = this.generateInputFromSchema(input as Record<string, SchemaType>, inputTypeName);
+                if (!this.definedTypes.has(inputTypeName)) {
+                    this.typeDefs += result.typeDefs;
+                    this.definedTypes.add(inputTypeName);
+                }
+                fieldDef += `(input: ${inputTypeName}!)`;
+            } else if (input && typeof input === 'object' && '_def' in input) {
+                // Legacy Zod schema path (deprecated — use Schema DSL `t.` API instead)
+                logger.warn(`Operation "${name}" uses a Zod schema as input. This is deprecated and will be removed in a future version. Use the Schema DSL (t.string(), t.object(), etc.) instead.`);
                 const inputTypeDef = this.generateInputTypeFromZod(input as ZodType, inputTypeName, scalarTypes || new Set());
                 if (inputTypeDef) {
-                    // Always add the typedef - generateInputTypeFromZod returns empty string if already defined
                     this.typeDefs += inputTypeDef;
                 }
-                
-                // Determine nullability exactly like V1
+
                 let inputNullability = '!';
                 try {
                     const allowsUndefined = !!(input && typeof (input as any).safeParse === 'function' && (input as any).safeParse(undefined).success);
@@ -231,10 +237,10 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
                 } catch (e) {
                     inputNullability = '!';
                 }
-                
+
                 fieldDef += `(input: ${inputTypeName}${inputNullability})`;
             } else if (typeof input === 'object') {
-                // Legacy Record<string, GraphQLType> format
+                // Fallback: Record<string, GraphQLType> format
                 const inputTypeDef = `input ${inputTypeName} {\n${Object.entries(input).map(([k, v]) => `  ${k}: ${v}`).join('\n')}\n}\n`;
                 if (!this.definedTypes.has(inputTypeName)) {
                     this.typeDefs += inputTypeDef;
@@ -331,6 +337,34 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
         return inferredName;
     }
     
+    /**
+     * Generate input type from Schema DSL definitions.
+     * Collects nested type definitions (depth-first) and builds a Zod schema for validation.
+     */
+    private generateInputFromSchema(
+        input: Record<string, SchemaType>,
+        inputName: string,
+    ): { typeDefs: string; zodSchema: ZodType } {
+        const collected = collectNestedTypeDefs(input);
+
+        // Build the top-level input type
+        const fields = Object.entries(input)
+            .map(([key, schema]) => `  ${key}: ${schema.toGraphQL()}`)
+            .join("\n");
+        collected.set(inputName, `input ${inputName} {\n${fields}\n}`);
+
+        // Build Zod schema for runtime validation
+        const zodShape: Record<string, ZodType> = {};
+        for (const [key, schema] of Object.entries(input)) {
+            zodShape[key] = schema.toZod();
+        }
+
+        return {
+            typeDefs: Array.from(collected.values()).join("\n\n") + "\n",
+            zodSchema: z.object(zodShape),
+        };
+    }
+
     /**
      * Generate input type from Zod schema exactly like V1
      * Returns the generated typedef string, or empty string if already defined

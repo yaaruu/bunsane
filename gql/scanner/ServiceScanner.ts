@@ -3,6 +3,7 @@ import type { GraphQLObjectTypeMeta, GraphQLOperationMeta, GraphQLSubscriptionMe
 import { SchemaGraph } from "../graph/SchemaGraph";
 import { ScalarNode, TypeNode, OperationNode, FieldNode, InputNode } from "../graph/GraphNode";
 import { OperationType, GraphQLTypeKind } from "../graph/GraphNode";
+import { isSchemaInput } from "../schema";
 
 /**
  * ServiceScanner extracts GraphQL metadata from services and converts it into graph nodes.
@@ -103,9 +104,9 @@ export class ServiceScanner {
         if (!operations) return;
 
         for (const op of operations) {
-            // Create input node if input is a plain object (not Zod schema)
+            // Create input node if input is a plain object (not Zod schema, not Schema DSL)
             let inputNodeId: string | undefined;
-            if (op.input && typeof op.input === 'object' && !Array.isArray(op.input) && !('_def' in op.input)) {
+            if (op.input && typeof op.input === 'object' && !Array.isArray(op.input) && !('_def' in op.input) && !isSchemaInput(op.input)) {
                 const inputTypeName = this.extractTypeNameFromInput(op.input, op.name!);
                 
                 // Only create node if it doesn't already exist
