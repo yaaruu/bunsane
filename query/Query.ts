@@ -13,7 +13,7 @@ import { shouldUseDirectPartition } from "../core/Config";
 import type { SQL } from "bun";
 import type { ComponentConstructor, TypedEntity, ComponentRecord } from "../types/query.types";
 
-export type FilterOperator = "=" | ">" | "<" | ">=" | "<=" | "!=" | "LIKE" | "IN" | "NOT IN" | string;
+export type FilterOperator = "=" | ">" | "<" | ">=" | "<=" | "!=" | "LIKE" | "ILIKE" | "IN" | "NOT IN" | string;
 
 export const FilterOp = {
     EQ: "=" as FilterOperator,
@@ -23,6 +23,7 @@ export const FilterOp = {
     LTE: "<=" as FilterOperator,
     NEQ: "!=" as FilterOperator,
     LIKE: "LIKE" as FilterOperator,
+    ILIKE: "ILIKE" as FilterOperator,
     IN: "IN" as FilterOperator,
     NOT_IN: "NOT IN" as FilterOperator
 }

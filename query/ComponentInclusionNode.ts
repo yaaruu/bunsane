@@ -382,7 +382,7 @@ export class ComponentInclusionNode extends QueryNode {
                 } else {
                     return null; // Invalid - fall back to normal path
                 }
-            } else if (filter.operator === 'LIKE' || filter.operator === 'NOT LIKE') {
+            } else if (filter.operator === 'LIKE' || filter.operator === 'NOT LIKE' || filter.operator === 'ILIKE') {
                 condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}::text`;
             } else {
                 condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}::text`;
@@ -529,8 +529,8 @@ export class ComponentInclusionNode extends QueryNode {
                         // UUID equality comparison - only cast the parameter, compare as text
                         // This allows matching UUID parameter against both UUID and text fields
                         condition = `${jsonPath} = $${context.addParam(filter.value)}`;
-                    } else if (filter.operator === 'LIKE' || filter.operator === 'NOT LIKE') {
-                        // String LIKE comparison - no casting
+                    } else if (filter.operator === 'LIKE' || filter.operator === 'NOT LIKE' || filter.operator === 'ILIKE') {
+                        // String LIKE/ILIKE comparison - no casting
                         condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
                     } else if (filter.operator === 'IN' || filter.operator === 'NOT IN') {
                         // IN/NOT IN comparison - handle arrays properly

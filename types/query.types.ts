@@ -98,7 +98,7 @@ export interface ArcheTypeQueryOptions {
 /**
  * Filter operators for typed queries
  */
-export type TypedFilterOperator = 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte' | 'in' | 'notIn' | 'like';
+export type TypedFilterOperator = 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte' | 'in' | 'notIn' | 'like' | 'ilike';
 
 /**
  * A typed filter for archetype queries

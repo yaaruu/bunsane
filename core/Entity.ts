@@ -32,6 +32,10 @@ export class Entity implements IEntity {
         return new Entity();
     }
 
+    public static CreateWithId(id: string): Entity {
+        return new Entity(id);
+    }
+
     protected addComponent(component: BaseComponent): Entity {
         this.components.set(component.getTypeID(), component);
         return this;

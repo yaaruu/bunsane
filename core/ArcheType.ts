@@ -810,7 +810,7 @@ export class ArcheTypeQuery<T extends BaseArcheType> {
         // Map operator to FilterOp
         const opMap: Record<string, string> = {
             'eq': '=', 'neq': '!=', 'gt': '>', 'gte': '>=',
-            'lt': '<', 'lte': '<=', 'in': 'IN', 'notIn': 'NOT IN', 'like': 'LIKE'
+            'lt': '<', 'lte': '<=', 'in': 'IN', 'notIn': 'NOT IN', 'like': 'LIKE', 'ilike': 'ILIKE'
         };
         const filterOp = opMap[operator] || '=';
 

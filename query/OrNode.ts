@@ -103,7 +103,8 @@ export class OrNode extends QueryNode {
                             paramIndex++;
                             break;
                         case "LIKE":
-                            branchSql += ` AND ${jsonPath} LIKE $${paramIndex}::text`;
+                        case "ILIKE":
+                            branchSql += ` AND ${jsonPath} ${operator} $${paramIndex}::text`;
                             context.params.push(value);
                             paramIndex++;
                             break;
@@ -221,6 +222,7 @@ export class OrNode extends QueryNode {
                         case "<=":
                         case "!=":
                         case "LIKE":
+                        case "ILIKE":
                             // Note: data->>'field' returns text, so no cast needed
                             // Explicit casting can cause issues with Bun's SQL parameter type inference
                             conditions.push(`${jsonPath} ${operator} $${paramIndex}`);
@@ -412,7 +414,8 @@ export class OrNode extends QueryNode {
                             }
                             break;
                         case "LIKE":
-                            filterConditions.push(`${jsonPath} LIKE $${paramIndex}`);
+                        case "ILIKE":
+                            filterConditions.push(`${jsonPath} ${operator} $${paramIndex}`);
                             context.params.push(value);
                             paramIndex++;
                             break;
