@@ -65,6 +65,8 @@ export default class App {
     private plugins: BasePlugin[] = [];
 
     private studioEnabled: boolean = false;
+    private server: ReturnType<typeof Bun.serve> | null = null;
+    private isShuttingDown = false;
 
     pubSub = createPubSub();
 
@@ -900,7 +902,7 @@ export default class App {
     async start() {
         logger.info("Application Started");
         const port = parseInt(process.env.APP_PORT || "3000");
-        const server = Bun.serve({
+        this.server = Bun.serve({
             idleTimeout: 0, // Disable idle timeout because we have subscriptions
             port: port,
             fetch: this.handleRequest.bind(this),
@@ -915,9 +917,22 @@ export default class App {
         logger.info(
             `Server is running on ${new URL(
                 this.yoga?.graphqlEndpoint || "/graphql",
-                `http://${server.hostname}:${server.port}`
+                `http://${this.server.hostname}:${this.server.port}`
             )}`
         );
+
+        // Register signal handlers for graceful shutdown
+        process.on('SIGTERM', async () => {
+            logger.info({ scope: 'app', component: 'App', msg: 'Received SIGTERM' });
+            await this.shutdown();
+            process.exit(0);
+        });
+
+        process.on('SIGINT', async () => {
+            logger.info({ scope: 'app', component: 'App', msg: 'Received SIGINT' });
+            await this.shutdown();
+            process.exit(0);
+        });
 
         this.appReadyCallbacks.forEach((cb) => cb());
     }
@@ -926,27 +941,38 @@ export default class App {
      * Gracefully shutdown the application
      */
     async shutdown(): Promise<void> {
+        if (this.isShuttingDown) return;
+        this.isShuttingDown = true;
+
         logger.info({ scope: 'app', component: 'App', msg: 'Shutting down application' });
-        
+
+        // Stop HTTP server
+        if (this.server) {
+            try {
+                this.server.stop();
+                logger.info({ scope: 'app', component: 'App', msg: 'HTTP server stopped' });
+            } catch (error) {
+                logger.warn({ scope: 'app', component: 'App', msg: 'HTTP server stop error', error });
+            }
+        }
+
+        // Stop scheduler
+        try {
+            await SchedulerManager.getInstance().stop();
+            logger.info({ scope: 'app', component: 'App', msg: 'Scheduler stopped' });
+        } catch (error) {
+            logger.warn({ scope: 'app', component: 'App', msg: 'Scheduler stop error', error });
+        }
+
         // Shutdown cache
         try {
             const { CacheManager } = await import('./cache/CacheManager');
-            const cacheManager = CacheManager.getInstance();
-            // Note: CacheManager doesn't have a shutdown method yet, but we can add cleanup here if needed
+            await CacheManager.getInstance().shutdown();
             logger.info({ scope: 'cache', component: 'App', msg: 'Cache shutdown completed' });
         } catch (error) {
             logger.warn({ scope: 'cache', component: 'App', msg: 'Cache shutdown error', error });
         }
-        
-        // Shutdown scheduler
-        try {
-            const scheduler = SchedulerManager.getInstance();
-            // Note: SchedulerManager may need shutdown method
-            logger.info({ scope: 'app', component: 'App', msg: 'Scheduler shutdown completed' });
-        } catch (error) {
-            logger.warn({ scope: 'app', component: 'App', msg: 'Scheduler shutdown error', error });
-        }
-        
+
         logger.info({ scope: 'app', component: 'App', msg: 'Application shutdown completed' });
     }
 }

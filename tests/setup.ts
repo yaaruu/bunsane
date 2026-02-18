@@ -86,7 +86,7 @@ async function initializeTestEnvironment(): Promise<void> {
 
         // 5. Initialize CacheManager with memory provider for tests
         const cacheManager = CacheManager.getInstance();
-        cacheManager.initialize({
+        await cacheManager.initialize({
             enabled: true,
             provider: 'memory',
             strategy: 'write-through',

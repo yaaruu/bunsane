@@ -1,10 +1,19 @@
 import { type CacheProvider } from './CacheProvider';
 import { type CacheConfig, defaultCacheConfig } from '../../config/cache.config';
 import { CacheFactory } from './CacheFactory';
+import { MultiLevelCache } from './MultiLevelCache';
+import { RedisCache } from './RedisCache';
 import { logger } from '../Logger';
 import type { Entity } from '../Entity';
 import type { BaseComponent } from '../components';
 import type { ComponentData } from '../RequestLoaders';
+
+interface InvalidationMessage {
+    instanceId: string;
+    type: 'key' | 'pattern';
+    keys?: string[];
+    pattern?: string;
+}
 
 /**
  * High-level cache operations manager
@@ -15,6 +24,9 @@ export class CacheManager {
     private static instance: CacheManager;
     private provider: CacheProvider;
     private config: CacheConfig;
+    private instanceId = crypto.randomUUID();
+    private pubSubEnabled = false;
+    private static readonly INVALIDATION_CHANNEL = 'bunsane:cache:invalidate';
 
     private constructor() {
         this.config = defaultCacheConfig;
@@ -31,9 +43,16 @@ export class CacheManager {
     /**
      * Initialize or reinitialize the cache manager with new config
      */
-    public initialize(config: Partial<CacheConfig>): void {
+    public async initialize(config: Partial<CacheConfig>): Promise<void> {
+        // Shutdown old provider before replacing
+        await this.shutdownProvider();
+        this.pubSubEnabled = false;
+
         this.config = { ...defaultCacheConfig, ...config };
         this.provider = CacheFactory.create(this.config);
+
+        await this.setupPubSub();
+
         logger.info({ scope: 'cache', component: 'CacheManager', msg: 'CacheManager initialized', provider: this.config.provider, enabled: this.config.enabled });
     }
 
@@ -102,6 +121,7 @@ export class CacheManager {
         try {
             const key = `entity:${id}`;
             await this.provider.delete(key);
+            await this.publishInvalidation('key', [key]);
         } catch (error) {
             logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error invalidating entity from cache', error });
         }
@@ -222,6 +242,7 @@ export class CacheManager {
             })
             const key = `component:${entityId}:${typeId}`;
             await this.provider.delete(key);
+            await this.publishInvalidation('key', [key]);
         } catch (error) {
             logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error invalidating component from cache', error });
         }
@@ -239,6 +260,7 @@ export class CacheManager {
         try {
             const keys = components.map(comp => `component:${comp.entityId}:${comp.typeId}`);
             await this.provider.deleteMany(keys);
+            await this.publishInvalidation('key', keys);
         } catch (error) {
             logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error invalidating components from cache', error });
         }
@@ -256,6 +278,7 @@ export class CacheManager {
         try {
             const pattern = `component:${entityId}:*`;
             await this.provider.invalidatePattern(pattern);
+            await this.publishInvalidation('pattern', undefined, pattern);
         } catch (error) {
             logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error invalidating all entity components from cache', error });
         }
@@ -344,6 +367,8 @@ export class CacheManager {
 
         try {
             await this.provider.delete(key);
+            const keys = Array.isArray(key) ? key : [key];
+            await this.publishInvalidation('key', keys);
         } catch (error) {
             logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error deleting from cache', error });
         }
@@ -359,6 +384,7 @@ export class CacheManager {
 
         try {
             await this.provider.clear();
+            await this.publishInvalidation('pattern', undefined, '*');
         } catch (error) {
             logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error clearing cache', error });
         }
@@ -394,15 +420,99 @@ export class CacheManager {
         }
     }
 
+    // --- Cross-instance pub/sub ---
+
+    /**
+     * Setup pub/sub for cross-instance cache invalidation.
+     * Only activates when using MultiLevel provider with a Redis L2.
+     */
+    private async setupPubSub(): Promise<void> {
+        if (!(this.provider instanceof MultiLevelCache)) return;
+
+        const l2 = this.provider.getL2Cache();
+        if (!(l2 instanceof RedisCache)) return;
+
+        try {
+            await l2.subscribeInvalidation(
+                CacheManager.INVALIDATION_CHANNEL,
+                (_channel, message) => this.handleRemoteInvalidation(message)
+            );
+            this.pubSubEnabled = true;
+            logger.info({ scope: 'cache', component: 'CacheManager', msg: 'Cross-instance cache invalidation enabled', instanceId: this.instanceId });
+        } catch (error) {
+            logger.warn({ scope: 'cache', component: 'CacheManager', msg: 'Failed to setup pub/sub', error });
+        }
+    }
+
+    /**
+     * Handle an invalidation message from another instance.
+     * Ignores messages from self. Invalidates L1 only (L2 is shared Redis).
+     */
+    private async handleRemoteInvalidation(raw: string): Promise<void> {
+        try {
+            const msg: InvalidationMessage = JSON.parse(raw);
+
+            // Ignore our own messages
+            if (msg.instanceId === this.instanceId) return;
+
+            if (!(this.provider instanceof MultiLevelCache)) return;
+            const l1 = this.provider.getL1Cache();
+
+            if (msg.type === 'key' && msg.keys) {
+                await l1.deleteMany(msg.keys);
+            } else if (msg.type === 'pattern' && msg.pattern) {
+                await l1.invalidatePattern(msg.pattern);
+            }
+
+            logger.debug({ scope: 'cache', component: 'CacheManager', msg: 'Applied remote invalidation', from: msg.instanceId, type: msg.type });
+        } catch (error) {
+            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error handling remote invalidation', error });
+        }
+    }
+
+    /**
+     * Publish an invalidation event to other instances via Redis pub/sub.
+     */
+    private async publishInvalidation(type: 'key' | 'pattern', keys?: string[], pattern?: string): Promise<void> {
+        if (!this.pubSubEnabled) return;
+        if (!(this.provider instanceof MultiLevelCache)) return;
+
+        const l2 = this.provider.getL2Cache();
+        if (!(l2 instanceof RedisCache)) return;
+
+        try {
+            const msg: InvalidationMessage = { instanceId: this.instanceId, type, keys, pattern };
+            await l2.publishInvalidation(CacheManager.INVALIDATION_CHANNEL, JSON.stringify(msg));
+        } catch (error) {
+            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error publishing invalidation', error });
+        }
+    }
+
+    /**
+     * Shutdown the current provider (disconnect Redis, stop Memory cleanup timer)
+     */
+    private async shutdownProvider(): Promise<void> {
+        try {
+            const provider = this.provider as any;
+            // RedisCache has disconnect()
+            if (typeof provider.disconnect === 'function') {
+                await provider.disconnect();
+            }
+            // MemoryCache has stopCleanup()
+            if (typeof provider.stopCleanup === 'function') {
+                provider.stopCleanup();
+            }
+        } catch (error) {
+            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error shutting down provider', error });
+        }
+    }
+
     /**
      * Shutdown the cache manager
      */
     public async shutdown(): Promise<void> {
         try {
-            // If the provider has a shutdown method, call it
-            if (typeof (this.provider as any).shutdown === 'function') {
-                await (this.provider as any).shutdown();
-            }
+            await this.shutdownProvider();
         } catch (error) {
             logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error shutting down cache', error });
         }

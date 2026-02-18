@@ -45,7 +45,7 @@ async function init() {
     (EntityManager as any).dbReady = true;
 
     // Init cache
-    CacheManager.getInstance().initialize({
+    await CacheManager.getInstance().initialize({
         enabled: true,
         provider: 'memory',
         strategy: 'write-through',

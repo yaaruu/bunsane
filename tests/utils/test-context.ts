@@ -42,7 +42,7 @@ export function createTestContext(): TestContext {
 
         // Initialize cache with memory provider
         cacheManager = CacheManager.getInstance();
-        cacheManager.initialize({
+        await cacheManager.initialize({
             enabled: true,
             provider: 'memory',
             strategy: 'write-through',
@@ -89,7 +89,7 @@ export function createTestContextWithoutCache(): TestContext {
     beforeEach(async () => {
         (EntityManager as any).dbReady = true;
         const cacheManager = CacheManager.getInstance();
-        cacheManager.initialize({
+        await cacheManager.initialize({
             enabled: false,
             provider: 'memory',
             strategy: 'write-through',

@@ -44,6 +44,8 @@ export class RedisCache implements CacheProvider {
         size: 0
     };
     private invalidationHandlers: Map<string, (channel: string, message: string) => void> = new Map();
+    private monitoringInterval: Timer | null = null;
+    private subscriberListenerAttached = false;
 
     constructor(config: RedisCacheConfig) {
         this.config = config;
@@ -97,7 +99,7 @@ export class RedisCache implements CacheProvider {
      */
     private setupMonitoring(): void {
         // Log memory usage every 5 minutes
-        setInterval(async () => {
+        this.monitoringInterval = setInterval(async () => {
             try {
                 const info = await this.client.info('memory');
                 const memoryMatch = info.match(/used_memory:(\d+)/);
@@ -386,11 +388,14 @@ export class RedisCache implements CacheProvider {
 
             this.invalidationHandlers.set(channel, handler);
             await this.subscriber.subscribe(channel);
-            this.subscriber.on('message', (receivedChannel, message) => {
-                if (receivedChannel === channel) {
-                    handler(channel, message);
-                }
-            });
+
+            // Only attach the message listener once to avoid stacking
+            if (!this.subscriberListenerAttached) {
+                this.subscriberListenerAttached = true;
+                this.subscriber.on('message', (receivedChannel, message) => {
+                    this.handleInvalidationEvent(receivedChannel, message);
+                });
+            }
         } catch (error) {
             logger.error({ error, msg: 'Redis subscribe invalidation error' });
         }
@@ -436,6 +441,11 @@ export class RedisCache implements CacheProvider {
      */
     async disconnect(): Promise<void> {
         try {
+            if (this.monitoringInterval) {
+                clearInterval(this.monitoringInterval);
+                this.monitoringInterval = null;
+            }
+
             await this.client.disconnect();
 
             if (this.subscriber) {

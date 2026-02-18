@@ -24,6 +24,14 @@ export class MultiLevelCache implements CacheProvider {
     this.config = config;
   }
 
+  getL1Cache(): CacheProvider {
+    return this.l1Cache;
+  }
+
+  getL2Cache(): CacheProvider | null {
+    return this.l2Cache;
+  }
+
   async get(key: string): Promise<any | null> {
     // Try L1 cache first
     const l1Result = await this.l1Cache.get(key);

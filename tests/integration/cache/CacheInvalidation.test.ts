@@ -16,9 +16,9 @@ describe('Cache Invalidation', () => {
         await ensureComponentsRegistered(TestUser, TestProduct);
     });
 
-    beforeEach(() => {
+    beforeEach(async () => {
         // Ensure cache is enabled for these tests
-        ctx.cacheManager.initialize({
+        await ctx.cacheManager.initialize({
             enabled: true,
             provider: 'memory',
             strategy: 'write-through',
@@ -136,7 +136,7 @@ describe('Cache Invalidation', () => {
 
     describe('write-through vs write-invalidate', () => {
         test('write-through strategy updates cache on save', async () => {
-            ctx.cacheManager.initialize({
+            await ctx.cacheManager.initialize({
                 enabled: true,
                 provider: 'memory',
                 strategy: 'write-through',
@@ -157,7 +157,7 @@ describe('Cache Invalidation', () => {
         });
 
         test('write-invalidate strategy removes from cache on save', async () => {
-            ctx.cacheManager.initialize({
+            await ctx.cacheManager.initialize({
                 enabled: true,
                 provider: 'memory',
                 strategy: 'write-invalidate',
@@ -186,8 +186,8 @@ describe('Cache Invalidation', () => {
     });
 
     describe('cache disabled', () => {
-        beforeEach(() => {
-            ctx.cacheManager.initialize({ enabled: false });
+        beforeEach(async () => {
+            await ctx.cacheManager.initialize({ enabled: false });
         });
 
         test('operations work without cache', async () => {

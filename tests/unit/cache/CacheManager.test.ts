@@ -2,15 +2,17 @@
  * Unit tests for CacheManager
  * Tests cache configuration and management
  */
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach, mock } from 'bun:test';
 import { CacheManager } from '../../../core/cache/CacheManager';
+import { MemoryCache } from '../../../core/cache/MemoryCache';
+import { MultiLevelCache } from '../../../core/cache/MultiLevelCache';
 
 describe('CacheManager', () => {
     let cacheManager: CacheManager;
 
-    beforeEach(() => {
+    beforeEach(async () => {
         cacheManager = CacheManager.getInstance();
-        cacheManager.initialize({
+        await cacheManager.initialize({
             enabled: true,
             provider: 'memory',
             strategy: 'write-through',
@@ -39,8 +41,8 @@ describe('CacheManager', () => {
     });
 
     describe('initialize()', () => {
-        test('applies configuration', () => {
-            cacheManager.initialize({
+        test('applies configuration', async () => {
+            await cacheManager.initialize({
                 enabled: true,
                 provider: 'memory',
                 defaultTTL: 5000
@@ -52,8 +54,8 @@ describe('CacheManager', () => {
             expect(config.defaultTTL).toBe(5000);
         });
 
-        test('can disable cache', () => {
-            cacheManager.initialize({ enabled: false });
+        test('can disable cache', async () => {
+            await cacheManager.initialize({ enabled: false });
             const config = cacheManager.getConfig();
             expect(config.enabled).toBe(false);
         });
@@ -189,8 +191,8 @@ describe('CacheManager', () => {
     });
 
     describe('cache disabled', () => {
-        beforeEach(() => {
-            cacheManager.initialize({ enabled: false });
+        beforeEach(async () => {
+            await cacheManager.initialize({ enabled: false });
         });
 
         test('get returns null when disabled', async () => {
@@ -201,7 +203,7 @@ describe('CacheManager', () => {
         test('set does nothing when disabled', async () => {
             await cacheManager.set('key', 'value');
             // Re-enable to check
-            cacheManager.initialize({ enabled: true, provider: 'memory' });
+            await cacheManager.initialize({ enabled: true, provider: 'memory' });
             const result = await cacheManager.get('key');
             expect(result).toBeNull();
         });
@@ -230,6 +232,116 @@ describe('CacheManager', () => {
         test('returns true for healthy cache', async () => {
             const result = await cacheManager.ping();
             expect(result).toBe(true);
+        });
+    });
+
+    describe('shutdown()', () => {
+        test('calls stopCleanup on MemoryCache provider', async () => {
+            await cacheManager.initialize({
+                enabled: true,
+                provider: 'memory',
+                defaultTTL: 3600000
+            });
+
+            const provider = cacheManager.getProvider() as MemoryCache;
+            const stopCleanupSpy = mock(() => {});
+            (provider as any).stopCleanup = stopCleanupSpy;
+
+            await cacheManager.shutdown();
+            expect(stopCleanupSpy).toHaveBeenCalled();
+        });
+
+        test('shutdown does not throw on NoOp provider', async () => {
+            await cacheManager.initialize({ enabled: false });
+            await expect(cacheManager.shutdown()).resolves.toBeUndefined();
+        });
+    });
+
+    describe('initialize() cleanup', () => {
+        test('shuts down old provider when reinitializing', async () => {
+            await cacheManager.initialize({
+                enabled: true,
+                provider: 'memory',
+                defaultTTL: 3600000
+            });
+
+            const oldProvider = cacheManager.getProvider() as MemoryCache;
+            const stopCleanupSpy = mock(() => {});
+            (oldProvider as any).stopCleanup = stopCleanupSpy;
+
+            // Reinitialize with new config
+            await cacheManager.initialize({
+                enabled: true,
+                provider: 'memory',
+                defaultTTL: 5000
+            });
+
+            expect(stopCleanupSpy).toHaveBeenCalled();
+        });
+    });
+
+    describe('cross-instance invalidation (pub/sub)', () => {
+        test('pub/sub not enabled for memory-only provider', async () => {
+            await cacheManager.initialize({
+                enabled: true,
+                provider: 'memory',
+                defaultTTL: 3600000
+            });
+
+            // pubSubEnabled is private, so we test indirectly:
+            // publishInvalidation should be a no-op (no errors, no side effects)
+            await cacheManager.set('test-key', 'value');
+            await cacheManager.delete('test-key');
+            // If pub/sub were broken for memory provider, this would throw
+            const result = await cacheManager.get('test-key');
+            expect(result).toBeNull();
+        });
+
+        test('invalidateEntity still works without pub/sub', async () => {
+            const provider = cacheManager.getProvider();
+            await provider.set('entity:abc', 'abc', 3600000);
+
+            await cacheManager.invalidateEntity('abc');
+            const result = await provider.get('entity:abc');
+            expect(result).toBeNull();
+        });
+
+        test('invalidateComponent still works without pub/sub', async () => {
+            const provider = cacheManager.getProvider();
+            await provider.set('component:e1:t1', { data: 'test' }, 3600000);
+
+            await cacheManager.invalidateComponent('e1', 't1');
+            const result = await provider.get('component:e1:t1');
+            expect(result).toBeNull();
+        });
+
+        test('clear still works without pub/sub', async () => {
+            await cacheManager.set('key1', 'v1');
+            await cacheManager.set('key2', 'v2');
+
+            await cacheManager.clear();
+            expect(await cacheManager.get('key1')).toBeNull();
+            expect(await cacheManager.get('key2')).toBeNull();
+        });
+
+        test('handleRemoteInvalidation ignores messages from self', async () => {
+            // Access private method via any
+            const cm = cacheManager as any;
+            const myId = cm.instanceId;
+
+            // Simulate receiving our own message — should NOT invalidate
+            await cacheManager.set('survive-key', 'should-survive');
+
+            // Call private method directly
+            await cm.handleRemoteInvalidation(JSON.stringify({
+                instanceId: myId,
+                type: 'key',
+                keys: ['survive-key']
+            }));
+
+            // Key should still exist because self-messages are ignored
+            const result = await cacheManager.get('survive-key');
+            expect(result).toBe('should-survive');
         });
     });
 });

@@ -4,16 +4,23 @@ import { timed } from "./Decorators";
 import db from "../database";
 import { sql } from "bun";
 
+interface CachedRelation {
+    ids: string[];
+    expiresAt: number;
+}
+
 interface BatchLoaderOptions {
     fieldName?: string;
     batchSize?: number;
     maxConcurrency?: number;
+    cacheTTL?: number;
 }
 
 export class BatchLoader {
-    private static cache = new Map<string, Map<string, string[]>>();
+    private static cache = new Map<string, Map<string, CachedRelation>>();
     private static readonly DEFAULT_BATCH_SIZE = 1000;
     private static readonly DEFAULT_MAX_CONCURRENCY = 5;
+    private static readonly DEFAULT_CACHE_TTL = 300_000; // 5 minutes
 
     /**
      * Load related entities efficiently with caching and batching
@@ -30,7 +37,8 @@ export class BatchLoader {
         const {
             fieldName = 'value',
             batchSize = this.DEFAULT_BATCH_SIZE,
-            maxConcurrency = this.DEFAULT_MAX_CONCURRENCY
+            maxConcurrency = this.DEFAULT_MAX_CONCURRENCY,
+            cacheTTL = this.DEFAULT_CACHE_TTL
         } = options;
 
         const comp = new component();
@@ -45,8 +53,18 @@ export class BatchLoader {
             this.cache.set(cacheKey, cachedResults);
         }
 
-        // Get uncached parent IDs
-        const uncachedParentIds = parentIds.filter(id => !cachedResults.has(id));
+        const now = Date.now();
+
+        // Get uncached or expired parent IDs
+        const uncachedParentIds = parentIds.filter(id => {
+            const entry = cachedResults.get(id);
+            if (!entry) return true;
+            if (now > entry.expiresAt) {
+                cachedResults.delete(id);
+                return true;
+            }
+            return false;
+        });
 
         if (uncachedParentIds.length > 0) {
             // Batch the parent IDs to avoid huge IN clauses
@@ -73,15 +91,17 @@ export class BatchLoader {
                     parentGroups.get(parentId)!.push(relatedId);
                 }
 
+                const expiresAt = Date.now() + cacheTTL;
+
                 // Cache the related IDs for each parent
                 for (const [parentId, relatedIds] of parentGroups) {
-                    cachedResults.set(parentId, relatedIds);
+                    cachedResults.set(parentId, { ids: relatedIds, expiresAt });
                 }
 
                 // Cache empty arrays for parents with no relations
                 for (const parentId of batch) {
                     if (!parentGroups.has(parentId)) {
-                        cachedResults.set(parentId, []);
+                        cachedResults.set(parentId, { ids: [], expiresAt });
                     }
                 }
             }
@@ -90,7 +110,8 @@ export class BatchLoader {
         // Collect all unique related IDs from cache
         const allRelatedIds = new Set<string>();
         for (const parentId of parentIds) {
-            const relatedIds = cachedResults.get(parentId) || [];
+            const entry = cachedResults.get(parentId);
+            const relatedIds = entry?.ids || [];
             relatedIds.forEach((id: string) => allRelatedIds.add(id));
         }
 
@@ -130,14 +151,21 @@ export class BatchLoader {
     }
 
     /**
-     * Get cache statistics
+     * Get cache statistics including expired entry count
      */
-    static getCacheStats(): { size: number; entries: number } {
+    static getCacheStats(): { size: number; entries: number; expired: number } {
         let totalEntries = 0;
+        let expiredEntries = 0;
+        const now = Date.now();
         for (const [, parentMap] of this.cache) {
-            totalEntries += parentMap.size;
+            for (const [, entry] of parentMap) {
+                totalEntries++;
+                if (now > entry.expiresAt) {
+                    expiredEntries++;
+                }
+            }
         }
-        return { size: this.cache.size, entries: totalEntries };
+        return { size: this.cache.size, entries: totalEntries, expired: expiredEntries };
     }
 
     private static chunkArray<T>(array: T[], size: number): T[][] {
