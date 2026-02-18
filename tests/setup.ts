@@ -14,18 +14,20 @@
 import { beforeAll, afterAll } from 'bun:test';
 import { file } from 'bun';
 
-// Load .env.test before anything else
-const envTestPath = new URL('../.env.test', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1');
-const envFile = file(envTestPath);
-if (await envFile.exists()) {
-    const envContent = await envFile.text();
-    for (const line of envContent.split('\n')) {
-        const trimmed = line.trim();
-        if (trimmed && !trimmed.startsWith('#')) {
-            const [key, ...valueParts] = trimmed.split('=');
-            if (key) {
-                const value = valueParts.join('=');
-                process.env[key.trim()] = value.trim();
+// Load .env.test before anything else (skip when PGlite provides env vars)
+if (process.env.USE_PGLITE !== 'true') {
+    const envTestPath = new URL('../.env.test', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1');
+    const envFile = file(envTestPath);
+    if (await envFile.exists()) {
+        const envContent = await envFile.text();
+        for (const line of envContent.split('\n')) {
+            const trimmed = line.trim();
+            if (trimmed && !trimmed.startsWith('#')) {
+                const [key, ...valueParts] = trimmed.split('=');
+                if (key) {
+                    const value = valueParts.join('=');
+                    process.env[key.trim()] = value.trim();
+                }
             }
         }
     }

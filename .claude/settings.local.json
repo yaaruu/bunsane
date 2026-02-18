@@ -33,7 +33,9 @@
       "Bash(wc:*)",
       "Bash(bun run:*)",
       "Bash(BUN_CONFIG_FILE=/dev/null bun test:*)",
-      "Bash(echo:*)"
+      "Bash(echo:*)",
+      "WebSearch",
+      "Bash(bun:*)"
     ]
   },
   "statusLine": {

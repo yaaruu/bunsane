@@ -62,7 +62,7 @@ export const ensureJSONBPathIndex = async (
         `);
 
         const isPartitioned = partitionCheck.length > 0 && partitionCheck[0].relkind === 'p';
-        const useConcurrently = !isPartitioned; // Cannot use CONCURRENTLY on partitioned tables
+        const useConcurrently = !isPartitioned && !process.env.USE_PGLITE;
 
         let indexSQL: string;
 
@@ -211,7 +211,7 @@ export const ensureNumericIndex = async (
         `);
 
         const isPartitioned = partitionCheck.length > 0 && partitionCheck[0].relkind === 'p';
-        const useConcurrently = !isPartitioned;
+        const useConcurrently = !isPartitioned && !process.env.USE_PGLITE;
 
         // Create a partial index that only includes rows where the field is a valid number
         // This prevents errors when some rows have non-numeric values
@@ -281,7 +281,7 @@ export const ensureCompositeIndex = async (
         `);
 
         const isPartitioned = partitionCheck.length > 0 && partitionCheck[0].relkind === 'p';
-        const useConcurrently = !isPartitioned;
+        const useConcurrently = !isPartitioned && !process.env.USE_PGLITE;
 
         // Build index expressions for each field
         const indexExpressions = fields.map(f => {
