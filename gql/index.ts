@@ -1,5 +1,7 @@
 import {createSchema, createYoga, type Plugin} from 'graphql-yoga';
+import { useValidationRule } from '@envelop/core';
 import { GraphQLSchema, GraphQLError } from 'graphql';
+import { depthLimitRule } from './depthLimit';
 import { GraphQLObjectType, GraphQLField, GraphQLOperation, GraphQLScalarType, GraphQLSubscription } from './Generator';
 import {GraphQLFieldTypes} from "./types"
 import {logger as MainLogger} from "../core/Logger"
@@ -130,6 +132,7 @@ export interface YogaInstanceOptions {
         allowedHeaders?: string[];
         methods?: string[];
     };
+    maxDepth?: number;
 }
 
 export function createYogaInstance(
@@ -138,8 +141,15 @@ export function createYogaInstance(
     contextFactory?: (context: any) => any,
     options?: YogaInstanceOptions
 ) {
+    // Prepend depth limit plugin if configured
+    const allPlugins: Plugin[] = [];
+    if (options?.maxDepth) {
+        allPlugins.push(useValidationRule(depthLimitRule(options.maxDepth)) as Plugin);
+    }
+    allPlugins.push(...plugins);
+
     const yogaConfig: any = {
-        plugins,
+        plugins: allPlugins,
         maskedErrors: {
             maskError,
         },

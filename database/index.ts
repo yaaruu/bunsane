@@ -5,7 +5,22 @@ let connectionUrl = `postgres://${process.env.POSTGRES_USER}:${process.env.POSTG
 if(process.env.DB_CONNECTION_URL) {
     connectionUrl = process.env.DB_CONNECTION_URL;
 }
-logger.info(`Database connection URL: ${connectionUrl}`);
+
+// Add statement_timeout only when explicitly configured (opt-in)
+// Note: PgBouncer rejects statement_timeout as a startup parameter — use PostgreSQL config or connect_query instead
+if (process.env.USE_PGLITE !== 'true' && process.env.DB_STATEMENT_TIMEOUT) {
+    try {
+        const urlObj = new URL(connectionUrl);
+        urlObj.searchParams.set('options', `-c statement_timeout=${process.env.DB_STATEMENT_TIMEOUT}`);
+        connectionUrl = urlObj.toString();
+    } catch {
+        // Non-standard URL format, skip statement_timeout
+    }
+}
+
+// Log connection URL with credentials redacted
+const redactedUrl = connectionUrl.replace(/:\/\/([^:]+):([^@]+)@/, '://$1:****@');
+logger.info(`Database connection URL: ${redactedUrl}`);
 
 // OPTIMIZED: Reduced from 20 to 10 to prevent overwhelming PGBouncer
 // With 5 app instances: 5 × 10 = 50 connections (well under PGBouncer's limit)

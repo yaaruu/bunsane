@@ -259,7 +259,7 @@ export const UpdateComponentIndexes = async (table_name: string, indexedProperti
             WHERE relname = '${table_name}' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
         `);
         const isPartitioned = partitionCheck.length > 0 && partitionCheck[0].relkind === 'p';
-        const useConcurrently = !isPartitioned; // Cannot use CONCURRENTLY on partitioned tables
+        const useConcurrently = !isPartitioned && !process.env.USE_PGLITE; // Cannot use CONCURRENTLY on partitioned tables or PGlite
 
         const indexes_list = await db.unsafe(`
             SELECT indexname 
@@ -446,12 +446,13 @@ export const CreateEntityComponentTable = async () => {
         deleted_at TIMESTAMP,
         UNIQUE(entity_id, type_id)
     );`;
-    await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_entity_id ON entity_components (entity_id)`;
-    await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_type_id ON entity_components (type_id)`;
-    await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_type_entity ON entity_components (type_id, entity_id)`;
-    await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_type_entity_deleted ON entity_components (type_id, entity_id, deleted_at)`;
-    await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_deleted_type ON entity_components (deleted_at, type_id) WHERE deleted_at IS NULL`;
-    await db`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_components_component_id ON entity_components (component_id)`;
+    const concurrently = process.env.USE_PGLITE ? '' : ' CONCURRENTLY';
+    await db.unsafe(`CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_entity_id ON entity_components (entity_id)`);
+    await db.unsafe(`CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_type_id ON entity_components (type_id)`);
+    await db.unsafe(`CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_type_entity ON entity_components (type_id, entity_id)`);
+    await db.unsafe(`CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_type_entity_deleted ON entity_components (type_id, entity_id, deleted_at)`);
+    await db.unsafe(`CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_deleted_type ON entity_components (deleted_at, type_id) WHERE deleted_at IS NULL`);
+    await db.unsafe(`CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_component_id ON entity_components (component_id)`);
     
     // Add component_id column if it doesn't exist (for backward compatibility)
     try {

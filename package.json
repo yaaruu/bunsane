@@ -23,12 +23,17 @@
         "test:unit": "bun test tests/unit/",
         "test:integration": "bun test tests/integration/",
         "test:graphql": "bun test tests/graphql/",
+        "test:pglite": "bun tests/pglite-setup.ts tests/unit tests/integration tests/graphql",
+        "test:pglite:unit": "bun tests/pglite-setup.ts tests/unit/",
+        "test:e2e": "SKIP_TEST_DB_SETUP=true bun test tests/e2e/",
         "test:stress": "bun test tests/stress --timeout 600000",
         "test:stress:smoke": "STRESS_RECORD_COUNT=10000 bun test tests/stress --timeout 300000",
         "test:stress:standard": "STRESS_RECORD_COUNT=100000 bun test tests/stress --timeout 600000",
         "test:stress:full": "STRESS_RECORD_COUNT=1000000 bun test tests/stress --timeout 1800000"
     },
     "devDependencies": {
+        "@electric-sql/pglite": "^0.3.15",
+        "@electric-sql/pglite-socket": "^0.0.20",
         "@types/bun": "latest",
         "@types/node": "^25.0.3",
         "knip": "^5.78.0"

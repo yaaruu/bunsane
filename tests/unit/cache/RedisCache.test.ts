@@ -147,9 +147,10 @@ describe('RedisCache', () => {
         });
 
         test('handles non-existent key gracefully', async () => {
-            // Should not throw when deleting non-existent key
+            // Should not throw and key should remain absent
             await cache.delete('definitely-not-exists');
-            expect(true).toBe(true);
+            const result = await cache.get('definitely-not-exists');
+            expect(result).toBeNull();
         });
     });
 
@@ -167,8 +168,11 @@ describe('RedisCache', () => {
         });
 
         test('handles empty array', async () => {
+            // Set a key first, then deleteMany([]) should not affect it
+            await cache.set('survive-key', 'value', 3600000);
             await cache.deleteMany([]);
-            expect(true).toBe(true);
+            const result = await cache.get<string>('survive-key');
+            expect(result).toBe('value');
         });
     });
 
@@ -231,8 +235,11 @@ describe('RedisCache', () => {
         });
 
         test('handles empty array', async () => {
+            // setMany([]) should be a no-op, existing keys unaffected
+            await cache.set('survive-set', 'value', 3600000);
             await cache.setMany([]);
-            expect(true).toBe(true);
+            const result = await cache.get<string>('survive-set');
+            expect(result).toBe('value');
         });
     });
 
