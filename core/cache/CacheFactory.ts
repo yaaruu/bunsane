@@ -69,7 +69,8 @@ export class CacheFactory {
             enableReadyCheck: true
         };
 
-        logger.debug({ msg: 'Creating RedisCache', config: redisConfig });
+        const { password: _pw, ...safeConfig } = redisConfig;
+        logger.debug({ msg: 'Creating RedisCache', config: safeConfig });
         return new RedisCache(redisConfig);
     }
 

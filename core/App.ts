@@ -24,6 +24,8 @@ import { preparedStatementCache } from "../database/PreparedStatementCache";
 import db from "../database";
 import studioEndpoint from "../endpoints";
 import { type Middleware, composeMiddleware } from "./Middleware";
+import { deepHealthCheck, readinessCheck } from "./health";
+import { validateEnv } from "./validateEnv";
 
 export type CorsConfig = {
     origin?: string | string[] | ((origin: string) => boolean);
@@ -70,6 +72,9 @@ export default class App {
     private studioEnabled: boolean = false;
     private server: ReturnType<typeof Bun.serve> | null = null;
     private isShuttingDown = false;
+    private isReady = false;
+    private graphqlMaxDepth: number = 10;
+    private shutdownGracePeriod = 10_000;
 
     pubSub = createPubSub();
 
@@ -119,6 +124,7 @@ export default class App {
     }
 
     async init() {
+        validateEnv();
         logger.trace(`Initializing App`);
         ComponentRegistry.init();
         ServiceRegistry.init();
@@ -197,8 +203,15 @@ export default class App {
                               }
                             : undefined;
 
+                        // Read env override for GraphQL depth limit
+                        const envDepth = process.env.GRAPHQL_MAX_DEPTH;
+                        if (envDepth) {
+                            this.graphqlMaxDepth = parseInt(envDepth, 10);
+                        }
+
                         const yogaOptions = {
                             cors: this.config.cors,
+                            maxDepth: this.graphqlMaxDepth || undefined,
                         };
 
                         if (schema) {
@@ -524,13 +537,37 @@ export default class App {
             // Health check endpoint
             if (url.pathname === "/health") {
                 clearTimeout(timeoutId);
+                const health = await deepHealthCheck();
                 return this.addCorsHeaders(new Response(
-                    JSON.stringify({
-                        status: "ok",
-                        timestamp: new Date().toISOString(),
-                        uptime: process.uptime(),
-                    }),
+                    JSON.stringify(health.result),
                     {
+                        status: health.httpStatus,
+                        headers: { "Content-Type": "application/json" },
+                    }
+                ), req);
+            }
+
+            // Metrics endpoint
+            if (url.pathname === "/metrics") {
+                clearTimeout(timeoutId);
+                const metrics = await this.collectMetrics();
+                return this.addCorsHeaders(new Response(
+                    JSON.stringify(metrics),
+                    {
+                        status: 200,
+                        headers: { "Content-Type": "application/json" },
+                    }
+                ), req);
+            }
+
+            // Readiness probe
+            if (url.pathname === "/health/ready") {
+                clearTimeout(timeoutId);
+                const ready = await readinessCheck(this.isReady, this.isShuttingDown);
+                return this.addCorsHeaders(new Response(
+                    JSON.stringify(ready.result),
+                    {
+                        status: ready.httpStatus,
                         headers: { "Content-Type": "application/json" },
                     }
                 ), req);
@@ -864,6 +901,20 @@ export default class App {
     }
 
     /**
+     * Set the maximum allowed GraphQL query depth. 0 disables the limit.
+     */
+    public setGraphQLMaxDepth(depth: number) {
+        this.graphqlMaxDepth = depth;
+    }
+
+    /**
+     * Set the grace period for draining connections during shutdown (ms).
+     */
+    public setShutdownGracePeriod(ms: number) {
+        this.shutdownGracePeriod = ms;
+    }
+
+    /**
      * Warm up the prepared statement cache with common query patterns
      */
     private async warmUpPreparedStatementCache(): Promise<void> {
@@ -922,9 +973,32 @@ export default class App {
         await preparedStatementCache.warmUp(commonQueries, db);
     }
 
+    private async collectMetrics() {
+        let cacheStats = null;
+        try {
+            const { CacheManager } = await import('./cache/CacheManager');
+            cacheStats = await CacheManager.getInstance().getStats();
+        } catch {}
+
+        return {
+            timestamp: new Date().toISOString(),
+            uptime: process.uptime(),
+            process: process.memoryUsage(),
+            cache: cacheStats,
+            scheduler: SchedulerManager.getInstance().getMetrics(),
+            preparedStatements: preparedStatementCache.getStats(),
+        };
+    }
+
     async start() {
         logger.info("Application Started");
         const port = parseInt(process.env.APP_PORT || "3000");
+
+        // Read env override for shutdown grace period
+        const envGracePeriod = process.env.SHUTDOWN_GRACE_PERIOD_MS;
+        if (envGracePeriod) {
+            this.shutdownGracePeriod = parseInt(envGracePeriod, 10);
+        }
 
         // Compose middleware chain around the core request handler
         this.composedHandler = composeMiddleware(
@@ -974,6 +1048,7 @@ export default class App {
             this.shutdown().finally(() => process.exit(1));
         });
 
+        this.isReady = true;
         this.appReadyCallbacks.forEach((cb) => cb());
     }
 
@@ -983,13 +1058,20 @@ export default class App {
     async shutdown(): Promise<void> {
         if (this.isShuttingDown) return;
         this.isShuttingDown = true;
+        this.isReady = false;
 
         logger.info({ scope: 'app', component: 'App', msg: 'Shutting down application' });
 
-        // Stop HTTP server
+        // Stop HTTP server — drain then force-close after grace period
         if (this.server) {
             try {
-                this.server.stop();
+                logger.info({ scope: 'app', component: 'App', msg: 'Draining connections' });
+                this.server.stop(false);
+                const forceTimer = setTimeout(() => {
+                    logger.warn({ scope: 'app', component: 'App', msg: 'Grace period expired, forcing connection close' });
+                    try { this.server?.stop(true); } catch {}
+                }, this.shutdownGracePeriod);
+                forceTimer.unref?.();
                 logger.info({ scope: 'app', component: 'App', msg: 'HTTP server stopped' });
             } catch (error) {
                 logger.warn({ scope: 'app', component: 'App', msg: 'HTTP server stop error', error });
@@ -1011,6 +1093,14 @@ export default class App {
             logger.info({ scope: 'cache', component: 'App', msg: 'Cache shutdown completed' });
         } catch (error) {
             logger.warn({ scope: 'cache', component: 'App', msg: 'Cache shutdown error', error });
+        }
+
+        // Close database pool (last step)
+        try {
+            db.close();
+            logger.info({ scope: 'app', component: 'App', msg: 'Database pool closed' });
+        } catch (error) {
+            logger.warn({ scope: 'app', component: 'App', msg: 'Database pool close error', error });
         }
 
         logger.info({ scope: 'app', component: 'App', msg: 'Application shutdown completed' });

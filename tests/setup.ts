@@ -144,14 +144,16 @@ async function cleanupTestEnvironment(): Promise<void> {
     }
 }
 
-// Register global hooks
-beforeAll(async () => {
-    await initializeTestEnvironment();
-});
+// Register global hooks (skip for E2E tests that don't need DB)
+if (process.env.SKIP_TEST_DB_SETUP !== 'true') {
+    beforeAll(async () => {
+        await initializeTestEnvironment();
+    });
 
-afterAll(async () => {
-    await cleanupTestEnvironment();
-});
+    afterAll(async () => {
+        await cleanupTestEnvironment();
+    });
+}
 
 // Export utilities for tests that need them
 export { initializeTestEnvironment, cleanupTestEnvironment };
