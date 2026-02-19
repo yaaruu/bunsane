@@ -3,6 +3,13 @@ import { logger } from "../../core/Logger";
 import { type ZodType } from "zod";
 import * as z from "zod";
 
+/** Check if error is a GraphQLError (handles cross-package version mismatches) */
+function isGraphQLError(error: unknown): error is GraphQLError {
+  return error instanceof GraphQLError ||
+    (error !== null && typeof error === 'object' && 'extensions' in error &&
+     'message' in error && typeof (error as any).message === 'string');
+}
+
 export interface ResolverDefinition {
   name: string;
   type: "Query" | "Mutation" | "Subscription";
@@ -74,7 +81,7 @@ export class ResolverBuilder {
       } catch (error) {
         logger.error(`Error in resolver with input:`);
         logger.error(error);
-        if (error instanceof GraphQLError) {
+        if (isGraphQLError(error)) {
           throw error;
         }
         throw new GraphQLError(`Internal error`, {
@@ -98,7 +105,7 @@ export class ResolverBuilder {
       } catch (error) {
         logger.error(`Error in resolver without input:`);
         logger.error(error);
-        if (error instanceof GraphQLError) {
+        if (isGraphQLError(error)) {
           throw error;
         }
         throw new GraphQLError(`Internal error`, {
@@ -138,7 +145,7 @@ export class ResolverBuilder {
         } catch (error) {
           logger.error(`Error in subscription with input:`);
           logger.error(error);
-          if (error instanceof GraphQLError) {
+          if (isGraphQLError(error)) {
             throw error;
           }
           throw new GraphQLError(`Internal error in subscription`, {
@@ -164,7 +171,7 @@ export class ResolverBuilder {
         } catch (error) {
           logger.error(`Error in subscription without input:`);
           logger.error(error);
-          if (error instanceof GraphQLError) {
+          if (isGraphQLError(error)) {
             throw error;
           }
           throw new GraphQLError(`Internal error in subscription`, {

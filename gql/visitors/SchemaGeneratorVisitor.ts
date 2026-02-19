@@ -155,8 +155,13 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
     }
     
     visitTypeNode(node: TypeNode): void {
-        // TypeNodes are handled separately by archetype weaving in beforeVisit()
-        logger.trace(`Visited type node: ${node.id}`);
+        // Archetype TypeNodes are handled by archetype weaving in beforeVisit().
+        // TypeNodes from @GraphQLObjectType must be emitted here if not already defined.
+        if (!this.definedTypes.has(node.name)) {
+            this.typeDefs += node.typeDef + '\n';
+            this.definedTypes.add(node.name);
+            logger.trace(`Added type definition: ${node.name}`);
+        }
     }
     
     visitOperationNode(node: OperationNode): void {
