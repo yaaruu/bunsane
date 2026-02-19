@@ -81,23 +81,27 @@ describe('ArcheType', () => {
     });
 
     describe('getComponentsToLoad()', () => {
-        test('returns components array', () => {
+        test('returns non-empty components array', () => {
             const archetype = new TestUserArchetype();
             const components = (archetype as any).getComponentsToLoad();
 
-            expect(components).toBeDefined();
             expect(Array.isArray(components)).toBe(true);
+            expect(components.length).toBeGreaterThan(0);
+            expect(components).toContain(TestUser);
         });
     });
 
     describe('withValidation()', () => {
-        test('validates input data', () => {
+        test('returns a Zod schema with validations applied', () => {
             const archetype = new TestUserArchetype();
-            const validResult = archetype.withValidation({
+            const schema = archetype.withValidation({
                 user: { name: 'Valid', email: 'valid@test.com', age: 25 }
             });
 
-            expect(validResult).toBeDefined();
+            expect(schema).toBeDefined();
+            // Should return a Zod schema with a shape property
+            expect(schema.shape).toBeDefined();
+            expect(typeof schema.safeParse).toBe('function');
         });
     });
 });

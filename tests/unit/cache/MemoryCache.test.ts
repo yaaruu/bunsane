@@ -103,10 +103,10 @@ describe('MemoryCache', () => {
         });
 
         test('handles non-existent key gracefully', async () => {
-            // Should not throw when deleting non-existent key
+            // Should not throw and key should remain absent
             await cache.delete('non-existent');
-            // If we reach here without error, test passes
-            expect(true).toBe(true);
+            const result = await cache.get('non-existent');
+            expect(result).toBeNull();
         });
     });
 
@@ -205,10 +205,10 @@ describe('MemoryCache', () => {
 
             const stats = await cache.getStats();
 
-            expect(stats.hits).toBeGreaterThanOrEqual(1);
-            expect(stats.misses).toBeGreaterThanOrEqual(1);
-            expect(typeof stats.hitRate).toBe('number');
-            expect(typeof stats.size).toBe('number');
+            expect(stats.hits).toBe(1);
+            expect(stats.misses).toBe(1);
+            expect(stats.hitRate).toBe(0.5);
+            expect(stats.size).toBe(1);
         });
 
         test('tracks size correctly', async () => {
@@ -246,6 +246,13 @@ describe('MemoryCache', () => {
 
             const stats = await smallCache.getStats();
             expect(stats.size).toBeLessThanOrEqual(3);
+
+            // 'b' was least recently used and should have been evicted
+            expect(await smallCache.get('b')).toBeNull();
+            // 'a', 'c', 'd' should still be present
+            expect(await smallCache.get<number>('a')).toBe(1);
+            expect(await smallCache.get<number>('c')).toBe(3);
+            expect(await smallCache.get<number>('d')).toBe(4);
 
             smallCache.stopCleanup();
         });

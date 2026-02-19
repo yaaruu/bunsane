@@ -46,30 +46,33 @@ describe('GraphQL Schema Generation', () => {
             const inputSchema = archetype.getInputSchema();
 
             expect(inputSchema).toBeDefined();
+            expect(typeof inputSchema).toBe('object');
         });
 
-        test('input schema validates data', () => {
+        test('input schema validates valid data', () => {
             const archetype = new TestUserArchetype();
-            const validResult = archetype.withValidation({
+            const schema = archetype.withValidation({
                 user: { name: 'Valid', email: 'valid@example.com', age: 25 }
             });
 
-            expect(validResult).toBeDefined();
+            expect(schema).toBeDefined();
+            expect(schema.shape).toBeDefined();
+            expect(typeof schema.safeParse).toBe('function');
         });
     });
 
-    describe('schema caching', () => {
-        test('schemas are cached for performance', () => {
+    describe('schema consistency', () => {
+        test('multiple calls return structurally equivalent schemas', () => {
             const archetype = new TestUserArchetype();
 
-            // First call
             const schema1 = archetype.getZodObjectSchema();
-            // Second call should return cached
             const schema2 = archetype.getZodObjectSchema();
 
-            // Both should be defined (caching is internal)
-            expect(schema1).toBeDefined();
-            expect(schema2).toBeDefined();
+            // Both should have the same shape keys
+            const keys1 = Object.keys(schema1.shape);
+            const keys2 = Object.keys(schema2.shape);
+            expect(keys1).toEqual(keys2);
+            expect(keys1.length).toBeGreaterThan(0);
         });
     });
 

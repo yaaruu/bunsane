@@ -84,6 +84,7 @@ describe('validateInput - error paths', () => {
         const schema = {
             email: t.string().email().required(),
         };
+        expect.assertions(2);
         try {
             validateInput(schema, { email: 'bad' }, 'createUser');
         } catch (e) {
@@ -97,6 +98,7 @@ describe('validateInput - error paths', () => {
             email: t.string().email().required(),
             age: t.int().min(0).required(),
         };
+        expect.assertions(2);
         try {
             validateInput(schema, { email: 'bad', age: -1 }, 'createUser');
         } catch (e) {
@@ -111,6 +113,7 @@ describe('validateInput - error paths', () => {
         const schema = {
             name: t.string().required(),
         };
+        expect.assertions(1);
         try {
             validateInput(schema, {}, 'createUser');
         } catch (e) {
@@ -125,6 +128,7 @@ describe('validateInput - error paths', () => {
                 city: t.string().required(),
             }, 'AddressInput').required(),
         };
+        expect.assertions(1);
         try {
             validateInput(schema, { address: {} }, 'createUser');
         } catch (e) {
@@ -136,6 +140,7 @@ describe('validateInput - error paths', () => {
 
     test('fieldErrors has path and message properties', () => {
         const schema = { x: t.int().min(10).required() };
+        expect.assertions(2);
         try {
             validateInput(schema, { x: 1 }, 'op');
         } catch (e) {

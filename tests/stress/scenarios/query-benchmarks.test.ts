@@ -188,16 +188,13 @@ describe('Stress Tests - Query Performance', () => {
             .exec();
 
         const cursorId = midpointResults[0]?.id;
-        if (!cursorId) {
-            console.log('  Skipping cursor test - no midpoint entity found');
-            return;
-        }
+        expect(cursorId).toBeDefined();
 
         const result = await benchmark.runWithOutput(
             'Cursor: from middle (O(1))',
             () => new Query()
                 .with(StressUser)
-                .cursor(cursorId)
+                .cursor(cursorId!)
                 .take(100)
                 .exec(),
             { targetP95: 50, iterations: 15 }
@@ -215,16 +212,13 @@ describe('Stress Tests - Query Performance', () => {
             .exec();
 
         const cursorId = nearEndResults[0]?.id;
-        if (!cursorId) {
-            console.log('  Skipping cursor test - no near-end entity found');
-            return;
-        }
+        expect(cursorId).toBeDefined();
 
         const result = await benchmark.runWithOutput(
             'Cursor: near end (O(1))',
             () => new Query()
                 .with(StressUser)
-                .cursor(cursorId)
+                .cursor(cursorId!)
                 .take(100)
                 .exec(),
             { targetP95: 50, iterations: 15 }

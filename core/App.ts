@@ -23,6 +23,7 @@ import type BasePlugin from "../plugins";
 import { preparedStatementCache } from "../database/PreparedStatementCache";
 import db from "../database";
 import studioEndpoint from "../endpoints";
+import { type Middleware, composeMiddleware } from "./Middleware";
 
 export type CorsConfig = {
     origin?: string | string[] | ((origin: string) => boolean);
@@ -63,6 +64,8 @@ export default class App {
     private appReadyCallbacks: Array<() => void> = [];
 
     private plugins: BasePlugin[] = [];
+    private middlewares: Middleware[] = [];
+    private composedHandler: ((req: Request) => Promise<Response>) | null = null;
 
     private studioEnabled: boolean = false;
     private server: ReturnType<typeof Bun.serve> | null = null;
@@ -405,6 +408,14 @@ export default class App {
 
     public addPlugin(plugin: BasePlugin) {
         this.plugins.push(plugin);
+    }
+
+    /**
+     * Register an HTTP middleware. Middlewares execute in registration order,
+     * wrapping around the core request handler (onion model).
+     */
+    public use(middleware: Middleware) {
+        this.middlewares.push(middleware);
     }
 
     public addStaticAssets(route: string, folder: string) {
@@ -772,7 +783,13 @@ export default class App {
                     );
                     clearTimeout(timeoutId);
                     return this.addCorsHeaders(new Response(
-                        JSON.stringify({ error: "Internal server error" }),
+                        JSON.stringify({
+                            error: "Internal server error",
+                            code: "INTERNAL_ERROR",
+                            ...(process.env.NODE_ENV === 'development' && {
+                                message: (error as Error)?.message,
+                            }),
+                        }),
                         {
                             status: 500,
                             headers: { "Content-Type": "application/json" },
@@ -801,7 +818,7 @@ export default class App {
 
             if ((error as Error).name === "AbortError") {
                 return this.addCorsHeaders(new Response(
-                    JSON.stringify({ error: "Request timeout" }),
+                    JSON.stringify({ error: "Request timeout", code: "TIMEOUT_ERROR" }),
                     {
                         status: 408,
                         headers: { "Content-Type": "application/json" },
@@ -810,7 +827,13 @@ export default class App {
             }
 
             return this.addCorsHeaders(new Response(
-                JSON.stringify({ error: "Internal server error" }),
+                JSON.stringify({
+                    error: "Internal server error",
+                    code: "INTERNAL_ERROR",
+                    ...(process.env.NODE_ENV === 'development' && {
+                        message: (error as Error)?.message,
+                    }),
+                }),
                 {
                     status: 500,
                     headers: { "Content-Type": "application/json" },
@@ -902,10 +925,17 @@ export default class App {
     async start() {
         logger.info("Application Started");
         const port = parseInt(process.env.APP_PORT || "3000");
+
+        // Compose middleware chain around the core request handler
+        this.composedHandler = composeMiddleware(
+            this.middlewares,
+            this.handleRequest.bind(this),
+        );
+
         this.server = Bun.serve({
             idleTimeout: 0, // Disable idle timeout because we have subscriptions
             port: port,
-            fetch: this.handleRequest.bind(this),
+            fetch: this.composedHandler,
         });
 
         // Update the OpenAPI spec with the actual server URL
@@ -932,6 +962,16 @@ export default class App {
             logger.info({ scope: 'app', component: 'App', msg: 'Received SIGINT' });
             await this.shutdown();
             process.exit(0);
+        });
+
+        // Global error handlers to prevent silent crashes
+        process.on('unhandledRejection', (reason, promise) => {
+            logger.error({ scope: 'app', component: 'App', reason, msg: 'Unhandled promise rejection' });
+        });
+
+        process.on('uncaughtException', (error) => {
+            logger.fatal({ scope: 'app', component: 'App', error, msg: 'Uncaught exception — shutting down' });
+            this.shutdown().finally(() => process.exit(1));
         });
 
         this.appReadyCallbacks.forEach((cb) => cb());

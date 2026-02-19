@@ -5,7 +5,9 @@ let connectionUrl = `postgres://${process.env.POSTGRES_USER}:${process.env.POSTG
 if(process.env.DB_CONNECTION_URL) {
     connectionUrl = process.env.DB_CONNECTION_URL;
 }
-logger.info(`Database connection URL: ${connectionUrl}`);
+// Log connection URL with credentials redacted
+const redactedUrl = connectionUrl.replace(/:\/\/([^:]+):([^@]+)@/, '://$1:****@');
+logger.info(`Database connection URL: ${redactedUrl}`);
 
 // OPTIMIZED: Reduced from 20 to 10 to prevent overwhelming PGBouncer
 // With 5 app instances: 5 × 10 = 50 connections (well under PGBouncer's limit)
