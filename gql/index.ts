@@ -30,6 +30,8 @@ export {
 }
 export { GraphQLSchemaOrchestrator } from "./orchestration";
 export { generateGraphQLSchemaV2 } from "./GeneratorV2";
+export { Middleware, composeOperationMiddleware } from "./middleware";
+export type { OperationMiddleware } from "./middleware";
 export type {
     GraphQLType,
     TypeFromGraphQL,
