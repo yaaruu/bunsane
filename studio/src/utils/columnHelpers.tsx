@@ -1,4 +1,5 @@
 import { type ColumnDef } from '@tanstack/react-table'
+import { Link } from 'react-router-dom'
 import ReactJson from 'react-json-view'
 
 /**
@@ -45,7 +46,7 @@ export function renderCellValue(
             <div className="max-w-xs">
                 <ReactJson
                     src={actualValue}
-                    collapsed={autoExpandRow ? 2 : 0}
+                    collapsed={autoExpandRow ? 2 : 1}
                     enableClipboard
                     displayDataTypes={false}
                     displayObjectSize={false}
@@ -87,14 +88,26 @@ export function createTextColumn<T>(
 }
 
 /**
- * Creates an ID column with monospace font styling
+ * Creates an ID column with monospace font styling and link to Entity Inspector
  */
-export function createIdColumn<T>(): ColumnDef<T> {
+export function createIdColumn<T>(options?: { linkToEntity?: boolean }): ColumnDef<T> {
+  const linkToEntity = options?.linkToEntity ?? false
   return {
     accessorKey: 'id',
     header: 'ID',
     cell: ({ getValue }) => {
       const value = getValue() as string
+      if (linkToEntity) {
+        return (
+          <Link
+            to={`/entity/${value}`}
+            className="font-mono text-xs text-primary hover:underline"
+            title="Inspect entity"
+          >
+            {value}
+          </Link>
+        )
+      }
       return <span className="font-mono text-xs">{value}</span>
     },
   }

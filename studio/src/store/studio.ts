@@ -1,11 +1,12 @@
 import { create } from 'zustand'
 import { persist } from "zustand/middleware";
 
-interface Metadata {
+export interface Metadata {
   archeTypes: Record<string, {
     fieldName: string
     componentName: string
     fieldLabel: string
+    nullable?: boolean
   }[]>
 }
 

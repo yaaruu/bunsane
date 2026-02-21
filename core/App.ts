@@ -632,8 +632,32 @@ export default class App {
                     return this.addCorsHeaders(await studioEndpoint.getTables(), req);
                 }
 
+                // Studio stats endpoint
+                if (url.pathname === "/studio/api/stats") {
+                    return this.addCorsHeaders(await studioEndpoint.handleStudioStatsRequest(), req);
+                }
+
+                // Studio components endpoint
+                if (url.pathname === "/studio/api/components") {
+                    return this.addCorsHeaders(await studioEndpoint.handleStudioComponentsRequest(), req);
+                }
+
+                // Studio query endpoint (POST only)
+                if (url.pathname === "/studio/api/query" && method === "POST") {
+                    const body = await req.json();
+                    return this.addCorsHeaders(await studioEndpoint.handleStudioQueryRequest(body), req);
+                }
+
                 const studioApiPath = url.pathname.replace("/studio/api/", "");
                 const pathSegments = studioApiPath.split("/");
+
+                if (pathSegments[0] === "entity" && pathSegments[1]) {
+                    const entityId = pathSegments[1];
+                    return this.addCorsHeaders(
+                        await studioEndpoint.handleEntityInspectorRequest(entityId),
+                        req
+                    );
+                }
 
                 if (pathSegments[0] === "table" && pathSegments[1]) {
                     const tableName = pathSegments[1];
@@ -671,6 +695,7 @@ export default class App {
                     const limit = url.searchParams.get("limit");
                     const offset = url.searchParams.get("offset");
                     const search = url.searchParams.get("search");
+                    const includeDeleted = url.searchParams.get("include_deleted");
 
                     return this.addCorsHeaders(await studioEndpoint.handleStudioArcheTypeRecordsRequest(
                         archeTypeName,
@@ -678,6 +703,7 @@ export default class App {
                             limit: limit ? parseInt(limit, 10) : undefined,
                             offset: offset ? parseInt(offset, 10) : undefined,
                             search: search ?? undefined,
+                            include_deleted: includeDeleted === "true",
                         }
                     ), req);
                 }
@@ -693,8 +719,9 @@ export default class App {
 
             // Studio endpoint - handle both root and all sub-routes
             if (
-                url.pathname === "/studio" ||
-                url.pathname.startsWith("/studio/")
+                this.studioEnabled &&
+                (url.pathname === "/studio" ||
+                url.pathname.startsWith("/studio/"))
             ) {
                 clearTimeout(timeoutId);
 

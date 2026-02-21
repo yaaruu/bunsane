@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { Link, useLocation } from "react-router-dom";
 import {
     Database,
@@ -8,6 +8,9 @@ import {
     PanelLeftOpenIcon,
     PanelLeftCloseIcon,
     FlameIcon,
+    Search,
+    Layers,
+    Terminal,
 } from "lucide-react";
 import { useStudioStore } from "../store/studio";
 import { fetchTables } from "../lib/api";
@@ -23,6 +26,7 @@ declare global {
                     fieldName: string;
                     componentName: string;
                     fieldLabel: string;
+                    nullable?: boolean;
                 }[]
             >;
         };
@@ -169,6 +173,54 @@ export function Sidebar() {
                     >
                         <Home className="h-4 w-4" />
                         {!isSidebarCollapsed && "Welcome"}
+                    </Link>
+
+                    {/* Entity Inspector */}
+                    <Link
+                        to="/entity"
+                        className={cn(
+                            "flex items-center gap-3 px-3 py-2 rounded-md text-sm font-medium transition-colors",
+                            location.pathname.startsWith("/entity")
+                                ? "bg-primary text-primary-foreground"
+                                : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+                            isSidebarCollapsed && "justify-center px-0"
+                        )}
+                        title={isSidebarCollapsed ? "Entity Inspector" : undefined}
+                    >
+                        <Search className="h-4 w-4" />
+                        {!isSidebarCollapsed && "Entity Inspector"}
+                    </Link>
+
+                    {/* Components */}
+                    <Link
+                        to="/components"
+                        className={cn(
+                            "flex items-center gap-3 px-3 py-2 rounded-md text-sm font-medium transition-colors",
+                            location.pathname === "/components"
+                                ? "bg-primary text-primary-foreground"
+                                : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+                            isSidebarCollapsed && "justify-center px-0"
+                        )}
+                        title={isSidebarCollapsed ? "Components" : undefined}
+                    >
+                        <Layers className="h-4 w-4" />
+                        {!isSidebarCollapsed && "Components"}
+                    </Link>
+
+                    {/* Query Runner */}
+                    <Link
+                        to="/query"
+                        className={cn(
+                            "flex items-center gap-3 px-3 py-2 rounded-md text-sm font-medium transition-colors",
+                            location.pathname === "/query"
+                                ? "bg-primary text-primary-foreground"
+                                : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+                            isSidebarCollapsed && "justify-center px-0"
+                        )}
+                        title={isSidebarCollapsed ? "SQL Query" : undefined}
+                    >
+                        <Terminal className="h-4 w-4" />
+                        {!isSidebarCollapsed && "SQL Query"}
                     </Link>
 
                     {/* Dynamic Sections */}

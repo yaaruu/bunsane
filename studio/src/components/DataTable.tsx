@@ -24,6 +24,7 @@ interface DataTableProps<T> {
     loadMoreRef: (node?: Element | null) => void;
     emptyMessage?: string;
     loadingMessage?: string;
+    getRowClassName?: (record: T) => string;
 }
 
 export function DataTable<T extends Record<string, any>>({
@@ -39,6 +40,7 @@ export function DataTable<T extends Record<string, any>>({
     loadMoreRef,
     emptyMessage = "No records found",
     loadingMessage = "Loading more records...",
+    getRowClassName,
 }: DataTableProps<T>) {
     const table = useReactTable({
         data,
@@ -156,10 +158,12 @@ export function DataTable<T extends Record<string, any>>({
                         ))}
                     </thead>
                     <tbody>
-                        {table.getRowModel().rows.map((row) => (
+                        {table.getRowModel().rows.map((row) => {
+                            const extraClass = getRowClassName ? getRowClassName(row.original) : '';
+                            return (
                             <tr
                                 key={row.id}
-                                className="border-b border-border hover:bg-muted/50"
+                                className={`border-b border-border hover:bg-muted/50 ${extraClass}`}
                             >
                                 {row.getVisibleCells().map((cell) => (
                                     <td
@@ -176,7 +180,8 @@ export function DataTable<T extends Record<string, any>>({
                                     </td>
                                 ))}
                             </tr>
-                        ))}
+                            );
+                        })}
                     </tbody>
                 </table>
             </div>

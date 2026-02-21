@@ -11,6 +11,7 @@ interface UseDataTableOptions<T> {
   fetchData: (params: { offset: number; limit: number; search?: string }) => Promise<{
     data: T[]
     hasMore: boolean
+    total?: number
   }>
   /** Function to delete records by IDs */
   deleteRecords: (ids: string[]) => Promise<void>
@@ -39,6 +40,7 @@ export function useDataTable<T>({
   const [data, setData] = useState<T[]>([])
   const [loading, setLoading] = useState(false)
   const [hasMore, setHasMore] = useState(true)
+  const [total, setTotal] = useState<number | null>(null)
   const [search, setSearch] = useState('')
   const [sorting, setSorting] = useState<SortingState>([])
   const [selectedRecords, setSelectedRecords] = useState<Set<string>>(new Set())
@@ -62,6 +64,9 @@ export function useDataTable<T>({
         setData(prev => [...prev, ...result.data])
       }
 
+      if (result.total !== undefined) {
+        setTotal(result.total)
+      }
       setHasMore(result.hasMore)
     } catch (error) {
       toast.error(fetchErrorMessage)
@@ -106,6 +111,7 @@ export function useDataTable<T>({
     data,
     loading,
     hasMore,
+    total,
     search,
     sorting,
     selectedRecords,

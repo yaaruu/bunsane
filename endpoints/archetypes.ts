@@ -17,6 +17,11 @@ export async function handleStudioArcheTypeRecordsRequest(
     const limit = Math.min(Math.max(params.limit ?? 50, 1), 1000);
     const offset = Math.max(params.offset ?? 0, 0);
     const searchTerm = params.search ?? "";
+    const includeDeleted = params.include_deleted ?? false;
+
+    // Conditional filter: include or exclude soft-deleted rows
+    const deletedFilter = includeDeleted ? "" : "AND c.deleted_at IS NULL";
+    const deletedFilterBare = includeDeleted ? "" : "AND deleted_at IS NULL";
 
     try {
         const metadataStorage = getSerializedMetadataStorage();
@@ -77,13 +82,11 @@ export async function handleStudioArcheTypeRecordsRequest(
                     .map((_, index) => `$${index + 2}`)
                     .join(", ");
 
-                // First find entities that have all required components (archetype membership)
-                // Then filter by search term in any of their components
                 entityIdsResult = await db.unsafe(
                     `SELECT entity_id FROM (
                          SELECT entity_id, MAX(created_at) as max_created_at
                          FROM components
-                         WHERE deleted_at IS NULL
+                         WHERE TRUE ${deletedFilterBare}
                          GROUP BY entity_id
                          HAVING COUNT(DISTINCT CASE WHEN name IN (${componentNamePlaceholders}) THEN name END) = $${
                         requiredComponentNames.length + 2
@@ -92,7 +95,7 @@ export async function handleStudioArcheTypeRecordsRequest(
                      WHERE entity_id IN (
                          SELECT DISTINCT entity_id
                          FROM components
-                         WHERE deleted_at IS NULL
+                         WHERE TRUE ${deletedFilterBare}
                          AND (
                              data::text ILIKE $1
                              OR id::text ILIKE $1
@@ -117,7 +120,7 @@ export async function handleStudioArcheTypeRecordsRequest(
                          SELECT c.entity_id, MAX(c.created_at) as max_created_at
                          FROM components c
                          WHERE c.name = $1
-                         AND c.deleted_at IS NULL
+                         ${deletedFilter}
                          GROUP BY c.entity_id
                          ORDER BY max_created_at DESC
                          LIMIT $2 OFFSET $3
@@ -146,9 +149,24 @@ export async function handleStudioArcheTypeRecordsRequest(
                  FROM components c
                  WHERE c.entity_id IN (${entityIdPlaceholders})
                  AND c.name IN (${componentNamePlaceholders})
-                 AND c.deleted_at IS NULL`,
+                 ${deletedFilter}`,
                 [...entityIds, ...allComponentNames]
             );
+
+            // When including deleted, also fetch entity-level deleted_at
+            let entityDeletedMap = new Map<string, string | null>();
+            if (includeDeleted) {
+                const entitiesResult = await db.unsafe(
+                    `SELECT id, deleted_at FROM entities WHERE id IN (${entityIdPlaceholders})`,
+                    entityIds
+                );
+                for (const row of entitiesResult) {
+                    entityDeletedMap.set(
+                        row.id as string,
+                        (row.deleted_at as string) ?? null
+                    );
+                }
+            }
 
             const entityComponentsMap = new Map<string, Map<string, unknown>>();
 
@@ -172,7 +190,6 @@ export async function handleStudioArcheTypeRecordsRequest(
                     continue;
                 }
 
-                // Check if all required components are present
                 const allRequiredComponentsPresent =
                     requiredComponentNames.every((name) =>
                         componentsMap.has(name)
@@ -184,10 +201,16 @@ export async function handleStudioArcheTypeRecordsRequest(
                         componentsObject[name] = data;
                     }
 
-                    validEntities.push({
+                    const record: ArcheTypeEntityRecord = {
                         entityId,
                         components: componentsObject,
-                    });
+                    };
+
+                    if (includeDeleted) {
+                        record.deleted_at = entityDeletedMap.get(entityId) ?? null;
+                    }
+
+                    validEntities.push(record);
 
                     if (validEntities.length >= limit) {
                         break;
@@ -211,7 +234,7 @@ export async function handleStudioArcheTypeRecordsRequest(
             totalResult = await db.unsafe(
                 `SELECT COUNT(DISTINCT c.entity_id) as count
                  FROM components c
-                 WHERE c.deleted_at IS NULL
+                 WHERE TRUE ${deletedFilter}
                  AND (
                      c.data::text ILIKE $1
                      OR c.id::text ILIKE $1
@@ -220,7 +243,7 @@ export async function handleStudioArcheTypeRecordsRequest(
                  AND c.entity_id IN (
                      SELECT entity_id
                      FROM components
-                     WHERE deleted_at IS NULL
+                     WHERE TRUE ${deletedFilterBare}
                      GROUP BY entity_id
                      HAVING COUNT(DISTINCT CASE WHEN name IN (${componentNamePlaceholders}) THEN name END) = $${
                     requiredComponentNames.length + 2
@@ -237,7 +260,7 @@ export async function handleStudioArcheTypeRecordsRequest(
                 `SELECT COUNT(DISTINCT c.entity_id) as count
                  FROM components c
                  WHERE c.name = $1
-                 AND c.deleted_at IS NULL`,
+                 ${deletedFilter}`,
                 [indicatorComponentName]
             );
         }

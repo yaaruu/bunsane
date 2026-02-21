@@ -149,14 +149,12 @@ export async function handleStudioTableDeleteRequest(
     try {
         const idPlaceholders = ids.map((_, index) => `$${index + 1}`).join(", ");
 
-        const result = await db.unsafe(
+        await db.unsafe(
             `DELETE FROM "${tableName}" WHERE id IN (${idPlaceholders})`,
             ids
         );
 
-        const deletedCount = typeof result === "object" && result !== null && "count" in result
-            ? Number(result.count)
-            : ids.length;
+        const deletedCount = ids.length;
 
         const responseData: DeleteResponse = {
             success: true,
