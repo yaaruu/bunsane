@@ -36,7 +36,8 @@
       "Bash(echo:*)",
       "WebSearch",
       "Bash(bun:*)",
-      "Bash(tsc:*)"
+      "Bash(tsc:*)",
+      "Bash(SKIP_TEST_DB_SETUP=true bun test:*)"
     ]
   },
   "statusLine": {

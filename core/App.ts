@@ -75,6 +75,7 @@ export default class App {
     private isReady = false;
     private graphqlMaxDepth: number = 10;
     private shutdownGracePeriod = 10_000;
+    private maxRequestBodySize = 50 * 1024 * 1024; // 50MB default
 
     pubSub = createPubSub();
 
@@ -942,6 +943,14 @@ export default class App {
     }
 
     /**
+     * Set the maximum request body size in bytes (default: 50MB).
+     * Rejects oversized requests at the HTTP layer before buffering.
+     */
+    public setMaxRequestBodySize(bytes: number) {
+        this.maxRequestBodySize = bytes;
+    }
+
+    /**
      * Warm up the prepared statement cache with common query patterns
      */
     private async warmUpPreparedStatementCache(): Promise<void> {
@@ -1021,10 +1030,14 @@ export default class App {
         logger.info("Application Started");
         const port = parseInt(process.env.APP_PORT || "3000");
 
-        // Read env override for shutdown grace period
+        // Read env overrides
         const envGracePeriod = process.env.SHUTDOWN_GRACE_PERIOD_MS;
         if (envGracePeriod) {
             this.shutdownGracePeriod = parseInt(envGracePeriod, 10);
+        }
+        const envBodySize = process.env.MAX_REQUEST_BODY_SIZE;
+        if (envBodySize) {
+            this.maxRequestBodySize = parseInt(envBodySize, 10);
         }
 
         // Compose middleware chain around the core request handler
@@ -1036,6 +1049,7 @@ export default class App {
         this.server = Bun.serve({
             idleTimeout: 0, // Disable idle timeout because we have subscriptions
             port: port,
+            maxRequestBodySize: this.maxRequestBodySize,
             fetch: this.composedHandler,
         });
 

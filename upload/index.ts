@@ -10,6 +10,12 @@ export { FileValidator } from "./FileValidator";
 // Storage Providers
 export { StorageProvider } from "../storage/StorageProvider";
 export { LocalStorageProvider } from "../storage/LocalStorageProvider";
+export { S3StorageProvider } from "../storage/S3StorageProvider";
+export type { S3StorageConfig } from "../storage/S3StorageProvider";
+
+// REST Upload Utilities
+export { handleUpload, parseFormData, uploadResponse, uploadErrorResponse } from "./RestUpload";
+export type { ParsedUpload, RestUploadOptions, RestUploadResult } from "./RestUpload";
 
 // Components
 export { UploadComponent, ImageMetadataComponent } from "./UploadComponent";
@@ -56,6 +62,8 @@ export type {
 
 // Imports for internal use
 import { UploadManager } from "./UploadManager";
+import { S3StorageProvider } from "../storage/S3StorageProvider";
+import type { S3StorageConfig } from "../storage/S3StorageProvider";
 import type { UploadConfiguration } from "../types/upload.types";
 
 /**
@@ -70,6 +78,15 @@ export async function initializeUploadSystem(config?: Partial<UploadConfiguratio
     
     // Initialize default storage provider
     await uploadManager.getStorageProvider("local").initialize();
+}
+
+/**
+ * Initialize S3 storage and register it with UploadManager
+ */
+export async function initializeS3Storage(config: S3StorageConfig): Promise<void> {
+    const provider = new S3StorageProvider(config);
+    await provider.initialize();
+    UploadManager.getInstance().registerStorageProvider("s3", provider);
 }
 
 /**

@@ -7,6 +7,8 @@ export const logger = pino({
         paths: [
             'password', 'secret', 'token', 'authorization',
             'config.password', '*.password', '*.secret', '*.token',
+            '*.accessKeyId', '*.secretAccessKey', '*.sessionToken',
+            'accessKeyId', 'secretAccessKey', 'sessionToken',
         ],
         censor: '[REDACTED]',
     },

@@ -30,6 +30,19 @@ const envSchema = z
             .regex(/^\d+$/, "GRAPHQL_MAX_DEPTH must be numeric")
             .optional(),
 
+        // S3 Storage (opt-in)
+        S3_BUCKET: z.string().optional(),
+        S3_REGION: z.string().optional(),
+        S3_ENDPOINT: z.string().optional(),
+        S3_ACCESS_KEY_ID: z.string().optional(),
+        S3_SECRET_ACCESS_KEY: z.string().optional(),
+
+        // HTTP
+        MAX_REQUEST_BODY_SIZE: z
+            .string()
+            .regex(/^\d+$/, "MAX_REQUEST_BODY_SIZE must be numeric")
+            .optional(),
+
         // Operational
         SHUTDOWN_GRACE_PERIOD_MS: z
             .string()
@@ -50,6 +63,18 @@ const envSchema = z
         {
             message:
                 "Database connection required: provide DB_CONNECTION_URL or POSTGRES_HOST + POSTGRES_USER + POSTGRES_DB",
+        },
+    )
+    .refine(
+        (env) => {
+            if (env.S3_BUCKET) {
+                return !!env.S3_ACCESS_KEY_ID && !!env.S3_SECRET_ACCESS_KEY;
+            }
+            return true;
+        },
+        {
+            message:
+                "S3_BUCKET requires S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY (or use IAM roles and omit S3_BUCKET from env)",
         },
     );
 

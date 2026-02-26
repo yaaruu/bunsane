@@ -7,12 +7,11 @@ import type { UploadConfiguration } from "../types/upload.types";
 export const DEFAULT_UPLOAD_CONFIG: UploadConfiguration = {
     maxFileSize: 10 * 1024 * 1024, // 10MB
     allowedMimeTypes: [
-        // Images
+        // Images (SVG excluded — XSS vector via embedded scripts)
         "image/jpeg",
-        "image/png", 
+        "image/png",
         "image/gif",
         "image/webp",
-        "image/svg+xml",
         // Documents
         "application/pdf",
         "text/plain",
@@ -21,8 +20,8 @@ export const DEFAULT_UPLOAD_CONFIG: UploadConfiguration = {
     ],
     allowedExtensions: [
         // Images
-        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
-        // Documents  
+        ".jpg", ".jpeg", ".png", ".gif", ".webp",
+        // Documents
         ".pdf", ".txt", ".doc", ".docx"
     ],
     validateFileSignature: true,

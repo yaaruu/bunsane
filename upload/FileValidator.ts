@@ -64,6 +64,15 @@ export class FileValidator {
             errors.push(...nameValidation.errors);
         }
 
+        // Dangerous content detection
+        try {
+            if (await this.isDangerous(file)) {
+                errors.push("File contains potentially dangerous content");
+            }
+        } catch (error) {
+            warnings.push(`Could not check file safety: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+
         // Custom validation
         if (config.validation?.customValidators) {
             for (const validator of config.validation.customValidators) {

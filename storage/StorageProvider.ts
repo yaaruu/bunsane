@@ -104,8 +104,12 @@ export abstract class StorageProvider {
      * Sanitize path to prevent directory traversal
      */
     protected sanitizePath(path: string): string {
-        return path
-            .replace(/\.\./g, '')
+        let sanitized = path;
+        // Iterative removal to prevent bypass via nested payloads (e.g. "....//")
+        while (sanitized.includes('..')) {
+            sanitized = sanitized.replace(/\.\./g, '');
+        }
+        return sanitized
             .replace(/\/+/g, '/')
             .replace(/^\/+/, '');
     }
