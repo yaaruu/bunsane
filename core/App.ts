@@ -193,9 +193,9 @@ export default class App {
 
                         // Wrap user's context factory to automatically spread Yoga context
                         const wrappedContextFactory = this.contextFactory
-                            ? (yogaContext: any) => {
+                            ? async (yogaContext: any) => {
                                   const userContext =
-                                      this.contextFactory!(yogaContext);
+                                      await this.contextFactory!(yogaContext);
                                   // Merge Yoga's context with user's context, preserving Yoga properties
                                   return {
                                       ...yogaContext, // Yoga context (request, params, etc.)
