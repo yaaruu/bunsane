@@ -114,6 +114,12 @@ const maskError = (error: any, message: string): GraphQLError => {
         }
     }
     
+    // Pass through known application-level GraphQL error codes
+    const knownCodes = ['FORBIDDEN', 'NOT_FOUND', 'BAD_USER_INPUT', 'BAD_REQUEST'];
+    if (error instanceof GraphQLError && knownCodes.includes(error.extensions?.code as string)) {
+        return error;
+    }
+
     if (process.env.NODE_ENV === 'production') {
         logger.error("GraphQL Error:", error);
         // Mask sensitive error details in production
