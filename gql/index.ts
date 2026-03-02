@@ -115,9 +115,12 @@ const maskError = (error: any, message: string): GraphQLError => {
     }
     
     // Pass through known application-level GraphQL error codes
+    const isGQLError = (e: any): e is GraphQLError =>
+        e instanceof GraphQLError ||
+        (e !== null && typeof e === 'object' && 'extensions' in e && 'message' in e && typeof e.message === 'string');
     const knownCodes = ['FORBIDDEN', 'NOT_FOUND', 'BAD_USER_INPUT', 'BAD_REQUEST'];
-    if (error instanceof GraphQLError && knownCodes.includes(error.extensions?.code as string)) {
-        return error;
+    if (isGQLError(error) && knownCodes.includes(error.extensions?.code as string)) {
+        return error instanceof GraphQLError ? error : new GraphQLError(error.message, { extensions: error.extensions });
     }
 
     if (process.env.NODE_ENV === 'production') {
@@ -130,7 +133,7 @@ const maskError = (error: any, message: string): GraphQLError => {
         });
     }
     // In development, return the original error
-    return error instanceof GraphQLError ? error : new GraphQLError(message, { originalError: error });
+    return isGQLError(error) ? (error instanceof GraphQLError ? error : new GraphQLError(error.message, { extensions: error.extensions })) : new GraphQLError(message, { originalError: error });
 };
 
 export interface YogaInstanceOptions {
