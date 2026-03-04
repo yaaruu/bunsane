@@ -21,7 +21,7 @@
 - Zod-friendly GraphQL error helper
 
 
-Full documentation visit: [Documentation](https://yaaruu.github.io/bunsane/#/)
+Full documentation visit: [Documentation](https://yaaruu.github.io/bunsane-docs/#/)
 
 
 ---
