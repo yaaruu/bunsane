@@ -255,21 +255,20 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
             }
         }
         
-        // Handle output exactly like V1
-        const outputType = this.extractOutputType(output);
+        // Handle output
+        const outputType = this.extractOutputType(output, name);
         fieldDef += `: ${outputType}`;
-        
+
         return fieldDef;
     }
-    
+
     /**
-     * Extract output type exactly like V1
+     * Extract output type from operation metadata
      */
-    private extractOutputType(output: any): string {
+    private extractOutputType(output: any, operationName: string): string {
         if (typeof output === 'string') {
             return output;
         } else if (Array.isArray(output)) {
-            // Handle array of archetypes: [serviceAreaArcheType]
             const archetypeInstance = output[0];
             const typeName = this.getArchetypeTypeName(archetypeInstance);
             if (typeName) {
@@ -279,7 +278,6 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
                 return '[Any]';
             }
         } else if (output instanceof BaseArcheType) {
-            // Handle single archetype instance: serviceAreaArcheType
             const typeName = this.getArchetypeTypeName(output);
             if (typeName) {
                 return typeName;
@@ -288,11 +286,16 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
                 return 'Any';
             }
         } else if (typeof output === 'object' && output !== null) {
-            // Legacy object output format - V1 would generate an output type
-            // For now, return String as fallback (V1 would create outputName+"Output")
-            return 'String';
+            // Inline object output — generate a named GraphQL output type
+            const capitalizedName = operationName.charAt(0).toUpperCase() + operationName.slice(1);
+            const outputTypeName = `${capitalizedName}Output`;
+            if (!this.definedTypes.has(outputTypeName)) {
+                const outputTypeDef = `type ${outputTypeName} {\n${Object.entries(output).map(([k, v]) => `  ${k}: ${v}`).join('\n')}\n}\n`;
+                this.typeDefs += outputTypeDef;
+                this.definedTypes.add(outputTypeName);
+            }
+            return outputTypeName;
         } else {
-            // Default case when output is not specified - assume String (like V1)
             return 'String';
         }
     }
