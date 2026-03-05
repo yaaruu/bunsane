@@ -15,6 +15,8 @@ export interface CacheConfig {
         db?: number;
         keyPrefix?: string;
         retryStrategy?: (times: number) => number | void;
+        connectTimeout?: number;
+        commandTimeout?: number;
     };
 
     entity?: {

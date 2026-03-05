@@ -27,6 +27,8 @@ export interface RedisCacheConfig {
     maxRetriesPerRequest?: number;
     lazyConnect?: boolean;
     enableReadyCheck?: boolean;
+    connectTimeout?: number;
+    commandTimeout?: number;
 }
 
 /**
@@ -60,7 +62,8 @@ export class RedisCache implements CacheProvider {
             maxRetriesPerRequest: config.maxRetriesPerRequest || 3,
             lazyConnect: config.lazyConnect || false,
             enableReadyCheck: config.enableReadyCheck || false,
-            // Connection pooling settings
+            connectTimeout: config.connectTimeout ?? 5000,
+            commandTimeout: config.commandTimeout ?? 3000,
             enableOfflineQueue: true,
         };
 
@@ -194,19 +197,20 @@ export class RedisCache implements CacheProvider {
             const prefixedKeys = keys.map(k => this.prefixKey(k));
             const values = await this.client.mget(...prefixedKeys);
 
-            return values.map((value, index) => {
+            return await Promise.all(values.map(async (value, index) => {
                 if (value === null) {
                     this.stats.misses++;
                     return null;
                 }
                 this.stats.hits++;
                 try {
-                    return JSON.parse(value) as T;
+                    const parsed = JSON.parse(value);
+                    return await CompressionUtils.decompress(parsed) as T;
                 } catch (parseError) {
                     logger.error({ error: parseError, key: keys[index], msg: 'Failed to parse cached value' });
                     return null;
                 }
-            });
+            }));
         } catch (error) {
             logger.error({ error, msg: 'Redis getMany error' });
             return new Array(keys.length).fill(null);
@@ -222,7 +226,8 @@ export class RedisCache implements CacheProvider {
 
             for (const entry of entries) {
                 const prefixedKey = this.prefixKey(entry.key);
-                const serializedValue = JSON.stringify(entry.value);
+                const compressedValue = await CompressionUtils.compress(entry.value);
+                const serializedValue = JSON.stringify(compressedValue);
 
                 if (entry.ttl) {
                     pipeline.setex(prefixedKey, Math.floor(entry.ttl / 1000), serializedValue);

@@ -1,5 +1,7 @@
 import { CacheManager } from './CacheManager.js';
 import { SchedulerManager } from '../SchedulerManager.js';
+import { Entity } from '../Entity.js';
+import { logger } from '../Logger.js';
 
 /**
  * CacheWarmer preloads frequently accessed data into the cache to improve
@@ -34,7 +36,7 @@ export class CacheWarmer {
     let warmed = 0;
     let failed = 0;
 
-    console.log(`Starting entity cache warming for ${entityIds.length} ${entityType} entities`);
+    logger.info({ msg: `Starting entity cache warming`, count: entityIds.length, entityType });
 
     // Process entities in batches to avoid overwhelming the database
     const batchSize = 10;
@@ -46,7 +48,7 @@ export class CacheWarmer {
         const entities = await this.loadEntitiesBatch(batch, entityType);
         warmed += entities.length;
       } catch (error) {
-        console.warn(`Failed to warm batch of entities:`, error);
+        logger.warn({ msg: 'Failed to warm batch of entities', error });
         failed += batch.length;
       }
 
@@ -55,7 +57,7 @@ export class CacheWarmer {
     }
 
     const duration = Date.now() - startTime;
-    console.log(`Entity cache warming completed: ${warmed} warmed, ${failed} failed in ${duration}ms`);
+    logger.info({ msg: 'Entity cache warming completed', warmed, failed, duration });
 
     return { success: failed === 0, warmed, failed, duration };
   }
@@ -71,7 +73,7 @@ export class CacheWarmer {
     enabled?: boolean;
   }): void {
     if (!config.enabled) {
-      console.log(`Cache warming job "${config.name}" is disabled`);
+      logger.debug({ msg: 'Cache warming job disabled', name: config.name });
       return;
     }
 
@@ -80,18 +82,18 @@ export class CacheWarmer {
 
     const job = this.scheduler.scheduleJob(config.name, config.cronExpression, async () => {
       try {
-        console.log(`Running scheduled cache warming: ${config.name}`);
+        logger.info({ msg: 'Running scheduled cache warming', name: config.name });
 
         if (config.type === 'entity') {
           await this.warmEntityCache(config.config.entityIds, config.config.entityType);
         }
       } catch (error) {
-        console.error(`Scheduled cache warming failed for "${config.name}":`, error);
+        logger.error({ msg: 'Scheduled cache warming failed', name: config.name, error });
       }
     });
 
     this.warmingJobs.set(config.name, job);
-    console.log(`Scheduled cache warming job "${config.name}" with cron: ${config.cronExpression}`);
+    logger.info({ msg: 'Scheduled cache warming job', name: config.name, cron: config.cronExpression });
   }
 
   /**
@@ -102,7 +104,7 @@ export class CacheWarmer {
     if (job) {
       job.cancel();
       this.warmingJobs.delete(name);
-      console.log(`Cancelled cache warming job: ${name}`);
+      logger.info({ msg: 'Cancelled cache warming job', name });
       return true;
     }
     return false;
@@ -126,11 +128,17 @@ export class CacheWarmer {
   }> {
     const startTime = Date.now();
 
-    // Warm entities
-    const firstEntity = config.entities?.[0];
-    const entityResults = firstEntity
-      ? await this.warmEntityCache(firstEntity.entityIds, firstEntity.entityType)
-      : { success: true, warmed: 0, failed: 0, duration: 0 };
+    // Warm all entity groups
+    let entityResults = { success: true, warmed: 0, failed: 0, duration: 0 };
+    if (config.entities) {
+      for (const entry of config.entities) {
+        const result = await this.warmEntityCache(entry.entityIds, entry.entityType);
+        entityResults.warmed += result.warmed;
+        entityResults.failed += result.failed;
+        entityResults.duration += result.duration;
+        if (!result.success) entityResults.success = false;
+      }
+    }
 
     const totalDuration = Date.now() - startTime;
 
@@ -141,17 +149,31 @@ export class CacheWarmer {
   }
 
   /**
-   * Loads a batch of entities (placeholder - would need actual entity loading logic)
+   * Loads a batch of entities from the database and populates the cache.
+   * Uses Entity.FindById to load each entity with all its components,
+   * then writes the entity and its components into cache via CacheManager.
    */
-  private async loadEntitiesBatch(entityIds: string[], entityType: string): Promise<any[]> {
-    // This is a placeholder - in a real implementation, this would load entities
-    // from the database using the appropriate entity manager or query system
-    console.log(`Loading batch of ${entityIds.length} ${entityType} entities: ${entityIds.slice(0, 3).join(', ')}...`);
+  private async loadEntitiesBatch(entityIds: string[], entityType: string): Promise<Entity[]> {
+    const loaded: Entity[] = [];
 
-    // Simulate loading delay
-    await new Promise(resolve => setTimeout(resolve, 10));
+    const results = await Promise.allSettled(
+      entityIds.map(id => Entity.FindById(id))
+    );
 
-    // Return mock entities - in real implementation, this would be actual entity data
-    return entityIds.map(id => ({ id, type: entityType, loaded: true }));
+    for (const result of results) {
+      if (result.status === 'fulfilled' && result.value) {
+        const entity = result.value;
+        loaded.push(entity);
+
+        await this.cacheManager.setEntityWriteThrough(entity);
+        const components = entity.componentList();
+        if (components.length > 0) {
+          await this.cacheManager.setComponentWriteThrough(entity.id, components);
+        }
+      }
+    }
+
+    logger.debug({ msg: 'Loaded entity batch', entityType, requested: entityIds.length, loaded: loaded.length });
+    return loaded;
   }
 }

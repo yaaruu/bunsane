@@ -66,7 +66,9 @@ export class CacheFactory {
             retryStrategy: config.redis.retryStrategy,
             maxRetriesPerRequest: 3,
             lazyConnect: false,
-            enableReadyCheck: true
+            enableReadyCheck: true,
+            connectTimeout: config.redis.connectTimeout,
+            commandTimeout: config.redis.commandTimeout
         };
 
         const { password: _pw, ...safeConfig } = redisConfig;
