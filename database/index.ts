@@ -27,24 +27,36 @@ logger.info(`Database connection URL: ${redactedUrl}`);
 const maxConnections = parseInt(process.env.POSTGRES_MAX_CONNECTIONS ?? '10', 10);
 logger.info(`Connection pool size: ${maxConnections} connections`);
 
+// Connection timeout in seconds (default 30s, configurable via env)
+const connectionTimeoutSec = parseInt(process.env.DB_CONNECTION_TIMEOUT ?? '30', 10);
+
+// Query timeout in milliseconds (default 30s, configurable via env)
+// This is used by Query.exec(), Entity.save(), etc.
+export const QUERY_TIMEOUT_MS = parseInt(process.env.DB_QUERY_TIMEOUT ?? '30000', 10);
+logger.info(`Query timeout: ${QUERY_TIMEOUT_MS}ms`);
+
 const db = new SQL({
     url: connectionUrl,
     // Connection pool settings - OPTIMIZED for PGBouncer
     max: maxConnections,
     idleTimeout: 30000, // Close idle connections after 30s
     maxLifetime: 600000, // Connection lifetime 10 minutes
-    connectionTimeout: 30, // Timeout when establishing new connections
+    connectionTimeout: connectionTimeoutSec, // Timeout when establishing new connections (seconds)
     onclose: (err) => {
         if (err) {
-            if((err as unknown as { code: string }).code === "ERR_POSTGRES_IDLE_TIMEOUT") {
+            const errCode = (err as unknown as { code: string }).code;
+            if(errCode === "ERR_POSTGRES_IDLE_TIMEOUT") {
                 logger.trace("Closing connection. Idle");
+            } else if (errCode === "ERR_POSTGRES_CONNECTION_CLOSED") {
+                // Connection closed - can happen during high load or network issues
+                logger.warn("Database connection closed unexpectedly");
             } else {
                 logger.error("Database connection closed with error:");
                 logger.error(err);
             }
         } else {
             logger.trace("Database connection closed gracefully.");
-        }   
+        }
     },
     onconnect: () => {
         // Log when new connections are created

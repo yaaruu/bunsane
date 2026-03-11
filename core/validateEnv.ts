@@ -52,6 +52,14 @@ const envSchema = z
             .string()
             .regex(/^\d+$/, "DB_STATEMENT_TIMEOUT must be numeric")
             .optional(),
+        DB_QUERY_TIMEOUT: z
+            .string()
+            .regex(/^\d+$/, "DB_QUERY_TIMEOUT must be numeric (milliseconds)")
+            .optional(),
+        DB_CONNECTION_TIMEOUT: z
+            .string()
+            .regex(/^\d+$/, "DB_CONNECTION_TIMEOUT must be numeric (seconds)")
+            .optional(),
     })
     .refine(
         (env) => {

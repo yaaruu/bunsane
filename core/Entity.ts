@@ -1,6 +1,6 @@
 import type { ComponentDataType, ComponentGetter, BaseComponent } from "./components";
 import { logger } from "./Logger";
-import db from "../database";
+import db, { QUERY_TIMEOUT_MS } from "../database";
 import EntityManager from "./EntityManager";
 import ComponentRegistry from "./components/ComponentRegistry";
 import { uuidv7 } from "../utils/uuid";
@@ -389,7 +389,7 @@ export class Entity implements IEntity {
             const timeout = setTimeout(() => {
                 logger.error(`Entity save timeout for entity ${this.id}`);
                 reject(new Error(`Entity save timeout for entity ${this.id}`));
-            }, 30000); // 30 second timeout
+            }, QUERY_TIMEOUT_MS); // Configurable timeout via DB_QUERY_TIMEOUT env var
 
             // Capture dirty components BEFORE doSave clears the dirty flags
             const changedComponentTypeIds = this.getDirtyComponents();

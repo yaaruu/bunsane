@@ -1,7 +1,7 @@
 import {ComponentRegistry , type BaseComponent, type ComponentDataType } from "../core/components";
 import { Entity } from "../core/Entity";
 import { logger } from "../core/Logger";
-import db from "../database";
+import db, { QUERY_TIMEOUT_MS } from "../database";
 import { timed } from "../core/Decorators";
 import { inList } from "../database/sqlHelpers";
 import { QueryContext, QueryDAG, SourceNode, ComponentInclusionNode } from "./index";
@@ -299,8 +299,8 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         return new Promise<number>((resolve, reject) => {
             const timeout = setTimeout(() => {
                 logger.error(`Query count execution timeout`);
-                reject(new Error(`Query count execution timeout after 30 seconds`));
-            }, 30000);
+                reject(new Error(`Query count execution timeout after ${QUERY_TIMEOUT_MS / 1000} seconds`));
+            }, QUERY_TIMEOUT_MS);
             this.doCount()
                 .then(result => {
                     clearTimeout(timeout);
@@ -455,8 +455,8 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         return new Promise<number>((resolve, reject) => {
             const timeout = setTimeout(() => {
                 logger.error(`Query sum execution timeout`);
-                reject(new Error(`Query sum execution timeout after 30 seconds`));
-            }, 30000);
+                reject(new Error(`Query sum execution timeout after ${QUERY_TIMEOUT_MS / 1000} seconds`));
+            }, QUERY_TIMEOUT_MS);
             this.doAggregate('SUM', componentCtor, field as string)
                 .then(result => {
                     clearTimeout(timeout);
@@ -483,8 +483,8 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         return new Promise<number>((resolve, reject) => {
             const timeout = setTimeout(() => {
                 logger.error(`Query average execution timeout`);
-                reject(new Error(`Query average execution timeout after 30 seconds`));
-            }, 30000);
+                reject(new Error(`Query average execution timeout after ${QUERY_TIMEOUT_MS / 1000} seconds`));
+            }, QUERY_TIMEOUT_MS);
             this.doAggregate('AVG', componentCtor, field as string)
                 .then(result => {
                     clearTimeout(timeout);
@@ -641,8 +641,8 @@ AND c.deleted_at IS NULL`;
             // Add timeout to prevent hanging queries
             const timeout = setTimeout(() => {
                 logger.error(`Query execution timeout`);
-                reject(new Error(`Query execution timeout after 30 seconds`));
-            }, 30000); // 30 second timeout
+                reject(new Error(`Query execution timeout after ${QUERY_TIMEOUT_MS / 1000} seconds`));
+            }, QUERY_TIMEOUT_MS); // 30 second timeout
 
             this.doExec()
                 .then(result => {
