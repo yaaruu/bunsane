@@ -3,7 +3,33 @@ import type { QueryResult } from "./QueryNode";
 import { QueryContext } from "./QueryContext";
 import { shouldUseLateralJoins, shouldUseDirectPartition } from "../core/Config";
 import { FilterBuilderRegistry } from "./FilterBuilderRegistry";
-import {ComponentRegistry} from "../core/components";
+import { ComponentRegistry } from "../core/components";
+import { getMetadataStorage } from "../core/metadata";
+
+/**
+ * Check if a component property is numeric based on metadata
+ * Used to apply proper casting in ORDER BY clauses for index usage
+ */
+function isNumericProperty(componentName: string, propertyName: string): boolean {
+    const storage = getMetadataStorage();
+    const typeId = storage.getComponentId(componentName);
+
+    // Check indexed fields first (most reliable)
+    const indexedFields = storage.getIndexedFields(typeId);
+    const indexedField = indexedFields.find(f => f.propertyKey === propertyName);
+    if (indexedField?.indexType === 'numeric') {
+        return true;
+    }
+
+    // Check property metadata for Number type
+    const props = storage.getComponentProperties(typeId);
+    const prop = props.find(p => p.propertyKey === propertyName);
+    if (prop?.propertyType === Number) {
+        return true;
+    }
+
+    return false;
+}
 
 export class ComponentInclusionNode extends QueryNode {
     private getComponentTableName(compId: string): string {
@@ -108,7 +134,8 @@ export class ComponentInclusionNode extends QueryNode {
             }
 
             // Apply component filters for single component (normal path)
-            sql = this.applyComponentFilters(context, componentIds, useCTE, useLateralJoins, lateralJoins, lateralConditions, sql, new Map());
+            // For single component, alias is 'ec' (or CTE name if using CTE)
+            sql = this.applyComponentFilters(context, componentIds, useCTE, useLateralJoins, lateralJoins, lateralConditions, sql, new Map(), useCTE ? context.cteName : "ec");
 
             // Apply sorting with component data joins if sortOrders are specified
             if (hasSortOrders) {
@@ -145,17 +172,11 @@ export class ComponentInclusionNode extends QueryNode {
             // Multiple components case
             // Create parameter indices for component IDs to avoid duplicates
             const componentParamIndices: Map<string, number> = new Map();
-            const componentPlaceholders = componentIds.map((id) => {
-                if (!componentParamIndices.has(id)) {
-                    componentParamIndices.set(id, context.addParam(id));
-                }
-                return `$${componentParamIndices.get(id)}::text`;
-            }).join(', ');
-            
+
             if (useCTE) {
                 // Use CTE for base entity filtering
                 sql = `SELECT DISTINCT ${context.cteName}.entity_id as id FROM ${context.cteName}`;
-                
+
                 // Ensure all required components are present
                 sql += ` WHERE (`;
                 const componentChecks = componentIds.map(compId => {
@@ -171,51 +192,66 @@ export class ComponentInclusionNode extends QueryNode {
                 });
                 sql += componentChecks.join(' AND ') + `)`;
             } else {
-                sql = `SELECT DISTINCT ec.entity_id as id FROM entity_components ec WHERE ec.type_id IN (${componentPlaceholders}) AND ec.deleted_at IS NULL`;
+                // Use INTERSECT for multi-component queries (much faster than GROUP BY + HAVING)
+                // INTERSECT lets PostgreSQL use index scans independently on each component type
+                // then merge the results efficiently with a hash or merge join
+                const intersectQueries = componentIds.map((compId) => {
+                    if (!componentParamIndices.has(compId)) {
+                        componentParamIndices.set(compId, context.addParam(compId));
+                    }
+                    return `SELECT ec.entity_id FROM entity_components ec WHERE ec.type_id = $${componentParamIndices.get(compId)}::text AND ec.deleted_at IS NULL`;
+                });
+                sql = `SELECT intersected.entity_id as id FROM (${intersectQueries.join(' INTERSECT ')}) AS intersected`;
             }
 
+            // For INTERSECT queries, the alias is 'intersected', not 'ec'
+            const multiCompAlias = useCTE ? context.cteName : "intersected";
+
+            // Track if outer query has WHERE clause (don't count WHERE inside INTERSECT subqueries)
+            // For INTERSECT queries, the outer query starts without WHERE
+            let outerHasWhere = useCTE && sql.indexOf('WHERE', sql.lastIndexOf('FROM')) > -1;
+
             if (context.withId) {
-                const tableAlias = useCTE ? context.cteName : "ec";
-                const whereKeyword = sql.includes('WHERE') ? 'AND' : 'WHERE';
-                sql += ` ${whereKeyword} ${tableAlias}.entity_id = $${context.addParam(context.withId)}`;
+                const whereKeyword = outerHasWhere ? 'AND' : 'WHERE';
+                sql += ` ${whereKeyword} ${multiCompAlias}.entity_id = $${context.addParam(context.withId)}`;
+                outerHasWhere = true;
             }
 
             // Add exclusions
             if (excludedIds.length > 0) {
-                const tableAlias = useCTE ? context.cteName : "ec";
-                const whereKeyword = sql.includes('WHERE') ? 'AND' : 'WHERE';
+                const whereKeyword = outerHasWhere ? 'AND' : 'WHERE';
                 const excludedPlaceholders = excludedIds.map((id) => `$${context.addParam(id)}`).join(', ');
                 sql += ` ${whereKeyword} NOT EXISTS (
                     SELECT 1 FROM entity_components ec_ex
-                    WHERE ec_ex.entity_id = ${tableAlias}.entity_id
+                    WHERE ec_ex.entity_id = ${multiCompAlias}.entity_id
                     AND ec_ex.type_id IN (${excludedPlaceholders})
                     AND ec_ex.deleted_at IS NULL
                 )`;
+                outerHasWhere = true;
             }
 
             // Add entity exclusions
             if (context.excludedEntityIds.size > 0) {
-                const tableAlias = useCTE ? context.cteName : "ec";
-                const whereKeyword = sql.includes('WHERE') ? 'AND' : 'WHERE';
+                const whereKeyword = outerHasWhere ? 'AND' : 'WHERE';
                 const entityExcludedIds = Array.from(context.excludedEntityIds);
                 const entityPlaceholders = entityExcludedIds.map((id) => `$${context.addParam(id)}`).join(', ');
-                sql += ` ${whereKeyword} ${tableAlias}.entity_id NOT IN (${entityPlaceholders})`;
+                sql += ` ${whereKeyword} ${multiCompAlias}.entity_id NOT IN (${entityPlaceholders})`;
+                outerHasWhere = true;
             }
 
             // Apply component filters for multiple components
-            sql = this.applyComponentFilters(context, componentIds, useCTE, useLateralJoins, lateralJoins, lateralConditions, sql, componentParamIndices);
+            // For INTERSECT queries, alias is 'intersected'; for CTE, use cteName
+            sql = this.applyComponentFilters(context, componentIds, useCTE, useLateralJoins, lateralJoins, lateralConditions, sql, componentParamIndices, multiCompAlias);
 
-            if (!useCTE) {
-                sql += ` GROUP BY ec.entity_id HAVING COUNT(DISTINCT ec.type_id) = $${context.addParam(componentCount)}`;
-            }
-            
+            // Note: GROUP BY HAVING removed - INTERSECT already ensures all components are present
+
             // Apply sorting with component data joins if sortOrders are specified
             if (hasSortOrders) {
                 sql = this.applySortingWithComponentJoins(sql, context);
             } else {
                 // Default: order by entity_id
-                const tableAlias = useCTE ? context.cteName : "ec";
-                const idColumn = useCTE ? `${context.cteName}.entity_id` : `${tableAlias}.entity_id`;
+                // For INTERSECT queries, use 'intersected' alias; for CTE, use cteName
+                const idColumn = `${multiCompAlias}.entity_id`;
 
                 // Apply cursor-based pagination if cursor is set (more efficient than OFFSET)
                 if (context.cursorId !== null && !context.paginationAppliedInCTE) {
@@ -266,44 +302,48 @@ export class ComponentInclusionNode extends QueryNode {
             if (singlePass) return singlePass;
         }
 
-        // Wrap the base query as a subquery to get entity ids
-        let sql = `SELECT base_entities.id FROM (${baseQuery}) AS base_entities`;
-        
-        // Build LEFT JOINs for each sort order to access component data
-        const sortJoins: string[] = [];
+        // Use scalar subquery approach for sorting to avoid cartesian product explosion
+        // This forces PostgreSQL to evaluate the sort expression for each entity row,
+        // rather than joining all component rows first and filtering later.
+        // This is dramatically faster when base_entities is a small subset of total entities.
         const orderByClauses: string[] = [];
-        
+
         for (let i = 0; i < context.sortOrders.length; i++) {
             const sortOrder = context.sortOrders[i]!;
-            const sortAlias = `sort_${i}`;
-            const compAlias = `comp_${i}`;
-            
+
             // Get the component type ID for this sort order
             const typeId = ComponentRegistry.getComponentId(sortOrder.component);
             if (!typeId) {
                 continue; // Skip if component not registered
             }
-            
-            // LEFT JOIN to entity_components and components to get the sort data
+
             const sortComponentTableName = this.getComponentTableName(typeId);
-            sortJoins.push(`
-                LEFT JOIN entity_components ${sortAlias}
-                    ON ${sortAlias}.entity_id = base_entities.id
-                    AND ${sortAlias}.type_id = $${context.addParam(typeId)}::text
-                    AND ${sortAlias}.deleted_at IS NULL
-                LEFT JOIN ${sortComponentTableName} ${compAlias}
-                    ON ${compAlias}.id = ${sortAlias}.component_id
-                    AND ${compAlias}.deleted_at IS NULL`);
-            
-            // Build ORDER BY clause for this sort order
-            // Access the property from JSONB data
             const nullsClause = sortOrder.nullsFirst ? 'NULLS FIRST' : 'NULLS LAST';
-            orderByClauses.push(`${compAlias}.data->>'${sortOrder.property}' ${sortOrder.direction} ${nullsClause}`);
+            const isNumeric = isNumericProperty(sortOrder.component, sortOrder.property);
+
+            // Build scalar subquery to get sort value for each entity
+            // This avoids nested loop join by forcing row-by-row evaluation
+            const sortExpr = isNumeric
+                ? `(sort_c.data->>'${sortOrder.property}')::numeric`
+                : `sort_c.data->>'${sortOrder.property}'`;
+
+            const subquery = `(
+                SELECT ${sortExpr}
+                FROM entity_components sort_ec
+                JOIN ${sortComponentTableName} sort_c ON sort_c.id = sort_ec.component_id
+                WHERE sort_ec.entity_id = base_entities.id
+                AND sort_ec.type_id = $${context.addParam(typeId)}::text
+                AND sort_ec.deleted_at IS NULL
+                AND sort_c.deleted_at IS NULL
+                LIMIT 1
+            )`;
+
+            orderByClauses.push(`${subquery} ${sortOrder.direction} ${nullsClause}`);
         }
-        
-        // Combine joins
-        sql += sortJoins.join('');
-        
+
+        // Wrap the base query as a subquery to get entity ids
+        let sql = `SELECT base_entities.id FROM (${baseQuery}) AS base_entities`;
+
         // Add ORDER BY clause
         if (orderByClauses.length > 0) {
             sql += ` ORDER BY ${orderByClauses.join(', ')}`;
@@ -311,7 +351,7 @@ export class ComponentInclusionNode extends QueryNode {
             // Fallback to entity id if no valid sort orders
             sql += ` ORDER BY base_entities.id`;
         }
-        
+
         // Add LIMIT and OFFSET only if not already applied in CTE
         // When pagination is applied at CTE level, skip it here to avoid double pagination
         if (!context.paginationAppliedInCTE) {
@@ -392,6 +432,10 @@ export class ComponentInclusionNode extends QueryNode {
         }
 
         const nullsClause = sortOrder.nullsFirst ? 'NULLS FIRST' : 'NULLS LAST';
+        const isNumeric = isNumericProperty(sortOrder.component, sortOrder.property);
+        const sortExpr = isNumeric
+            ? `(c.data->>'${sortOrder.property}')::numeric`
+            : `c.data->>'${sortOrder.property}'`;
 
         let sql: string;
         if (useDirectPartition) {
@@ -401,7 +445,7 @@ export class ComponentInclusionNode extends QueryNode {
                 WHERE c.type_id = $${context.addParam(sortTypeId)}::text
                 AND c.deleted_at IS NULL
                 AND ${filterConditions.join(' AND ')}
-                ORDER BY c.data->>'${sortOrder.property}' ${sortOrder.direction} ${nullsClause}`;
+                ORDER BY ${sortExpr} ${sortOrder.direction} ${nullsClause}`;
         } else {
             // Use entity_components junction
             // No DISTINCT needed since each entity has one component of this type
@@ -410,7 +454,7 @@ export class ComponentInclusionNode extends QueryNode {
                 WHERE ec.type_id = $${context.addParam(sortTypeId)}::text
                 AND ec.deleted_at IS NULL
                 AND ${filterConditions.join(' AND ')}
-                ORDER BY c.data->>'${sortOrder.property}' ${sortOrder.direction} ${nullsClause}`;
+                ORDER BY ${sortExpr} ${sortOrder.direction} ${nullsClause}`;
         }
 
         // Add pagination
@@ -427,29 +471,41 @@ export class ComponentInclusionNode extends QueryNode {
     }
 
     /**
-     * Optimized sorting for direct partition access
-     * Queries the partition table directly without going through entity_components for the sort join
+     * Optimized sorting for direct partition access.
+     * Uses scalar subquery to avoid cartesian product explosion when sorting.
+     * Queries the partition table directly without going through entity_components.
      */
     private applySortingOptimized(baseQuery: string, context: QueryContext): string | null {
         if (context.sortOrders.length !== 1) return null;
-        
+
         const sortOrder = context.sortOrders[0]!;
         const typeId = ComponentRegistry.getComponentId(sortOrder.component);
         if (!typeId) return null;
-        
+
         const partitionTable = ComponentRegistry.getPartitionTableName(typeId);
         if (!partitionTable) return null;
-        
+
         const nullsClause = sortOrder.nullsFirst ? 'NULLS FIRST' : 'NULLS LAST';
-        
-        // Optimized query: Direct join to partition table, skip entity_components for sort
-        // This is faster because we go directly to the partition table
+        const isNumeric = isNumericProperty(sortOrder.component, sortOrder.property);
+        const sortExpr = isNumeric
+            ? `(sort_c.data->>'${sortOrder.property}')::numeric`
+            : `sort_c.data->>'${sortOrder.property}'`;
+
+        // Use scalar subquery to avoid cartesian product explosion
+        // This forces PostgreSQL to evaluate sort value per-entity, preventing
+        // the nested loop join that scans all component rows before filtering
+        const sortSubquery = `(
+            SELECT ${sortExpr}
+            FROM ${partitionTable} sort_c
+            WHERE sort_c.entity_id = base.id
+            AND sort_c.type_id = $${context.addParam(typeId)}::text
+            AND sort_c.deleted_at IS NULL
+            LIMIT 1
+        )`;
+
         let sql = `SELECT base.id FROM (${baseQuery}) AS base
-            JOIN ${partitionTable} c ON c.entity_id = base.id 
-                AND c.type_id = $${context.addParam(typeId)}::text 
-                AND c.deleted_at IS NULL
-            ORDER BY c.data->>'${sortOrder.property}' ${sortOrder.direction} ${nullsClause}`;
-        
+            ORDER BY ${sortSubquery} ${sortOrder.direction} ${nullsClause}`;
+
         // Add LIMIT and OFFSET only if not already applied in CTE
         // When pagination is applied at CTE level, skip it here to avoid double pagination
         if (!context.paginationAppliedInCTE) {
@@ -467,6 +523,7 @@ export class ComponentInclusionNode extends QueryNode {
 
     /**
      * Apply component filters using either EXISTS subqueries or LATERAL joins
+     * @param entityTableAlias - The alias for the entity table (e.g., 'ec', 'intersected', or CTE name)
      */
     private applyComponentFilters(
         context: QueryContext,
@@ -476,7 +533,8 @@ export class ComponentInclusionNode extends QueryNode {
         lateralJoins: string[],
         lateralConditions: string[],
         sql: string,
-        componentParamIndices: Map<string, number>
+        componentParamIndices: Map<string, number>,
+        entityTableAlias?: string
     ): string {
         for (const [compId, filters] of context.componentFilters) {
             for (const filter of filters) {
@@ -500,20 +558,11 @@ export class ComponentInclusionNode extends QueryNode {
                     if (filter.value === '' || (typeof filter.value === 'string' && filter.value.trim() === '')) {
                         throw new Error(`Filter value for field "${filter.field}" is an empty string. This would cause PostgreSQL UUID parsing errors.`);
                     }
-                    
+
                     // Check if value looks like a UUID (case-insensitive, with or without hyphens)
                     const valueStr = String(filter.value);
                     const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(valueStr);
-                    
-                    // Debug logging
-                    // console.log('[ComponentInclusionNode] Filter:', { 
-                    //     field: filter.field, 
-                    //     operator: filter.operator, 
-                    //     value: filter.value,
-                    //     valueStr,
-                    //     isUUID 
-                    // });
-                    
+
                     // Build JSON path for nested fields (e.g., "device.unique_id" -> "c.data->'device'->>'unique_id'")
                     let jsonPath: string;
                     if (filter.field.includes('.')) {
@@ -524,7 +573,7 @@ export class ComponentInclusionNode extends QueryNode {
                     } else {
                         jsonPath = `c.data->>'${filter.field}'`;
                     }
-                    
+
                     if (isUUID && filter.operator === '=') {
                         // UUID equality comparison - only cast the parameter, compare as text
                         // This allows matching UUID parameter against both UUID and text fields
@@ -550,11 +599,10 @@ export class ComponentInclusionNode extends QueryNode {
                         // Default: text comparison without casting
                         condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
                     }
-                    
-                    // console.log('[ComponentInclusionNode] Condition:', condition);
                 }
-                
-                const tableAlias = useCTE ? context.cteName : "ec";
+
+                // Use provided alias, or fall back to CTE name or 'ec'
+                const tableAlias = entityTableAlias || (useCTE ? context.cteName : "ec");
                 const whereKeyword = sql.includes('WHERE') ? 'AND' : 'WHERE';
 
                 if (useLateralJoins) {

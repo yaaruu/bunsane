@@ -108,6 +108,14 @@ export const CreateEntityTable = async () => {
         updated_at TIMESTAMP DEFAULT NOW(),
         deleted_at TIMESTAMP
     );`;
+
+    // Add partial index for soft-delete queries - critical for 1M+ scale
+    // This allows efficient filtering of non-deleted entities
+    await db.unsafe(`
+        CREATE INDEX IF NOT EXISTS idx_entities_deleted_null
+        ON entities (id)
+        WHERE deleted_at IS NULL
+    `);
 }
 
 export const CreateComponentTable = async () => {

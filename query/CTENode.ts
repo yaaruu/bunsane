@@ -13,49 +13,69 @@ export class CTENode extends QueryNode {
         }
 
         let cteSql = "WITH base_entities AS (\n";
-        cteSql += "    SELECT DISTINCT ec.entity_id\n";
-        cteSql += "    FROM entity_components ec\n";
-        cteSql += "    WHERE ec.type_id IN (";
 
-        // Add component type placeholders
-        const typePlaceholders = componentIds.map((_, index) => `$${context.addParam(componentIds[index])}`).join(', ');
-        cteSql += typePlaceholders + ")\n";
-        cteSql += "    AND ec.deleted_at IS NULL\n";
-
-        // Add cursor-based pagination filter in CTE (more efficient than OFFSET)
+        // Build cursor condition for reuse across INTERSECT queries
+        let cursorCondition = "";
         if (context.cursorId !== null) {
             const operator = context.cursorDirection === 'after' ? '>' : '<';
-            cteSql += `    AND ec.entity_id ${operator} $${context.addParam(context.cursorId)}\n`;
+            cursorCondition = ` AND ec.entity_id ${operator} $${context.addParam(context.cursorId)}`;
         }
 
-        // Add exclusions if any
+        // Build exclusion condition for reuse across INTERSECT queries
+        let exclusionCondition = "";
         if (excludedIds.length > 0) {
             const excludedPlaceholders = excludedIds.map((id) => `$${context.addParam(id)}`).join(', ');
-            cteSql += `    AND NOT EXISTS (\n`;
-            cteSql += `        SELECT 1 FROM entity_components ec_ex\n`;
-            cteSql += `        WHERE ec_ex.entity_id = ec.entity_id\n`;
-            cteSql += `        AND ec_ex.type_id IN (${excludedPlaceholders})\n`;
-            cteSql += `        AND ec_ex.deleted_at IS NULL\n`;
-            cteSql += `    )\n`;
+            exclusionCondition = ` AND NOT EXISTS (
+                SELECT 1 FROM entity_components ec_ex
+                WHERE ec_ex.entity_id = ec.entity_id
+                AND ec_ex.type_id IN (${excludedPlaceholders})
+                AND ec_ex.deleted_at IS NULL
+            )`;
         }
 
-        // Add entity exclusions if any
+        // Build entity exclusion condition for reuse
+        let entityExclusionCondition = "";
         if (context.excludedEntityIds.size > 0) {
             const entityExcludedIds = Array.from(context.excludedEntityIds);
             const entityPlaceholders = entityExcludedIds.map((id) => `$${context.addParam(id)}`).join(', ');
-            cteSql += `    AND ec.entity_id NOT IN (${entityPlaceholders})\n`;
+            entityExclusionCondition = ` AND ec.entity_id NOT IN (${entityPlaceholders})`;
         }
 
-        // Group by entity_id to count distinct component types
-        // This ensures entities have ALL required components
-        cteSql += `    GROUP BY ec.entity_id\n`;
-        cteSql += `    HAVING COUNT(DISTINCT ec.type_id) >= $${context.addParam(componentIds.length)}\n`;
+        if (componentIds.length === 1) {
+            // Single component - simple query, no INTERSECT needed
+            const paramIdx = context.addParam(componentIds[0]);
+            cteSql += `    SELECT DISTINCT ec.entity_id\n`;
+            cteSql += `    FROM entity_components ec\n`;
+            cteSql += `    WHERE ec.type_id = $${paramIdx}::text\n`;
+            cteSql += `    AND ec.deleted_at IS NULL\n`;
+            if (cursorCondition) cteSql += `    ${cursorCondition.trim()}\n`;
+            if (exclusionCondition) cteSql += `    ${exclusionCondition.trim()}\n`;
+            if (entityExclusionCondition) cteSql += `    ${entityExclusionCondition.trim()}\n`;
+        } else {
+            // Multiple components - use INTERSECT for much faster queries
+            // INTERSECT allows PostgreSQL to use index scans independently per component
+            // then efficiently merge results, avoiding Cartesian product explosion
+            const intersectQueries = componentIds.map((compId) => {
+                const paramIdx = context.addParam(compId);
+                let subquery = `SELECT ec.entity_id FROM entity_components ec WHERE ec.type_id = $${paramIdx}::text AND ec.deleted_at IS NULL`;
+                // Add cursor/exclusion conditions to each subquery for efficiency
+                if (cursorCondition) subquery += cursorCondition;
+                if (exclusionCondition) subquery += exclusionCondition;
+                if (entityExclusionCondition) subquery += entityExclusionCondition;
+                return `(${subquery})`;
+            });
+            cteSql += `    SELECT entity_id FROM (\n`;
+            cteSql += `        ${intersectQueries.join('\n        INTERSECT\n        ')}\n`;
+            cteSql += `    ) AS intersected\n`;
+        }
 
         // Add ORDER BY for deterministic pagination results
         // Must be before LIMIT/OFFSET for consistent page results
         // Reverse order for 'before' cursor direction
         const orderDirection = context.cursorDirection === 'before' ? 'DESC' : 'ASC';
-        cteSql += `    ORDER BY ec.entity_id ${orderDirection}\n`;
+        // Use correct column reference based on query structure
+        const orderColumn = componentIds.length === 1 ? 'ec.entity_id' : 'entity_id';
+        cteSql += `    ORDER BY ${orderColumn} ${orderDirection}\n`;
 
         // Check if there are component filters - if so, pagination must happen AFTER filtering
         // Otherwise we'd limit results before applying filters, causing incorrect results
