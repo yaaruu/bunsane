@@ -54,10 +54,14 @@ export class ComponentInclusionNode extends QueryNode {
 
         let sql = "";
         const componentCount = componentIds.length;
-        const useLateralJoins = Boolean(shouldUseLateralJoins());
 
         // Check if CTE is available and use it to avoid redundant entity_components scans
         const useCTE = Boolean(context.hasCTE && context.cteName);
+
+        // LATERAL joins don't work correctly with INTERSECT queries (non-CTE multi-component)
+        // because the SQL insertion logic places joins inside the INTERSECT subqueries
+        const isIntersectQuery = componentCount > 1 && !useCTE;
+        const useLateralJoins = Boolean(shouldUseLateralJoins()) && !isIntersectQuery;
 
         // Collect LATERAL join fragments if using LATERAL joins
         const lateralJoins: string[] = [];
@@ -430,11 +434,11 @@ export class ComponentInclusionNode extends QueryNode {
             } else if (typeof filter.value === 'boolean') {
                 condition = `(${jsonPath})::boolean ${filter.operator} $${context.addParam(filter.value)}`;
             } else if (filter.operator === 'IN' || filter.operator === 'NOT IN') {
-                if (Array.isArray(filter.value)) {
+                if (Array.isArray(filter.value) && filter.value.length > 0) {
                     const placeholders = filter.value.map((v: any) => `$${context.addParam(v)}`).join(', ');
                     condition = `${jsonPath} ${filter.operator} (${placeholders})`;
                 } else {
-                    return null; // Invalid - fall back to normal path
+                    return null; // Invalid or empty array - fall back to normal path
                 }
             } else if (filter.operator === 'LIKE' || filter.operator === 'NOT LIKE' || filter.operator === 'ILIKE') {
                 condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}::text`;
@@ -444,6 +448,9 @@ export class ComponentInclusionNode extends QueryNode {
 
             filterConditions.push(condition);
         }
+
+        // Guard: if no conditions were built, fall back to normal path
+        if (filterConditions.length === 0) return null;
 
         const nullsClause = sortOrder.nullsFirst ? 'NULLS FIRST' : 'NULLS LAST';
         const isNumeric = isNumericProperty(sortOrder.component, sortOrder.property);
@@ -622,9 +629,12 @@ export class ComponentInclusionNode extends QueryNode {
                         condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
                     } else if (filter.operator === 'IN' || filter.operator === 'NOT IN') {
                         // IN/NOT IN comparison - handle arrays properly
-                        if (Array.isArray(filter.value)) {
+                        if (Array.isArray(filter.value) && filter.value.length > 0) {
                             const placeholders = Array.from({length: filter.value.length}, (_, i) => `$${context.addParam(filter.value[i])}`).join(', ');
                             condition = `${jsonPath} ${filter.operator} (${placeholders})`;
+                        } else if (Array.isArray(filter.value) && filter.value.length === 0) {
+                            // Empty array: IN () is always false, NOT IN () is always true
+                            condition = filter.operator === 'IN' ? 'FALSE' : 'TRUE';
                         } else {
                             throw new Error(`${filter.operator} operator requires an array of values`);
                         }
