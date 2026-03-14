@@ -1,0 +1,9 @@
+[test]
+# No preload for benchmark tests - we manage the database connection ourselves
+preload = []
+
+# Longer timeout for benchmarks
+timeout = 300000
+
+# Single-threaded to avoid connection conflicts
+smol = true

@@ -108,6 +108,14 @@ export const CreateEntityTable = async () => {
         updated_at TIMESTAMP DEFAULT NOW(),
         deleted_at TIMESTAMP
     );`;
+
+    // Add partial index for soft-delete queries - critical for 1M+ scale
+    // This allows efficient filtering of non-deleted entities
+    await db.unsafe(`
+        CREATE INDEX IF NOT EXISTS idx_entities_deleted_null
+        ON entities (id)
+        WHERE deleted_at IS NULL
+    `);
 }
 
 export const CreateComponentTable = async () => {
@@ -639,3 +647,107 @@ export const BenchmarkPartitionCounts = async (partitionCounts: number[] = [8, 1
 }
 
 export const GenerateTableName = (name: string) => `components_${name.toLowerCase().replace(/\s+/g, '_')}`;
+
+/**
+ * Creates a GIN index on a JSONB foreign key field for optimized relation queries.
+ * This significantly improves @HasMany and @BelongsTo relation resolution performance.
+ *
+ * @param tableName The component table name (e.g., 'components_userprofile')
+ * @param foreignKeyField The JSONB field name that holds the foreign key (e.g., 'user_id')
+ * @returns Promise<boolean> - true if index was created, false if it already exists
+ *
+ * @example
+ * // Create index for user_id foreign key
+ * await CreateForeignKeyIndex('components_userprofile', 'user_id');
+ */
+export const CreateForeignKeyIndex = async (tableName: string, foreignKeyField: string): Promise<boolean> => {
+    tableName = validateIdentifier(tableName);
+    foreignKeyField = validateIdentifier(foreignKeyField);
+
+    const indexName = `idx_${tableName}_fk_${foreignKeyField}`;
+
+    // Check if index already exists
+    const existingIndex = await db.unsafe(`
+        SELECT 1 FROM pg_indexes
+        WHERE tablename = '${tableName}' AND indexname = '${indexName}'
+    `);
+
+    if (existingIndex.length > 0) {
+        logger.trace(`Foreign key index ${indexName} already exists`);
+        return false;
+    }
+
+    // Check partition strategy
+    const partitionStrategy = await GetPartitionStrategy();
+    const useConcurrently = partitionStrategy !== 'hash' && !process.env.USE_PGLITE;
+
+    try {
+        await retryWithBackoff(async () => {
+            // Use btree index on the extracted text value for equality lookups (faster than GIN for FK)
+            await db.unsafe(`
+                CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} IF NOT EXISTS ${indexName}
+                ON ${tableName} ((data->>'${foreignKeyField}'))
+                WHERE deleted_at IS NULL
+            `);
+        });
+        logger.info(`Created foreign key index ${indexName} on ${tableName}.data->>'${foreignKeyField}'`);
+        return true;
+    } catch (error: any) {
+        if (error.message?.includes('duplicate key value violates unique constraint')) {
+            logger.trace(`Foreign key index ${indexName} already exists (concurrent creation)`);
+            return false;
+        }
+        throw error;
+    }
+};
+
+/**
+ * Creates foreign key indexes for all relation fields defined in archetypes.
+ * Should be called during database initialization for optimal relation query performance.
+ */
+export const CreateRelationIndexes = async (): Promise<void> => {
+    const storage = getMetadataStorage();
+    const createdIndexes: string[] = [];
+
+    for (const [archetypeId, relations] of storage.archetypes_relations_map) {
+        for (const relation of relations) {
+            if (!relation.options?.foreignKey) continue;
+
+            const foreignKey = relation.options.foreignKey;
+            // Skip nested foreign keys (handled differently)
+            if (foreignKey.includes('.')) continue;
+
+            // Find the component that has this foreign key
+            const archetypeMetadata = storage.archetypes.find(a =>
+                storage.getComponentId(a.name) === archetypeId || a.typeId === archetypeId
+            );
+
+            if (!archetypeMetadata) continue;
+
+            // Get the component fields for this archetype
+            const archetypeFields = storage.archetypes_field_map.get(archetypeId) || [];
+
+            for (const field of archetypeFields) {
+                const componentId = storage.getComponentId(field.component.name);
+                const componentProps = storage.getComponentProperties(componentId);
+                const hasForeignKey = componentProps.some(prop => prop.propertyKey === foreignKey);
+
+                if (hasForeignKey) {
+                    const tableName = GenerateTableName(field.component.name);
+                    try {
+                        const created = await CreateForeignKeyIndex(tableName, foreignKey);
+                        if (created) {
+                            createdIndexes.push(`${tableName}.${foreignKey}`);
+                        }
+                    } catch (error) {
+                        logger.warn(`Failed to create FK index for ${tableName}.${foreignKey}: ${error}`);
+                    }
+                }
+            }
+        }
+    }
+
+    if (createdIndexes.length > 0) {
+        logger.info(`Created ${createdIndexes.length} relation foreign key indexes`);
+    }
+};

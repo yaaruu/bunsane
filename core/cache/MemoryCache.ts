@@ -1,6 +1,14 @@
 import { type CacheProvider, type CacheStats } from './CacheProvider';
 import { logger } from '../Logger';
 
+function formatBytes(bytes: number): string {
+    if (bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    const value = bytes / Math.pow(1024, i);
+    return `${value.toFixed(2)} ${units[i]}`;
+}
+
 interface CacheEntry<T> {
     value: T;
     expiresAt?: number;
@@ -158,7 +166,8 @@ export class MemoryCache implements CacheProvider {
             misses: this.stats.misses,
             hitRate,
             size: this.stats.size,
-            memoryUsage: this.stats.memoryUsage
+            memoryUsage: this.stats.memoryUsage,
+            memoryUsageHuman: formatBytes(this.stats.memoryUsage)
         };
     }
 
