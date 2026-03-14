@@ -273,7 +273,8 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
               return entity;
             });
 
-            const mapKey = `${key.entityId}-${key.relationField}-${key.relatedType}`;
+            // Use null byte separator to prevent key collision when fields contain hyphens
+            const mapKey = `${key.entityId}\x00${key.relationField}\x00${key.relatedType}`;
             resultMap.set(mapKey, entities);
             
             logger.trace(`[RelationLoader] Mapped ${entities.length} entities for ${key.relationField} on ${key.entityId}`);
@@ -291,7 +292,8 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
           if (!k.entityId || typeof k.entityId !== 'string' || k.entityId.trim() === '') {
             return [];
           }
-          const mapKey = `${k.entityId}-${k.relationField}-${k.relatedType}`;
+          // Use null byte separator to prevent key collision when fields contain hyphens
+          const mapKey = `${k.entityId}\x00${k.relationField}\x00${k.relatedType}`;
           const result = resultMap.get(mapKey) || [];
           return result;
         });

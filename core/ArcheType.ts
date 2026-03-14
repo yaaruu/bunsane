@@ -1323,16 +1323,29 @@ export class BaseArcheType {
                             }
                         }
                     } else {
+                        // OPTIMIZED: Find candidate components first, then load in parallel
+                        const candidateComponents: Array<{ compCtor: any }> = [];
                         for (const compCtor of Object.values(this.componentMap)) {
                             const typeId = storage.getComponentId(compCtor.name);
                             const componentProps = storage.getComponentProperties(typeId);
                             const hasForeignKey = componentProps.some(prop => prop.propertyKey === foreignKey);
-                            if (!hasForeignKey) continue;
-                            
-                            const componentInstance = await entity.get(compCtor as any);
-                            if (componentInstance && (componentInstance as any)[foreignKey] !== undefined) {
-                                foreignId = (componentInstance as any)[foreignKey];
-                                break;
+                            if (hasForeignKey) {
+                                candidateComponents.push({ compCtor });
+                            }
+                        }
+
+                        if (candidateComponents.length > 0) {
+                            // Load all candidate components in parallel
+                            const componentInstances = await Promise.all(
+                                candidateComponents.map(({ compCtor }) => entity.get(compCtor as any))
+                            );
+
+                            // Find the first one with the foreign key value
+                            for (const componentInstance of componentInstances) {
+                                if (componentInstance && (componentInstance as any)[foreignKey] !== undefined) {
+                                    foreignId = (componentInstance as any)[foreignKey];
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1392,19 +1405,13 @@ export class BaseArcheType {
                     }
 
                     if (foreignKeyComponent) {
-                        // Query related entities
-                        const relatedEntities = await new Query()
-                            .with(foreignKeyComponent)
+                        // OPTIMIZED: Use Query with filter instead of fetching all + filtering in JS
+                        // This pushes the filtering to the database, avoiding N+1 queries
+                        const matchingEntities = await new Query()
+                            .with(foreignKeyComponent, {
+                                filters: [{ field: foreignKey, operator: '=', value: entity.id }]
+                            })
                             .exec();
-
-                        // Filter entities that reference this entity
-                        const matchingEntities: Entity[] = [];
-                        for (const relatedEntity of relatedEntities) {
-                            const componentInstance = await relatedEntity.get(foreignKeyComponent);
-                            if (componentInstance && (componentInstance as any)[foreignKey] === entity.id) {
-                                matchingEntities.push(relatedEntity);
-                            }
-                        }
 
                         // Attach as computed property
                         (entity as any)[fieldName] = matchingEntities;
@@ -2037,21 +2044,34 @@ export class BaseArcheType {
                                         }
                                     }
                                 } else {
-                                    // Original logic for flat foreign key
+                                    // OPTIMIZED: Load all candidate components in parallel via DataLoader
+                                    const candidateLoads: Array<{ compCtor: any; typeId: string }> = [];
                                     for (const [componentField, compCtor] of Object.entries(this.componentMap)) {
                                         const typeIdForComponent = storage.getComponentId(compCtor.name);
                                         const componentProps = storage.getComponentProperties(typeIdForComponent);
                                         const hasForeignKey = componentProps.some(prop => prop.propertyKey === foreignKey);
-                                        if (!hasForeignKey || !foreignKey) continue;
+                                        if (hasForeignKey && foreignKey) {
+                                            candidateLoads.push({ compCtor, typeId: typeIdForComponent });
+                                        }
+                                    }
 
-                                        const componentData = await context.loaders.componentsByEntityType.load({
-                                            entityId: entityId,
-                                            typeId: typeIdForComponent,
-                                        });
+                                    if (candidateLoads.length > 0) {
+                                        // Load all candidate components in parallel
+                                        const componentDataResults = await Promise.all(
+                                            candidateLoads.map(({ typeId }) =>
+                                                context.loaders.componentsByEntityType.load({
+                                                    entityId: entityId,
+                                                    typeId: typeId,
+                                                })
+                                            )
+                                        );
 
-                                        if (componentData?.data && componentData.data[foreignKey] !== undefined) {
-                                            foreignId = componentData.data[foreignKey];
-                                            break;
+                                        // Find the first one with the foreign key value
+                                        for (const componentData of componentDataResults) {
+                                            if (componentData?.data && componentData.data[foreignKey] !== undefined) {
+                                                foreignId = componentData.data[foreignKey];
+                                                break;
+                                            }
                                         }
                                     }
                                 }
@@ -2072,16 +2092,29 @@ export class BaseArcheType {
                                         }
                                     }
                                 } else {
-                                    // Original logic for flat foreign key
+                                    // OPTIMIZED: Find candidates first, then load in parallel
+                                    const candidateComponents: Array<{ compCtor: any }> = [];
                                     for (const compCtor of Object.values(this.componentMap)) {
                                         const typeIdForComponent = storage.getComponentId(compCtor.name);
                                         const componentProps = storage.getComponentProperties(typeIdForComponent);
                                         const hasForeignKey = componentProps.some(prop => prop.propertyKey === foreignKey);
-                                        if (!hasForeignKey || !foreignKey) continue;
-                                        const componentInstance = await entity.get(compCtor as any);
-                                        if (componentInstance && (componentInstance as any)[foreignKey] !== undefined) {
-                                            foreignId = (componentInstance as any)[foreignKey];
-                                            break;
+                                        if (hasForeignKey && foreignKey) {
+                                            candidateComponents.push({ compCtor });
+                                        }
+                                    }
+
+                                    if (candidateComponents.length > 0) {
+                                        // Load all candidate components in parallel
+                                        const componentInstances = await Promise.all(
+                                            candidateComponents.map(({ compCtor }) => entity.get(compCtor as any))
+                                        );
+
+                                        // Find the first one with the foreign key value
+                                        for (const componentInstance of componentInstances) {
+                                            if (componentInstance && (componentInstance as any)[foreignKey] !== undefined) {
+                                                foreignId = (componentInstance as any)[foreignKey];
+                                                break;
+                                            }
                                         }
                                     }
                                 }

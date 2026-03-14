@@ -35,3 +35,6 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .DS_Store
 
 .conductor
+
+# Benchmark databases (generated, large files)
+tests/benchmark/databases/

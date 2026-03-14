@@ -135,7 +135,9 @@ export class ComponentInclusionNode extends QueryNode {
 
             // Apply component filters for single component (normal path)
             // For single component, alias is 'ec' (or CTE name if using CTE)
-            sql = this.applyComponentFilters(context, componentIds, useCTE, useLateralJoins, lateralJoins, lateralConditions, sql, new Map(), useCTE ? context.cteName : "ec");
+            // Single component queries have WHERE from the initial select, so pass true
+            const singleCompHasWhere = sql.includes(' WHERE ');
+            sql = this.applyComponentFilters(context, componentIds, useCTE, useLateralJoins, lateralJoins, lateralConditions, sql, new Map(), useCTE ? context.cteName : "ec", singleCompHasWhere);
 
             // Apply sorting with component data joins if sortOrders are specified
             if (hasSortOrders) {
@@ -241,7 +243,10 @@ export class ComponentInclusionNode extends QueryNode {
 
             // Apply component filters for multiple components
             // For INTERSECT queries, alias is 'intersected'; for CTE, use cteName
-            sql = this.applyComponentFilters(context, componentIds, useCTE, useLateralJoins, lateralJoins, lateralConditions, sql, componentParamIndices, multiCompAlias);
+            // Pass outerHasWhere to correctly track WHERE clause in outer query (not in INTERSECT subqueries)
+            const filterResult = this.applyComponentFiltersWithState(context, componentIds, useCTE, useLateralJoins, lateralJoins, lateralConditions, sql, componentParamIndices, multiCompAlias, outerHasWhere);
+            sql = filterResult.sql;
+            outerHasWhere = filterResult.hasWhere;
 
             // Note: GROUP BY HAVING removed - INTERSECT already ensures all components are present
 
@@ -256,8 +261,10 @@ export class ComponentInclusionNode extends QueryNode {
                 // Apply cursor-based pagination if cursor is set (more efficient than OFFSET)
                 if (context.cursorId !== null && !context.paginationAppliedInCTE) {
                     const operator = context.cursorDirection === 'after' ? '>' : '<';
-                    const whereKeyword = sql.includes('WHERE') ? 'AND' : 'WHERE';
+                    // Use tracked WHERE state for INTERSECT queries
+                    const whereKeyword = outerHasWhere ? 'AND' : 'WHERE';
                     sql += ` ${whereKeyword} ${idColumn} ${operator} $${context.addParam(context.cursorId)}`;
+                    outerHasWhere = true;
                 }
 
                 // Order direction depends on cursor direction
@@ -374,9 +381,16 @@ export class ComponentInclusionNode extends QueryNode {
      *
      * This is dramatically faster because PostgreSQL can use indexes to find
      * the top N matching rows directly instead of finding ALL matches first.
+     *
+     * NOTE: This optimization cannot be used when multiple component types are required,
+     * because it only queries one component table and would miss the join requirement.
      */
     private applySinglePassFilterSort(context: QueryContext): string | null {
         if (context.sortOrders.length !== 1) return null;
+
+        // Can't use single-pass when multiple components are required
+        // (we need to ensure entities have ALL required components)
+        if (context.componentIds.size > 1) return null;
 
         const sortOrder = context.sortOrders[0]!;
         const sortTypeId = ComponentRegistry.getComponentId(sortOrder.component);
@@ -523,7 +537,7 @@ export class ComponentInclusionNode extends QueryNode {
 
     /**
      * Apply component filters using either EXISTS subqueries or LATERAL joins
-     * @param entityTableAlias - The alias for the entity table (e.g., 'ec', 'intersected', or CTE name)
+     * Wrapper that returns just the SQL string for backward compatibility
      */
     private applyComponentFilters(
         context: QueryContext,
@@ -534,8 +548,33 @@ export class ComponentInclusionNode extends QueryNode {
         lateralConditions: string[],
         sql: string,
         componentParamIndices: Map<string, number>,
-        entityTableAlias?: string
+        entityTableAlias?: string,
+        outerHasWhere: boolean = false
     ): string {
+        return this.applyComponentFiltersWithState(context, componentIds, useCTE, useLateralJoins, lateralJoins, lateralConditions, sql, componentParamIndices, entityTableAlias, outerHasWhere).sql;
+    }
+
+    /**
+     * Apply component filters using either EXISTS subqueries or LATERAL joins
+     * Returns both SQL and updated WHERE state for proper tracking
+     * @param entityTableAlias - The alias for the entity table (e.g., 'ec', 'intersected', or CTE name)
+     * @param outerHasWhere - Track if outer query already has WHERE clause (for INTERSECT queries)
+     */
+    private applyComponentFiltersWithState(
+        context: QueryContext,
+        componentIds: string[],
+        useCTE: boolean,
+        useLateralJoins: boolean,
+        lateralJoins: string[],
+        lateralConditions: string[],
+        sql: string,
+        componentParamIndices: Map<string, number>,
+        entityTableAlias?: string,
+        outerHasWhere: boolean = false
+    ): { sql: string; hasWhere: boolean } {
+        // Track whether we've added WHERE to the outer query
+        let hasOuterWhere = outerHasWhere;
+
         for (const [compId, filters] of context.componentFilters) {
             for (const filter of filters) {
                 let condition: string;
@@ -603,7 +642,8 @@ export class ComponentInclusionNode extends QueryNode {
 
                 // Use provided alias, or fall back to CTE name or 'ec'
                 const tableAlias = entityTableAlias || (useCTE ? context.cteName : "ec");
-                const whereKeyword = sql.includes('WHERE') ? 'AND' : 'WHERE';
+                // Use tracked WHERE state instead of sql.includes() to handle INTERSECT correctly
+                const whereKeyword = hasOuterWhere ? 'AND' : 'WHERE';
 
                 if (useLateralJoins) {
                     // Use LATERAL join approach
@@ -648,7 +688,7 @@ export class ComponentInclusionNode extends QueryNode {
                     // Use traditional EXISTS subquery
                     const componentTableName = this.getComponentTableName(compId);
                     const useDirectPartition = shouldUseDirectPartition() && componentTableName !== 'components';
-                    
+
                     if (useDirectPartition) {
                         // Direct partition access - query partition table directly by entity_id
                         sql += ` ${whereKeyword} EXISTS (
@@ -670,6 +710,8 @@ export class ComponentInclusionNode extends QueryNode {
                         AND c.deleted_at IS NULL
                     )`;
                     }
+                    // Mark that we've added WHERE to the outer query
+                    hasOuterWhere = true;
                 }
             }
         }
@@ -728,7 +770,7 @@ export class ComponentInclusionNode extends QueryNode {
             }
         }
 
-        return sql;
+        return { sql, hasWhere: hasOuterWhere };
     }
 
     public getNodeType(): string {
