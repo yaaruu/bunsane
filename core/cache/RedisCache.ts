@@ -13,8 +13,20 @@ export interface HealthStatus {
     connected: boolean;
     latency: number;
     memoryUsage?: number;
+    memoryUsageHuman?: string;
     connections?: number;
     version?: string;
+}
+
+/**
+ * Format bytes into human-readable string
+ */
+function formatBytes(bytes: number): string {
+    if (bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    const value = bytes / Math.pow(1024, i);
+    return `${value.toFixed(2)} ${units[i]}`;
 }
 
 export interface RedisCacheConfig {
@@ -108,7 +120,7 @@ export class RedisCache implements CacheProvider {
                 const memoryMatch = info.match(/used_memory:(\d+)/);
                 if (memoryMatch && memoryMatch[1]) {
                     const memoryUsage = parseInt(memoryMatch[1], 10);
-                    logger.debug({ msg: 'Redis memory usage', memoryUsage });
+                    logger.debug({ msg: 'Redis memory usage', memoryUsage: formatBytes(memoryUsage), memoryUsageBytes: memoryUsage });
                 }
             } catch (error) {
                 logger.error({ error, msg: 'Failed to get Redis memory info' });
@@ -311,7 +323,8 @@ export class RedisCache implements CacheProvider {
                 misses: this.stats.misses,
                 hitRate: this.stats.hits / (this.stats.hits + this.stats.misses) || 0,
                 size,
-                memoryUsage
+                memoryUsage,
+                memoryUsageHuman: memoryUsage !== undefined ? formatBytes(memoryUsage) : undefined
             };
         } catch (error) {
             logger.error({ error, msg: 'Redis getStats error' });
@@ -356,6 +369,7 @@ export class RedisCache implements CacheProvider {
                 connected: true,
                 latency,
                 memoryUsage,
+                memoryUsageHuman: memoryUsage !== undefined ? formatBytes(memoryUsage) : undefined,
                 connections,
                 version
             };

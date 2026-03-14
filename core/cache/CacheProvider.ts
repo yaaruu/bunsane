@@ -9,6 +9,7 @@ export interface CacheStats {
     hitRate: number;
     size: number;
     memoryUsage?: number;
+    memoryUsageHuman?: string;
 }
 
 export interface CacheProvider {
