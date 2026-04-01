@@ -25,7 +25,11 @@ export const FilterOp = {
     LIKE: "LIKE" as FilterOperator,
     ILIKE: "ILIKE" as FilterOperator,
     IN: "IN" as FilterOperator,
-    NOT_IN: "NOT IN" as FilterOperator
+    NOT_IN: "NOT IN" as FilterOperator,
+    CONTAINS: "CONTAINS" as FilterOperator,
+    CONTAINED_BY: "CONTAINED_BY" as FilterOperator,
+    HAS_ANY: "HAS_ANY" as FilterOperator,
+    HAS_ALL: "HAS_ALL" as FilterOperator,
 }
 
 export interface QueryFilter {

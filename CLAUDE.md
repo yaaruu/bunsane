@@ -134,6 +134,32 @@ class UserService extends BaseService {
 - PGlite: `CREATE INDEX CONCURRENTLY` must check `process.env.USE_PGLITE`
 - PGlite JSONB: pass JS objects directly, never `JSON.stringify() + ::jsonb`
 
+### Running Tests with PGlite
+
+**IMPORTANT**: To run tests with PGlite, always use `tests/pglite-setup.ts` as the entry point. This script starts an in-memory PostgreSQL server before spawning the test runner.
+
+```bash
+# Correct - uses pglite-setup.ts wrapper
+bun run test:pglite                              # All tests
+bun run test:pglite:unit                         # Unit tests only
+bun tests/pglite-setup.ts tests/unit/            # Specific directory
+bun tests/pglite-setup.ts path/to/file.test.ts   # Single file
+
+# WRONG - will fail with connection errors
+USE_PGLITE=true bun test path/to/file.test.ts    # Won't work!
+```
+
+The wrapper script:
+1. Starts PGlite Socket server on port 54321
+2. Sets required env vars (`USE_PGLITE`, `POSTGRES_*`)
+3. Spawns `bun test` with correct configuration
+4. Cleans up server on exit
+
+**PGlite limitations:**
+- `?|` and `?&` operators not supported (use `@>` / `<@` instead)
+- `CREATE INDEX CONCURRENTLY` not supported
+- Single connection only (`POSTGRES_MAX_CONNECTIONS=1`)
+
 ## Directory Structure
 
 ```

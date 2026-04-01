@@ -66,6 +66,31 @@ export function buildJSONPath(field: string, alias: string): string {
 }
 
 /**
+ * Build a JSON path expression that returns a JSONB node (not text)
+ *
+ * Unlike buildJSONPath which uses ->> (text extraction) at the leaf,
+ * this uses -> throughout, preserving the JSONB type. Required for
+ * JSONB operators like @>, <@, ?|, ?& that operate on JSONB values.
+ *
+ * @param field - The field path (e.g., "tags" or "metadata.tags")
+ * @param alias - The table alias (e.g., "c")
+ * @returns PostgreSQL JSONB path expression
+ *
+ * @example
+ * buildJSONBPath("tags", "c")          // "c.data->'tags'"
+ * buildJSONBPath("metadata.tags", "c") // "c.data->'metadata'->'tags'"
+ */
+export function buildJSONBPath(field: string, alias: string): string {
+    if (field.includes('.')) {
+        const parts = field.split('.');
+        const lastPart = parts.pop()!;
+        const nestedPath = parts.map(p => `'${p}'`).join('->');
+        return `${alias}.data->${nestedPath}->'${lastPart}'`;
+    }
+    return `${alias}.data->'${field}'`;
+}
+
+/**
  * Compose multiple filter builders into a single builder that applies all conditions
  *
  * This allows chaining multiple custom filters together (e.g., spatial proximity AND full-text search).
