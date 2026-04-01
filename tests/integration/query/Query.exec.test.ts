@@ -16,16 +16,28 @@ describe('Query Execution', () => {
     });
 
     describe('basic query execution', () => {
-        test('exec() returns entities with specified component', async () => {
-            const entity = ctx.tracker.create();
-            entity.add(TestUser, { name: 'QueryTest', email: 'query@example.com', age: 30 });
-            await entity.save();
+        test('exec() returns only entities with specified component', async () => {
+            // Positive case: entity WITH TestUser component
+            const withUser = ctx.tracker.create();
+            withUser.add(TestUser, { name: 'QueryTest', email: 'query@example.com', age: 30 });
+            await withUser.save();
+
+            // Negative case: entity WITHOUT TestUser component (only has TestProduct)
+            const withoutUser = ctx.tracker.create();
+            withoutUser.add(TestProduct, { sku: 'NO_USER', name: 'No User Product', price: 10, inStock: true });
+            await withoutUser.save();
 
             const results = await new Query()
                 .with(TestUser)
                 .exec();
 
-            expect(results.length).toBeGreaterThanOrEqual(1);
+            // Positive: entity with TestUser should be found
+            const foundWithUser = results.some(e => e.id === withUser.id);
+            expect(foundWithUser).toBe(true);
+
+            // Negative: entity without TestUser should NOT be found
+            const foundWithoutUser = results.some(e => e.id === withoutUser.id);
+            expect(foundWithoutUser).toBe(false);
         });
 
         test('populate() loads all component data', async () => {
@@ -282,11 +294,17 @@ describe('Query Execution', () => {
     });
 
     describe('multiple components', () => {
-        test('with() multiple components finds entities with all', async () => {
-            const entity = ctx.tracker.create();
-            entity.add(TestUser, { name: 'MultiComp', email: 'multi@example.com', age: 30 });
-            entity.add(TestProduct, { sku: 'MULTI', name: 'Multi Product', price: 50, inStock: true });
-            await entity.save();
+        test('with() multiple components finds only entities with ALL components', async () => {
+            // Positive case: entity with BOTH TestUser AND TestProduct
+            const withBoth = ctx.tracker.create();
+            withBoth.add(TestUser, { name: 'MultiComp', email: 'multi@example.com', age: 30 });
+            withBoth.add(TestProduct, { sku: 'MULTI', name: 'Multi Product', price: 50, inStock: true });
+            await withBoth.save();
+
+            // Negative case: entity with ONLY TestUser (missing TestProduct)
+            const withOnlyUser = ctx.tracker.create();
+            withOnlyUser.add(TestUser, { name: 'OnlyUser', email: 'onlyuser@example.com', age: 25 });
+            await withOnlyUser.save();
 
             const results = await new Query()
                 .with(TestUser)
@@ -294,10 +312,15 @@ describe('Query Execution', () => {
                 .populate()
                 .exec();
 
-            const found = results.find(e => e.id === entity.id);
-            expect(found).toBeDefined();
-            expect(found?.getInMemory(TestUser)).toBeDefined();
-            expect(found?.getInMemory(TestProduct)).toBeDefined();
+            // Positive: entity with both components should be found
+            const foundWithBoth = results.find(e => e.id === withBoth.id);
+            expect(foundWithBoth).toBeDefined();
+            expect(foundWithBoth?.getInMemory(TestUser)).toBeDefined();
+            expect(foundWithBoth?.getInMemory(TestProduct)).toBeDefined();
+
+            // Negative: entity with only one component should NOT be found
+            const foundWithOnlyUser = results.some(e => e.id === withOnlyUser.id);
+            expect(foundWithOnlyUser).toBe(false);
         });
 
         test('without() excludes entities with component', async () => {
@@ -317,6 +340,36 @@ describe('Query Execution', () => {
 
             const hasWithProduct = results.some(e => e.id === withProduct.id);
             expect(hasWithProduct).toBe(false);
+        });
+
+        test('with() 3+ components without filters finds entities with ALL components', async () => {
+            // Positive case: entity with ALL 3 components
+            const withAll = ctx.tracker.create();
+            withAll.add(TestUser, { name: 'AllThree', email: 'allthree@example.com', age: 30 });
+            withAll.add(TestProduct, { sku: 'ALL3', name: 'All Three Product', price: 100, inStock: true });
+            withAll.add(TestOrder, { orderNumber: 'ORD-ALL3', total: 100, status: 'pending' });
+            await withAll.save();
+
+            // Negative case: entity with only 2 of 3 components (missing TestOrder)
+            const withTwo = ctx.tracker.create();
+            withTwo.add(TestUser, { name: 'TwoOnly', email: 'twoonly@example.com', age: 25 });
+            withTwo.add(TestProduct, { sku: 'TWO', name: 'Two Only Product', price: 50, inStock: true });
+            await withTwo.save();
+
+            // Query for entities with all 3 components - NO FILTERS
+            const results = await new Query()
+                .with(TestUser)
+                .with(TestProduct)
+                .with(TestOrder)
+                .exec();
+
+            // Positive: entity with all 3 components should be found
+            const foundWithAll = results.some(e => e.id === withAll.id);
+            expect(foundWithAll).toBe(true);
+
+            // Negative: entity with only 2 components should NOT be found
+            const foundWithTwo = results.some(e => e.id === withTwo.id);
+            expect(foundWithTwo).toBe(false);
         });
     });
 

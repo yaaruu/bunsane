@@ -35,6 +35,7 @@ const proc = spawn('bun', ['test', ...testDirs], {
     env: {
         ...process.env,
         USE_PGLITE: 'true',
+        DB_CONNECTION_URL: '', // Clear to use POSTGRES_* vars
         POSTGRES_HOST: 'localhost',
         POSTGRES_PORT: String(PORT),
         POSTGRES_USER: 'postgres',

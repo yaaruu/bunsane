@@ -160,9 +160,9 @@ WHERE component_types @> ARRAY[$1, $2]::text[]
 ## Migration Strategy
 
 1. New indexes are additive (no breaking changes)
-2. Query changes behind feature flag: `BUNSANE_QUERY_V2=true`
-3. Gradual rollout with A/B testing on query performance
-4. Deprecate old patterns after validation
+2. Query optimizations are **always on** (no feature flag needed)
+3. INTERSECT + scalar subquery patterns enabled by default since v0.2.7
+4. LATERAL joins disabled for INTERSECT queries to fix SQL generation bug (2026-03-14)
 
 ## Files to Modify
 
