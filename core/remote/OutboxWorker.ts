@@ -1,0 +1,176 @@
+/**
+ * Remote Communication: OutboxWorker
+ *
+ * Polls `remote_outbox` for unpublished rows, publishes each to Redis, and
+ * marks the row published. Uses `FOR UPDATE SKIP LOCKED` so multiple
+ * instances can run workers concurrently without double-publishing:
+ * each row is claimed by exactly one worker per batch.
+ *
+ * At-least-once semantics: if the worker crashes after XADD but before the
+ * UPDATE commits, the row stays pending and will be republished. Consumers
+ * must be idempotent — enforce this at the handler level (e.g., dedup on
+ * `ctx.messageId` or domain-level idempotency keys).
+ */
+
+import type Redis from "ioredis";
+import type { SQL } from "bun";
+import { logger } from "../Logger";
+import type { RemoteMetrics } from "./metrics";
+
+const loggerInstance = logger.child({ scope: "OutboxWorker" });
+
+export interface OutboxWorkerConfig {
+    sourceApp: string;
+    streamPrefix: string;
+    pollIntervalMs: number;
+    batchSize: number;
+    enableLogging: boolean;
+}
+
+interface OutboxRow {
+    id: string;
+    target: string;
+    event: string;
+    data: unknown;
+    created_at: Date;
+}
+
+export class OutboxWorker {
+    private db: SQL;
+    private publisher: Redis;
+    private config: OutboxWorkerConfig;
+    private running = false;
+    private timer: ReturnType<typeof setTimeout> | null = null;
+    private currentTick: Promise<void> | null = null;
+    private metrics?: RemoteMetrics;
+
+    constructor(
+        db: SQL,
+        publisher: Redis,
+        config: OutboxWorkerConfig,
+        metrics?: RemoteMetrics
+    ) {
+        this.db = db;
+        this.publisher = publisher;
+        this.config = config;
+        this.metrics = metrics;
+    }
+
+    async start(): Promise<void> {
+        if (this.running) return;
+        this.running = true;
+        this.scheduleNext(0);
+        loggerInstance.info(
+            `OutboxWorker started pollMs=${this.config.pollIntervalMs} batch=${this.config.batchSize}`
+        );
+    }
+
+    async stop(): Promise<void> {
+        if (!this.running) return;
+        this.running = false;
+        if (this.timer) {
+            clearTimeout(this.timer);
+            this.timer = null;
+        }
+        if (this.currentTick) {
+            await this.currentTick.catch(() => {});
+        }
+        loggerInstance.info("OutboxWorker stopped");
+    }
+
+    /**
+     * Force an immediate tick. Used during shutdown to flush any
+     * committed-but-unpublished rows before the process exits.
+     */
+    async flush(): Promise<void> {
+        await this.tick();
+    }
+
+    private scheduleNext(delayMs: number): void {
+        if (!this.running) return;
+        this.timer = setTimeout(() => {
+            this.currentTick = this.tick().finally(() => {
+                this.currentTick = null;
+                this.scheduleNext(this.config.pollIntervalMs);
+            });
+        }, delayMs);
+    }
+
+    private async tick(): Promise<void> {
+        if (!this.running) return;
+        try {
+            await this.processBatch();
+        } catch (error: any) {
+            loggerInstance.error(
+                { err: error, msg: "OutboxWorker tick error" }
+            );
+        }
+    }
+
+    private async processBatch(): Promise<void> {
+        const db = this.db as any;
+        await db.begin(async (trx: any) => {
+            const rows: OutboxRow[] = await trx`
+                SELECT id, target, event, data, created_at
+                FROM remote_outbox
+                WHERE published_at IS NULL
+                ORDER BY created_at
+                LIMIT ${this.config.batchSize}
+                FOR UPDATE SKIP LOCKED
+            `;
+
+            if (rows.length === 0) return;
+
+            this.metrics?.outboxClaimed(rows.length);
+            if (this.config.enableLogging) {
+                loggerInstance.debug(`Claimed ${rows.length} outbox rows`);
+            }
+
+            const successIds: string[] = [];
+
+            for (const row of rows) {
+                const stream = `${this.config.streamPrefix}${row.target}`;
+                const envelope = JSON.stringify({
+                    kind: "event",
+                    sourceApp: this.config.sourceApp,
+                    event: row.event,
+                    data: row.data,
+                    emittedAt: row.created_at.getTime(),
+                });
+                try {
+                    await this.publisher.xadd(
+                        stream,
+                        "*",
+                        "data",
+                        envelope
+                    );
+                    successIds.push(row.id);
+                } catch (err: any) {
+                    this.metrics?.outboxPublishFailed();
+                    loggerInstance.error(
+                        {
+                            err,
+                            outboxId: row.id,
+                            target: row.target,
+                            event: row.event,
+                            msg: "Outbox XADD failed — row will retry next tick",
+                        }
+                    );
+                    // Leave row unpublished; SKIP LOCKED releases on tx end
+                    // so next tick (or another instance) picks it up.
+                }
+            }
+
+            if (successIds.length > 0) {
+                for (const id of successIds) {
+                    await trx`
+                        UPDATE remote_outbox
+                        SET published_at = NOW()
+                        WHERE id = ${id}::uuid
+                    `;
+                }
+                this.metrics?.outboxPublished(successIds.length);
+            }
+        });
+    }
+}

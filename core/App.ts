@@ -26,6 +26,12 @@ import studioEndpoint from "../endpoints";
 import { type Middleware, composeMiddleware } from "./Middleware";
 import { deepHealthCheck, readinessCheck } from "./health";
 import { validateEnv } from "./validateEnv";
+import {
+    RemoteManager,
+    registerRemoteHandlers,
+    setRemoteManager,
+} from "./remote";
+import type { RemoteManagerConfig } from "./remote";
 
 export type CorsConfig = {
     origin?: string | string[] | ((origin: string) => boolean);
@@ -70,6 +76,8 @@ export default class App {
     private composedHandler: ((req: Request) => Promise<Response>) | null = null;
 
     private studioEnabled: boolean = false;
+    private remote: RemoteManager | null = null;
+    private remoteConfig: Partial<RemoteManagerConfig> | null = null;
     private server: ReturnType<typeof Bun.serve> | null = null;
     private isShuttingDown = false;
     private isReady = false;
@@ -253,6 +261,40 @@ export default class App {
                         logger.info(
                             `Registered scheduled tasks for ${services.length} services`
                         );
+
+                        // Initialize RemoteManager (opt-in via enableRemote())
+                        if (this.remoteConfig) {
+                            try {
+                                const rmConfig: RemoteManagerConfig = {
+                                    appName:
+                                        this.remoteConfig.appName ||
+                                        this.name,
+                                    ...this.remoteConfig,
+                                };
+                                this.remote = new RemoteManager(rmConfig);
+                                setRemoteManager(this.remote);
+                                await this.remote.start();
+
+                                for (const service of services) {
+                                    try {
+                                        registerRemoteHandlers(service);
+                                    } catch (error) {
+                                        logger.warn(
+                                            `Failed to register remote handlers for service ${service.constructor.name}`
+                                        );
+                                        logger.warn(error);
+                                    }
+                                }
+                                logger.info(
+                                    `RemoteManager initialized for app "${rmConfig.appName}"`
+                                );
+                            } catch (error) {
+                                logger.error(
+                                    "Failed to start RemoteManager:"
+                                );
+                                logger.error(error);
+                            }
+                        }
 
                         // Collect REST endpoints from all services
                         for (const service of services) {
@@ -556,6 +598,31 @@ export default class App {
                     JSON.stringify(metrics),
                     {
                         status: 200,
+                        headers: { "Content-Type": "application/json" },
+                    }
+                ), req);
+            }
+
+            // Remote health check
+            if (url.pathname === "/health/remote") {
+                clearTimeout(timeoutId);
+                if (!this.remote) {
+                    return this.addCorsHeaders(new Response(
+                        JSON.stringify({
+                            healthy: false,
+                            error: "Remote subsystem not enabled",
+                        }),
+                        {
+                            status: 503,
+                            headers: { "Content-Type": "application/json" },
+                        }
+                    ), req);
+                }
+                const health = await this.remote.health();
+                return this.addCorsHeaders(new Response(
+                    JSON.stringify(health),
+                    {
+                        status: health.healthy ? 200 : 503,
                         headers: { "Content-Type": "application/json" },
                     }
                 ), req);
@@ -911,8 +978,25 @@ export default class App {
         this.name = name;
     }
 
+    public getName(): string {
+        return this.name;
+    }
+
     public setVersion(version: string) {
         this.version = version;
+    }
+
+    /**
+     * Enable remote cross-app communication over Redis Streams.
+     * Must be called before `init()` (initialization happens in SYSTEM_READY).
+     * `appName` defaults to the app name.
+     */
+    public enableRemote(config: Partial<RemoteManagerConfig> = {}) {
+        this.remoteConfig = config;
+    }
+
+    public getRemote(): RemoteManager | null {
+        return this.remote;
     }
 
     public subscribeAppReady(callback: () => void) {
@@ -1023,6 +1107,7 @@ export default class App {
             cache: cacheStats,
             scheduler: SchedulerManager.getInstance().getMetrics(),
             preparedStatements: preparedStatementCache.getStats(),
+            remote: this.remote ? this.remote.getMetrics() : null,
         };
     }
 
@@ -1125,6 +1210,18 @@ export default class App {
             logger.info({ scope: 'app', component: 'App', msg: 'Scheduler stopped' });
         } catch (error) {
             logger.warn({ scope: 'app', component: 'App', msg: 'Scheduler stop error', error });
+        }
+
+        // Shutdown RemoteManager (after scheduler, before cache — DB still available)
+        if (this.remote) {
+            try {
+                await this.remote.shutdown();
+                setRemoteManager(null);
+                this.remote = null;
+                logger.info({ scope: 'app', component: 'App', msg: 'RemoteManager shutdown' });
+            } catch (error) {
+                logger.warn({ scope: 'app', component: 'App', msg: 'RemoteManager shutdown error', error });
+            }
         }
 
         // Shutdown cache

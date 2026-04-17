@@ -1,110 +1,118 @@
 /**
  * Distributed Lock using PostgreSQL Advisory Locks
  *
- * PostgreSQL advisory locks are application-level locks that can be used
- * to coordinate between multiple application instances. They are:
- * - Session-based: automatically released when connection closes
- * - Non-blocking with pg_try_advisory_lock
- * - Perfect for distributed task scheduling
+ * PostgreSQL advisory locks are session-level (bound to the connection that
+ * acquired them). Bun's SQL pool hands out a different connection per query,
+ * so naively calling `pg_try_advisory_lock` on the pooled client leaves the
+ * lock stranded on whichever connection was used — `pg_advisory_unlock` on a
+ * different connection silently returns `false` and the lock is held until
+ * that connection eventually closes.
+ *
+ * Fix: reserve a dedicated connection via `sql.reserve()` once per instance
+ * and route every lock/unlock query through it. All locks owned by this
+ * instance live in one PostgreSQL session, so unlock always hits the session
+ * that acquired the lock. If the process crashes, PostgreSQL terminates the
+ * session and every held lock is released automatically — no cleanup needed.
+ *
+ * The reservation is lazy (acquired on first use) and released when either
+ * `releaseAll()` is called or no locks remain outstanding, so idle instances
+ * do not permanently consume a pool slot.
  *
  * @see https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS
  */
 
+import type { ReservedSQL } from "bun";
 import db from "../../database";
 import { logger } from "../Logger";
 
 const loggerInstance = logger.child({ scope: "DistributedLock" });
 
-/**
- * Result of a lock acquisition attempt
- */
 export interface LockResult {
     acquired: boolean;
     lockKey: bigint;
     taskId: string;
 }
 
-/**
- * Configuration for the distributed lock system
- */
 export interface DistributedLockConfig {
-    /** Whether distributed locking is enabled */
     enabled: boolean;
-    /** Prefix for lock keys to avoid collisions with other applications */
     lockKeyPrefix: number;
-    /** Whether to log lock acquisition/release events */
     enableLogging: boolean;
-    /** Timeout for lock acquisition attempts in milliseconds (0 = no retry) */
+    /** Timeout for lock acquisition attempts in ms (0 = no retry) */
     lockTimeout: number;
     /** Retry interval when lockTimeout > 0 */
     retryInterval: number;
 }
 
-/**
- * Default configuration
- */
 export const DEFAULT_LOCK_CONFIG: DistributedLockConfig = {
     enabled: true,
     lockKeyPrefix: 0x42554E53, // "BUNS" in hex as a namespace prefix
     enableLogging: false,
-    lockTimeout: 0, // No retry by default - skip if can't acquire
+    lockTimeout: 0,
     retryInterval: 100,
 };
 
-/**
- * Distributed Lock Manager using PostgreSQL Advisory Locks
- *
- * Provides distributed coordination for scheduled tasks across multiple
- * application instances. Uses PostgreSQL's advisory lock system which
- * guarantees that only one instance can hold a lock at a time.
- *
- * Advisory locks are automatically released when:
- * - Explicitly unlocked via pg_advisory_unlock
- * - The database session ends
- * - The connection is closed
- */
 export class DistributedLock {
     private config: DistributedLockConfig;
     private heldLocks: Set<string> = new Set();
+    private reservedConn: ReservedSQL | null = null;
+    private reservePromise: Promise<ReservedSQL> | null = null;
 
     constructor(config: Partial<DistributedLockConfig> = {}) {
         this.config = { ...DEFAULT_LOCK_CONFIG, ...config };
     }
 
-    /**
-     * Generate a consistent 64-bit lock key from a task ID
-     * Uses a simple hash function to convert string task IDs to bigints
-     *
-     * The lock key is composed of:
-     * - Upper 32 bits: lockKeyPrefix (namespace)
-     * - Lower 32 bits: hash of taskId
-     */
     private generateLockKey(taskId: string): bigint {
-        // Simple hash function for the task ID
         let hash = 0;
         for (let i = 0; i < taskId.length; i++) {
             const char = taskId.charCodeAt(i);
             hash = ((hash << 5) - hash) + char;
-            hash = hash & hash; // Convert to 32-bit integer
+            hash = hash & hash;
         }
-        // Make it positive
         hash = Math.abs(hash);
 
-        // Combine prefix (upper 32 bits) with hash (lower 32 bits)
         const prefix = BigInt(this.config.lockKeyPrefix);
-        const hashBigInt = BigInt(hash >>> 0); // Ensure unsigned
+        const hashBigInt = BigInt(hash >>> 0);
         return (prefix << 32n) | hashBigInt;
     }
 
     /**
-     * Try to acquire a distributed lock for a task
-     *
-     * Uses pg_try_advisory_lock which is non-blocking:
-     * - Returns true immediately if lock is available
-     * - Returns false immediately if lock is held by another session
-     *
-     * @param taskId The unique identifier for the task
-     * @returns LockResult indicating whether the lock was acquired
+     * Lazily reserve one dedicated connection that owns every advisory lock
+     * this instance takes. Concurrent callers share the same reservation via
+     * `reservePromise`.
+     */
+    private async ensureReserved(): Promise<ReservedSQL> {
+        if (this.reservedConn) return this.reservedConn;
+        if (!this.reservePromise) {
+            this.reservePromise = db.reserve().then((conn) => {
+                this.reservedConn = conn;
+                this.reservePromise = null;
+                return conn;
+            });
+        }
+        return this.reservePromise;
+    }
+
+    /**
+     * Release the pinned connection back to the pool. Only safe when no
+     * advisory locks are currently held on this instance — otherwise the
+     * session would be closed and locks forfeited.
+     */
+    private releaseReservation(): void {
+        if (!this.reservedConn) return;
+        try {
+            this.reservedConn.release();
+        } catch (error) {
+            loggerInstance.warn(
+                `Failed to release reserved connection: ${error instanceof Error ? error.message : String(error)}`
+            );
+        }
+        this.reservedConn = null;
+    }
+
+    /**
+     * Try to acquire a distributed lock for a task. Non-blocking when
+     * `lockTimeout` is 0 (default); retries every `retryInterval` ms up to
+     * `lockTimeout` otherwise.
      */
     async tryAcquire(taskId: string): Promise<LockResult> {
         if (!this.config.enabled) {
@@ -112,141 +120,179 @@ export class DistributedLock {
         }
 
         const lockKey = this.generateLockKey(taskId);
+
+        if (this.heldLocks.has(taskId)) {
+            if (this.config.enableLogging) {
+                loggerInstance.debug(
+                    `Lock for ${taskId} already held locally, returning acquired`
+                );
+            }
+            return { acquired: true, lockKey, taskId };
+        }
+
         const startTime = Date.now();
 
         try {
-            // Try to acquire the lock
-            let acquired = await this.attemptLock(lockKey);
+            const conn = await this.ensureReserved();
 
-            // If lockTimeout > 0, retry until timeout
+            let acquired = await this.attemptLock(conn, lockKey);
+
             if (!acquired && this.config.lockTimeout > 0) {
-                while (!acquired && (Date.now() - startTime) < this.config.lockTimeout) {
+                while (
+                    !acquired &&
+                    Date.now() - startTime < this.config.lockTimeout
+                ) {
                     await this.sleep(this.config.retryInterval);
-                    acquired = await this.attemptLock(lockKey);
+                    acquired = await this.attemptLock(conn, lockKey);
                 }
             }
 
             if (acquired) {
                 this.heldLocks.add(taskId);
                 if (this.config.enableLogging) {
-                    loggerInstance.debug(`Acquired lock for task ${taskId} (key: ${lockKey})`);
+                    loggerInstance.debug(
+                        `Acquired lock for task ${taskId} (key: ${lockKey})`
+                    );
                 }
-            } else {
-                if (this.config.enableLogging) {
-                    loggerInstance.debug(`Failed to acquire lock for task ${taskId} (key: ${lockKey}) - another instance is executing`);
-                }
+                return { acquired: true, lockKey, taskId };
             }
 
-            return { acquired, lockKey, taskId };
+            // No locks taken on this attempt — if nothing else is held,
+            // return the reserved connection to the pool.
+            if (this.heldLocks.size === 0) {
+                this.releaseReservation();
+            }
+
+            if (this.config.enableLogging) {
+                loggerInstance.debug(
+                    `Failed to acquire lock for task ${taskId} (key: ${lockKey}) — another instance is executing`
+                );
+            }
+            return { acquired: false, lockKey, taskId };
         } catch (error) {
-            loggerInstance.error(`Error acquiring lock for task ${taskId}: ${error instanceof Error ? error.message : String(error)}`);
-            // On error, return false to be safe (don't execute without lock)
+            loggerInstance.error(
+                `Error acquiring lock for task ${taskId}: ${error instanceof Error ? error.message : String(error)}`
+            );
+            if (this.heldLocks.size === 0) {
+                this.releaseReservation();
+            }
             return { acquired: false, lockKey, taskId };
         }
     }
 
     /**
-     * Attempt to acquire the PostgreSQL advisory lock
-     */
-    private async attemptLock(lockKey: bigint): Promise<boolean> {
-        const result = await db`
-            SELECT pg_try_advisory_lock(${lockKey}::bigint) as pg_try_advisory_lock
-        `;
-        return result[0]?.pg_try_advisory_lock ?? false;
-    }
-
-    /**
-     * Release a distributed lock for a task
-     *
-     * Uses pg_advisory_unlock to explicitly release the lock.
-     * The lock is also automatically released if the connection closes.
-     *
-     * @param taskId The unique identifier for the task
-     * @returns true if the lock was released, false if it wasn't held
+     * Release a single distributed lock. When the last lock is released the
+     * reserved connection is returned to the pool.
      */
     async release(taskId: string): Promise<boolean> {
         if (!this.config.enabled) {
             return true;
         }
 
+        if (!this.heldLocks.has(taskId)) {
+            if (this.config.enableLogging) {
+                loggerInstance.warn(
+                    `Lock for task ${taskId} was not held or already released`
+                );
+            }
+            return false;
+        }
+
         const lockKey = this.generateLockKey(taskId);
 
+        if (!this.reservedConn) {
+            loggerInstance.warn(
+                `No reserved connection available for ${taskId}; dropping from heldLocks`
+            );
+            this.heldLocks.delete(taskId);
+            return false;
+        }
+
         try {
-            const result = await db`
+            const result = await this.reservedConn`
                 SELECT pg_advisory_unlock(${lockKey}::bigint) as pg_advisory_unlock
             `;
-
             const released = result[0]?.pg_advisory_unlock ?? false;
 
-            if (released) {
-                this.heldLocks.delete(taskId);
-                if (this.config.enableLogging) {
-                    loggerInstance.debug(`Released lock for task ${taskId} (key: ${lockKey})`);
-                }
-            } else {
-                if (this.config.enableLogging) {
-                    loggerInstance.warn(`Lock for task ${taskId} was not held or already released`);
-                }
+            this.heldLocks.delete(taskId);
+
+            if (released && this.config.enableLogging) {
+                loggerInstance.debug(
+                    `Released lock for task ${taskId} (key: ${lockKey})`
+                );
+            } else if (!released) {
+                loggerInstance.warn(
+                    `pg_advisory_unlock returned false for task ${taskId} (key: ${lockKey})`
+                );
             }
 
+            if (this.heldLocks.size === 0) {
+                this.releaseReservation();
+            }
             return released;
         } catch (error) {
-            loggerInstance.error(`Error releasing lock for task ${taskId}: ${error instanceof Error ? error.message : String(error)}`);
-            this.heldLocks.delete(taskId); // Remove from tracking even on error
+            loggerInstance.error(
+                `Error releasing lock for task ${taskId}: ${error instanceof Error ? error.message : String(error)}`
+            );
+            this.heldLocks.delete(taskId);
+            if (this.heldLocks.size === 0) {
+                this.releaseReservation();
+            }
             return false;
         }
     }
 
     /**
-     * Release all locks held by this instance
-     * Useful during shutdown
+     * Release all held locks. Safe to call during shutdown.
      */
     async releaseAll(): Promise<void> {
         const tasks = Array.from(this.heldLocks);
         for (const taskId of tasks) {
             await this.release(taskId);
         }
+        // release() returns the reservation once heldLocks empties, but if
+        // nothing was held we still need to clean up any pending reservation.
+        if (this.heldLocks.size === 0) {
+            this.releaseReservation();
+        }
     }
 
-    /**
-     * Check if a lock is currently held (locally tracked)
-     */
     isHeld(taskId: string): boolean {
         return this.heldLocks.has(taskId);
     }
 
-    /**
-     * Get the count of locks held by this instance
-     */
     getHeldLockCount(): number {
         return this.heldLocks.size;
     }
 
-    /**
-     * Update the configuration
-     */
     updateConfig(config: Partial<DistributedLockConfig>): void {
         this.config = { ...this.config, ...config };
     }
 
-    /**
-     * Get current configuration
-     */
     getConfig(): DistributedLockConfig {
         return { ...this.config };
     }
 
+    private async attemptLock(
+        conn: ReservedSQL,
+        lockKey: bigint
+    ): Promise<boolean> {
+        const result = await conn`
+            SELECT pg_try_advisory_lock(${lockKey}::bigint) as pg_try_advisory_lock
+        `;
+        return result[0]?.pg_try_advisory_lock ?? false;
+    }
+
     private sleep(ms: number): Promise<void> {
-        return new Promise(resolve => setTimeout(resolve, ms));
+        return new Promise((resolve) => setTimeout(resolve, ms));
     }
 }
 
-/**
- * Singleton instance for global access
- */
 let distributedLockInstance: DistributedLock | null = null;
 
-export function getDistributedLock(config?: Partial<DistributedLockConfig>): DistributedLock {
+export function getDistributedLock(
+    config?: Partial<DistributedLockConfig>
+): DistributedLock {
     if (!distributedLockInstance) {
         distributedLockInstance = new DistributedLock(config);
     } else if (config) {
@@ -255,9 +301,6 @@ export function getDistributedLock(config?: Partial<DistributedLockConfig>): Dis
     return distributedLockInstance;
 }
 
-/**
- * Reset the singleton instance (useful for testing)
- */
 export function resetDistributedLock(): void {
     if (distributedLockInstance) {
         distributedLockInstance.releaseAll().catch(() => {});
