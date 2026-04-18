@@ -4,6 +4,60 @@ All notable changes to bunsane are documented here.
 
 ## Unreleased
 
+### Fixed (PR E — outbox, cache, query hardening)
+
+- **OutboxWorker publishes to Redis concurrently and marks rows in bulk.**
+  Previously `processBatch` awaited each `publisher.xadd` serially inside
+  the PG transaction, holding `FOR UPDATE` row locks for up to N ×
+  `commandTimeout` when Redis was slow. Now uses `Promise.allSettled` to
+  publish the whole batch in parallel — worst-case lock hold drops to a
+  single xadd timeout. Followed by a single bulk `UPDATE … WHERE id IN
+  …` instead of N serial updates. Tickets H-DB-1 (partial — full fix
+  needs claim-via-column redesign so Redis latency is outside the PG
+  transaction entirely) and H-DB-3.
+
+- **`Entity.save` pre-flights `ComponentRegistry.getReadyPromise` outside
+  the transaction.** Previously `doSave` awaited registry readiness from
+  inside `executeSave`, so a slow DDL (partition creation) would keep a PG
+  transaction idle. Pre-flight loop in `save()` awaits readiness before
+  opening the transaction; `doSave` now only asserts readiness and throws
+  if a caller bypassed `save()`. Ticket H-DB-4.
+
+- **Entity.set / Entity.remove fire-and-forget cache ops now drainable on
+  shutdown.** Previously `setImmediate(async () => { … })` was untracked,
+  so SIGTERM could abandon in-flight cache writes. `Entity.pendingCacheOps`
+  is a drainable `Set<Promise<void>>`, and `Entity.drainPendingCacheOps`
+  is awaited by `App.shutdown` between HTTP drain and cache disconnect.
+  Ticket H-CACHE-1.
+
+- **`CacheManager.shutdownProvider` descends into `MultiLevelCache` layers.**
+  Previously only checked the top-level provider for `disconnect` /
+  `stopCleanup` methods, so a MultiLevelCache deployment left its inner
+  MemoryCache cleanup timer and Redis connection alive forever. Now
+  dispatches to `getL1Cache()` and `getL2Cache()` when available. Ticket
+  H-CACHE-2.
+
+- **`setComponentWriteThrough` preserves `createdAt` across updates.**
+  Previously every write-through stamped `createdAt: new Date()`,
+  corrupting the timeline across consecutive updates. Now peeks the
+  existing cache entry and preserves its `createdAt` when present; only
+  `updatedAt` is stamped fresh. Full fix (BaseComponent tracking
+  timestamps natively) deferred. Ticket H-CACHE-3.
+
+- **Default query limit applied when `.take()` is omitted.** `Query.exec()`
+  now applies a framework-level default LIMIT
+  (env `BUNSANE_DEFAULT_QUERY_LIMIT`, default 10000, 0 to disable) and
+  emits a warning so runaway queries are visible. Ticket H-QUERY-1.
+
+- **OrNode debug `console.log` traces removed from the production path.**
+  Ticket H-QUERY-2.
+
+- **`unregisterDecoratedHooks` now actually unregisters.** Previously a
+  no-op stub that warned to stderr. Hook IDs returned from each
+  registration are stored in a `WeakMap<instance, string[]>` and passed
+  to `EntityHookManager.removeHook` on tear-down. Enables per-instance
+  cleanup in tests and service destruction. Ticket H-HOOK-3.
+
 ### Fixed (PR D — scheduler + hook concurrency hardening)
 
 - **Entity.add / Entity.set / Entity.remove hook calls no longer leak

@@ -305,15 +305,13 @@ export class OrNode extends QueryNode {
     public execute(context: QueryContext): QueryResult {
         // Try optimized UNION ALL path for direct partition access
         // This avoids the slow multi-partition scanning by querying each partition directly
+        // (Verbose console.log debug traces removed — H-QUERY-2. Re-enable via
+        // a framework logger at debug level if needed.)
         const canUseOptimized = this.canUseUnionAllOptimization() && this.dependencies.length === 0;
-        console.log(`OrNode: Using optimized path: ${canUseOptimized}, dependencies: ${this.dependencies.length}, direct partition: ${require("../core/Config").shouldUseDirectPartition()}`);
-        console.log(`OrNode: Component types:`, Array.from(this.orQuery.getComponentTypes()));
 
         if (canUseOptimized) {
-            console.log("OrNode: Using optimized UNION path");
             return this.executeUnionAllOptimized(context);
         }
-        console.log("OrNode: Using fallback path");
 
         // Fall back to original implementation for:
         // - HASH partitioning (no direct partition access)

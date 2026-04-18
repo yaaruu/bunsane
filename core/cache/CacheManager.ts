@@ -201,27 +201,45 @@ export class CacheManager {
 
         try {
             const effectiveTTL = ttl ?? this.config.component.ttl;
-            
-            // Convert BaseComponent to ComponentData format for cache compatibility with DataLoader
+
+            // Convert BaseComponent to ComponentData format for cache
+            // compatibility with DataLoader. BaseComponent does not track
+            // createdAt/updatedAt today (data-model gap), but we preserve an
+            // existing cache entry's createdAt when available and stamp
+            // updatedAt=now, so consumers see monotonic update times rather
+            // than a reset on every write-through (H-CACHE-3 — full fix
+            // requires BaseComponent timestamp tracking).
             for (const component of components) {
                 const typeId = componentType || component.getTypeID();
                 const key = `component:${entityId}:${typeId}`;
-                
-                // Create ComponentData structure matching what DataLoader expects
+
+                const now = new Date();
+                let createdAt: Date = now;
+                try {
+                    const existing = await this.provider.get<ComponentData>(key);
+                    if (existing && existing.createdAt) {
+                        createdAt = existing.createdAt instanceof Date
+                            ? existing.createdAt
+                            : new Date(existing.createdAt);
+                    }
+                } catch {
+                    // Cache miss or provider error — fall through to now.
+                }
+
                 const componentData: ComponentData = {
                     id: component.id,
                     entityId: entityId,
                     typeId: typeId,
                     data: component.data(),
-                    createdAt: new Date(), // Component doesn't track this, use current time
-                    updatedAt: new Date(),
+                    createdAt,
+                    updatedAt: now,
                     deletedAt: null
                 };
-                
+
                 await this.provider.set(key, componentData, effectiveTTL);
             }
         } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error setting components in cache', error });
+            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error setting components in cache', err: error });
         }
     }
 
@@ -489,21 +507,40 @@ export class CacheManager {
     }
 
     /**
-     * Shutdown the current provider (disconnect Redis, stop Memory cleanup timer)
+     * Shutdown the current provider (disconnect Redis, stop Memory cleanup
+     * timer). For `MultiLevelCache`, descends into both L1 and L2 layers —
+     * previously the method only dispatched on the top-level provider, so a
+     * MultiLevelCache left its inner `MemoryCache` cleanup timer and Redis
+     * connection alive (H-CACHE-2).
      */
     private async shutdownProvider(): Promise<void> {
+        const shutdownOne = async (p: any) => {
+            try {
+                if (p && typeof p.disconnect === 'function') {
+                    await p.disconnect();
+                }
+                if (p && typeof p.stopCleanup === 'function') {
+                    p.stopCleanup();
+                }
+            } catch (error) {
+                logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error shutting down layer', err: error });
+            }
+        };
+
         try {
             const provider = this.provider as any;
-            // RedisCache has disconnect()
-            if (typeof provider.disconnect === 'function') {
-                await provider.disconnect();
+            // MultiLevelCache exposes getL1Cache / getL2Cache.
+            if (provider && typeof provider.getL1Cache === 'function') {
+                await shutdownOne(provider.getL1Cache());
+                if (typeof provider.getL2Cache === 'function') {
+                    await shutdownOne(provider.getL2Cache());
+                }
+                return;
             }
-            // MemoryCache has stopCleanup()
-            if (typeof provider.stopCleanup === 'function') {
-                provider.stopCleanup();
-            }
+            // Single-layer providers.
+            await shutdownOne(provider);
         } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error shutting down provider', error });
+            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error shutting down provider', err: error });
         }
     }
 

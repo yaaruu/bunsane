@@ -655,6 +655,19 @@ AND c.deleted_at IS NULL`;
      */
     @timed("Query.exec")
     public async exec(): Promise<TypedEntity<TComponents>[]> {
+        // Apply default LIMIT so unbounded queries cannot load entire tables
+        // into memory. Configurable via BUNSANE_DEFAULT_QUERY_LIMIT, 0 to
+        // disable. When the default is applied without an explicit .take(),
+        // warn once at execution so developers notice runaway queries
+        // (H-QUERY-1).
+        if (this.context.limit === null || this.context.limit === undefined) {
+            const envLimit = parseInt(process.env.BUNSANE_DEFAULT_QUERY_LIMIT ?? '10000', 10);
+            if (envLimit > 0) {
+                this.context.limit = envLimit;
+                logger.warn({ scope: 'Query.exec', defaultLimit: envLimit }, 'Query executed without explicit .take() — applying framework default LIMIT. Call .take(N) to suppress this warning.');
+            }
+        }
+
         return new Promise<TypedEntity<TComponents>[]>((resolve, reject) => {
             // Add timeout to prevent hanging queries
             const timeout = setTimeout(() => {

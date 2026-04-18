@@ -114,6 +114,10 @@ export function ComponentTargetHook(
     };
 }
 
+/** Per-instance registry of hook IDs created by registerDecoratedHooks.
+ *  Used by unregisterDecoratedHooks to undo registration (H-HOOK-3). */
+const REGISTERED_IDS = new WeakMap<object, string[]>();
+
 /**
  * Register all decorated hooks for a service class
  * Call this method after instantiating a service to register its decorated hooks
@@ -121,17 +125,18 @@ export function ComponentTargetHook(
  */
 export function registerDecoratedHooks(serviceInstance: any): void {
     const constructor = serviceInstance.constructor;
+    const ids: string[] = REGISTERED_IDS.get(serviceInstance) ?? [];
 
     // Register entity hooks
     if (constructor.__entityHooks) {
         for (const hookInfo of constructor.__entityHooks) {
             const hookMethod = serviceInstance[hookInfo.methodName].bind(serviceInstance);
 
-            EntityHookManager.registerEntityHook(
+            ids.push(EntityHookManager.registerEntityHook(
                 hookInfo.eventType,
                 hookMethod,
                 hookInfo.options
-            );
+            ));
         }
     }
 
@@ -140,11 +145,11 @@ export function registerDecoratedHooks(serviceInstance: any): void {
         for (const hookInfo of constructor.__componentHooks) {
             const hookMethod = serviceInstance[hookInfo.methodName].bind(serviceInstance);
 
-            EntityHookManager.registerComponentHook(
+            ids.push(EntityHookManager.registerComponentHook(
                 hookInfo.eventType,
                 hookMethod,
                 hookInfo.options
-            );
+            ));
         }
     }
 
@@ -153,14 +158,14 @@ export function registerDecoratedHooks(serviceInstance: any): void {
         for (const hookInfo of constructor.__componentTargetHooks) {
             const hookMethod = serviceInstance[hookInfo.methodName].bind(serviceInstance);
 
-            EntityHookManager.registerEntityHook(
+            ids.push(EntityHookManager.registerEntityHook(
                 hookInfo.eventType,
                 hookMethod,
                 {
                     ...hookInfo.options,
                     componentTarget: hookInfo.componentTarget
                 }
-            );
+            ));
         }
     }
 
@@ -169,19 +174,26 @@ export function registerDecoratedHooks(serviceInstance: any): void {
         for (const hookInfo of constructor.__lifecycleHooks) {
             const hookMethod = serviceInstance[hookInfo.methodName].bind(serviceInstance);
 
-            EntityHookManager.registerLifecycleHook(
+            ids.push(EntityHookManager.registerLifecycleHook(
                 hookMethod,
                 hookInfo.options
-            );
+            ));
         }
     }
+
+    REGISTERED_IDS.set(serviceInstance, ids);
 }
 
 /**
- * Unregister all decorated hooks for a service class
- * Call this method before destroying a service to clean up its hooks
- * @param serviceInstance The service instance to unregister hooks for
+ * Unregister all decorated hooks for a service instance.
+ * Call during teardown (service destruction, test isolation) to prevent
+ * hook leaks across repeated instantiations (H-HOOK-3).
  */
 export function unregisterDecoratedHooks(serviceInstance: any): void {
-    console.warn('unregisterDecoratedHooks is not fully implemented. Use EntityHookManager.removeHook() for individual hook removal.');
+    const ids = REGISTERED_IDS.get(serviceInstance);
+    if (!ids) return;
+    for (const id of ids) {
+        EntityHookManager.removeHook(id);
+    }
+    REGISTERED_IDS.delete(serviceInstance);
 }

@@ -22,6 +22,34 @@ export class Entity implements IEntity {
     private savedRemovedComponents: Set<string> = new Set<string>();
     protected _dirty: boolean = false;
 
+    // Drainable set of fire-and-forget cache ops triggered from set/remove.
+    // App.shutdown can await these to avoid losing writes mid-shutdown
+    // (H-CACHE-1).
+    private static pendingCacheOps: Set<Promise<void>> = new Set();
+
+    /**
+     * Await all pending background cache operations. Call during shutdown
+     * after HTTP drain but before cache.disconnect so setImmediate'd cache
+     * writes are not lost. Bounded by `timeoutMs`.
+     */
+    public static async drainPendingCacheOps(timeoutMs: number = 5_000): Promise<void> {
+        if (Entity.pendingCacheOps.size === 0) return;
+        const snapshot = [...Entity.pendingCacheOps];
+        const drainTimer = new Promise<'timeout'>((resolve) => {
+            const t = setTimeout(() => resolve('timeout'), timeoutMs);
+            t.unref?.();
+        });
+        await Promise.race([
+            Promise.allSettled(snapshot).then(() => 'drained' as const),
+            drainTimer,
+        ]);
+    }
+
+    private static trackCacheOp(p: Promise<void>): void {
+        Entity.pendingCacheOps.add(p);
+        p.finally(() => Entity.pendingCacheOps.delete(p));
+    }
+
     constructor(id?: string) {
         // Use || instead of ?? to also handle empty strings
         this.id = (id && id.trim() !== '') ? id : uuidv7();
@@ -141,26 +169,25 @@ export class Entity implements IEntity {
                 });
             }
             
-            // Handle cache operations for component update
-            setImmediate(async () => {
+            // Fire-and-forget cache update, tracked via drainable set so
+            // App.shutdown can await it (H-CACHE-1).
+            Entity.trackCacheOp((async () => {
                 try {
                     const { CacheManager } = await import('./cache/CacheManager');
                     const cacheManager = CacheManager.getInstance();
                     const config = cacheManager.getConfig();
-                    
+
                     if (config.enabled && config.component?.enabled) {
                         if (config.strategy === 'write-through') {
-                            // Write-through: update cache with new component data
                             await cacheManager.setComponentWriteThrough(this.id, [component], component.getTypeID(), config.component.ttl);
                         } else {
-                            // Write-invalidate: remove from cache
                             await cacheManager.invalidateComponent(this.id, component.getTypeID());
                         }
                     }
                 } catch (error) {
-                    logger.warn({ scope: 'cache', component: 'Entity', msg: 'Cache operation failed after set', error });
+                    logger.warn({ scope: 'cache', component: 'Entity', msg: 'Cache operation failed after set', err: error });
                 }
-            });
+            })());
         } else {
             // Add new component
             this.add(ctor, data);
@@ -207,20 +234,21 @@ export class Entity implements IEntity {
                 });
             }
             
-            // Invalidate cache for removed component
-            setImmediate(async () => {
+            // Fire-and-forget cache invalidation, tracked for shutdown drain
+            // (H-CACHE-1).
+            Entity.trackCacheOp((async () => {
                 try {
                     const { CacheManager } = await import('./cache/CacheManager');
                     const cacheManager = CacheManager.getInstance();
                     const config = cacheManager.getConfig();
-                    
+
                     if (config.enabled && config.component?.enabled) {
                         await cacheManager.invalidateComponent(this.id, typeId);
                     }
                 } catch (error) {
-                    logger.warn({ scope: 'cache', component: 'Entity', msg: 'Cache invalidation failed after remove', error });
+                    logger.warn({ scope: 'cache', component: 'Entity', msg: 'Cache invalidation failed after remove', err: error });
                 }
-            });
+            })());
             
             return true;
         }
@@ -394,6 +422,18 @@ export class Entity implements IEntity {
         const wasNew = !this._persisted;
         const changedComponentTypeIds = this.getDirtyComponents();
         const removedComponentTypeIds = Array.from(this.removedComponents);
+
+        // Pre-flight: await ComponentRegistry readiness for every component on
+        // this entity BEFORE opening the transaction. Previously doSave awaited
+        // ComponentRegistry.getReadyPromise inside the executeSave loop, so a
+        // slow DDL (partition creation) would keep the PG transaction open and
+        // idle-in-transaction waiting on registry state. (H-DB-4).
+        for (const comp of this.components.values()) {
+            const compName = comp.constructor.name;
+            if (!ComponentRegistry.isComponentReady(compName)) {
+                await ComponentRegistry.getReadyPromise(compName);
+            }
+        }
 
         const profile = process.env.DB_SAVE_PROFILE === 'true';
         const phaseStart = profile ? performance.now() : 0;
@@ -657,8 +697,13 @@ export class Entity implements IEntity {
 
             for (const comp of this.components.values()) {
                 const compName = comp.constructor.name;
+                // Registry readiness is pre-flighted in save() before the
+                // transaction starts (H-DB-4). This assert catches a
+                // theoretical race if a caller skipped save() and jumped
+                // straight to doSave — we refuse to await inside the txn so
+                // a slow DDL cannot hold a pg session idle in transaction.
                 if (!ComponentRegistry.isComponentReady(compName)) {
-                    await ComponentRegistry.getReadyPromise(compName);
+                    throw new Error(`Component ${compName} not ready; call save() (not doSave) or await registry readiness before the transaction.`);
                 }
 
                 if (!(comp as any)._persisted) {

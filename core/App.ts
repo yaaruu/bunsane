@@ -1376,7 +1376,16 @@ export default class App {
             }
         }
 
-        // 4. Shutdown cache (flush pending writes, unsubscribe pub/sub, disconnect).
+        // 4. Drain any fire-and-forget cache ops triggered by entity.set /
+        //    entity.remove before we disconnect the cache (H-CACHE-1).
+        try {
+            const { Entity } = await import('./Entity');
+            await Entity.drainPendingCacheOps(Math.min(budgetRemaining(), 5_000));
+        } catch (error) {
+            logger.warn({ scope: 'cache', component: 'App', msg: 'Entity cache op drain error', err: error });
+        }
+
+        // 5. Shutdown cache (flush pending writes, unsubscribe pub/sub, disconnect).
         try {
             const { CacheManager } = await import('./cache/CacheManager');
             await CacheManager.getInstance().shutdown();
