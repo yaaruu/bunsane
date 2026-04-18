@@ -334,6 +334,18 @@ export class SchedulerManager {
             return;
         }
 
+        // Skip if the previous tick is still executing. Without this guard
+        // a slow task with interval < execution-time burns a lock-acquire
+        // round-trip every tick and floods the skipped-executions metric
+        // (H-SCHED-1). Cheap in-process check before reaching out to PG.
+        if (taskInfo.isRunning) {
+            this.metrics.skippedExecutions++;
+            if (this.config.enableLogging) {
+                loggerInstance.debug(`Task ${taskInfo.name} skipped - previous execution still running`);
+            }
+            return;
+        }
+
         if (this.metrics.runningTasks >= this.config.maxConcurrentTasks) {
             if (this.config.enableLogging) {
                 loggerInstance.warn(`Maximum concurrent tasks reached. Skipping execution of ${taskInfo.name}`);
@@ -665,12 +677,20 @@ export class SchedulerManager {
     }
 
     /**
-     * Execute a task with timeout enforcement
+     * Execute a task with timeout enforcement.
+     *
+     * Note: JS has no way to cancel an arbitrary Promise — on timeout the
+     * wrapper rejects but the underlying task continues. The second .catch
+     * below captures a late rejection after the wrapper already rejected,
+     * preventing an unhandled-rejection process crash (H-SCHED-5). The
+     * `settled` flag guards against double-settle.
      */
     private async executeWithTimeout<T>(task: Promise<T>, timeoutMs: number, taskInfo: ScheduledTaskInfo): Promise<T> {
         return new Promise((resolve, reject) => {
+            let settled = false;
             const timeoutId = setTimeout(() => {
-                clearTimeout(timeoutId);
+                if (settled) return;
+                settled = true;
                 this.metrics.timedOutTasks++;
                 this.updateTaskMetrics(taskInfo.id, {
                     timeoutCount: (this.metrics.taskMetrics[taskInfo.id]?.timeoutCount || 0) + 1
@@ -687,10 +707,20 @@ export class SchedulerManager {
 
             task
                 .then((result) => {
+                    if (settled) return;
+                    settled = true;
                     clearTimeout(timeoutId);
                     resolve(result);
                 })
                 .catch((error) => {
+                    if (settled) {
+                        // Late rejection after timeout. Log only — the wrapper
+                        // promise is already settled, so re-rejecting would be
+                        // a no-op but the rejection would escape as unhandled.
+                        loggerInstance.warn({ taskId: taskInfo.id, err: error }, 'Late rejection from scheduled task after timeout');
+                        return;
+                    }
+                    settled = true;
                     clearTimeout(timeoutId);
                     reject(error);
                 });
@@ -722,10 +752,19 @@ export class SchedulerManager {
                 loggerInstance.warn(`Task ${taskInfo.name} failed (attempt ${taskInfo.retryCount}/${maxRetries}), retrying in ${retryDelay}ms: ${error.message}`);
             }
 
-            // Schedule retry
-            setTimeout(async () => {
+            // Schedule retry. Track the timer handle in `intervals` under a
+            // unique key so `stop()` can clear it (H-SCHED-3); without this
+            // the retry fires post-shutdown against a closed DB pool. Also
+            // skip the retry if the scheduler is no longer running by the
+            // time the timer fires, and rely on the new isRunning guard in
+            // doExecuteTask (H-SCHED-1) to prevent retry/tick overlap.
+            const retryKey = `${taskInfo.id}:retry:${taskInfo.retryCount}`;
+            const retryHandle = setTimeout(async () => {
+                this.intervals.delete(retryKey);
+                if (!this.isRunning) return;
                 await this.executeTask(taskInfo.id);
             }, retryDelay);
+            this.intervals.set(retryKey, retryHandle as any);
 
             this.emitEvent({
                 type: 'task.retry',

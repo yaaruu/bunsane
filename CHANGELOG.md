@@ -4,6 +4,67 @@ All notable changes to bunsane are documented here.
 
 ## Unreleased
 
+### Fixed (PR D — scheduler + hook concurrency hardening)
+
+- **Entity.add / Entity.set / Entity.remove hook calls no longer leak
+  unhandled rejections.** `EntityHookManager.executeHooks` is async, but
+  the three mutating methods previously invoked it without `await` and the
+  surrounding `try/catch` captured only synchronous throws. A hook
+  declared `async` that rejected escaped as an unhandled rejection. `set`
+  now `await`s consistently; `add` and `remove` remain synchronous (to
+  preserve their fluent-chain / boolean signatures) and attach a
+  `.catch` to the returned promise so rejections are logged rather than
+  escaping. Ticket H-HOOK-1.
+
+- **Hook timeout timers no longer leak and late rejections no longer
+  escape.** All four timeout race sites in `EntityHookManager` (sync path,
+  async-parallel path, sync-batch path, async-batch path) now capture the
+  `setTimeout` handle and `clearTimeout` on normal completion, and
+  attach a detached `.catch` to the hook callback promise so a rejection
+  that arrives after the race has been decided is logged rather than
+  emitted as an unhandled rejection. Tickets H-HOOK-2 / H-MEM-2.
+
+- **SchedulerManager task interval no longer burns lock attempts for a
+  still-running task.** `doExecuteTask` now skips early if
+  `taskInfo.isRunning` is true, avoiding a wasted PG advisory-lock
+  round-trip every tick when execution outlasts the interval. Increments
+  `skippedExecutions`. Ticket H-SCHED-1.
+
+- **Scheduled-task retry timer is now tracked and cleared on stop.**
+  `handleTaskFailure` previously scheduled retries with a bare
+  `setTimeout` whose handle was never stored, so `stop()` could not
+  clear it and the retry fired post-shutdown against a closed DB pool.
+  The retry handle is now registered in `intervals` under
+  `<taskId>:retry:<n>` and self-deletes once fired. The retry callback
+  also checks `isRunning` before executing. Tickets H-SCHED-2 /
+  H-SCHED-3.
+
+- **DistributedLock re-entry now reports overlap instead of success.**
+  `tryAcquire` previously returned `acquired: true` when the instance
+  already held the lock for `taskId`, which meant retry + interval could
+  both enter `executeTask` concurrently. Now returns
+  `acquired: false` so the second caller skips — defense-in-depth on
+  top of the caller-side `isRunning` guard. Ticket H-SCHED-4.
+
+- **`executeWithTimeout` no longer leaks late rejections.** A scheduled
+  task that rejects after its wrapper timed out previously produced an
+  unhandled rejection (the wrapper was already settled). The wrapper now
+  uses a `settled` flag and logs late rejections instead of propagating.
+  Ticket H-SCHED-5.
+
+- **DistributedLock `reservePromise` nulls on reject.** Previously, if
+  `db.reserve()` rejected (pool exhausted, shutdown mid-call), the
+  rejected promise was cached in `reservePromise` forever and every
+  subsequent `ensureReserved` received the same rejection. Now nulls the
+  promise in the reject handler so future callers retry a fresh reserve.
+  Ticket H-DB-2.
+
+- **`App.waitForAppReady` no longer polls indefinitely.** Replaced the
+  100ms `setInterval` with a one-shot phase listener and default 60s
+  timeout. A boot failure that never reaches `APPLICATION_READY` now
+  surfaces as a rejection instead of leaking a timer for process
+  lifetime. Ticket H-MEM-1.
+
 ### Security
 
 - **SQL injection hardening across Query layer.** Identifiers (component

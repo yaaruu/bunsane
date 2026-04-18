@@ -302,11 +302,28 @@ class EntityHookManager {
 
             try {
                 if (hook.options.timeout && hook.options.timeout > 0) {
-                    // Execute with timeout
+                    // Execute with timeout. Timer handle is stored so the
+                    // normal-completion path clears it (no leaked pending
+                    // timers per successful hook). The underlying callback
+                    // promise is attached with a detached .catch so a late
+                    // rejection after timeout does not escape as unhandled
+                    // (H-HOOK-2 / H-MEM-2).
+                    let timerHandle: ReturnType<typeof setTimeout> | null = null;
                     const timeoutPromise = new Promise<never>((_, reject) => {
-                        setTimeout(() => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)), hook.options.timeout);
+                        timerHandle = setTimeout(
+                            () => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)),
+                            hook.options.timeout
+                        );
                     });
-                    await Promise.race([hook.callback(event), timeoutPromise]);
+                    const hookPromise = Promise.resolve().then(() => hook.callback(event));
+                    hookPromise.catch((err) => {
+                        logger.warn({ hookId: hook.id, err }, `Late rejection from hook after timeout`);
+                    });
+                    try {
+                        await Promise.race([hookPromise, timeoutPromise]);
+                    } finally {
+                        if (timerHandle) clearTimeout(timerHandle);
+                    }
                 } else {
                     // Always await — callback may be an async function declared
                     // with async:false by mistake. Without await, a rejection
@@ -336,12 +353,26 @@ class EntityHookManager {
 
                 try {
                     if (hook.options.timeout && hook.options.timeout > 0) {
-                        // Execute with timeout
-                        const hookPromise = hook.callback(event);
-                        const timeoutPromise = new Promise<never>((_, reject) => {
-                            setTimeout(() => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)), hook.options.timeout);
+                        // Execute with timeout. See sync path for rationale —
+                        // clear the timer on normal completion and detach a
+                        // .catch on the hook promise so late rejections do
+                        // not escape (H-HOOK-2 / H-MEM-2).
+                        let timerHandle: ReturnType<typeof setTimeout> | null = null;
+                        const hookPromise = Promise.resolve().then(() => hook.callback(event));
+                        hookPromise.catch((err) => {
+                            logger.warn({ hookId: hook.id, err }, `Late rejection from hook after timeout`);
                         });
-                        await Promise.race([hookPromise, timeoutPromise]);
+                        const timeoutPromise = new Promise<never>((_, reject) => {
+                            timerHandle = setTimeout(
+                                () => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)),
+                                hook.options.timeout
+                            );
+                        });
+                        try {
+                            await Promise.race([hookPromise, timeoutPromise]);
+                        } finally {
+                            if (timerHandle) clearTimeout(timerHandle);
+                        }
                     } else {
                         // Execute normally
                         await hook.callback(event);
@@ -479,14 +510,27 @@ class EntityHookManager {
 
                 try {
                     if (hook.options.timeout && hook.options.timeout > 0) {
-                        // Execute with timeout
-                        const timeoutPromise = new Promise<never>((_, reject) => {
-                            setTimeout(() => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)), hook.options.timeout);
+                        // Same cleanup pattern as single-event path (H-HOOK-2 / H-MEM-2).
+                        let timerHandle: ReturnType<typeof setTimeout> | null = null;
+                        const hookPromise = Promise.resolve().then(() => hook.callback(event));
+                        hookPromise.catch((err) => {
+                            logger.warn({ hookId: hook.id, err }, `Late rejection from hook after timeout`);
                         });
-                        await Promise.race([hook.callback(event), timeoutPromise]);
+                        const timeoutPromise = new Promise<never>((_, reject) => {
+                            timerHandle = setTimeout(
+                                () => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)),
+                                hook.options.timeout
+                            );
+                        });
+                        try {
+                            await Promise.race([hookPromise, timeoutPromise]);
+                        } finally {
+                            if (timerHandle) clearTimeout(timerHandle);
+                        }
                     } else {
-                        // Execute normally
-                        hook.callback(event);
+                        // Await so async callbacks do not escape as unhandled
+                        // rejections (C13 parity).
+                        await hook.callback(event);
                     }
                 } catch (error) {
                     logger.error(`Error executing sync hook ${hook.id} for event ${eventType}: ${error}`);
@@ -530,12 +574,23 @@ class EntityHookManager {
                     (async () => {
                         try {
                             if (hook.options.timeout && hook.options.timeout > 0) {
-                                // Execute with timeout
-                                const hookPromise = hook.callback(event);
-                                const timeoutPromise = new Promise<never>((_, reject) => {
-                                    setTimeout(() => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)), hook.options.timeout);
+                                // Same cleanup pattern (H-HOOK-2 / H-MEM-2).
+                                let timerHandle: ReturnType<typeof setTimeout> | null = null;
+                                const hookPromise = Promise.resolve().then(() => hook.callback(event));
+                                hookPromise.catch((err) => {
+                                    logger.warn({ hookId: hook.id, err }, `Late rejection from hook after timeout`);
                                 });
-                                await Promise.race([hookPromise, timeoutPromise]);
+                                const timeoutPromise = new Promise<never>((_, reject) => {
+                                    timerHandle = setTimeout(
+                                        () => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)),
+                                        hook.options.timeout
+                                    );
+                                });
+                                try {
+                                    await Promise.race([hookPromise, timeoutPromise]);
+                                } finally {
+                                    if (timerHandle) clearTimeout(timerHandle);
+                                }
                             } else {
                                 // Execute normally
                                 await hook.callback(event);

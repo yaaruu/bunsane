@@ -89,15 +89,18 @@ export class Entity implements IEntity {
             Object.assign(instance, {});
         }
         this.addComponent(instance);
-        this._dirty = true; 
-        // Fire component added event
-        try {
-            EntityHookManager.executeHooks(new ComponentAddedEvent(this, instance));
-        } catch (error) {
-            logger.error(`Error firing component added hook for ${instance.getTypeID()}: ${error}`);
-            // Don't fail the add operation if hooks fail
-        }
-        
+        this._dirty = true;
+        // executeHooks is async; the surrounding try/catch only captures
+        // synchronous throws. Attach a .catch so an async rejection from a
+        // hook handler does not escape as an unhandled rejection (H-HOOK-1).
+        // Add stays sync to preserve the fluent chaining signature; hook
+        // failures are logged and do not fail the add operation.
+        Promise.resolve()
+            .then(() => EntityHookManager.executeHooks(new ComponentAddedEvent(this, instance)))
+            .catch((error) => {
+                logger.error(`Error firing component added hook for ${instance.getTypeID()}: ${error}`);
+            });
+
         return this;
     }
 
@@ -120,9 +123,11 @@ export class Entity implements IEntity {
             component.setDirty(true);
             this._dirty = true;
             
-            // Fire component updated event
+            // Fire component updated event. Await so a hook rejection is
+            // captured by this method's try/catch and does not escape as an
+            // unhandled rejection (H-HOOK-1).
             try {
-                EntityHookManager.executeHooks(new ComponentUpdatedEvent(this, component, oldData, component));
+                await EntityHookManager.executeHooks(new ComponentUpdatedEvent(this, component, oldData, component));
             } catch (error) {
                 logger.error(`Error firing component updated hook for ${component.getTypeID()}: ${error}`);
                 // Don't fail the set operation if hooks fail
@@ -185,13 +190,14 @@ export class Entity implements IEntity {
             this.components.delete(typeId);
             this._dirty = true;
             
-            // Fire component removed event
-            try {
-                EntityHookManager.executeHooks(new ComponentRemovedEvent(this, component));
-            } catch (error) {
-                logger.error(`Error firing component removed hook for ${typeId}: ${error}`);
-                // Don't fail the remove operation if hooks fail
-            }
+            // Fire component removed event. remove() stays sync to preserve
+            // the boolean return signature used by callers; attach .catch so
+            // async hook rejections do not escape (H-HOOK-1).
+            Promise.resolve()
+                .then(() => EntityHookManager.executeHooks(new ComponentRemovedEvent(this, component)))
+                .catch((error) => {
+                    logger.error(`Error firing component removed hook for ${typeId}: ${error}`);
+                });
             
             // Invalidate DataLoader cache if context is provided
             if (context?.loaders?.componentsByEntityType) {

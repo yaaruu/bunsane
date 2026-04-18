@@ -482,17 +482,31 @@ export default class App {
         }
     }
 
-    waitForAppReady(): Promise<void> {
-        return new Promise((resolve) => {
-            const interval = setInterval(() => {
-                if (
-                    ApplicationLifecycle.getCurrentPhase() >=
-                    ApplicationPhase.APPLICATION_READY
-                ) {
-                    clearInterval(interval);
+    /**
+     * Resolve once the application has reached APPLICATION_READY. Previously
+     * polled every 100ms with no exit condition — a boot failure would keep
+     * the interval timer alive forever (H-MEM-1). Now attaches a one-shot
+     * phase listener and self-cleans on first match. Bounded by `timeoutMs`
+     * so callers cannot hang indefinitely; default matches waitForPhase.
+     */
+    waitForAppReady(timeoutMs = 60_000): Promise<void> {
+        if (ApplicationLifecycle.getCurrentPhase() >= ApplicationPhase.APPLICATION_READY) {
+            return Promise.resolve();
+        }
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                ApplicationLifecycle.removePhaseListener(onPhase);
+                reject(new Error(`waitForAppReady timed out after ${timeoutMs}ms; current phase=${ApplicationLifecycle.getCurrentPhase()}`));
+            }, timeoutMs);
+            timer.unref?.();
+            const onPhase = (event: PhaseChangeEvent) => {
+                if (event.detail === ApplicationPhase.APPLICATION_READY) {
+                    clearTimeout(timer);
+                    ApplicationLifecycle.removePhaseListener(onPhase);
                     resolve();
                 }
-            }, 100);
+            };
+            ApplicationLifecycle.addPhaseListener(onPhase);
         });
     }
 

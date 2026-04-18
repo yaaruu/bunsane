@@ -83,11 +83,20 @@ export class DistributedLock {
     private async ensureReserved(): Promise<ReservedSQL> {
         if (this.reservedConn) return this.reservedConn;
         if (!this.reservePromise) {
-            this.reservePromise = db.reserve().then((conn) => {
-                this.reservedConn = conn;
-                this.reservePromise = null;
-                return conn;
-            });
+            // On reject (pool exhausted, shutdown mid-reserve), null the
+            // promise so subsequent callers retry a fresh reserve instead of
+            // receiving the same rejected promise forever (H-DB-2).
+            this.reservePromise = db.reserve().then(
+                (conn) => {
+                    this.reservedConn = conn;
+                    this.reservePromise = null;
+                    return conn;
+                },
+                (err) => {
+                    this.reservePromise = null;
+                    throw err;
+                }
+            );
         }
         return this.reservePromise;
     }
@@ -122,12 +131,18 @@ export class DistributedLock {
         const lockKey = this.generateLockKey(taskId);
 
         if (this.heldLocks.has(taskId)) {
+            // Defense in depth: if this instance already holds the lock for
+            // taskId, a second concurrent acquirer would mean overlapping
+            // execution (retry firing while previous run is still in the
+            // finally → release step, for example). Return acquired:false so
+            // the second caller skips, even if caller-side guards missed it.
+            // (H-SCHED-4).
             if (this.config.enableLogging) {
                 loggerInstance.debug(
-                    `Lock for ${taskId} already held locally, returning acquired`
+                    `Lock for ${taskId} already held locally — reporting overlap (acquired:false)`
                 );
             }
-            return { acquired: true, lockKey, taskId };
+            return { acquired: false, lockKey, taskId };
         }
 
         const startTime = Date.now();
