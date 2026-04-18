@@ -4,7 +4,46 @@ All notable changes to bunsane are documented here.
 
 ## Unreleased
 
+### Security
+
+- **SQL injection hardening across Query layer.** Identifiers (component
+  table names, JSON field paths, ORDER BY properties, text-search language)
+  interpolated into SQL via `db.unsafe(...)` or template literals are now
+  validated against strict allow-lists before use. Added `query/SqlIdentifier.ts`
+  with `assertIdentifier`, `assertComponentTableName`, `assertFieldPath`,
+  `assertTsLanguage`. Applied at `Query.estimatedCount`, `Query.doAggregate`,
+  `ComponentInclusionNode` sort expressions (3 sites), and
+  `FullTextSearchBuilder` (3 sites + factory). Throws `InvalidIdentifierError`
+  on unsafe input. Ticket C08.
+
+- **GraphQL depth limit hard minimum enforced.** Previously `maxDepth: 0`
+  or `undefined` silently disabled the depth-limit guard, allowing CPU/memory
+  DoS via deeply nested queries. Now `createYogaInstance` enforces a hard
+  floor of 15 regardless of input; callers can raise but cannot disable.
+  Ticket C06.
+
+- **Request AbortSignal now propagates into Yoga and REST handlers.** The
+  30s wall-clock timer previously only logged a warning; the signal was
+  never forwarded downstream. Request timeouts (and client disconnects) now
+  cancel in-flight resolvers, DB queries, and external calls. Uses
+  `AbortSignal.any` (Bun/Node 20+) with a manual combiner fallback.
+  Ticket C05.
+
 ### Fixed
+
+- **Sync lifecycle hooks now awaited, preventing unhandled rejections.**
+  `EntityHookManager.executeHooks` previously discarded the return value of
+  `hook.callback(event)` on the sync path when no timeout was configured.
+  A hook mistakenly declared `async: false` but implemented as an
+  `async function` would silently throw unhandled rejections, crashing the
+  process under strict mode. Sync path now awaits consistently. Ticket C13.
+
+- **`createRequestContextPlugin` auto-applied by default.** Previously
+  opt-in (and the export was commented out of the root barrel), so any app
+  using `@BelongsTo` / `@HasMany` relations silently fell into N+1 query
+  patterns. `App` now prepends the plugin to Yoga plugins by default. Opt
+  out via `App.disableRequestContextPlugin()` if supplying your own
+  DataLoader layer. Ticket C07.
 
 - **Redis cache no longer causes unbounded heap growth when Redis is
   unreachable.** `enableOfflineQueue` now defaults to `false` so commands

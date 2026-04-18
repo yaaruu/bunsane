@@ -8,6 +8,7 @@
 import type { FilterBuilder, FilterBuilderOptions } from "../FilterBuilder";
 import type { QueryFilter } from "../QueryContext";
 import type { QueryContext } from "../QueryContext";
+import { assertTsLanguage, assertFieldPath } from "../SqlIdentifier";
 
 /**
  * Full-text search filter value interface
@@ -68,12 +69,16 @@ export const fullTextSearchBuilder: FilterBuilder = (
     const value = filter.value as FullTextFilterValue;
     const { query, language = 'english', type = 'plain' } = value;
 
+    // Validate identifiers (C08).
+    const safeLanguage = assertTsLanguage(language, 'fullTextSearchBuilder.language');
+    assertFieldPath(filter.field, 'fullTextSearchBuilder.field');
+
     // Build the text search vector from the specified field
     const fieldPath = filter.field.includes('.')
         ? filter.field.split('.').map(p => `'${p}'`).join('->')
         : `'${filter.field}'`;
 
-    const vectorSql = `to_tsvector('${language}', ${alias}.data->${fieldPath})`;
+    const vectorSql = `to_tsvector('${safeLanguage}', ${alias}.data->${fieldPath})`;
 
     // Choose the appropriate query function based on type
     let queryFunction: string;
@@ -93,7 +98,7 @@ export const fullTextSearchBuilder: FilterBuilder = (
             break;
     }
 
-    const querySql = `${queryFunction}('${language}', $${context.addParam(query)})`;
+    const querySql = `${queryFunction}('${safeLanguage}', $${context.addParam(query)})`;
 
     return {
         sql: `${vectorSql} @@ ${querySql}`,
@@ -120,12 +125,16 @@ export const fullTextSearchWithRankBuilder: FilterBuilder = (
     const value = filter.value as FullTextFilterValue;
     const { query, language = 'english', type = 'plain' } = value;
 
+    // Validate identifiers (C08).
+    const safeLanguage = assertTsLanguage(language, 'fullTextSearchWithRankBuilder.language');
+    assertFieldPath(filter.field, 'fullTextSearchWithRankBuilder.field');
+
     // Build the text search vector from the specified field
     const fieldPath = filter.field.includes('.')
         ? filter.field.split('.').map(p => `'${p}'`).join('->')
         : `'${filter.field}'`;
 
-    const vectorSql = `to_tsvector('${language}', ${alias}.data->${fieldPath})`;
+    const vectorSql = `to_tsvector('${safeLanguage}', ${alias}.data->${fieldPath})`;
 
     // Choose the appropriate query function based on type
     let queryFunction: string;
@@ -145,7 +154,7 @@ export const fullTextSearchWithRankBuilder: FilterBuilder = (
             break;
     }
 
-    const querySql = `${queryFunction}('${language}', $${context.addParam(query)})`;
+    const querySql = `${queryFunction}('${safeLanguage}', $${context.addParam(query)})`;
 
     // Include ranking in the condition (can be used for ordering)
     const rankSql = `ts_rank(${vectorSql}, ${querySql})`;
@@ -187,16 +196,20 @@ export function createFullTextSearchBuilder(
     language: string = 'english',
     searchType: 'plain' | 'phrase' | 'web' | 'tsquery' = 'plain'
 ): { builder: FilterBuilder; options: FilterBuilderOptions } {
+    // Validate the language at factory-construction time so callers get an
+    // immediate error on invalid input rather than a runtime SQL error.
+    const safeLanguage = assertTsLanguage(language, 'createFullTextSearchBuilder.language');
     const builder: FilterBuilder = (filter: QueryFilter, alias: string, context: QueryContext) => {
         const value = filter.value as FullTextFilterValue;
         const query = value.query;
+        assertFieldPath(filter.field, 'createFullTextSearchBuilder.field');
 
         // Build the text search vector from the specified field
         const fieldPath = filter.field.includes('.')
             ? filter.field.split('.').map(p => `'${p}'`).join('->')
             : `'${filter.field}'`;
 
-        const vectorSql = `to_tsvector('${language}', ${alias}.data->${fieldPath})`;
+        const vectorSql = `to_tsvector('${safeLanguage}', ${alias}.data->${fieldPath})`;
 
         // Choose the appropriate query function based on type
         let queryFunction: string;
@@ -216,7 +229,7 @@ export function createFullTextSearchBuilder(
                 break;
         }
 
-        const querySql = `${queryFunction}('${language}', $${context.addParam(query)})`;
+        const querySql = `${queryFunction}('${safeLanguage}', $${context.addParam(query)})`;
 
         return {
             sql: `${vectorSql} @@ ${querySql}`,

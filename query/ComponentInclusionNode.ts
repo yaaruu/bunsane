@@ -5,6 +5,7 @@ import { shouldUseLateralJoins, shouldUseDirectPartition } from "../core/Config"
 import { FilterBuilderRegistry } from "./FilterBuilderRegistry";
 import { ComponentRegistry } from "../core/components";
 import { getMetadataStorage } from "../core/metadata";
+import { assertIdentifier } from "./SqlIdentifier";
 
 /**
  * Check if a component property is numeric based on metadata
@@ -331,12 +332,16 @@ export class ComponentInclusionNode extends QueryNode {
             const sortComponentTableName = this.getComponentTableName(typeId);
             const nullsClause = sortOrder.nullsFirst ? 'NULLS FIRST' : 'NULLS LAST';
             const isNumeric = isNumericProperty(sortOrder.component, sortOrder.property);
+            // Validate property name before interpolating into JSON path.
+            // Without this, a malicious or malformed sortOrder.property could
+            // inject SQL through the template (C08).
+            const safeProperty = assertIdentifier(sortOrder.property, 'sortOrder.property');
 
             // Build scalar subquery to get sort value for each entity
             // This avoids nested loop join by forcing row-by-row evaluation
             const sortExpr = isNumeric
-                ? `(sort_c.data->>'${sortOrder.property}')::numeric`
-                : `sort_c.data->>'${sortOrder.property}'`;
+                ? `(sort_c.data->>'${safeProperty}')::numeric`
+                : `sort_c.data->>'${safeProperty}'`;
 
             const subquery = `(
                 SELECT ${sortExpr}
@@ -454,9 +459,10 @@ export class ComponentInclusionNode extends QueryNode {
 
         const nullsClause = sortOrder.nullsFirst ? 'NULLS FIRST' : 'NULLS LAST';
         const isNumeric = isNumericProperty(sortOrder.component, sortOrder.property);
+        const safeProperty = assertIdentifier(sortOrder.property, 'sortOrder.property');
         const sortExpr = isNumeric
-            ? `(c.data->>'${sortOrder.property}')::numeric`
-            : `c.data->>'${sortOrder.property}'`;
+            ? `(c.data->>'${safeProperty}')::numeric`
+            : `c.data->>'${safeProperty}'`;
 
         let sql: string;
         if (useDirectPartition) {
@@ -508,9 +514,10 @@ export class ComponentInclusionNode extends QueryNode {
 
         const nullsClause = sortOrder.nullsFirst ? 'NULLS FIRST' : 'NULLS LAST';
         const isNumeric = isNumericProperty(sortOrder.component, sortOrder.property);
+        const safeProperty = assertIdentifier(sortOrder.property, 'sortOrder.property');
         const sortExpr = isNumeric
-            ? `(sort_c.data->>'${sortOrder.property}')::numeric`
-            : `sort_c.data->>'${sortOrder.property}'`;
+            ? `(sort_c.data->>'${safeProperty}')::numeric`
+            : `sort_c.data->>'${safeProperty}'`;
 
         // Use scalar subquery to avoid cartesian product explosion
         // This forces PostgreSQL to evaluate sort value per-entity, preventing

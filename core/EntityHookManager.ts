@@ -308,8 +308,11 @@ class EntityHookManager {
                     });
                     await Promise.race([hook.callback(event), timeoutPromise]);
                 } else {
-                    // Execute normally
-                    hook.callback(event);
+                    // Always await — callback may be an async function declared
+                    // with async:false by mistake. Without await, a rejection
+                    // from such a callback escapes as an unhandled rejection
+                    // and crashes the process under strict mode (C13).
+                    await hook.callback(event);
                 }
             } catch (error) {
                 logger.error(`Error executing sync hook ${hook.id} for event ${eventType}: ${error}`);

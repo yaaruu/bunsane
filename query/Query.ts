@@ -12,6 +12,7 @@ import { getMetadataStorage } from "../core/metadata";
 import { shouldUseDirectPartition } from "../core/Config";
 import type { SQL } from "bun";
 import type { ComponentConstructor, TypedEntity, ComponentRecord } from "../types/query.types";
+import { assertComponentTableName, assertFieldPath } from "./SqlIdentifier";
 
 export type FilterOperator = "=" | ">" | "<" | ">=" | "<=" | "!=" | "LIKE" | "ILIKE" | "IN" | "NOT IN" | string;
 
@@ -338,7 +339,13 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
             throw new Error(`Component ${component.name} not registered`);
         }
 
-        const tableName = ComponentRegistry.getPartitionTableName(typeId);
+        // Validate the resolved partition table name against the component
+        // table allow-list before passing to pg_class lookup. Although
+        // `relname` here is a bound parameter ($1) and cannot inject SQL
+        // directly, we still reject unexpected names so a registry
+        // poisoning bug cannot query arbitrary tables.
+        const rawTableName = ComponentRegistry.getPartitionTableName(typeId);
+        const tableName = rawTableName ? assertComponentTableName(rawTableName, 'estimatedCount.tableName') : null;
         const dbConn = this.getDb();
 
         // Use PostgreSQL's statistics for fast count estimate
@@ -557,10 +564,17 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         // Execute the DAG to get the base query
         const result = dag.execute(this.context);
 
-        // Determine the component table name
-        const componentTableName = shouldUseDirectPartition()
+        // Determine the component table name. Validate against allow-list so
+        // a poisoned registry cannot inject SQL through the embedded name.
+        const rawComponentTableName = shouldUseDirectPartition()
             ? (ComponentRegistry.getPartitionTableName(typeId) || 'components')
             : 'components';
+        const componentTableName = assertComponentTableName(rawComponentTableName, 'doAggregate.componentTableName');
+
+        // Validate the field path — each dotted segment must be a safe
+        // identifier. Without this, a caller-supplied field with quote or
+        // `->` metacharacters would corrupt the JSON path expression (C08).
+        assertFieldPath(field, 'doAggregate.field');
 
         // Build the JSON path for the field
         let jsonPath: string;

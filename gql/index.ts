@@ -152,11 +152,13 @@ export function createYogaInstance(
     contextFactory?: (context: any) => any,
     options?: YogaInstanceOptions
 ) {
-    // Prepend depth limit plugin if configured
+    // Prepend depth limit plugin. Enforce a hard minimum so maxDepth: 0 or
+    // undefined cannot silently disable the guard (C06). If a deployment
+    // explicitly needs a higher bound, raise it — but we never allow it off.
+    const HARD_MIN_DEPTH = 15;
+    const effectiveDepth = Math.max(options?.maxDepth ?? HARD_MIN_DEPTH, HARD_MIN_DEPTH);
     const allPlugins: Plugin[] = [];
-    if (options?.maxDepth) {
-        allPlugins.push(useValidationRule(depthLimitRule(options.maxDepth)) as Plugin);
-    }
+    allPlugins.push(useValidationRule(depthLimitRule(effectiveDepth)) as Plugin);
     allPlugins.push(...plugins);
 
     const yogaConfig: any = {

@@ -34,6 +34,7 @@ import {
 } from "./remote";
 import type { RemoteManagerConfig } from "./remote";
 import type { CacheConfig } from "../config/cache.config";
+import { createRequestContextPlugin } from "./RequestContext";
 
 export type CorsConfig = {
     origin?: string | string[] | ((origin: string) => boolean);
@@ -84,6 +85,7 @@ export default class App {
     private isShuttingDown = false;
     private isReady = false;
     private cacheConfig: Partial<CacheConfig> | null = null;
+    private requestContextPluginEnabled = true;
     private phaseListener: ((event: PhaseChangeEvent) => void) | null = null;
     private signalHandlersRegistered = false;
     private processHandlersRegistered = false;
@@ -248,17 +250,25 @@ export default class App {
                             maxDepth: this.graphqlMaxDepth || undefined,
                         };
 
+                        // Auto-apply RequestContext plugin by default so
+                        // apps using @BelongsTo / @HasMany get DataLoader
+                        // batching without opt-in. Prevents N+1 query
+                        // explosion. Opt out via disableRequestContextPlugin().
+                        const effectivePlugins: Plugin[] = this.requestContextPluginEnabled
+                            ? [createRequestContextPlugin(), ...this.yogaPlugins]
+                            : [...this.yogaPlugins];
+
                         if (schema) {
                             this.yoga = createYogaInstance(
                                 schema,
-                                this.yogaPlugins,
+                                effectivePlugins,
                                 wrappedContextFactory,
                                 yogaOptions
                             );
                         } else {
                             this.yoga = createYogaInstance(
                                 undefined,
-                                this.yogaPlugins,
+                                effectivePlugins,
                                 wrappedContextFactory,
                                 yogaOptions
                             );
@@ -579,6 +589,27 @@ export default class App {
         return headers;
     }
 
+    /**
+     * Combine multiple AbortSignals into one that aborts when any input
+     * aborts. Uses `AbortSignal.any` when available (Node 20+/current Bun),
+     * falls back to a manual combiner for older runtimes.
+     */
+    private combineSignals(signals: AbortSignal[]): AbortSignal {
+        const anyFn = (AbortSignal as any).any;
+        if (typeof anyFn === 'function') {
+            return anyFn.call(AbortSignal, signals);
+        }
+        const controller = new AbortController();
+        for (const s of signals) {
+            if (s.aborted) {
+                controller.abort((s as any).reason);
+                return controller.signal;
+            }
+            s.addEventListener('abort', () => controller.abort((s as any).reason), { once: true });
+        }
+        return controller.signal;
+    }
+
     private addCorsHeaders(response: Response, req?: Request): Response {
         const corsHeaders = this.getCorsHeaders(req);
         if (Object.keys(corsHeaders).length === 0) return response;
@@ -608,12 +639,22 @@ export default class App {
             });
         }
 
-        // Add request timeout
+        // Request timeout — combine the framework wall-clock with the client's
+        // abort signal. The combined signal is attached to a cloned request
+        // that is passed to Yoga / REST handlers so downstream work (DB
+        // queries, resolvers) actually gets cancelled on timeout or client
+        // disconnect. Previously the signal was created but never propagated,
+        // so the timer only logged a warning while the request continued
+        // consuming resources (C05).
         const controller = new AbortController();
         const timeoutId = setTimeout(() => {
-            controller.abort();
+            controller.abort(new Error(`Request timeout after 30000ms: ${method} ${url.pathname}`));
             logger.warn(`Request timeout: ${method} ${url.pathname}`);
-        }, 30000); // 30 second timeout
+        }, 30000);
+        const combinedSignal = this.combineSignals([req.signal, controller.signal]);
+        // Rebind the request with the combined signal so handlers (Yoga, REST)
+        // see it via req.signal and can propagate cancellation.
+        req = new Request(req, { signal: combinedSignal });
 
         try {
             // Health check endpoint
@@ -1065,6 +1106,16 @@ export default class App {
      */
     public setCacheConfig(config: Partial<CacheConfig>) {
         this.cacheConfig = config;
+    }
+
+    /**
+     * Disable the auto-applied RequestContext plugin. Only do this if your
+     * app does not use `@BelongsTo` / `@HasMany` relations OR you are
+     * supplying your own DataLoader plugin. Without it, nested relation
+     * resolvers issue one DB query per row (N+1).
+     */
+    public disableRequestContextPlugin() {
+        this.requestContextPluginEnabled = false;
     }
 
     /**
