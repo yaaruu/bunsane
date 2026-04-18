@@ -30,10 +30,29 @@ class ApplicationLifecycle {
     private currentPhase = ApplicationPhase.DATABASE_INITIALIZING;
 
 
-    async waitForPhase(phase: ApplicationPhase): Promise<void> {
-        while (this.currentPhase !== phase) {
-            await new Promise(resolve => setTimeout(resolve, 100));
-        }
+    /**
+     * Wait for the lifecycle to reach the given phase. Resolves immediately if
+     * already at that phase; otherwise attaches a one-shot listener that
+     * resolves when the phase is reached. Bounded by `timeoutMs` so callers
+     * cannot hang forever when a phase transition fails silently.
+     */
+    async waitForPhase(phase: ApplicationPhase, timeoutMs = 30_000): Promise<void> {
+        if (this.currentPhase === phase) return;
+        return new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.eventEmitter.removeEventListener("phaseChanged", onPhase as EventListener);
+                reject(new Error(`waitForPhase(${phase}) timed out after ${timeoutMs}ms; current=${this.currentPhase}`));
+            }, timeoutMs);
+            timer.unref?.();
+            const onPhase = (event: PhaseChangeEvent) => {
+                if (event.detail === phase) {
+                    clearTimeout(timer);
+                    this.eventEmitter.removeEventListener("phaseChanged", onPhase as EventListener);
+                    resolve();
+                }
+            };
+            this.eventEmitter.addEventListener("phaseChanged", onPhase as EventListener);
+        });
     }
 
     addPhaseListener(listener: (event: PhaseChangeEvent) => void) {
@@ -43,6 +62,14 @@ class ApplicationLifecycle {
 
     removePhaseListener(listener: (event: PhaseChangeEvent) => void) {
         this.eventEmitter.removeEventListener("phaseChanged", listener as EventListener);
+    }
+
+    /**
+     * Test / shutdown helper: remove all phase listeners. Call before
+     * recreating singletons in tests to prevent listener stacking.
+     */
+    removeAllListeners() {
+        this.eventEmitter = new EventTarget();
     }
 
     setPhase(phase: ApplicationPhase) {

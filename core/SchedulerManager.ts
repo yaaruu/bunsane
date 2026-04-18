@@ -1,5 +1,5 @@
 import { logger } from "./Logger";
-import ApplicationLifecycle, { ApplicationPhase } from "./ApplicationLifecycle";
+import ApplicationLifecycle, { ApplicationPhase, type PhaseChangeEvent } from "./ApplicationLifecycle";
 import {
     ScheduleInterval
 } from "../types/scheduler.types";
@@ -30,6 +30,8 @@ export class SchedulerManager {
     private eventListeners: SchedulerEventCallback[] = [];
     public config: SchedulerConfig;
     private distributedLock: DistributedLock;
+    private phaseListener: ((event: PhaseChangeEvent) => void) | null = null;
+    private inflightTasks: Set<Promise<any>> = new Set();
     private metrics: SchedulerMetrics = {
         totalTasks: 0,
         runningTasks: 0,
@@ -76,14 +78,22 @@ export class SchedulerManager {
     }
 
     private initializeLifecycleIntegration(): void {
-        ApplicationLifecycle.addPhaseListener((event) => {
+        this.phaseListener = (event) => {
             const phase = event.detail;
             if (phase === ApplicationPhase.APPLICATION_READY) {
                 if (this.config.runOnStart) {
                     this.start();
                 }
             }
-        });
+        };
+        ApplicationLifecycle.addPhaseListener(this.phaseListener);
+    }
+
+    public disposeLifecycleIntegration(): void {
+        if (this.phaseListener) {
+            ApplicationLifecycle.removePhaseListener(this.phaseListener);
+            this.phaseListener = null;
+        }
     }
 
     public registerTask(taskInfo: ScheduledTaskInfo): void {
@@ -308,6 +318,17 @@ export class SchedulerManager {
     }
 
     private async executeTask(taskId: string): Promise<void> {
+        // Track this execution so stop() can await in-flight work before
+        // resources (DB pool, cache) are torn down. Without this, a task mid-
+        // write during SIGTERM hits a closed DB pool and silently corrupts
+        // or loses data.
+        const p = this.doExecuteTask(taskId);
+        this.inflightTasks.add(p);
+        p.finally(() => this.inflightTasks.delete(p));
+        return p;
+    }
+
+    private async doExecuteTask(taskId: string): Promise<void> {
         const taskInfo = this.tasks.get(taskId);
         if (!taskInfo || !taskInfo.enabled) {
             return;
@@ -492,7 +513,7 @@ export class SchedulerManager {
         });
     }
 
-    public async stop(): Promise<void> {
+    public async stop(drainTimeoutMs: number = 15_000): Promise<void> {
         if (!this.isRunning) {
             loggerInstance.warn("Scheduler is not running");
             return;
@@ -500,15 +521,38 @@ export class SchedulerManager {
 
         this.isRunning = false;
 
-        // Clear all intervals and timeouts
+        // Clear all intervals and timeouts so no new executions start.
         for (const intervalId of this.intervals.values()) {
             clearInterval(intervalId);
             clearTimeout(intervalId as any);
         }
         this.intervals.clear();
 
+        // Drain in-flight tasks before releasing locks + returning control to
+        // App.shutdown (which will close the DB pool). Bounded by drainTimeoutMs
+        // so shutdown cannot hang forever on a stuck task.
+        if (this.inflightTasks.size > 0) {
+            const inflightSnapshot = [...this.inflightTasks];
+            if (this.config.enableLogging) {
+                loggerInstance.info(`Draining ${inflightSnapshot.length} in-flight scheduled task(s), timeout=${drainTimeoutMs}ms`);
+            }
+            const drainTimer = new Promise<'timeout'>((resolve) => {
+                const t = setTimeout(() => resolve('timeout'), drainTimeoutMs);
+                t.unref?.();
+            });
+            const result = await Promise.race([
+                Promise.allSettled(inflightSnapshot).then(() => 'drained' as const),
+                drainTimer,
+            ]);
+            if (result === 'timeout') {
+                loggerInstance.warn(`Scheduler drain timed out after ${drainTimeoutMs}ms with ${this.inflightTasks.size} task(s) still running`);
+            }
+        }
+
         // Release all distributed locks held by this instance
         await this.distributedLock.releaseAll();
+
+        this.disposeLifecycleIntegration();
 
         if (this.config.enableLogging) {
             loggerInstance.info("Scheduler stopped");

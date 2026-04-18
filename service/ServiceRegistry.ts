@@ -1,5 +1,5 @@
 import type BaseService from "./Service";
-import ApplicationLifecycle, {ApplicationPhase} from "../core/ApplicationLifecycle";
+import ApplicationLifecycle, {ApplicationPhase, type PhaseChangeEvent} from "../core/ApplicationLifecycle";
 import { generateGraphQLSchemaV2 } from "../gql";
 import { GraphQLSchema } from "graphql";
 
@@ -8,28 +8,41 @@ class ServiceRegistry {
 
     private services: Map<string, BaseService> = new Map();
     private schema: GraphQLSchema | null = null;
+    private phaseListener: ((event: PhaseChangeEvent) => void) | null = null;
 
 
     constructor() {
-        
+
     }
 
     public init() {
-        ApplicationLifecycle.addPhaseListener((event) => {
+        // Remove previous listener if re-init (tests) to prevent listener stacking.
+        if (this.phaseListener) {
+            ApplicationLifecycle.removePhaseListener(this.phaseListener);
+        }
+        this.phaseListener = (event: PhaseChangeEvent) => {
             switch(event.detail) {
                 case ApplicationPhase.SYSTEM_REGISTERING: {
                     const servicesArray = Array.from(this.services.values());
-                    
-                    const result = generateGraphQLSchemaV2(servicesArray, { 
-                        enableArchetypeOperations: false 
+
+                    const result = generateGraphQLSchemaV2(servicesArray, {
+                        enableArchetypeOperations: false
                     });
-                    
+
                     this.schema = result.schema;
                     ApplicationLifecycle.setPhase(ApplicationPhase.SYSTEM_READY);
                     break;
                 };
             }
-        });
+        };
+        ApplicationLifecycle.addPhaseListener(this.phaseListener);
+    }
+
+    public dispose(): void {
+        if (this.phaseListener) {
+            ApplicationLifecycle.removePhaseListener(this.phaseListener);
+            this.phaseListener = null;
+        }
     }
 
 

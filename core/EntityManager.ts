@@ -1,18 +1,27 @@
-import ApplicationLifecycle, { ApplicationPhase } from "./ApplicationLifecycle";
+import ApplicationLifecycle, { ApplicationPhase, type PhaseChangeEvent } from "./ApplicationLifecycle";
 import type { IEntity } from "./EntityInterface";
 
 class EntityManager {
     static #instance: EntityManager;
     private dbReady = false;
     private entityQueue: IEntity[] = [];
+    private phaseListener: ((event: PhaseChangeEvent) => void) | null = null;
 
     constructor() {
-        ApplicationLifecycle.addPhaseListener(async (event) => {
+        this.phaseListener = async (event: PhaseChangeEvent) => {
             if (event.detail === ApplicationPhase.DATABASE_READY) {
                 this.dbReady = true;
                 await this.savePendingEntities();
             }
-        });
+        };
+        ApplicationLifecycle.addPhaseListener(this.phaseListener);
+    }
+
+    public dispose(): void {
+        if (this.phaseListener) {
+            ApplicationLifecycle.removePhaseListener(this.phaseListener);
+            this.phaseListener = null;
+        }
     }
 
     public deleteEntity(entity: IEntity, force: boolean = false) {

@@ -15,7 +15,7 @@ import {
     type LifecycleEvent
 } from "./events/EntityLifecycleEvents";
 import { logger as MainLogger } from "./Logger";
-import ApplicationLifecycle, { ApplicationPhase } from "./ApplicationLifecycle";
+import ApplicationLifecycle, { ApplicationPhase, type PhaseChangeEvent } from "./ApplicationLifecycle";
 
 const logger = MainLogger.child({ scope: "EntityHookManager" });
 
@@ -99,6 +99,7 @@ class EntityHookManager {
     private hooks: Map<string, RegisteredHook[]> = new Map();
     private hookCounter: number = 0;
     private metrics: Map<string, HookMetrics> = new Map();
+    private phaseListener: ((event: PhaseChangeEvent) => void) | null = null;
     private globalMetrics: HookMetrics = {
         totalExecutions: 0,
         totalExecutionTime: 0,
@@ -117,7 +118,7 @@ class EntityHookManager {
      */
     private initializeLifecycleIntegration(): void {
         // Wait for components to be ready before allowing hook registration
-        ApplicationLifecycle.addPhaseListener((event) => {
+        this.phaseListener = (event: PhaseChangeEvent) => {
             const phase = event.detail;
             switch (phase) {
                 case ApplicationPhase.COMPONENTS_READY:
@@ -127,7 +128,15 @@ class EntityHookManager {
                     logger.info("EntityHookManager fully operational");
                     break;
             }
-        });
+        };
+        ApplicationLifecycle.addPhaseListener(this.phaseListener);
+    }
+
+    public dispose(): void {
+        if (this.phaseListener) {
+            ApplicationLifecycle.removePhaseListener(this.phaseListener);
+            this.phaseListener = null;
+        }
     }
 
     /**

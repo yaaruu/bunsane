@@ -1,5 +1,6 @@
 import ApplicationLifecycle, {
     ApplicationPhase,
+    type PhaseChangeEvent,
 } from "./ApplicationLifecycle";
 import {
     GenerateTableName,
@@ -81,6 +82,13 @@ export default class App {
     private server: ReturnType<typeof Bun.serve> | null = null;
     private isShuttingDown = false;
     private isReady = false;
+    private phaseListener: ((event: PhaseChangeEvent) => void) | null = null;
+    private signalHandlersRegistered = false;
+    private processHandlersRegistered = false;
+    private sigTermHandler: (() => void) | null = null;
+    private sigIntHandler: (() => void) | null = null;
+    private unhandledRejectionHandler: ((reason: unknown, promise: Promise<unknown>) => void) | null = null;
+    private uncaughtExceptionHandler: ((error: Error) => void) | null = null;
     private graphqlMaxDepth: number = 10;
     private shutdownGracePeriod = 10_000;
     private maxRequestBodySize = 50 * 1024 * 1024; // 50MB default
@@ -133,6 +141,12 @@ export default class App {
     }
 
     async init() {
+        // Register process-level error handlers FIRST so failures during init
+        // (DB prep, component registration, schema build) are observable. If
+        // registration happens later (e.g. in start()) any boot-sequence
+        // unhandled rejection is silently discarded by the runtime.
+        this.registerProcessHandlers();
+
         validateEnv();
         logger.trace(`Initializing App`);
         ComponentRegistry.init();
@@ -155,7 +169,12 @@ export default class App {
             }
         }
 
-        ApplicationLifecycle.addPhaseListener(async (event) => {
+        // Remove any previous listener so repeated init() calls (tests) don't
+        // stack handlers on the lifecycle singleton.
+        if (this.phaseListener) {
+            ApplicationLifecycle.removePhaseListener(this.phaseListener);
+        }
+        this.phaseListener = async (event: PhaseChangeEvent) => {
             const phase = event.detail;
             logger.info(`Application phase changed to: ${phase}`);
             // Notify plugins of phase change
@@ -402,8 +421,21 @@ export default class App {
                             ApplicationPhase.APPLICATION_READY
                         );
                     } catch (error) {
-                        logger.error("Error during SYSTEM_READY phase:");
-                        logger.error(error);
+                        // SYSTEM_READY failures must not be swallowed silently.
+                        // Without this, the app stays forever in SYSTEM_READY
+                        // (isReady=false, /health/ready → 503 forever) and k8s
+                        // rollout hangs with no observable cause. Surface the
+                        // failure so the readiness probe reports it and the
+                        // orchestrator can restart.
+                        this.isReady = false;
+                        logger.fatal({ scope: 'app', component: 'App', err: error }, 'Fatal error during SYSTEM_READY phase — marking app unready');
+                        // In production, exit so k8s can restart the pod.
+                        // In tests, rethrow so the test sees the failure.
+                        if (process.env.NODE_ENV === 'test') {
+                            throw error;
+                        }
+                        // Give the logger a chance to flush, then exit.
+                        setTimeout(() => process.exit(1), 100).unref?.();
                     }
                     break;
                 }
@@ -414,7 +446,8 @@ export default class App {
                     break;
                 }
             }
-        });
+        };
+        ApplicationLifecycle.addPhaseListener(this.phaseListener);
 
         if (
             ApplicationLifecycle.getCurrentPhase() ===
@@ -1151,68 +1184,107 @@ export default class App {
             )}`
         );
 
-        // Register signal handlers for graceful shutdown
-        process.on('SIGTERM', async () => {
-            logger.info({ scope: 'app', component: 'App', msg: 'Received SIGTERM' });
-            await this.shutdown();
-            process.exit(0);
-        });
-
-        process.on('SIGINT', async () => {
-            logger.info({ scope: 'app', component: 'App', msg: 'Received SIGINT' });
-            await this.shutdown();
-            process.exit(0);
-        });
-
-        // Global error handlers to prevent silent crashes
-        process.on('unhandledRejection', (reason, promise) => {
-            logger.error({ scope: 'app', component: 'App', reason, msg: 'Unhandled promise rejection' });
-        });
-
-        process.on('uncaughtException', (error) => {
-            logger.fatal({ scope: 'app', component: 'App', error, msg: 'Uncaught exception — shutting down' });
-            this.shutdown().finally(() => process.exit(1));
-        });
+        // Signal handlers now registered in init() via registerProcessHandlers()
+        // so they cover the boot sequence (before start() runs).
 
         this.isReady = true;
         this.appReadyCallbacks.forEach((cb) => cb());
     }
 
     /**
-     * Gracefully shutdown the application
+     * Register process-level signal and error handlers. Called at the top of
+     * `init()` so that failures during boot (DB prep, component registration,
+     * schema build) are logged and don't silently crash the runtime.
+     *
+     * Uses `process.once` for signals so a double SIGTERM can't fire two
+     * concurrent shutdown paths racing each other to `process.exit`. Also
+     * idempotent — safe to call multiple times (e.g. in tests).
+     */
+    private registerProcessHandlers(): void {
+        if (this.processHandlersRegistered) return;
+
+        // Use arrow-bound handlers so `once` works cleanly.
+        this.sigTermHandler = () => {
+            logger.info({ scope: 'app', component: 'App', msg: 'Received SIGTERM' });
+            this.shutdown().finally(() => process.exit(0));
+        };
+        this.sigIntHandler = () => {
+            logger.info({ scope: 'app', component: 'App', msg: 'Received SIGINT' });
+            this.shutdown().finally(() => process.exit(0));
+        };
+        process.once('SIGTERM', this.sigTermHandler);
+        process.once('SIGINT', this.sigIntHandler);
+
+        // Global error handlers to prevent silent crashes during init AND runtime.
+        this.unhandledRejectionHandler = (reason, promise) => {
+            logger.error({ scope: 'app', component: 'App', reason, msg: 'Unhandled promise rejection' });
+        };
+        this.uncaughtExceptionHandler = (error) => {
+            logger.fatal({ scope: 'app', component: 'App', err: error, msg: 'Uncaught exception — shutting down' });
+            this.shutdown().finally(() => process.exit(1));
+        };
+        process.on('unhandledRejection', this.unhandledRejectionHandler);
+        process.on('uncaughtException', this.uncaughtExceptionHandler);
+
+        this.processHandlersRegistered = true;
+    }
+
+    private unregisterProcessHandlers(): void {
+        if (!this.processHandlersRegistered) return;
+        if (this.sigTermHandler) process.removeListener('SIGTERM', this.sigTermHandler);
+        if (this.sigIntHandler) process.removeListener('SIGINT', this.sigIntHandler);
+        if (this.unhandledRejectionHandler) process.removeListener('unhandledRejection', this.unhandledRejectionHandler);
+        if (this.uncaughtExceptionHandler) process.removeListener('uncaughtException', this.uncaughtExceptionHandler);
+        this.sigTermHandler = null;
+        this.sigIntHandler = null;
+        this.unhandledRejectionHandler = null;
+        this.uncaughtExceptionHandler = null;
+        this.processHandlersRegistered = false;
+    }
+
+    /**
+     * Gracefully shutdown the application.
+     *
+     * Ordered drain: HTTP → scheduler → remote → cache → database. Each step
+     * awaits completion before the next begins so in-flight work always sees
+     * its dependencies still available. Total budget bounded by
+     * `shutdownGracePeriod`; per-step budgets fall back to reasonable defaults.
      */
     async shutdown(): Promise<void> {
         if (this.isShuttingDown) return;
         this.isShuttingDown = true;
         this.isReady = false;
 
-        logger.info({ scope: 'app', component: 'App', msg: 'Shutting down application' });
+        const shutdownStart = Date.now();
+        logger.info({ scope: 'app', component: 'App', msg: 'Shutting down application', gracePeriodMs: this.shutdownGracePeriod });
 
-        // Stop HTTP server — drain then force-close after grace period
+        const budgetRemaining = () => Math.max(500, this.shutdownGracePeriod - (Date.now() - shutdownStart));
+
+        // 1. Stop HTTP server: stop accepting new connections, wait for in-flight
+        //    requests to finish. Bun's server.stop(false) initiates graceful
+        //    drain but does not return a promise — we poll the server's
+        //    pendingRequests count, then force-close on deadline.
         if (this.server) {
             try {
-                logger.info({ scope: 'app', component: 'App', msg: 'Draining connections' });
+                logger.info({ scope: 'app', component: 'App', msg: 'Draining HTTP connections' });
                 this.server.stop(false);
-                const forceTimer = setTimeout(() => {
-                    logger.warn({ scope: 'app', component: 'App', msg: 'Grace period expired, forcing connection close' });
-                    try { this.server?.stop(true); } catch {}
-                }, this.shutdownGracePeriod);
-                forceTimer.unref?.();
+                await this.waitForHttpDrain(budgetRemaining());
+                try { this.server.stop(true); } catch {}
                 logger.info({ scope: 'app', component: 'App', msg: 'HTTP server stopped' });
             } catch (error) {
-                logger.warn({ scope: 'app', component: 'App', msg: 'HTTP server stop error', error });
+                logger.warn({ scope: 'app', component: 'App', msg: 'HTTP server stop error', err: error });
             }
         }
 
-        // Stop scheduler
+        // 2. Stop scheduler (awaits in-flight tasks internally, see C14).
         try {
-            await SchedulerManager.getInstance().stop();
+            await SchedulerManager.getInstance().stop(Math.min(budgetRemaining(), 15_000));
             logger.info({ scope: 'app', component: 'App', msg: 'Scheduler stopped' });
         } catch (error) {
-            logger.warn({ scope: 'app', component: 'App', msg: 'Scheduler stop error', error });
+            logger.warn({ scope: 'app', component: 'App', msg: 'Scheduler stop error', err: error });
         }
 
-        // Shutdown RemoteManager (after scheduler, before cache — DB still available)
+        // 3. Shutdown RemoteManager (after scheduler, before cache — DB still available).
         if (this.remote) {
             try {
                 await this.remote.shutdown();
@@ -1220,27 +1292,61 @@ export default class App {
                 this.remote = null;
                 logger.info({ scope: 'app', component: 'App', msg: 'RemoteManager shutdown' });
             } catch (error) {
-                logger.warn({ scope: 'app', component: 'App', msg: 'RemoteManager shutdown error', error });
+                logger.warn({ scope: 'app', component: 'App', msg: 'RemoteManager shutdown error', err: error });
             }
         }
 
-        // Shutdown cache
+        // 4. Shutdown cache (flush pending writes, unsubscribe pub/sub, disconnect).
         try {
             const { CacheManager } = await import('./cache/CacheManager');
             await CacheManager.getInstance().shutdown();
             logger.info({ scope: 'cache', component: 'App', msg: 'Cache shutdown completed' });
         } catch (error) {
-            logger.warn({ scope: 'cache', component: 'App', msg: 'Cache shutdown error', error });
+            logger.warn({ scope: 'cache', component: 'App', msg: 'Cache shutdown error', err: error });
         }
 
-        // Close database pool (last step)
+        // 5. Close database pool (last — after all consumers done).
         try {
             db.close();
             logger.info({ scope: 'app', component: 'App', msg: 'Database pool closed' });
         } catch (error) {
-            logger.warn({ scope: 'app', component: 'App', msg: 'Database pool close error', error });
+            logger.warn({ scope: 'app', component: 'App', msg: 'Database pool close error', err: error });
         }
 
-        logger.info({ scope: 'app', component: 'App', msg: 'Application shutdown completed' });
+        // 6. Dispose lifecycle listeners so a subsequent init() (tests) doesn't
+        //    stack handlers on the singleton.
+        try {
+            if (this.phaseListener) {
+                ApplicationLifecycle.removePhaseListener(this.phaseListener);
+                this.phaseListener = null;
+            }
+            SchedulerManager.getInstance().disposeLifecycleIntegration();
+        } catch { /* ignore */ }
+
+        // 7. Unregister process handlers (signals + error handlers) last so
+        //    shutdown errors still surface via them above.
+        this.unregisterProcessHandlers();
+
+        logger.info({ scope: 'app', component: 'App', msg: 'Application shutdown completed', durationMs: Date.now() - shutdownStart });
+    }
+
+    /**
+     * Wait for pending HTTP requests to drain, bounded by `timeoutMs`.
+     * Bun's `Server` exposes `pendingRequests` for this poll. If the field is
+     * unavailable (older Bun), fall back to a fixed sleep.
+     */
+    private async waitForHttpDrain(timeoutMs: number): Promise<void> {
+        if (!this.server) return;
+        const deadline = Date.now() + timeoutMs;
+        // Poll pending request count. Bun exposes this on the Server object.
+        while (Date.now() < deadline) {
+            const pending = (this.server as any).pendingRequests ?? 0;
+            if (pending === 0) return;
+            await new Promise((r) => setTimeout(r, 50));
+        }
+        const leftover = (this.server as any).pendingRequests ?? -1;
+        if (leftover > 0) {
+            logger.warn({ scope: 'app', component: 'App', msg: 'HTTP drain timeout, pending requests remaining', pendingRequests: leftover });
+        }
     }
 }

@@ -730,55 +730,91 @@ export class Entity implements IEntity {
         return EntityManager.deleteEntity(this, force);
     }
 
-    public doDelete(force: boolean = false) {
-        return new Promise<boolean>(async resolve => {
-            if(!this._persisted) {
-                logger.warn("Entity is not persisted, cannot delete.");
-                return resolve(false); 
+    public async doDelete(force: boolean = false): Promise<boolean> {
+        if (!this._persisted) {
+            logger.warn("Entity is not persisted, cannot delete.");
+            return false;
+        }
+
+        // AbortController cancels in-flight queries on wall-clock timeout so a
+        // hanging DELETE cannot leak backends into `idle in transaction` under
+        // pgbouncer transaction pool mode. Same pattern as Entity.save.
+        const controller = new AbortController();
+        const timeoutMs = QUERY_TIMEOUT_MS;
+        const timeoutHandle = setTimeout(() => {
+            const err = new Error(`Entity delete timeout for entity ${this.id} after ${timeoutMs}ms`);
+            logger.error({ scope: 'Entity.doDelete', entityId: this.id, timeoutMs }, err.message);
+            controller.abort(err);
+        }, timeoutMs);
+
+        const signal = controller.signal;
+        const run = async <T>(q: any): Promise<T> => {
+            if (signal.aborted) {
+                try { q.cancel?.(); } catch { /* ignore */ }
+                throw signal.reason ?? new Error('Entity.doDelete aborted');
             }
+            const onAbort = () => { try { q.cancel?.(); } catch { /* ignore */ } };
+            signal.addEventListener('abort', onAbort, { once: true });
             try {
-                await db.transaction(async (trx) => {
-                    if(force) {
-                        await trx`DELETE FROM entity_components WHERE entity_id = ${this.id}`;
-                        await trx`DELETE FROM components WHERE entity_id = ${this.id}`;
-                        await trx`DELETE FROM entities WHERE id = ${this.id}`;
-                    } else {
-                        await trx`UPDATE entities SET deleted_at = CURRENT_TIMESTAMP WHERE id = ${this.id} AND deleted_at IS NULL`;
-                        await trx`UPDATE entity_components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`;
-                        await trx`UPDATE components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`;
-                    }
-                });
-
-                // Fire lifecycle event after successful deletion
-                try {
-                    await EntityHookManager.executeHooks(new EntityDeletedEvent(this, !force));
-                } catch (error) {
-                    logger.error(`Error firing delete lifecycle hook for entity ${this.id}: ${error}`);
-                    // Don't fail the delete operation if hooks fail
-                }
-
-                // Invalidate cache after successful deletion
-                try {
-                    const { CacheManager } = await import('./cache/CacheManager');
-                    const cacheManager = CacheManager.getInstance();
-                    const config = cacheManager.getConfig();
-
-                    if (config.enabled && config.entity?.enabled) {
-                        await cacheManager.invalidateEntity(this.id);
-                    }
-                    if (config.enabled && config.component?.enabled) {
-                        await cacheManager.invalidateAllEntityComponents(this.id);
-                    }
-                } catch (error) {
-                    logger.warn({ scope: 'cache', component: 'Entity', msg: 'Cache invalidation failed after delete', error });
-                }
-
-                resolve(true);
-            } catch (error) {
-                logger.error(`Failed to delete entity: ${error}`);
-                resolve(false);
+                return await q;
+            } finally {
+                signal.removeEventListener('abort', onAbort);
             }
-        })
+        };
+
+        try {
+            await db.transaction(async (trx) => {
+                if (force) {
+                    await run(trx`DELETE FROM entity_components WHERE entity_id = ${this.id}`);
+                    await run(trx`DELETE FROM components WHERE entity_id = ${this.id}`);
+                    await run(trx`DELETE FROM entities WHERE id = ${this.id}`);
+                } else {
+                    await run(trx`UPDATE entities SET deleted_at = CURRENT_TIMESTAMP WHERE id = ${this.id} AND deleted_at IS NULL`);
+                    await run(trx`UPDATE entity_components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`);
+                    await run(trx`UPDATE components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`);
+                }
+            });
+            clearTimeout(timeoutHandle);
+
+            // Fire-and-forget post-commit side effects: lifecycle hooks + cache
+            // invalidation. Errors are logged, never propagate to caller.
+            queueMicrotask(() => this.runPostDeleteSideEffects(!force));
+
+            return true;
+        } catch (error) {
+            clearTimeout(timeoutHandle);
+            if (signal.aborted) {
+                logger.error({ scope: 'Entity.doDelete', entityId: this.id }, `Entity delete aborted: ${signal.reason ?? error}`);
+            } else {
+                logger.error({ scope: 'Entity.doDelete', entityId: this.id, err: error }, 'Failed to delete entity');
+            }
+            return false;
+        } finally {
+            if (!signal.aborted) controller.abort();
+        }
+    }
+
+    private async runPostDeleteSideEffects(softDelete: boolean): Promise<void> {
+        try {
+            await EntityHookManager.executeHooks(new EntityDeletedEvent(this, softDelete));
+        } catch (err) {
+            logger.error({ scope: 'hooks', entityId: this.id, err }, 'post-delete lifecycle hooks failed');
+        }
+
+        try {
+            const { CacheManager } = await import('./cache/CacheManager');
+            const cacheManager = CacheManager.getInstance();
+            const config = cacheManager.getConfig();
+
+            if (config.enabled && config.entity?.enabled) {
+                await cacheManager.invalidateEntity(this.id);
+            }
+            if (config.enabled && config.component?.enabled) {
+                await cacheManager.invalidateAllEntityComponents(this.id);
+            }
+        } catch (err) {
+            logger.warn({ scope: 'cache', entityId: this.id, err }, 'post-delete cache invalidation failed');
+        }
     }
 
     public setPersisted(persisted: boolean) {
