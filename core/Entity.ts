@@ -383,46 +383,103 @@ export class Entity implements IEntity {
     }
 
     @timed("Entity.save")
-    public save(trx?: SQL, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }) {
-        return new Promise<boolean>((resolve, reject) => {
-            // Add timeout to prevent hanging
-            const timeout = setTimeout(() => {
-                logger.error(`Entity save timeout for entity ${this.id}`);
-                reject(new Error(`Entity save timeout for entity ${this.id}`));
-            }, QUERY_TIMEOUT_MS); // Configurable timeout via DB_QUERY_TIMEOUT env var
+    public async save(trx?: SQL, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }): Promise<boolean> {
+        // Capture pre-save state BEFORE doSave mutates persisted/dirty flags.
+        const wasNew = !this._persisted;
+        const changedComponentTypeIds = this.getDirtyComponents();
+        const removedComponentTypeIds = Array.from(this.removedComponents);
 
-            // Capture dirty components BEFORE doSave clears the dirty flags
-            const changedComponentTypeIds = this.getDirtyComponents();
-            const removedComponentTypeIds = Array.from(this.removedComponents);
+        const profile = process.env.DB_SAVE_PROFILE === 'true';
+        const phaseStart = profile ? performance.now() : 0;
+        const phases: Record<string, number> = {};
 
+        // AbortController cancels in-flight queries and propagates ROLLBACK
+        // when the wall-clock timer fires. Throwing from inside the transaction
+        // callback triggers Bun SQL's auto-ROLLBACK, releasing the pooled connection.
+        const controller = new AbortController();
+        const timeoutMs = QUERY_TIMEOUT_MS;
+        const timeoutHandle = setTimeout(() => {
+            const err = new Error(`Entity save timeout for entity ${this.id} after ${timeoutMs}ms`);
+            logger.error({ scope: 'Entity.save', entityId: this.id, timeoutMs }, err.message);
+            controller.abort(err);
+        }, timeoutMs);
+
+        try {
+            const dbStart = profile ? performance.now() : 0;
             if (trx) {
-                // Use provided transaction
-                this.doSave(trx)
-                .then(async result => {
-                    clearTimeout(timeout);
-                    await this.handleCacheAfterSave(changedComponentTypeIds, removedComponentTypeIds, context);
-                    resolve(result);
-                })
-                .catch(error => {
-                    clearTimeout(timeout);
-                    reject(error);
-                });
+                await this.doSave(trx, controller.signal);
             } else {
-                // Create new transaction
-                db.transaction(async (newTrx) => {
-                    return await this.doSave(newTrx);
-                })
-                .then(async result => {
-                    clearTimeout(timeout);
-                    await this.handleCacheAfterSave(changedComponentTypeIds, removedComponentTypeIds, context);
-                    resolve(result);
-                })
-                .catch(error => {
-                    clearTimeout(timeout);
-                    reject(error);
+                await db.transaction(async (newTrx) => {
+                    await this.doSave(newTrx, controller.signal);
                 });
             }
-        });
+            if (profile) phases.db = performance.now() - dbStart;
+
+            clearTimeout(timeoutHandle);
+
+            // Post-commit side effects are fire-and-forget so Redis / hook
+            // latency cannot consume the save budget or block the caller.
+            queueMicrotask(() => this.runPostCommitSideEffects(
+                wasNew,
+                changedComponentTypeIds,
+                removedComponentTypeIds,
+                context,
+                profile ? phases : undefined,
+                profile ? phaseStart : undefined,
+            ));
+
+            return true;
+        } catch (error) {
+            clearTimeout(timeoutHandle);
+            if (controller.signal.aborted) {
+                throw controller.signal.reason ?? error;
+            }
+            throw error;
+        } finally {
+            // Ensure AbortController listeners are released even on success.
+            if (!controller.signal.aborted) controller.abort();
+        }
+    }
+
+    /**
+     * Fire-and-forget post-commit work: cache invalidation + lifecycle hooks.
+     * Runs outside the save budget. Errors are logged and swallowed so cache
+     * or hook failures never surface as save failures.
+     */
+    private async runPostCommitSideEffects(
+        wasNew: boolean,
+        changedComponentTypeIds: string[],
+        removedComponentTypeIds: string[],
+        context: { loaders?: { componentsByEntityType?: any }; trx?: SQL } | undefined,
+        phases: Record<string, number> | undefined,
+        phaseStart: number | undefined,
+    ): Promise<void> {
+        const profile = phases !== undefined && phaseStart !== undefined;
+
+        const cacheStart = profile ? performance.now() : 0;
+        try {
+            await this.handleCacheAfterSave(changedComponentTypeIds, removedComponentTypeIds, context);
+        } catch (err) {
+            logger.warn({ scope: 'cache', entityId: this.id, err }, 'post-commit cache invalidation failed');
+        }
+        if (profile) phases!.cache = performance.now() - cacheStart;
+
+        const hookStart = profile ? performance.now() : 0;
+        try {
+            if (wasNew) {
+                await EntityHookManager.executeHooks(new EntityCreatedEvent(this));
+            } else if (changedComponentTypeIds.length > 0) {
+                await EntityHookManager.executeHooks(new EntityUpdatedEvent(this, changedComponentTypeIds));
+            }
+        } catch (err) {
+            logger.error({ scope: 'hooks', entityId: this.id, err }, 'post-commit lifecycle hooks failed');
+        }
+        if (profile) phases!.hooks = performance.now() - hookStart;
+
+        if (profile) {
+            phases!.total = performance.now() - phaseStart!;
+            logger.info({ scope: 'Entity.save.profile', entityId: this.id, phases }, 'Entity.save phase timings');
+        }
     }
 
     /**
@@ -490,180 +547,183 @@ export class Entity implements IEntity {
         }
     }
 
-    public doSave(trx: SQL) {
-        return new Promise<boolean>(async (resolve, reject) => {
-            // Validate entity ID to prevent PostgreSQL UUID parsing errors
-            if (!this.id || this.id.trim() === '') {
-                logger.error(`Cannot save entity: id is empty or invalid`);
-                return reject(new Error(`Cannot save entity: id is empty or invalid`));
+    public async doSave(trx: SQL, signal?: AbortSignal): Promise<boolean> {
+        // Validate entity ID to prevent PostgreSQL UUID parsing errors
+        if (!this.id || this.id.trim() === '') {
+            logger.error(`Cannot save entity: id is empty or invalid`);
+            throw new Error(`Cannot save entity: id is empty or invalid`);
+        }
+
+        if (!this._dirty) {
+            let dirtyComponents: string[] = [];
+            try {
+                dirtyComponents = this.getDirtyComponents();
+            } catch {
+                // best-effort diagnostics only
             }
 
-            if(!this._dirty) {
-                let dirtyComponents: string[] = [];
-                try {
-                    dirtyComponents = this.getDirtyComponents();
-                } catch {
-                    // best-effort diagnostics only
-                }
+            const removedTypeIds = Array.from(this.removedComponents);
+            const entityType = (this as any)?.constructor?.name ?? "Entity";
+            const dirtyComponentPreview = dirtyComponents.slice(0, 10).map((component) => {
+                const anyComponent = component as any;
+                return {
+                    type: anyComponent?.constructor?.name ?? "Component",
+                    typeId: typeof anyComponent?.getTypeID === "function" ? anyComponent.getTypeID() : undefined,
+                    id: anyComponent?.id,
+                    persisted: anyComponent?._persisted,
+                    dirty: anyComponent?._dirty,
+                };
+            });
 
-                const removedTypeIds = Array.from(this.removedComponents);
-                const entityType = (this as any)?.constructor?.name ?? "Entity";
-                const dirtyComponentPreview = dirtyComponents.slice(0, 10).map((component) => {
-                    const anyComponent = component as any;
-                    return {
-                        type: anyComponent?.constructor?.name ?? "Component",
-                        typeId: typeof anyComponent?.getTypeID === "function" ? anyComponent.getTypeID() : undefined,
-                        id: anyComponent?.id,
-                        persisted: anyComponent?._persisted,
-                        dirty: anyComponent?._dirty,
-                    };
-                });
-
-                logger.trace(
-                    {
-                        component: "Entity",
-                        entity: {
-                            type: entityType,
-                            id: this.id,
-                            persisted: this._persisted,
-                            dirty: this._dirty,
-                        },
-                        components: {
-                            total: this.components.size,
-                            dirtyCount: dirtyComponents.length,
-                            dirtyPreview: dirtyComponentPreview,
-                        },
-                        removedComponents: {
-                            count: removedTypeIds.length,
-                            typeIdsPreview: removedTypeIds.slice(0, 10),
-                        },
+            logger.trace(
+                {
+                    component: "Entity",
+                    entity: {
+                        type: entityType,
+                        id: this.id,
+                        persisted: this._persisted,
+                        dirty: this._dirty,
                     },
-                    "[Entity.doSave] Skipping save because entity is not dirty"
-                );
-                return resolve(true);
+                    components: {
+                        total: this.components.size,
+                        dirtyCount: dirtyComponents.length,
+                        dirtyPreview: dirtyComponentPreview,
+                    },
+                    removedComponents: {
+                        count: removedTypeIds.length,
+                        typeIdsPreview: removedTypeIds.slice(0, 10),
+                    },
+                },
+                "[Entity.doSave] Skipping save because entity is not dirty"
+            );
+            return true;
+        }
+
+        // Execute a Bun SQL query with AbortSignal support. On abort, the
+        // in-flight query is cancelled (SQL.Query.cancel()) which causes the
+        // transaction callback to throw, triggering Bun's automatic ROLLBACK
+        // and releasing the pooled backend connection. Without this, a wall-
+        // clock timeout leaks backends into `idle in transaction` state —
+        // fatal under pgbouncer transaction-mode pooling.
+        const run = async <T>(q: any): Promise<T> => {
+            if (!signal) return await q;
+            if (signal.aborted) {
+                try { q.cancel?.(); } catch { /* ignore */ }
+                throw signal.reason ?? new Error('Entity.save aborted');
+            }
+            const onAbort = () => { try { q.cancel?.(); } catch { /* ignore */ } };
+            signal.addEventListener('abort', onAbort, { once: true });
+            try {
+                return await q;
+            } finally {
+                signal.removeEventListener('abort', onAbort);
+            }
+        };
+
+        const executeSave = async (saveTrx: SQL) => {
+            if (!this._persisted) {
+                await run(saveTrx`INSERT INTO entities (id) VALUES (${this.id}) ON CONFLICT DO NOTHING`);
+                this._persisted = true;
             }
 
-            const wasNew = !this._persisted;
-            const changedComponents = this.getDirtyComponents();
+            // Delete removed components from database
+            if (this.removedComponents.size > 0) {
+                const typeIds = Array.from(this.removedComponents);
+                await run(saveTrx`DELETE FROM components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`);
+                await run(saveTrx`DELETE FROM entity_components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`);
+                // Move to savedRemovedComponents so resolvers can still detect removed components
+                // This is needed because DataLoader may have stale cached data for this request
+                for (const typeId of typeIds) {
+                    this.savedRemovedComponents.add(typeId);
+                }
+                this.removedComponents.clear();
+            }
 
-            const executeSave = async (saveTrx: SQL) => {
-                if(!this._persisted) {
-                    await saveTrx`INSERT INTO entities (id) VALUES (${this.id}) ON CONFLICT DO NOTHING`;
-                    this._persisted = true;
+            if (this.components.size === 0) {
+                logger.trace(`No components to save for entity ${this.id}`);
+                return;
+            }
+
+            // Batch inserts and updates for better performance
+            const componentsToInsert = [];
+            const entityComponentsToInsert = [];
+            const componentsToUpdate = [];
+
+            for (const comp of this.components.values()) {
+                const compName = comp.constructor.name;
+                if (!ComponentRegistry.isComponentReady(compName)) {
+                    await ComponentRegistry.getReadyPromise(compName);
                 }
 
-                // Delete removed components from database
-                if (this.removedComponents.size > 0) {
-                    const typeIds = Array.from(this.removedComponents);
-                    await saveTrx`DELETE FROM components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`;
-                    await saveTrx`DELETE FROM entity_components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`;
-                    // Move to savedRemovedComponents so resolvers can still detect removed components
-                    // This is needed because DataLoader may have stale cached data for this request
-                    for (const typeId of typeIds) {
-                        this.savedRemovedComponents.add(typeId);
+                if (!(comp as any)._persisted) {
+                    if (comp.id === "") {
+                        comp.id = uuidv7();
                     }
-                    this.removedComponents.clear();
+                    componentsToInsert.push({
+                        id: comp.id,
+                        entity_id: this.id,
+                        name: compName,
+                        type_id: comp.getTypeID(),
+                        data: comp.serializableData()
+                    });
+                    entityComponentsToInsert.push({
+                        entity_id: this.id,
+                        type_id: comp.getTypeID(),
+                        component_id: comp.id
+                    });
+                    (comp as any).setPersisted(true);
+                    (comp as any).setDirty(false);
+                } else if ((comp as any)._dirty) {
+                    componentsToUpdate.push({
+                        id: comp.id,
+                        data: comp.serializableData()
+                    });
+                    (comp as any).setDirty(false);
                 }
-                
-                if(this.components.size === 0) {
-                    logger.trace(`No components to save for entity ${this.id}`);
-                    return;
-                }
-                
-                // Batch inserts and updates for better performance
-                const componentsToInsert = [];
-                const entityComponentsToInsert = [];
-                const componentsToUpdate = [];
-                
-                for(const comp of this.components.values()) {
-                    const compName = comp.constructor.name;
-                    if (!ComponentRegistry.isComponentReady(compName)) {
-                        await ComponentRegistry.getReadyPromise(compName);
-                    }
-                    
-                    if(!(comp as any)._persisted) {
-                        if(comp.id === "") {
-                            comp.id = uuidv7();
-                        }
-                        componentsToInsert.push({
-                            id: comp.id,
-                            entity_id: this.id,
-                            name: compName,
-                            type_id: comp.getTypeID(),
-                            data: comp.serializableData()
-                        });
-                        entityComponentsToInsert.push({
+            }
+
+            // Perform batch inserts
+            if (componentsToInsert.length > 0) {
+                await run(saveTrx`INSERT INTO components ${sql(componentsToInsert, 'id', 'entity_id', 'name', 'type_id', 'data')}`);
+                await run(saveTrx`INSERT INTO entity_components ${sql(entityComponentsToInsert, 'entity_id', 'type_id', 'component_id')} ON CONFLICT DO NOTHING`);
+            }
+
+            // Insert entity_components for existing components if entity is new
+            if (!this._persisted) {
+                const existingEntityComponents = [];
+                for (const comp of this.components.values()) {
+                    if ((comp as any)._persisted) {
+                        existingEntityComponents.push({
                             entity_id: this.id,
                             type_id: comp.getTypeID(),
                             component_id: comp.id
                         });
-                        (comp as any).setPersisted(true);
-                        (comp as any).setDirty(false);
-                    } else if((comp as any)._dirty) {
-                        componentsToUpdate.push({
-                            id: comp.id,
-                            data: comp.serializableData()
-                        });
-                        (comp as any).setDirty(false);
                     }
                 }
-                
-                // Perform batch inserts
-                if(componentsToInsert.length > 0) {
-                    await saveTrx`INSERT INTO components ${sql(componentsToInsert, 'id', 'entity_id', 'name', 'type_id', 'data')}`;
-                    await saveTrx`INSERT INTO entity_components ${sql(entityComponentsToInsert, 'entity_id', 'type_id', 'component_id')} ON CONFLICT DO NOTHING`;
+                if (existingEntityComponents.length > 0) {
+                    await run(saveTrx`INSERT INTO entity_components ${sql(existingEntityComponents, 'entity_id', 'type_id', 'component_id')} ON CONFLICT DO NOTHING`);
                 }
-
-                // Insert entity_components for existing components if entity is new
-                if(!this._persisted) {
-                    const existingEntityComponents = [];
-                    for(const comp of this.components.values()) {
-                        if((comp as any)._persisted) {
-                            existingEntityComponents.push({
-                                entity_id: this.id,
-                                type_id: comp.getTypeID(),
-                                component_id: comp.id
-                            });
-                        }
-                    }
-                    if(existingEntityComponents.length > 0) {
-                        await saveTrx`INSERT INTO entity_components ${sql(existingEntityComponents, 'entity_id', 'type_id', 'component_id')} ON CONFLICT DO NOTHING`;
-                    }
-                }
-
-                // Perform batch updates
-                if(componentsToUpdate.length > 0) {
-                    for(const comp of componentsToUpdate) {
-                        // Validate component ID to prevent PostgreSQL UUID parsing errors
-                        if (!comp.id || comp.id.trim() === '') {
-                            logger.error(`Cannot update component: id is empty or invalid. Component data: ${JSON.stringify(comp.data).substring(0, 200)}`);
-                            throw new Error(`Cannot update component: component id is empty or invalid`);
-                        }
-                        logger.trace({ componentId: comp.id, data: comp.data }, `[Entity.doSave] Updating component`);
-                        await saveTrx`UPDATE components SET data = ${comp.data} WHERE id = ${comp.id}`;
-                    }
-                }
-            };
-
-            await executeSave(trx);
-
-            this._dirty = false;
-
-            // Fire lifecycle events after successful save
-            try {
-                if (wasNew) {
-                    await EntityHookManager.executeHooks(new EntityCreatedEvent(this));
-                } else if (changedComponents.length > 0) {
-                    await EntityHookManager.executeHooks(new EntityUpdatedEvent(this, changedComponents));
-                }
-            } catch (error) {
-                logger.error(`Error firing lifecycle hooks for entity ${this.id}: ${error}`);
-                // Don't fail the save operation if hooks fail
             }
 
-            resolve(true);
-        })
-        
+            // Perform batch updates
+            if (componentsToUpdate.length > 0) {
+                for (const comp of componentsToUpdate) {
+                    // Validate component ID to prevent PostgreSQL UUID parsing errors
+                    if (!comp.id || comp.id.trim() === '') {
+                        logger.error(`Cannot update component: id is empty or invalid. Component data: ${JSON.stringify(comp.data).substring(0, 200)}`);
+                        throw new Error(`Cannot update component: component id is empty or invalid`);
+                    }
+                    logger.trace({ componentId: comp.id, data: comp.data }, `[Entity.doSave] Updating component`);
+                    await run(saveTrx`UPDATE components SET data = ${comp.data} WHERE id = ${comp.id}`);
+                }
+            }
+        };
+
+        await executeSave(trx);
+
+        this._dirty = false;
+
+        return true;
     }
 
     public delete(force: boolean = false) {
