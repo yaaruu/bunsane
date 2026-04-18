@@ -6,6 +6,27 @@ All notable changes to bunsane are documented here.
 
 ### Fixed
 
+- **Redis cache no longer causes unbounded heap growth when Redis is
+  unreachable.** `enableOfflineQueue` now defaults to `false` so commands
+  fail fast and the caller's `try/catch` treats it as a cache miss instead
+  of queuing indefinitely. Can be overridden per-deployment via
+  `REDIS_ENABLE_OFFLINE_QUEUE=true` when you accept the memory risk.
+  Ticket C02.
+
+- **Redis reconnect storm capped.** `retryStrategy` now returns `null`
+  after `maxReconnectAttempts` (default 20) so a permanently unreachable
+  Redis cannot spin forever, saturating logs and keeping the ioredis
+  state machine busy. Configurable via `REDIS_MAX_RECONNECT_ATTEMPTS`.
+  Default inter-attempt delay also raised from `times * 50` to
+  `times * 200` (capped at 2s) for a gentler back-off. Ticket C03.
+
+- **`App.init()` now awaits `CacheManager.initialize()`.** Previously only
+  `getInstance()` was called so pub/sub cross-instance invalidation was
+  never set up and any app-supplied cache config was silently ignored.
+  Added `App.setCacheConfig(config)` so callers can supply a partial
+  config that is merged with `defaultCacheConfig` and passed to
+  `initialize()`. Ticket C04.
+
 - **`Entity.doDelete` no longer leaks `idle in transaction` backends on timeout.**
   Same AbortController + in-flight query cancellation pattern as `Entity.save`.
   Post-commit cache invalidation and lifecycle hooks moved out of the save

@@ -33,6 +33,7 @@ import {
     setRemoteManager,
 } from "./remote";
 import type { RemoteManagerConfig } from "./remote";
+import type { CacheConfig } from "../config/cache.config";
 
 export type CorsConfig = {
     origin?: string | string[] | ((origin: string) => boolean);
@@ -82,6 +83,7 @@ export default class App {
     private server: ReturnType<typeof Bun.serve> | null = null;
     private isShuttingDown = false;
     private isReady = false;
+    private cacheConfig: Partial<CacheConfig> | null = null;
     private phaseListener: ((event: PhaseChangeEvent) => void) | null = null;
     private signalHandlersRegistered = false;
     private processHandlersRegistered = false;
@@ -152,14 +154,18 @@ export default class App {
         ComponentRegistry.init();
         ServiceRegistry.init();
         
-        // Initialize CacheManager
+        // Initialize CacheManager with merged config. MUST await — initialize()
+        // is async and sets up pub/sub for cross-instance invalidation. Previously
+        // only getInstance() was called, silently skipping pub/sub setup and
+        // ignoring any app-supplied config (C04).
         try {
             const { CacheManager } = await import('./cache/CacheManager');
             const cacheManager = CacheManager.getInstance();
-            // CacheManager initializes with default config, can be customized later
-            logger.info({ scope: 'cache', component: 'App', msg: 'CacheManager initialized' });
+            await cacheManager.initialize(this.cacheConfig ?? {});
+            const config = cacheManager.getConfig();
+            logger.info({ scope: 'cache', component: 'App', msg: 'CacheManager initialized', provider: config.provider, enabled: config.enabled, strategy: config.strategy });
         } catch (error) {
-            logger.warn({ scope: 'cache', component: 'App', msg: 'Failed to initialize CacheManager', error });
+            logger.warn({ scope: 'cache', component: 'App', msg: 'Failed to initialize CacheManager', err: error });
         }
         
         // Plugin initialization
@@ -1050,6 +1056,15 @@ export default class App {
      */
     public setGraphQLMaxDepth(depth: number) {
         this.graphqlMaxDepth = depth;
+    }
+
+    /**
+     * Supply a cache configuration that will be merged with `defaultCacheConfig`
+     * and passed to `CacheManager.initialize()` during `init()`. Must be called
+     * before `init()`.
+     */
+    public setCacheConfig(config: Partial<CacheConfig>) {
+        this.cacheConfig = config;
     }
 
     /**

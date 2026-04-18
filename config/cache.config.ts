@@ -14,9 +14,13 @@ export interface CacheConfig {
         password?: string;
         db?: number;
         keyPrefix?: string;
-        retryStrategy?: (times: number) => number | void;
+        retryStrategy?: (times: number) => number | null | void;
         connectTimeout?: number;
         commandTimeout?: number;
+        /** Give up after this many reconnect attempts. Default 20. */
+        maxReconnectAttempts?: number;
+        /** Queue commands while offline. Default false (fail-fast). */
+        enableOfflineQueue?: boolean;
     };
 
     entity?: {
@@ -53,8 +57,14 @@ export const defaultCacheConfig: CacheConfig = {
         password: process.env.REDIS_PASSWORD,
         db: parseInt(process.env.REDIS_DB || '0'),
         keyPrefix: process.env.REDIS_KEY_PREFIX || 'bunsane:',
+        // Cap reconnect attempts so a permanently unreachable Redis doesn't
+        // spin forever (C03). Tune via REDIS_MAX_RECONNECT_ATTEMPTS.
+        maxReconnectAttempts: parseInt(process.env.REDIS_MAX_RECONNECT_ATTEMPTS || '20'),
+        // Fail-fast on outage instead of unbounded offline queue (C02).
+        // Override only if caller accepts the memory risk.
+        enableOfflineQueue: process.env.REDIS_ENABLE_OFFLINE_QUEUE === 'true',
         retryStrategy: (times: number) => {
-            const delay = Math.min(times * 50, 2000);
+            const delay = Math.min(times * 200, 2000);
             return delay;
         }
     },

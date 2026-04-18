@@ -68,7 +68,9 @@ export class CacheFactory {
             lazyConnect: false,
             enableReadyCheck: true,
             connectTimeout: config.redis.connectTimeout,
-            commandTimeout: config.redis.commandTimeout
+            commandTimeout: config.redis.commandTimeout,
+            maxReconnectAttempts: config.redis.maxReconnectAttempts,
+            enableOfflineQueue: config.redis.enableOfflineQueue
         };
 
         const { password: _pw, ...safeConfig } = redisConfig;

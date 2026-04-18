@@ -35,12 +35,25 @@ export interface RedisCacheConfig {
     password?: string;
     db?: number;
     keyPrefix?: string;
-    retryStrategy?: (times: number) => number | void;
+    retryStrategy?: (times: number) => number | null | void;
     maxRetriesPerRequest?: number;
     lazyConnect?: boolean;
     enableReadyCheck?: boolean;
     connectTimeout?: number;
     commandTimeout?: number;
+    /**
+     * When true (default false), ioredis queues commands while offline. This
+     * can grow unboundedly during a Redis outage and exhaust heap. Keep false
+     * so cache operations fail fast and the caller's try/catch treats it as
+     * a cache miss instead of a hang.
+     */
+    enableOfflineQueue?: boolean;
+    /**
+     * Maximum reconnect attempts before the retry strategy returns null and
+     * ioredis gives up. Prevents infinite reconnect storms when Redis is
+     * permanently unreachable. Default 20 attempts (~ 40s at 2s cap).
+     */
+    maxReconnectAttempts?: number;
 }
 
 /**
@@ -65,18 +78,40 @@ export class RedisCache implements CacheProvider {
         this.config = config;
         this.keyPrefix = config.keyPrefix || 'bunsane:';
 
+        const maxReconnectAttempts = config.maxReconnectAttempts ?? 20;
+        const userRetryStrategy = config.retryStrategy;
+
+        // Wrap caller's retry strategy (or default) with a hard attempt cap so
+        // a permanently unreachable Redis cannot spin forever (C03).
+        const retryStrategy = (times: number): number | null => {
+            if (times > maxReconnectAttempts) {
+                logger.error({ scope: 'cache', provider: 'redis', attempts: times, msg: 'Redis retry cap reached — giving up reconnect attempts' });
+                return null;
+            }
+            if (userRetryStrategy) {
+                const result = userRetryStrategy(times);
+                if (result === null || result === undefined) return null;
+                return result as number;
+            }
+            return Math.min(times * 200, 2000);
+        };
+
         const redisOptions: RedisOptions = {
             host: config.host,
             port: config.port,
             password: config.password,
             db: config.db || 0,
-            retryStrategy: config.retryStrategy,
+            retryStrategy,
             maxRetriesPerRequest: config.maxRetriesPerRequest || 3,
             lazyConnect: config.lazyConnect || false,
             enableReadyCheck: config.enableReadyCheck || false,
             connectTimeout: config.connectTimeout ?? 5000,
             commandTimeout: config.commandTimeout ?? 3000,
-            enableOfflineQueue: true,
+            // Fail-fast when Redis is down. Unbounded offline queue → heap
+            // exhaustion under sustained load during outage (C02). Callers
+            // already wrap cache ops in try/catch and treat failures as
+            // cache miss; bounded failure is better than buildup.
+            enableOfflineQueue: config.enableOfflineQueue ?? false,
         };
 
         this.client = new Redis(redisOptions);
