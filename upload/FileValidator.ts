@@ -258,31 +258,34 @@ export class FileValidator {
      * Check if file is potentially dangerous
      */
     public async isDangerous(file: File): Promise<boolean> {
-        // Check for executable file extensions
         const dangerousExtensions = [
             '.exe', '.scr', '.bat', '.cmd', '.com', '.pif', '.vbs', '.js', '.jar',
-            '.sh', '.py', '.pl', '.php', '.asp', '.aspx', '.jsp'
+            '.sh', '.py', '.pl', '.php', '.asp', '.aspx', '.jsp',
+            '.svg',
         ];
+        const dangerousMimeTypes = ['image/svg+xml'];
 
         const extension = this.getFileExtension(file.name);
         if (dangerousExtensions.includes(extension)) {
             return true;
         }
+        if (dangerousMimeTypes.includes(file.type)) {
+            return true;
+        }
 
-        // Check for polyglot files (files that are valid in multiple formats)
         try {
             const buffer = await file.slice(0, 1024).arrayBuffer();
             const bytes = new Uint8Array(buffer);
             const content = new TextDecoder().decode(bytes);
-            
-            // Look for script patterns
+
             const scriptPatterns = [
                 /<script/i,
                 /javascript:/i,
                 /vbscript:/i,
                 /<iframe/i,
                 /<object/i,
-                /<embed/i
+                /<embed/i,
+                /on[a-z]+\s*=/i,
             ];
 
             return scriptPatterns.some(pattern => pattern.test(content));

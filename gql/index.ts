@@ -2,6 +2,7 @@ import {createSchema, createYoga, type Plugin} from 'graphql-yoga';
 import { useValidationRule } from '@envelop/core';
 import { GraphQLSchema, GraphQLError } from 'graphql';
 import { depthLimitRule } from './depthLimit';
+import { complexityLimitRule } from './complexityLimit';
 import { GraphQLObjectType, GraphQLField, GraphQLOperation, GraphQLScalarType, GraphQLSubscription } from './Generator';
 import {GraphQLFieldTypes} from "./types"
 import {logger as MainLogger} from "../core/Logger"
@@ -144,6 +145,8 @@ export interface YogaInstanceOptions {
         methods?: string[];
     };
     maxDepth?: number;
+    /** Maximum query complexity (default: 1000). 0 disables. */
+    maxComplexity?: number;
 }
 
 export function createYogaInstance(
@@ -159,6 +162,13 @@ export function createYogaInstance(
     const effectiveDepth = Math.max(options?.maxDepth ?? HARD_MIN_DEPTH, HARD_MIN_DEPTH);
     const allPlugins: Plugin[] = [];
     allPlugins.push(useValidationRule(depthLimitRule(effectiveDepth)) as Plugin);
+
+    // Complexity budget: count per-field cost with `first`/`limit`/`take`
+    // multipliers. 0 disables, undefined defaults to 1000.
+    const complexityBudget = options?.maxComplexity ?? 1000;
+    if (complexityBudget > 0) {
+        allPlugins.push(useValidationRule(complexityLimitRule(complexityBudget)) as Plugin);
+    }
     allPlugins.push(...plugins);
 
     const yogaConfig: any = {

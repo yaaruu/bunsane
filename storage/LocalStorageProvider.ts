@@ -1,4 +1,6 @@
 import fs from "fs";
+import { pipeline } from "stream/promises";
+import { Readable } from "stream";
 import path from "path";
 import { StorageProvider } from "./StorageProvider";
 import type { UploadConfiguration, StorageResult, FileMetadata } from "../types/upload.types";
@@ -51,9 +53,16 @@ export class LocalStorageProvider extends StorageProvider {
                 fs.mkdirSync(uploadDir, { recursive: true });
             }
 
-            // Write file to disk
-            const buffer = Buffer.from(await file.arrayBuffer());
-            fs.writeFileSync(fullPath, buffer);
+            // Stream File → disk to avoid full in-memory buffering of large uploads.
+            const writeStream = fs.createWriteStream(fullPath);
+            try {
+                const webStream = file.stream() as ReadableStream<Uint8Array>;
+                const nodeStream = Readable.fromWeb(webStream as any);
+                await pipeline(nodeStream, writeStream);
+            } catch (streamError) {
+                try { fs.unlinkSync(fullPath); } catch { /* best-effort cleanup */ }
+                throw streamError;
+            }
 
             // Generate URL
             const url = this.buildUrl(relativePath);

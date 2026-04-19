@@ -213,11 +213,11 @@ export class S3StorageProvider extends StorageProvider {
         const destKey = this.resolveKey(destinationPath);
 
         try {
-            const [data, stat] = await Promise.all([
-                this.client.file(sourceKey).arrayBuffer(),
-                this.client.stat(sourceKey),
-            ]);
-            await this.client.write(destKey, data, {
+            const stat = await this.client.stat(sourceKey);
+            const sourceFile = this.client.file(sourceKey);
+            // Pass the S3File directly so Bun streams bytes rather than loading
+            // the entire object into memory (previously `arrayBuffer()`).
+            await this.client.write(destKey, sourceFile, {
                 type: stat.type,
                 acl: this.acl,
             });
@@ -226,7 +226,7 @@ export class S3StorageProvider extends StorageProvider {
         } catch (error) {
             const msg =
                 error instanceof Error ? error.message : "Unknown error";
-            logger.error({ sourceKey, destKey }, "Failed to copy file");
+            logger.error({ sourceKey, destKey, err: msg }, "Failed to copy file");
             return false;
         }
     }

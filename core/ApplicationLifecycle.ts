@@ -9,6 +9,16 @@ export enum ApplicationPhase {
     APPLICATION_READY = "application_ready"
 }
 
+const PHASE_ORDER: Record<ApplicationPhase, number> = {
+    [ApplicationPhase.DATABASE_INITIALIZING]: 0,
+    [ApplicationPhase.DATABASE_READY]: 1,
+    [ApplicationPhase.COMPONENTS_REGISTERING]: 2,
+    [ApplicationPhase.COMPONENTS_READY]: 3,
+    [ApplicationPhase.SYSTEM_REGISTERING]: 4,
+    [ApplicationPhase.SYSTEM_READY]: 5,
+    [ApplicationPhase.APPLICATION_READY]: 6,
+};
+
 export interface PhaseChangeEvent extends CustomEvent {
     detail: ApplicationPhase;
 }
@@ -72,7 +82,34 @@ class ApplicationLifecycle {
         this.eventEmitter = new EventTarget();
     }
 
+    /**
+     * Test helper: reset the current phase to the initial value. Paired with
+     * `removeAllListeners()` when re-initializing the lifecycle in tests.
+     * Monotonic phase enforcement would otherwise reject re-entering early
+     * phases on a second App.init().
+     */
+    resetPhase() {
+        this.currentPhase = ApplicationPhase.DATABASE_INITIALIZING;
+    }
+
     setPhase(phase: ApplicationPhase) {
+        // Phases are linear: refuse non-monotonic transitions to prevent
+        // concurrent callers from clobbering each other's progress (H-LIFE-2).
+        // Idempotent re-emits at the same phase are silently ignored.
+        const currentRank = PHASE_ORDER[this.currentPhase];
+        const nextRank = PHASE_ORDER[phase];
+        if (nextRank === undefined) {
+            throw new Error(`Unknown application phase: ${phase}`);
+        }
+        if (nextRank < currentRank) {
+            throw new Error(
+                `Non-monotonic phase transition rejected: ${this.currentPhase} → ${phase}`,
+            );
+        }
+        if (nextRank === currentRank) {
+            // Same phase — no-op, no re-dispatch
+            return;
+        }
         this.currentPhase = phase;
         this.eventEmitter.dispatchEvent(new CustomEvent("phaseChanged", { detail: phase }));
     }

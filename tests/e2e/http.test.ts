@@ -76,8 +76,12 @@ describe("E2E HTTP Routes", () => {
 
     it("OPTIONS /health returns 204 when CORS configured", async () => {
         app.setCors({ origin: "*" });
-        // Re-compose middleware chain not needed — CORS headers are added per-request in handleRequest
-        const res = await fetch(`${BASE}/health`, { method: "OPTIONS" });
+        // Preflight must carry Origin header per CORS spec; otherwise the
+        // server emits no Access-Control-Allow-Origin (no `|| '*'` fallback).
+        const res = await fetch(`${BASE}/health`, {
+            method: "OPTIONS",
+            headers: { Origin: "https://client.example" },
+        });
         expect(res.status).toBe(204);
         expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
     });

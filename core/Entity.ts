@@ -839,7 +839,11 @@ export class Entity implements IEntity {
             } else {
                 logger.error({ scope: 'Entity.doDelete', entityId: this.id, err: error }, 'Failed to delete entity');
             }
-            return false;
+            // Re-throw so callers can distinguish DB failures (pool exhausted,
+            // lock timeout, etc.) from "entity not found" / not persisted,
+            // which still returns `false`. Previously any error produced the
+            // same `false` return, hiding infrastructure problems (H-OBS-4).
+            throw error instanceof Error ? error : new Error(String(error));
         } finally {
             if (!signal.aborted) controller.abort();
         }

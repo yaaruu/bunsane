@@ -378,11 +378,9 @@ describe("S3StorageProvider", () => {
 
         it("returns false on failure", async () => {
             const client = createMockS3Client({
-                file: mock(() => ({
-                    arrayBuffer: async () => {
-                        throw new Error("Read failed");
-                    },
-                })),
+                stat: mock(async () => {
+                    throw new Error("Stat failed");
+                }),
             });
             const provider = new S3StorageProvider(
                 { bucket: "my-bucket" },
@@ -413,11 +411,9 @@ describe("S3StorageProvider", () => {
 
         it("returns false if copy fails", async () => {
             const client = createMockS3Client({
-                file: mock(() => ({
-                    arrayBuffer: async () => {
-                        throw new Error("Read failed");
-                    },
-                })),
+                stat: mock(async () => {
+                    throw new Error("Stat failed");
+                }),
             });
             const provider = new S3StorageProvider(
                 { bucket: "my-bucket" },

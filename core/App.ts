@@ -94,6 +94,7 @@ export default class App {
     private unhandledRejectionHandler: ((reason: unknown, promise: Promise<unknown>) => void) | null = null;
     private uncaughtExceptionHandler: ((error: Error) => void) | null = null;
     private graphqlMaxDepth: number = 10;
+    private graphqlMaxComplexity: number = 1000;
     private shutdownGracePeriod = 10_000;
     private maxRequestBodySize = 50 * 1024 * 1024; // 50MB default
 
@@ -137,6 +138,9 @@ export default class App {
     }
 
     public setCors(cors: CorsConfig) {
+        if (cors.origin === undefined) {
+            throw new Error('[CORS] `origin` is required. Pass an explicit string, array, function, or "*" if you truly want to allow everyone.');
+        }
         this.config.cors = cors;
         // Warn about invalid configuration
         if (cors.credentials && cors.origin === '*') {
@@ -244,10 +248,18 @@ export default class App {
                         if (envDepth) {
                             this.graphqlMaxDepth = parseInt(envDepth, 10);
                         }
+                        const envComplexity = process.env.GRAPHQL_MAX_COMPLEXITY;
+                        if (envComplexity) {
+                            const parsed = parseInt(envComplexity, 10);
+                            if (Number.isFinite(parsed) && parsed >= 0) {
+                                this.graphqlMaxComplexity = parsed;
+                            }
+                        }
 
                         const yogaOptions = {
                             cors: this.config.cors,
                             maxDepth: this.graphqlMaxDepth || undefined,
+                            maxComplexity: this.graphqlMaxComplexity,
                         };
 
                         // Auto-apply RequestContext plugin by default so
@@ -548,8 +560,12 @@ export default class App {
 
         const configOrigin = this.config.cors.origin;
 
-        // Wildcard allows all
-        if (configOrigin === '*' || configOrigin === undefined) {
+        // origin is required by setCors; undefined here would indicate a
+        // programming error. Treat as deny rather than silent wildcard.
+        if (configOrigin === undefined) return null;
+
+        // Explicit wildcard allows all
+        if (configOrigin === '*') {
             // If credentials enabled, cannot use wildcard - return actual origin
             return this.config.cors.credentials ? requestOrigin : '*';
         }
@@ -581,12 +597,16 @@ export default class App {
         // If origin not allowed, return empty (no CORS headers)
         if (requestOrigin && !allowedOrigin) return {};
 
+        // No allowedOrigin means request carried no Origin header. Skip
+        // Access-Control-Allow-Origin rather than falling back to '*'.
         const headers: Record<string, string> = {
-            'Access-Control-Allow-Origin': allowedOrigin || '*',
             'Access-Control-Allow-Methods': this.config.cors.methods?.join(', ') || 'GET, POST, PUT, DELETE, OPTIONS',
             'Access-Control-Allow-Headers': this.config.cors.allowedHeaders?.join(', ') || 'Content-Type, Authorization',
             'Vary': 'Origin',
         };
+        if (allowedOrigin) {
+            headers['Access-Control-Allow-Origin'] = allowedOrigin;
+        }
 
         if (this.config.cors.credentials) {
             headers['Access-Control-Allow-Credentials'] = 'true';
@@ -673,8 +693,8 @@ export default class App {
         try {
             // Health check endpoint
             if (url.pathname === "/health") {
-                clearTimeout(timeoutId);
                 const health = await deepHealthCheck();
+                clearTimeout(timeoutId);
                 return this.addCorsHeaders(new Response(
                     JSON.stringify(health.result),
                     {
@@ -686,8 +706,8 @@ export default class App {
 
             // Metrics endpoint
             if (url.pathname === "/metrics") {
-                clearTimeout(timeoutId);
                 const metrics = await this.collectMetrics();
+                clearTimeout(timeoutId);
                 return this.addCorsHeaders(new Response(
                     JSON.stringify(metrics),
                     {
@@ -699,8 +719,8 @@ export default class App {
 
             // Remote health check
             if (url.pathname === "/health/remote") {
-                clearTimeout(timeoutId);
                 if (!this.remote) {
+                    clearTimeout(timeoutId);
                     return this.addCorsHeaders(new Response(
                         JSON.stringify({
                             healthy: false,
@@ -713,6 +733,7 @@ export default class App {
                     ), req);
                 }
                 const health = await this.remote.health();
+                clearTimeout(timeoutId);
                 return this.addCorsHeaders(new Response(
                     JSON.stringify(health),
                     {
@@ -724,8 +745,8 @@ export default class App {
 
             // Readiness probe
             if (url.pathname === "/health/ready") {
-                clearTimeout(timeoutId);
                 const ready = await readinessCheck(this.isReady, this.isShuttingDown);
+                clearTimeout(timeoutId);
                 return this.addCorsHeaders(new Response(
                     JSON.stringify(ready.result),
                     {
@@ -1114,6 +1135,15 @@ export default class App {
     }
 
     /**
+     * Set the maximum GraphQL query complexity. 0 disables.
+     * Complexity = sum of per-field costs, multiplied by `first`/`limit`/`take`
+     * arguments when present on each field.
+     */
+    public setGraphQLMaxComplexity(complexity: number) {
+        this.graphqlMaxComplexity = complexity;
+    }
+
+    /**
      * Supply a cache configuration that will be merged with `defaultCacheConfig`
      * and passed to `CacheManager.initialize()` during `init()`. Must be called
      * before `init()`.
@@ -1211,7 +1241,9 @@ export default class App {
         try {
             const { CacheManager } = await import('./cache/CacheManager');
             cacheStats = await CacheManager.getInstance().getStats();
-        } catch {}
+        } catch (err) {
+            logger.warn({ err }, 'metrics: cache stats unavailable');
+        }
 
         return {
             timestamp: new Date().toISOString(),

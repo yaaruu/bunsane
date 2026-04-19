@@ -87,7 +87,7 @@ export class ResolverBuilder {
         throw new GraphQLError(`Internal error`, {
           extensions: {
             code: "INTERNAL_ERROR",
-            originalError: process.env.NODE_ENV === 'development' ? error : undefined
+            originalError: process.env.NODE_ENV !== 'production' ? error : undefined
           }
         });
       }
@@ -111,7 +111,7 @@ export class ResolverBuilder {
         throw new GraphQLError(`Internal error`, {
           extensions: {
             code: "INTERNAL_ERROR",
-            originalError: process.env.NODE_ENV === 'development' ? error : undefined
+            originalError: process.env.NODE_ENV !== 'production' ? error : undefined
           }
         });
       }
@@ -151,7 +151,7 @@ export class ResolverBuilder {
           throw new GraphQLError(`Internal error in subscription`, {
             extensions: {
               code: "INTERNAL_ERROR",
-              originalError: process.env.NODE_ENV === 'development' ? error : undefined
+              originalError: process.env.NODE_ENV !== 'production' ? error : undefined
             }
           });
         }
@@ -177,7 +177,7 @@ export class ResolverBuilder {
           throw new GraphQLError(`Internal error in subscription`, {
             extensions: {
               code: "INTERNAL_ERROR",
-              originalError: process.env.NODE_ENV === 'development' ? error : undefined
+              originalError: process.env.NODE_ENV !== 'production' ? error : undefined
             }
           });
         }

@@ -3,6 +3,7 @@ import { createRequestLoaders } from './RequestLoaders';
 import type { RequestLoaders } from './RequestLoaders';
 import db from '../database';
 import { CacheManager } from './cache/CacheManager';
+import { getRequestId } from './middleware/RequestId';
 
 declare module 'graphql-yoga' {
   interface Context {
@@ -26,7 +27,9 @@ export function createRequestContextPlugin(): Plugin {
       const cacheManager = CacheManager.getInstance();
       // Mount loaders at context.loaders to match ArcheType.ts resolver access pattern
       (args as any).contextValue.loaders = createRequestLoaders(db, cacheManager);
-      (args as any).contextValue.requestId = crypto.randomUUID();
+      // Prefer the HTTP-layer request id (from requestId() middleware's
+      // AsyncLocalStorage) so access log + GraphQL logs share the same id.
+      (args as any).contextValue.requestId = getRequestId() ?? crypto.randomUUID();
       (args as any).contextValue.cacheManager = cacheManager;
     },
   };

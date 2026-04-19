@@ -1,6 +1,8 @@
 import { GraphVisitor } from "./GraphVisitor";
 import { TypeNode, OperationNode, FieldNode, InputNode, ScalarNode } from "../graph/GraphNode";
 import { ResolverBuilder } from "../builders/ResolverBuilder";
+import { isSchemaInput } from "../schema";
+import * as z from "zod";
 import { logger } from "../../core/Logger";
 
 /**
@@ -54,9 +56,21 @@ export class ResolverGeneratorVisitor extends GraphVisitor {
 
         const type = node.operationType.charAt(0).toUpperCase() + node.operationType.slice(1).toLowerCase() as "Query" | "Mutation" | "Subscription";
 
-        // Extract Zod schema from input if it's a Zod type (check for '_def' property)
+        // Extract Zod schema from input. If it's already a Zod type (`_def`),
+        // use directly. If it's a Schema DSL input (`t.` API), convert each
+        // field `.toZod()` into a Zod object so the resolver validates it
+        // instead of passing raw args through (H-GQL-4).
         const input = node.metadata.input;
-        const zodSchema = (input && typeof input === 'object' && '_def' in input) ? input as any : null;
+        let zodSchema: any = null;
+        if (input && typeof input === 'object' && '_def' in input) {
+            zodSchema = input;
+        } else if (isSchemaInput(input)) {
+            const zodShape: Record<string, z.ZodType> = {};
+            for (const [key, field] of Object.entries(input)) {
+                zodShape[key] = (field as any).toZod();
+            }
+            zodSchema = z.object(zodShape);
+        }
 
         // Create resolver definitions for operations
         const resolverDef = {
