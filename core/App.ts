@@ -1410,9 +1410,13 @@ export default class App {
 
         // 4. Drain any fire-and-forget cache ops triggered by entity.set /
         //    entity.remove before we disconnect the cache (H-CACHE-1).
+        //    Also drain post-commit side effects (cache + hooks scheduled
+        //    via queueMicrotask from save()) so hook-triggered DB work
+        //    doesn't hit a closed pool.
         try {
             const { Entity } = await import('./Entity');
             await Entity.drainPendingCacheOps(Math.min(budgetRemaining(), 5_000));
+            await Entity.drainPendingSideEffects(Math.min(budgetRemaining(), 5_000));
         } catch (error) {
             logger.warn({ scope: 'cache', component: 'App', msg: 'Entity cache op drain error', err: error });
         }

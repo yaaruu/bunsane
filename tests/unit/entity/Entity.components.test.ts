@@ -187,6 +187,79 @@ describe('Entity Component Management', () => {
 
             expect(data?.createdAt).toBe('2024-01-15T10:30:00.000Z');
         });
+
+        test('serializableData throws descriptive error on invalid Date', () => {
+            const entity = new Entity();
+            entity.add(TestOrder, {
+                orderNumber: 'ORD-002',
+                total: 50,
+                status: 'pending',
+                createdAt: new Date('not-a-date')
+            });
+
+            const component = entity.getInMemory(TestOrder);
+            expect(() => component?.serializableData()).toThrow(
+                /Invalid Date for property 'createdAt' on component 'TestOrder'/
+            );
+        });
+
+        test('serializableData throws on Date type mismatch', () => {
+            const entity = new Entity();
+            entity.add(TestOrder, {
+                orderNumber: 'ORD-003',
+                total: 50,
+                status: 'pending',
+                createdAt: '2024-01-15' as any
+            });
+
+            const component = entity.getInMemory(TestOrder);
+            expect(() => component?.serializableData()).toThrow(
+                /Type mismatch for property 'createdAt' on component 'TestOrder': expected Date, got string/
+            );
+        });
+
+        test('serializableData throws on NaN number', () => {
+            const entity = new Entity();
+            entity.add(TestOrder, {
+                orderNumber: 'ORD-004',
+                total: NaN,
+                status: 'pending',
+                createdAt: new Date()
+            });
+
+            const component = entity.getInMemory(TestOrder);
+            expect(() => component?.serializableData()).toThrow(
+                /Invalid number for property 'total' on component 'TestOrder'/
+            );
+        });
+
+        test('serializableData throws on Infinity number', () => {
+            const entity = new Entity();
+            entity.add(TestOrder, {
+                orderNumber: 'ORD-005',
+                total: Infinity,
+                status: 'pending',
+                createdAt: new Date()
+            });
+
+            const component = entity.getInMemory(TestOrder);
+            expect(() => component?.serializableData()).toThrow(
+                /Invalid number for property 'total' on component 'TestOrder'/
+            );
+        });
+
+        test('serializableData allows null/undefined for nullable Date/Number', () => {
+            const entity = new Entity();
+            entity.add(TestOrder, {
+                orderNumber: 'ORD-006',
+                total: 0,
+                status: 'pending',
+                createdAt: null as any
+            });
+
+            const component = entity.getInMemory(TestOrder);
+            expect(() => component?.serializableData()).not.toThrow();
+        });
     });
 
     describe('component state', () => {

@@ -141,6 +141,26 @@ describe('CacheManager', () => {
             expect(result).toBeNull();
         });
 
+        test('invalidateEntities clears entity + all component caches for a batch', async () => {
+            const provider = cacheManager.getProvider();
+            // Two entities, each with cached entity entry + one component
+            await provider.set('entity:e1', 'e1', 3600000);
+            await provider.set('entity:e2', 'e2', 3600000);
+            await provider.set('component:e1:t1', { data: 'a' }, 3600000);
+            await provider.set('component:e2:t1', { data: 'b' }, 3600000);
+
+            await cacheManager.invalidateEntities(['e1', 'e2']);
+
+            expect(await cacheManager.getEntity('e1')).toBeNull();
+            expect(await cacheManager.getEntity('e2')).toBeNull();
+            expect(await cacheManager.getComponentsByEntity('e1', 't1')).toBeNull();
+            expect(await cacheManager.getComponentsByEntity('e2', 't1')).toBeNull();
+        });
+
+        test('invalidateEntities is a noop for empty list', async () => {
+            await expect(cacheManager.invalidateEntities([])).resolves.toBeUndefined();
+        });
+
         test('getEntities returns null for missing entities', async () => {
             const results = await cacheManager.getEntities(['id1', 'id2', 'id3']);
             expect(results.length).toBe(3);

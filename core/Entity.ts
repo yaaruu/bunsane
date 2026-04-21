@@ -27,6 +27,17 @@ export class Entity implements IEntity {
     // (H-CACHE-1).
     private static pendingCacheOps: Set<Promise<void>> = new Set();
 
+    // Drainable set of post-commit side-effect Promises scheduled via
+    // queueMicrotask from save(). Includes cache invalidation + lifecycle
+    // hooks (EntityCreated / EntityUpdated). Hooks may transitively trigger
+    // more DB work (e.g., entity.save() from a handler), which is why this
+    // is tracked separately from pendingCacheOps. Tests running against
+    // PGlite's single-connection pool should drain this between test files
+    // to prevent background work from prior files queueing behind the
+    // current file's save and masking visibility of recently-committed
+    // rows. See BUNSANE-001.
+    private static pendingSideEffects: Set<Promise<void>> = new Set();
+
     /**
      * Await all pending background cache operations. Call during shutdown
      * after HTTP drain but before cache.disconnect so setImmediate'd cache
@@ -45,9 +56,34 @@ export class Entity implements IEntity {
         ]);
     }
 
+    /**
+     * Await all pending post-commit side effects (cache invalidation +
+     * lifecycle hooks scheduled via queueMicrotask from save()). Call from
+     * test setup/teardown hooks under PGlite to guarantee prior-file
+     * background work has settled before the next file's saves run. Bounded
+     * by `timeoutMs`. Safe to call repeatedly; no-op when the set is empty.
+     */
+    public static async drainPendingSideEffects(timeoutMs: number = 5_000): Promise<void> {
+        if (Entity.pendingSideEffects.size === 0) return;
+        const snapshot = [...Entity.pendingSideEffects];
+        const drainTimer = new Promise<'timeout'>((resolve) => {
+            const t = setTimeout(() => resolve('timeout'), timeoutMs);
+            t.unref?.();
+        });
+        await Promise.race([
+            Promise.allSettled(snapshot).then(() => 'drained' as const),
+            drainTimer,
+        ]);
+    }
+
     private static trackCacheOp(p: Promise<void>): void {
         Entity.pendingCacheOps.add(p);
         p.finally(() => Entity.pendingCacheOps.delete(p));
+    }
+
+    private static trackSideEffect(p: Promise<void>): void {
+        Entity.pendingSideEffects.add(p);
+        p.finally(() => Entity.pendingSideEffects.delete(p));
     }
 
     constructor(id?: string) {
@@ -348,6 +384,81 @@ export class Entity implements IEntity {
         return this._loadComponent(ctor, context);
     }
 
+    /**
+     * Discard in-memory component state and re-hydrate from the database.
+     * Preserves entity identity — callers holding a reference see fresh data
+     * on the same instance. Use after a raw-SQL write that bypassed
+     * `entity.set`/`entity.save`, or when a different `Entity` instance with
+     * the same id mutated persisted data.
+     *
+     * @param opts Optional transaction
+     */
+    public async reload(opts?: { trx?: SQL }): Promise<this> {
+        if (!this.id || this.id.trim() === '') {
+            return this;
+        }
+        this.components.clear();
+        this.removedComponents.clear();
+        this.savedRemovedComponents.clear();
+
+        const dbConn = opts?.trx ?? db;
+        const rows = await dbConn`
+            SELECT c.id, c.type_id, c.data
+            FROM components c
+            WHERE c.entity_id = ${this.id} AND c.deleted_at IS NULL
+        `;
+
+        const storage = getMetadataStorage();
+        for (const row of rows) {
+            const ctor = ComponentRegistry.getConstructor(row.type_id);
+            if (!ctor) continue;
+            const comp: any = new ctor();
+            const parsed = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+            Object.assign(comp, parsed);
+            comp.id = row.id;
+            const props = storage.componentProperties.get(row.type_id);
+            if (props) {
+                for (const prop of props) {
+                    if (prop.propertyType === Date && typeof comp[prop.propertyKey] === 'string') {
+                        comp[prop.propertyKey] = new Date(comp[prop.propertyKey]);
+                    }
+                }
+            }
+            comp.setPersisted(true);
+            comp.setDirty(false);
+            this.addComponent(comp);
+        }
+
+        this.setPersisted(true);
+        this.setDirty(false);
+        return this;
+    }
+
+    /**
+     * Ensure the given components are hydrated on this entity's in-memory
+     * componentList. No-op for components already loaded. Batched: one SQL
+     * call for all missing components.
+     *
+     * Required when a later `entity.set(...)` + `entity.save()` may trigger
+     * a `@ComponentTargetHook` whose `includeComponents` lists tag
+     * components. Hook matching reads `componentList()` (in-memory only), so
+     * tags must be loaded first for the hook to fire.
+     *
+     * @param ctors Component constructors to ensure are loaded
+     */
+    public async requireComponents(ctors: Array<new (...args: any[]) => BaseComponent>): Promise<void> {
+        if (ctors.length === 0) return;
+        const missing: string[] = [];
+        for (const ctor of ctors) {
+            const existing = Array.from(this.components.values()).find(c => c instanceof ctor);
+            if (existing) continue;
+            const typeId = new ctor().getTypeID();
+            missing.push(typeId);
+        }
+        if (missing.length === 0) return;
+        await Entity.LoadComponents([this], missing);
+    }
+
     private async _loadComponent<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }): Promise<T | null> {
         const comp = Array.from(this.components.values()).find(comp => comp instanceof ctor) as T | undefined;
         if (typeof comp !== "undefined") {
@@ -465,14 +576,21 @@ export class Entity implements IEntity {
 
             // Post-commit side effects are fire-and-forget so Redis / hook
             // latency cannot consume the save budget or block the caller.
-            queueMicrotask(() => this.runPostCommitSideEffects(
-                wasNew,
-                changedComponentTypeIds,
-                removedComponentTypeIds,
-                context,
-                profile ? phases : undefined,
-                profile ? phaseStart : undefined,
-            ));
+            // Tracked in pendingSideEffects so tests/shutdown can drain
+            // background work before asserting or tearing down.
+            const sideEffectPromise = new Promise<void>((resolve) => {
+                queueMicrotask(() => {
+                    this.runPostCommitSideEffects(
+                        wasNew,
+                        changedComponentTypeIds,
+                        removedComponentTypeIds,
+                        context,
+                        profile ? phases : undefined,
+                        profile ? phaseStart : undefined,
+                    ).finally(() => resolve());
+                });
+            });
+            Entity.trackSideEffect(sideEffectPromise);
 
             return true;
         } catch (error) {

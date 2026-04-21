@@ -285,6 +285,24 @@ export class CacheManager {
     }
 
     /**
+     * Invalidate cached state (entity + all components) for a batch of
+     * entity IDs. Call this after a raw-SQL write (db.unsafe) that bypasses
+     * Entity.set/save, so downstream reads observe fresh data instead of
+     * stale L1/L2 cache entries.
+     */
+    public async invalidateEntities(entityIds: string[]): Promise<void> {
+        if (!this.config.enabled || entityIds.length === 0) {
+            return;
+        }
+        await Promise.all(
+            entityIds.flatMap(id => [
+                this.invalidateEntity(id),
+                this.invalidateAllEntityComponents(id),
+            ])
+        );
+    }
+
+    /**
      * Invalidate all components for a specific entity from cache
      * Uses pattern matching to efficiently clear all component caches for an entity
      */

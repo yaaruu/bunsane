@@ -159,6 +159,26 @@ The wrapper script:
 - `?|` and `?&` operators not supported (use `@>` / `<@` instead)
 - `CREATE INDEX CONCURRENTLY` not supported
 - Single connection only (`POSTGRES_MAX_CONNECTIONS=1`)
+- **Known Bun SQL + PGlite visibility race**: under a single-connection
+  pool with background work from a prior test file, `await entity.save()`
+  may resolve ≥1ms before the `INSERT INTO entity_components` row is
+  visible to a subsequent `db.unsafe('SELECT ...')` on the same driver.
+  The per-component partition INSERT (e.g. `components_<compname>`) in
+  the same transaction is visible immediately; only the flat
+  `entity_components` row lags. This causes multi-component Query
+  INTERSECTs to return 0 rows when run immediately after save.
+
+  **Mitigation (not a full fix):**
+  1. Shut down application-owned background workers (AI processors,
+     outbox workers, hook-driven save chains) in `afterAll` of each test
+     file — prevents cross-file bleed that amplifies the race.
+  2. Call `await Entity.drainPendingSideEffects()` in `beforeAll` / test
+     `setup` to settle hook-triggered post-commit work (helpful but
+     insufficient on its own).
+  3. Skip the affected test or poll with a short `setTimeout(1)`.
+
+  Root cause lives in the Bun SQL adapter's ACK handling, not bunsane.
+  File upstream with a minimal repro if you hit this.
 
 ## Directory Structure
 

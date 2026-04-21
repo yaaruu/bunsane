@@ -430,14 +430,11 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
             console.log('---');
         }
 
-        // Validate params before execution to catch UUID errors early
-        for (let i = 0; i < result.params.length; i++) {
-            const param = result.params[i];
-            if (param === '' || (typeof param === 'string' && param.trim() === '')) {
-                logger.error(`Empty string parameter detected at position ${i + 1} in count query`);
-                throw new Error(`Query count parameter $${i + 1} is an empty string. This will cause PostgreSQL UUID parsing errors.`);
-            }
-        }
+        // Empty-string params are legitimate for text-field filters
+        // (`c.data->>'field' = ''`). UUID-typed params never reach this
+        // point empty — findById guards at entry; cursor/excluded IDs come
+        // from saved entities. PG emits a clear error if a UUID cast meets
+        // an empty string at execution time.
 
         // Safely extract count from result - handle undefined/null cases
         if (!countResult || countResult.length === 0 || countResult[0] === undefined) {
@@ -623,14 +620,8 @@ AND c.deleted_at IS NULL`;
             console.log('---');
         }
 
-        // Validate params
-        for (let i = 0; i < result.params.length; i++) {
-            const param = result.params[i];
-            if (param === '' || (typeof param === 'string' && param.trim() === '')) {
-                logger.error(`Empty string parameter detected at position ${i + 1} in ${aggregateType} query`);
-                throw new Error(`Query ${aggregateType} parameter $${i + 1} is an empty string.`);
-            }
-        }
+        // Empty-string params are legitimate for text-field filters; see
+        // comment above in doCount.
 
         // Extract result
         if (!aggregateResult || aggregateResult.length === 0 || aggregateResult[0] === undefined) {
@@ -794,14 +785,11 @@ AND c.deleted_at IS NULL`;
             console.log('---');
         }
 
-        // Validate params before execution to catch UUID errors early
-        for (let i = 0; i < result.params.length; i++) {
-            const param = result.params[i];
-            if (param === '' || (typeof param === 'string' && param.trim() === '')) {
-                logger.error(`Empty string parameter detected at position ${i + 1}: SQL=${result.sql.substring(0, 200)}`);
-                throw new Error(`Query parameter $${i + 1} is an empty string. This will cause PostgreSQL UUID parsing errors. SQL: ${result.sql.substring(0, 100)}...`);
-            }
-        }
+        // Empty-string params are legitimate for text-field filters
+        // (`c.data->>'field' = ''`). UUID-typed params never reach this
+        // point empty — findById guards at entry; cursor/excluded IDs
+        // originate from saved entities. PG emits a clear error at
+        // execution time if a UUID cast meets an empty string.
 
         // Validate parameters before execution
         for (let i = 0; i < result.params.length; i++) {
@@ -1021,10 +1009,6 @@ AND c.deleted_at IS NULL`;
     static filterOp = FilterOp;
 
     public static filter(field: string, operator: FilterOperator, value: any): QueryFilter {
-        // Validate value to catch empty strings early
-        if (value === '' || (typeof value === 'string' && value.trim() === '')) {
-            throw new Error(`Query.filter: Cannot create filter for field "${field}" with empty string value. This would cause PostgreSQL UUID parsing errors.`);
-        }
         return { field, operator, value };
     }
 

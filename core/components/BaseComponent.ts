@@ -55,8 +55,18 @@ export class BaseComponent {
         this.properties().forEach((prop: string) => {
             let value = (this as any)[prop];
             const propMeta = props?.find(p => p.propertyKey === prop);
-            if (propMeta?.propertyType === Date && value instanceof Date) {
-                value = value.toISOString();
+            if (value !== null && value !== undefined) {
+                if (propMeta?.propertyType === Date) {
+                    if (!(value instanceof Date)) {
+                        throw new Error(`Type mismatch for property '${prop}' on component '${this._comp_name}': expected Date, got ${typeof value}`);
+                    }
+                    if (Number.isNaN(value.getTime())) {
+                        throw new Error(`Invalid Date for property '${prop}' on component '${this._comp_name}'`);
+                    }
+                    value = value.toISOString();
+                } else if (propMeta?.propertyType === Number && typeof value === 'number' && !Number.isFinite(value)) {
+                    throw new Error(`Invalid number for property '${prop}' on component '${this._comp_name}': ${value}`);
+                }
             }
             data[prop] = value;
         });

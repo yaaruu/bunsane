@@ -3,7 +3,13 @@ import ApplicationLifecycle, {ApplicationPhase, type PhaseChangeEvent} from "../
 import { generateGraphQLSchemaV2 } from "../gql";
 import { GraphQLSchema } from "graphql";
 
-class ServiceRegistry {
+/**
+ * ServiceRegistry is a singleton. The default export and the re-exported
+ * named `ServiceRegistry` from `service/index.ts` both resolve to the
+ * singleton instance (for backward compatibility). When you need the class
+ * itself (for typing or subclassing), import `ServiceRegistryClass`.
+ */
+export class ServiceRegistry {
     static #instance: ServiceRegistry;
 
     private services: Map<string, BaseService> = new Map();

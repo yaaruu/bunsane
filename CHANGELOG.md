@@ -4,6 +4,58 @@ All notable changes to bunsane are documented here.
 
 ## Unreleased
 
+### Added (HR-Screening ticket batch — BUNSANE-002..006)
+
+- **`@ScheduledTask` allows entity-less time-based tasks.** Previously
+  `SchedulerManager.registerTask` rejected tasks without `query` or
+  `componentTarget`, contradicting documented "runs every hour" examples.
+  Time-based tasks now register successfully and invoke the handler with
+  no entity argument on each tick. Existing entity-targeted tasks
+  unchanged. Ticket BUNSANE-002.
+
+- **`Entity.requireComponents(ctors)` hydrator.** Batched-load helper
+  that ensures the given component constructors are present on the
+  in-memory `componentList`. Required before `set` / `save` flows that
+  may trigger `@ComponentTargetHook` — hook matching reads
+  `componentList()` (in-memory only), so tag components must be loaded
+  first for the hook to fire. Ticket BUNSANE-003.
+
+- **`ServiceRegistry` class named-exported.** `service/ServiceRegistry.ts`
+  now exports the class as named alongside the existing default-instance
+  export. Available via `service/index.ts` as `ServiceRegistryClass` for
+  type/subclass use; existing `ServiceRegistry` import remains the
+  singleton instance for backward compatibility. Ticket BUNSANE-004.
+
+- **`CacheManager.invalidateEntities(ids: string[])`.** Batched helper
+  that invalidates both the entity-existence cache and all component
+  caches for a list of IDs. Call after a raw-SQL write (`db.unsafe`)
+  that bypasses `Entity.set` / `Entity.save`. Ticket BUNSANE-005.
+
+- **`Entity.reload(opts?)` refresher.** Discards in-memory component
+  state and re-hydrates from the `components` table. Preserves entity
+  identity — callers holding a reference see fresh data on the same
+  instance. Use after raw-SQL writes or when a sibling `Entity`
+  instance with the same id mutated persisted data. Ticket BUNSANE-006.
+
+- **Empty-string filter values supported.** `Query.filter(field, op, '')`
+  and the downstream SQL emit path (`ComponentInclusionNode`,
+  `PreparedStatementCache.execute`, `Query.doExec` / `doCount` /
+  `doAggregate` param validators) previously rejected empty /
+  whitespace-only values with "would cause PostgreSQL UUID parsing errors".
+  JSONB text extraction (`c.data->>'field'`) returns text, so `= ''` /
+  `!= ''` / `LIKE ''` are legitimate for text fields. The UUID-cast path
+  is gated by a value-side regex that an empty string cannot match, so
+  unsafe casts never fire. `findById('')` still throws — entity IDs
+  remain UUID-typed.
+
+- **`Entity.drainPendingSideEffects(timeoutMs)`.** Drainable tracking
+  for post-commit work scheduled via `queueMicrotask` from `save()`
+  (cache invalidation + lifecycle hooks). Wired into `App.shutdown`
+  after `drainPendingCacheOps`. Tests under PGlite can call this in
+  `beforeAll` to settle prior-file background work before asserting.
+  Partial mitigation for BUNSANE-001 (Bun SQL / PGlite visibility race
+  — see `CLAUDE.md` PGlite section for full context).
+
 ### Fixed (PR E — outbox, cache, query hardening)
 
 - **OutboxWorker publishes to Redis concurrently and marks rows in bulk.**

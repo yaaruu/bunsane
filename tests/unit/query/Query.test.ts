@@ -192,12 +192,14 @@ describe('Query', () => {
             expect(filter.value).toBe('John');
         });
 
-        test('throws for empty string value', () => {
-            expect(() => Query.filter('name', FilterOp.EQ, '')).toThrow();
+        test('accepts empty string value', () => {
+            const filter = Query.filter('name', FilterOp.EQ, '');
+            expect(filter.value).toBe('');
         });
 
-        test('throws for whitespace value', () => {
-            expect(() => Query.filter('name', FilterOp.EQ, '   ')).toThrow();
+        test('accepts whitespace value', () => {
+            const filter = Query.filter('name', FilterOp.EQ, '   ');
+            expect(filter.value).toBe('   ');
         });
     });
 

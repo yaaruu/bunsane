@@ -109,12 +109,10 @@ export class SchedulerManager {
             throw error;
         }
 
-        // Validate query configuration
-        if (!taskInfo.options?.query && !taskInfo.options?.componentTarget && !taskInfo.componentTarget) {
-            const error = new Error(`Invalid task info: must provide either query function, componentTarget config, or legacy componentTarget`);
-            loggerInstance.error(`Failed to register task: ${error.message}`);
-            throw error;
-        }
+        // Time-based tasks (no query, no componentTarget) are allowed — they
+        // invoke the handler with no entity arguments on each tick. Useful
+        // for external polling, stats aggregation, or ad-hoc queries inside
+        // the callback.
 
         if (!taskInfo.service) {
             const error = new Error(`Task ${taskInfo.id} has no service instance`);
@@ -395,7 +393,7 @@ export class SchedulerManager {
         try {
             // Create query based on targeting configuration
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            let query: Query<any>;
+            let query: Query<any> | null = null;
 
             if (taskInfo.options?.query) {
                 // Use custom query function (preferred approach)
@@ -407,16 +405,16 @@ export class SchedulerManager {
             } else if (taskInfo.componentTarget) {
                 // Use legacy single component targeting (deprecated - use query instead)
                 query = new Query().with(taskInfo.componentTarget);
-            } else {
-                throw new Error('No query function or component target specified');
             }
+            // else: time-based task — no entity selection. Handler invoked
+            // with no arguments on each tick.
 
             // Apply entity limit if specified (can be used with query function)
-            if (taskInfo.options?.maxEntitiesPerExecution) {
+            if (query && taskInfo.options?.maxEntitiesPerExecution) {
                 query.take(taskInfo.options.maxEntitiesPerExecution);
             }
 
-            const entities = await query.exec();
+            const entities = query ? await query.exec() : [];
 
             // Execute the scheduled method with the entities array
             const method = taskInfo.service[taskInfo.methodName];
@@ -424,9 +422,11 @@ export class SchedulerManager {
                 throw new Error(`Method ${taskInfo.methodName} not found on service`);
             }
 
-            // Execute with timeout
+            // Execute with timeout. Time-based tasks receive no entity arg.
             const result = await this.executeWithTimeout(
-                method.call(taskInfo.service, entities),
+                query
+                    ? method.call(taskInfo.service, entities)
+                    : method.call(taskInfo.service),
                 timeout,
                 taskInfo
             );

@@ -1,10 +1,12 @@
 import BaseService from "./Service";
-import  ServiceRegistry  from "./ServiceRegistry";
+import ServiceRegistry from "./ServiceRegistry";
+import { ServiceRegistry as ServiceRegistryClass } from "./ServiceRegistry";
 import { httpEndpoint } from "../rest";
 
 export {
     BaseService,
-    ServiceRegistry
+    ServiceRegistry,
+    ServiceRegistryClass,
 }
 
 // Shorthand decorators for HTTP methods

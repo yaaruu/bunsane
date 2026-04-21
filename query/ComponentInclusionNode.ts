@@ -606,11 +606,11 @@ export class ComponentInclusionNode extends QueryNode {
                     condition = result.sql;
                     // Note: custom builder is responsible for adding parameters via context.addParam()
                 } else {
-                    // Default filter logic
-                    // Validate filter value to prevent PostgreSQL UUID parsing errors
-                    if (filter.value === '' || (typeof filter.value === 'string' && filter.value.trim() === '')) {
-                        throw new Error(`Filter value for field "${filter.field}" is an empty string. This would cause PostgreSQL UUID parsing errors.`);
-                    }
+                    // Default filter logic. Empty-string values are permitted
+                    // here — `c.data->>'field'` extracts text, so `=`/`!=`/
+                    // `LIKE` against '' is legitimate. The UUID-cast path
+                    // below is gated on a regex that empty string cannot
+                    // match, so unsafe casts never fire.
 
                     // Check if value looks like a UUID (case-insensitive, with or without hyphens)
                     const valueStr = String(filter.value);
