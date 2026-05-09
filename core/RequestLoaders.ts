@@ -6,6 +6,7 @@ import {logger as MainLogger} from './Logger';
 const logger = MainLogger.child({ module: 'RequestLoaders' });
 import { getMetadataStorage } from './metadata';
 import type { CacheManager } from './cache/CacheManager';
+import { COMPONENT_TOMBSTONE } from './cache/CacheManager';
 
 export type ComponentData = {
   id: string;  // Component ID for updates
@@ -99,16 +100,20 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
 
         const results = new Map<string, ComponentData | null>();
 
-        // Check cache first if cache manager is available
+        // Check cache first if cache manager is available. Tombstone hits
+        // are recorded as null in `results` so the DB-fetch step skips them.
         let cacheHits = 0;
         let cacheMisses = 0;
         if (cacheManager && cacheManager.getConfig().enabled && cacheManager.getConfig().component?.enabled) {
           try {
             const cachedComponents = await cacheManager.getComponents(validKeys);
-            cachedComponents.forEach((component, index) => {
-              if (component) {
-                const key = `${validKeys[index]!.entityId}-${validKeys[index]!.typeId}`;
-                results.set(key, component);
+            cachedComponents.forEach((value, index) => {
+              const key = `${validKeys[index]!.entityId}-${validKeys[index]!.typeId}`;
+              if (value === COMPONENT_TOMBSTONE) {
+                results.set(key, null);
+                cacheHits++;
+              } else if (value) {
+                results.set(key, value);
                 cacheHits++;
               } else {
                 cacheMisses++;
@@ -122,17 +127,16 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
           cacheMisses += validKeys.length;
         }
 
-        // Log cache hit/miss rates for monitoring
         if (validKeys.length > 0) {
           const hitRate = (cacheHits / validKeys.length) * 100;
-          logger.debug({ 
-            scope: 'cache', 
-            component: 'RequestLoaders', 
-            msg: 'Component cache statistics', 
-            total: validKeys.length, 
-            hits: cacheHits, 
-            misses: cacheMisses, 
-            hitRate: `${hitRate.toFixed(1)}%` 
+          logger.trace({
+            scope: 'cache',
+            component: 'RequestLoaders',
+            msg: 'Component cache statistics',
+            total: validKeys.length,
+            hits: cacheHits,
+            misses: cacheMisses,
+            hitRate: `${hitRate.toFixed(1)}%`,
           });
         }
 
@@ -162,10 +166,15 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
             deletedAt: row.deleted_at,
           }));
 
-          // Cache the loaded components if cache is enabled
+          // Cache the loaded components + tombstone any requested keys whose
+          // row was absent (single setMany — see CacheManager.setComponentsWriteThrough).
           if (cacheManager && cacheManager.getConfig().enabled && cacheManager.getConfig().component?.enabled) {
             try {
-              await cacheManager.setComponentsWriteThrough(components, cacheManager.getConfig().component!.ttl);
+              await cacheManager.setComponentsWriteThrough(
+                components,
+                missingKeys,
+                cacheManager.getConfig().component!.ttl,
+              );
             } catch (error: any) {
               logger.warn({ scope: 'cache', component: 'RequestLoaders', msg: 'Cache write failed for components', error });
             }
@@ -207,17 +216,41 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
           return keys.map(() => []);
         }
 
+        const resultMap = new Map<string, Entity[]>();
+
+        // Negative-cache lookup: skip DB for keys recorded as empty.
+        let keysToQuery = validKeys;
+        const relCacheEnabled = !!(cacheManager
+          && cacheManager.getConfig().enabled
+          && cacheManager.getConfig().relation?.negativeCacheEnabled);
+        if (relCacheEnabled) {
+          try {
+            const tombstones = await cacheManager!.getRelationsEmpty(validKeys);
+            const remaining: typeof validKeys = [];
+            tombstones.forEach((isEmpty, i) => {
+              const k = validKeys[i]!;
+              if (isEmpty) {
+                const mapKey = `${k.entityId}\x00${k.relationField}\x00${k.relatedType}`;
+                resultMap.set(mapKey, []);
+              } else {
+                remaining.push(k);
+              }
+            });
+            keysToQuery = remaining;
+          } catch (error) {
+            logger.warn({ scope: 'cache', component: 'RequestLoaders', msg: 'Cache read failed for relation tombstones', error });
+          }
+        }
+
         // Group keys by foreign key for efficient batching
-        const keysByForeignKey = new Map<string, typeof validKeys>();
-        for (const key of validKeys) {
+        const keysByForeignKey = new Map<string, typeof keysToQuery>();
+        for (const key of keysToQuery) {
           const fk = key.foreignKey || 'default';
           if (!keysByForeignKey.has(fk)) {
             keysByForeignKey.set(fk, []);
           }
           keysByForeignKey.get(fk)!.push(key);
         }
-
-        const resultMap = new Map<string, Entity[]>();
 
         // OPTIMIZED: Batch query for each foreign key type (instead of N separate queries)
         for (const [foreignKey, groupedKeys] of keysByForeignKey) {
@@ -278,6 +311,22 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
             resultMap.set(mapKey, entities);
             
             logger.trace(`[RelationLoader] Mapped ${entities.length} entities for ${key.relationField} on ${key.entityId}`);
+          }
+        }
+
+        // Write tombstones for queried keys whose result was empty.
+        if (relCacheEnabled && keysToQuery.length > 0) {
+          const emptyKeys = keysToQuery.filter(k => {
+            const mapKey = `${k.entityId}\x00${k.relationField}\x00${k.relatedType}`;
+            const r = resultMap.get(mapKey);
+            return !r || r.length === 0;
+          });
+          if (emptyKeys.length > 0) {
+            try {
+              await cacheManager!.setRelationsEmpty(emptyKeys);
+            } catch (error) {
+              logger.warn({ scope: 'cache', component: 'RequestLoaders', msg: 'Cache write failed for relation tombstones', error });
+            }
           }
         }
 
