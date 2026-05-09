@@ -1,4 +1,4 @@
-import ApplicationLifecycle, {
+﻿import ApplicationLifecycle, {
     ApplicationPhase,
     type PhaseChangeEvent,
 } from "./ApplicationLifecycle";
@@ -11,7 +11,6 @@ import {
 } from "../database/DatabaseHelper";
 import { ComponentRegistry } from "./components";
 import { logger as MainLogger } from "./Logger";
-import { getSerializedMetadataStorage } from "./metadata";
 const logger = MainLogger.child({ scope: "App" });
 import ServiceRegistry from "../service/ServiceRegistry";
 import { type Plugin, createPubSub } from "graphql-yoga";
@@ -24,12 +23,7 @@ import { type Middleware, composeMiddleware } from "./Middleware";
 import { validateEnv } from "./validateEnv";
 import type { RemoteManager, RemoteManagerConfig } from "./remote";
 import type { CacheConfig } from "../config/cache.config";
-import {
-    assertValidCorsConfig,
-    validateOrigin as validateOriginFn,
-    getCorsHeaders as getCorsHeadersFn,
-    addCorsHeaders as addCorsHeadersFn,
-} from "./app/cors";
+import { assertValidCorsConfig } from "./app/cors";
 import {
     registerProcessHandlers as registerProcessHandlersFn,
     unregisterProcessHandlers as unregisterProcessHandlersFn,
@@ -37,13 +31,8 @@ import {
 import { runShutdown } from "./app/shutdown";
 import { warmUpPreparedStatementCache as warmUpPreparedStatementCacheFn } from "./app/preparedStatementWarmup";
 import { collectMetrics as collectMetricsFn } from "./app/metricsCollector";
-import {
-    handleHealth as handleHealthFn,
-    handleReady as handleReadyFn,
-    handleRemoteHealth as handleRemoteHealthFn,
-} from "./app/healthEndpoints";
-import { routeStudio } from "./app/studioRouter";
 import { createPhaseListener } from "./app/bootstrap";
+import { handleRequest as handleRequestFn } from "./app/requestRouter";
 
 export type CorsConfig = {
     origin?: string | string[] | ((origin: string) => boolean);
@@ -163,7 +152,7 @@ export default class App {
         ComponentRegistry.init();
         ServiceRegistry.init();
         
-        // Initialize CacheManager with merged config. MUST await — initialize()
+        // Initialize CacheManager with merged config. MUST await â€” initialize()
         // is async and sets up pub/sub for cross-instance invalidation. Previously
         // only getInstance() was called, silently skipping pub/sub setup and
         // ignoring any app-supplied config (C04).
@@ -211,7 +200,7 @@ export default class App {
 
     /**
      * Resolve once the application has reached APPLICATION_READY. Previously
-     * polled every 100ms with no exit condition — a boot failure would keep
+     * polled every 100ms with no exit condition â€” a boot failure would keep
      * the interval timer alive forever (H-MEM-1). Now attaches a one-shot
      * phase listener and self-cleans on first match. Bounded by `timeoutMs`
      * so callers cannot hang indefinitely; default matches waitForPhase.
@@ -270,346 +259,8 @@ export default class App {
         this.staticAssets.set(route, resolvedFolder);
     }
 
-    private validateOrigin(requestOrigin: string | null | undefined): string | null {
-        return validateOriginFn(this.config.cors, requestOrigin);
-    }
-
-    private getCorsHeaders(req?: Request): Record<string, string> {
-        return getCorsHeadersFn(this.config.cors, req);
-    }
-
-    /**
-     * Combine multiple AbortSignals into one that aborts when any input
-     * aborts. Uses `AbortSignal.any` when available (Node 20+/current Bun),
-     * falls back to a manual combiner for older runtimes.
-     */
-    private combineSignals(signals: AbortSignal[]): AbortSignal {
-        const anyFn = (AbortSignal as any).any;
-        if (typeof anyFn === 'function') {
-            return anyFn.call(AbortSignal, signals);
-        }
-        const controller = new AbortController();
-        for (const s of signals) {
-            if (s.aborted) {
-                controller.abort((s as any).reason);
-                return controller.signal;
-            }
-            s.addEventListener('abort', () => controller.abort((s as any).reason), { once: true });
-        }
-        return controller.signal;
-    }
-
-    private addCorsHeaders(response: Response, req?: Request): Response {
-        return addCorsHeadersFn(response, this.config.cors, req);
-    }
-
     private async handleRequest(req: Request): Promise<Response> {
-        const url = new URL(req.url);
-        const method = req.method;
-        const startTime = Date.now();
-
-        // Handle CORS preflight requests
-        if (method === 'OPTIONS') {
-            return new Response(null, {
-                status: 204,
-                headers: this.getCorsHeaders(req),
-            });
-        }
-
-        // Request timeout — combine the framework wall-clock with the client's
-        // abort signal. The combined signal is attached to a cloned request
-        // that is passed to Yoga / REST handlers so downstream work (DB
-        // queries, resolvers) actually gets cancelled on timeout or client
-        // disconnect. Previously the signal was created but never propagated,
-        // so the timer only logged a warning while the request continued
-        // consuming resources (C05).
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => {
-            controller.abort(new Error(`Request timeout after 30000ms: ${method} ${url.pathname}`));
-            logger.warn(`Request timeout: ${method} ${url.pathname}`);
-        }, 30000);
-        const combinedSignal = this.combineSignals([req.signal, controller.signal]);
-        // Rebind the request with the combined signal so handlers (Yoga, REST)
-        // see it via req.signal and can propagate cancellation.
-        req = new Request(req, { signal: combinedSignal });
-
-        try {
-            if (url.pathname === "/health") {
-                const response = await handleHealthFn(this);
-                clearTimeout(timeoutId);
-                return this.addCorsHeaders(response, req);
-            }
-
-            // Metrics endpoint stays in router — collectMetrics is not a pure
-            // health probe (dynamic CacheManager import + reads app.remote).
-            if (url.pathname === "/metrics") {
-                const metrics = await this.collectMetrics();
-                clearTimeout(timeoutId);
-                return this.addCorsHeaders(new Response(
-                    JSON.stringify(metrics),
-                    {
-                        status: 200,
-                        headers: { "Content-Type": "application/json" },
-                    }
-                ), req);
-            }
-
-            if (url.pathname === "/health/remote") {
-                const response = await handleRemoteHealthFn(this);
-                clearTimeout(timeoutId);
-                return this.addCorsHeaders(response, req);
-            }
-
-            if (url.pathname === "/health/ready") {
-                const response = await handleReadyFn(this);
-                clearTimeout(timeoutId);
-                return this.addCorsHeaders(response, req);
-            }
-
-            // OpenAPI spec endpoint
-            if (url.pathname === "/openapi.json") {
-                clearTimeout(timeoutId);
-                return this.addCorsHeaders(new Response(this.openAPISpecGenerator!.toJSON(), {
-                    headers: { "Content-Type": "application/json" },
-                }), req);
-            }
-
-            // Swagger UI endpoint
-            if (url.pathname === "/docs") {
-                clearTimeout(timeoutId);
-                const swaggerUIHTML = `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>${this.name} Documentation</title>
-    <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.10.3/swagger-ui.css" />
-    <style>
-        html { box-sizing: border-box; overflow: -moz-scrollbars-vertical; overflow-y: scroll; }
-        *, *:before, *:after { box-sizing: inherit; }
-        body { margin: 0; background: #fafafa; }
-    </style>
-</head>
-<body>
-    <div id="swagger-ui"></div>
-    <script src="https://unpkg.com/swagger-ui-dist@5.10.3/swagger-ui-bundle.js"></script>
-    <script>
-        window.onload = function() {
-            const ui = SwaggerUIBundle({
-                url: '/openapi.json',
-                dom_id: '#swagger-ui',
-                deepLinking: true,
-                presets: [
-                    SwaggerUIBundle.presets.apis,
-                    SwaggerUIBundle.presets.standalone
-                ],
-                plugins: [
-                    SwaggerUIBundle.plugins.DownloadUrl
-                ],
-                layout: "BaseLayout"
-            });
-        };
-    </script>
-</body>
-</html>`;
-                return this.addCorsHeaders(new Response(swaggerUIHTML, {
-                    headers: { "Content-Type": "text/html" },
-                }), req);
-            }
-
-            // Studio API endpoints
-            const studioApiResponse = await routeStudio(this, url, req, method);
-            if (studioApiResponse) {
-                clearTimeout(timeoutId);
-                return this.addCorsHeaders(studioApiResponse, req);
-            }
-
-            // Studio endpoint - handle both root and all sub-routes
-            if (
-                this.studioEnabled &&
-                (url.pathname === "/studio" ||
-                url.pathname.startsWith("/studio/"))
-            ) {
-                clearTimeout(timeoutId);
-
-                // Skip API routes - they're handled by the API handler above
-                if (url.pathname.startsWith("/studio/api/")) {
-                    return this.addCorsHeaders(new Response(
-                        JSON.stringify({
-                            error: "Studio API endpoint not found",
-                        }),
-                        {
-                            status: 404,
-                            headers: { "Content-Type": "application/json" },
-                        }
-                    ), req);
-                }
-
-                // Check if this is a request for static assets (CSS, JS, etc.)
-                if (url.pathname.startsWith("/studio/assets/")) {
-                    // Let the static assets handler below handle this
-                    // Don't return here, fall through to static assets handler
-                } else {
-                    // For all other /studio/* routes, serve the React app's index.html
-                    const studioIndexPath = path.join(
-                        import.meta.dirname,
-                        "..",
-                        "studio",
-                        "dist",
-                        "index.html"
-                    );
-                    try {
-                        const studioFile = Bun.file(studioIndexPath);
-                        if (await studioFile.exists()) {
-                            let html = await studioFile.text();
-                            // Inject metadata into the HTML
-                            const metadata = getSerializedMetadataStorage();
-                            const metadataScript = `<script>window.bunsaneMetadata = ${JSON.stringify(
-                                metadata
-                            )};</script>`;
-                            // Insert before the closing </head> tag
-                            html = html.replace(
-                                "</head>",
-                                `${metadataScript}</head>`
-                            );
-                            return this.addCorsHeaders(new Response(html, {
-                                headers: { "Content-Type": "text/html" },
-                            }), req);
-                        } else {
-                            return this.addCorsHeaders(new Response(
-                                "Studio not built. Run `bun run build:studio` to build the studio.",
-                                {
-                                    status: 404,
-                                    headers: { "Content-Type": "text/plain" },
-                                }
-                            ), req);
-                        }
-                    } catch (error) {
-                        console.log("Error loading studio index.html:", error);
-                        return this.addCorsHeaders(new Response("Studio not available", {
-                            status: 404,
-                            headers: { "Content-Type": "text/plain" },
-                        }), req);
-                    }
-                }
-            }
-            for (const [route, folder] of this.staticAssets) {
-                if (url.pathname.startsWith(route)) {
-                    const relativePath = url.pathname.slice(route.length);
-                    const filePath = path.join(folder, relativePath);
-                    try {
-                        const file = Bun.file(filePath);
-                        if (await file.exists()) {
-                            clearTimeout(timeoutId);
-                            return this.addCorsHeaders(new Response(file), req);
-                        }
-                    } catch (error) {
-                        logger.error(
-                            `Error serving static file ${filePath}:`,
-                            error as any
-                        );
-                    }
-                }
-            }
-
-            // Lookup REST endpoint using map for O(1) performance
-            const endpointKey = `${method}:${url.pathname}`;
-            let endpoint = this.restEndpointMap.get(endpointKey);
-
-            // If exact match not found, try pattern matching for parameterized routes
-            if (!endpoint) {
-                for (const ep of this.restEndpoints) {
-                    if (ep.method !== method) continue;
-                    // Convert route pattern to regex (e.g., /api/v1/users/:id -> /api/v1/users/[^/]+)
-                    const pattern = ep.path.replace(/:[^/]+/g, '[^/]+');
-                    const regex = new RegExp(`^${pattern}$`);
-                    if (regex.test(url.pathname)) {
-                        endpoint = ep;
-                        break;
-                    }
-                }
-            }
-
-            if (endpoint) {
-                try {
-                    const result = await endpoint.handler(req);
-                    const duration = Date.now() - startTime;
-                    logger.trace(
-                        `REST ${method} ${url.pathname} completed in ${duration}ms`
-                    );
-
-                    clearTimeout(timeoutId);
-                    if (result instanceof Response) {
-                        return this.addCorsHeaders(result, req);
-                    } else {
-                        return this.addCorsHeaders(new Response(JSON.stringify(result), {
-                            headers: { "Content-Type": "application/json" },
-                        }), req);
-                    }
-                } catch (error) {
-                    const duration = Date.now() - startTime;
-                    logger.error(
-                        `Error in REST endpoint ${method} ${endpoint.path} after ${duration}ms`,
-                        error as any
-                    );
-                    clearTimeout(timeoutId);
-                    return this.addCorsHeaders(new Response(
-                        JSON.stringify({
-                            error: "Internal server error",
-                            code: "INTERNAL_ERROR",
-                            ...(process.env.NODE_ENV === 'development' && {
-                                message: (error as Error)?.message,
-                            }),
-                        }),
-                        {
-                            status: 500,
-                            headers: { "Content-Type": "application/json" },
-                        }
-                    ), req);
-                }
-            }
-
-            if (this.yoga) {
-                const response = await this.yoga(req);
-                const duration = Date.now() - startTime;
-                logger.trace(`GraphQL request completed in ${duration}ms`);
-                clearTimeout(timeoutId);
-                return response;
-            }
-
-            clearTimeout(timeoutId);
-            return this.addCorsHeaders(new Response("Not Found", { status: 404 }), req);
-        } catch (error) {
-            const duration = Date.now() - startTime;
-            logger.error(
-                `Request failed after ${duration}ms: ${method} ${url.pathname}`,
-                error as any
-            );
-            clearTimeout(timeoutId);
-
-            if ((error as Error).name === "AbortError") {
-                return this.addCorsHeaders(new Response(
-                    JSON.stringify({ error: "Request timeout", code: "TIMEOUT_ERROR" }),
-                    {
-                        status: 408,
-                        headers: { "Content-Type": "application/json" },
-                    }
-                ), req);
-            }
-
-            return this.addCorsHeaders(new Response(
-                JSON.stringify({
-                    error: "Internal server error",
-                    code: "INTERNAL_ERROR",
-                    ...(process.env.NODE_ENV === 'development' && {
-                        message: (error as Error)?.message,
-                    }),
-                }),
-                {
-                    status: 500,
-                    headers: { "Content-Type": "application/json" },
-                }
-            ), req);
-        }
+        return handleRequestFn(this, req);
     }
 
     public setName(name: string) {
@@ -762,7 +413,7 @@ export default class App {
      *
      * Uses `process.once` for signals so a double SIGTERM can't fire two
      * concurrent shutdown paths racing each other to `process.exit`. Also
-     * idempotent — safe to call multiple times (e.g. in tests).
+     * idempotent â€” safe to call multiple times (e.g. in tests).
      */
     private registerProcessHandlers(): void {
         registerProcessHandlersFn(this);
@@ -775,7 +426,7 @@ export default class App {
     /**
      * Gracefully shutdown the application.
      *
-     * Ordered drain: HTTP → scheduler → remote → cache → database. Each step
+     * Ordered drain: HTTP â†’ scheduler â†’ remote â†’ cache â†’ database. Each step
      * awaits completion before the next begins so in-flight work always sees
      * its dependencies still available. Total budget bounded by
      * `shutdownGracePeriod`; per-step budgets fall back to reasonable defaults.
