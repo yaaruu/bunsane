@@ -13,7 +13,6 @@ import { ComponentRegistry } from "./components";
 import { logger as MainLogger } from "./Logger";
 import { getSerializedMetadataStorage } from "./metadata";
 const logger = MainLogger.child({ scope: "App" });
-import { createYogaInstance } from "../gql";
 import ServiceRegistry from "../service/ServiceRegistry";
 import { type Plugin, createPubSub } from "graphql-yoga";
 import * as path from "path";
@@ -32,7 +31,6 @@ import {
 } from "./remote";
 import type { RemoteManagerConfig } from "./remote";
 import type { CacheConfig } from "../config/cache.config";
-import { createRequestContextPlugin } from "./RequestContext";
 import {
     assertValidCorsConfig,
     validateOrigin as validateOriginFn,
@@ -52,6 +50,8 @@ import {
     handleRemoteHealth as handleRemoteHealthFn,
 } from "./app/healthEndpoints";
 import { routeStudio } from "./app/studioRouter";
+import { setupGraphQL } from "./app/graphqlSetup";
+import { collectRestEndpoints } from "./app/restRegistry";
 
 export type CorsConfig = {
     origin?: string | string[] | ((origin: string) => boolean);
@@ -239,63 +239,7 @@ export default class App {
                     }
 
                     try {
-                        const schema = ServiceRegistry.getSchema();
-
-                        // Wrap user's context factory to automatically spread Yoga context
-                        const wrappedContextFactory = this.contextFactory
-                            ? async (yogaContext: any) => {
-                                  const userContext =
-                                      await this.contextFactory!(yogaContext);
-                                  // Merge Yoga's context with user's context, preserving Yoga properties
-                                  return {
-                                      ...yogaContext, // Yoga context (request, params, etc.)
-                                      ...userContext, // User's additional context
-                                  };
-                              }
-                            : undefined;
-
-                        // Read env override for GraphQL depth limit
-                        const envDepth = process.env.GRAPHQL_MAX_DEPTH;
-                        if (envDepth) {
-                            this.graphqlMaxDepth = parseInt(envDepth, 10);
-                        }
-                        const envComplexity = process.env.GRAPHQL_MAX_COMPLEXITY;
-                        if (envComplexity) {
-                            const parsed = parseInt(envComplexity, 10);
-                            if (Number.isFinite(parsed) && parsed >= 0) {
-                                this.graphqlMaxComplexity = parsed;
-                            }
-                        }
-
-                        const yogaOptions = {
-                            cors: this.config.cors,
-                            maxDepth: this.graphqlMaxDepth || undefined,
-                            maxComplexity: this.graphqlMaxComplexity,
-                        };
-
-                        // Auto-apply RequestContext plugin by default so
-                        // apps using @BelongsTo / @HasMany get DataLoader
-                        // batching without opt-in. Prevents N+1 query
-                        // explosion. Opt out via disableRequestContextPlugin().
-                        const effectivePlugins: Plugin[] = this.requestContextPluginEnabled
-                            ? [createRequestContextPlugin(), ...this.yogaPlugins]
-                            : [...this.yogaPlugins];
-
-                        if (schema) {
-                            this.yoga = createYogaInstance(
-                                schema,
-                                effectivePlugins,
-                                wrappedContextFactory,
-                                yogaOptions
-                            );
-                        } else {
-                            this.yoga = createYogaInstance(
-                                undefined,
-                                effectivePlugins,
-                                wrappedContextFactory,
-                                yogaOptions
-                            );
-                        }
+                        setupGraphQL(this);
 
                         // Get all services for processing
                         const services = ServiceRegistry.getServices();
@@ -354,107 +298,7 @@ export default class App {
                             }
                         }
 
-                        // Collect REST endpoints from all services
-                        for (const service of services) {
-                            const endpoints = (service.constructor as any)
-                                .httpEndpoints;
-                            if (endpoints) {
-                                for (const endpoint of endpoints) {
-                                    const endpointInfo = {
-                                        method: endpoint.method,
-                                        path: endpoint.path,
-                                        handler: endpoint.handler.bind(service),
-                                        service: service,
-                                    };
-                                    logger.trace(
-                                        `Registered REST endpoint: [${endpoint.method}] ${endpoint.path} for service ${service.constructor.name}`
-                                    );
-                                    this.restEndpoints.push(endpointInfo);
-                                    this.restEndpointMap.set(
-                                        `${endpoint.method}:${endpoint.path}`,
-                                        endpointInfo
-                                    );
-
-                                    // Check if this endpoint has a swagger operation
-                                    if (
-                                        (endpoint.handler as any)
-                                            .swaggerOperation
-                                    ) {
-                                        // Collect tags from class and method decorators
-                                        const classTags =
-                                            (service.constructor as any)
-                                                .swaggerClassTags || [];
-                                        const methodTags =
-                                            (service.constructor as any)
-                                                .swaggerMethodTags?.[
-                                                endpoint.handler.name
-                                            ] || [];
-                                        const allTags = [
-                                            ...classTags,
-                                            ...methodTags,
-                                        ];
-
-                                        logger.trace(
-                                            `Generating OpenAPI spec for endpoint: [${
-                                                endpoint.method
-                                            }] ${
-                                                endpoint.path
-                                            } with tags: ${allTags.join(", ")}`
-                                        );
-
-                                        // Merge tags into the operation
-                                        const operation = {
-                                            ...(endpoint.handler as any)
-                                                .swaggerOperation,
-                                        };
-                                        if (allTags.length > 0) {
-                                            operation.tags = [
-                                                ...(operation.tags || []),
-                                                ...allTags,
-                                            ];
-                                        }
-
-                                        this.openAPISpecGenerator!.addEndpoint({
-                                            method: endpoint.method,
-                                            path: endpoint.path,
-                                            operation,
-                                        });
-                                        logger.trace(
-                                            `Registered OpenAPI spec for endpoint: [${endpoint.method}] ${endpoint.path}`
-                                        );
-                                    } else {
-                                        if (this.enforceDocs) {
-                                            logger.warn(
-                                                `No swagger operation found for endpoint: [${endpoint.method}] ${endpoint.path} in service ${service.constructor.name}`
-                                            );
-                                            this.openAPISpecGenerator!.addEndpoint(
-                                                {
-                                                    method: endpoint.method,
-                                                    path: endpoint.path,
-                                                    operation: {
-                                                        summary: `No description for ${endpoint.path}. Don't use this endpoint until it's properly documented!`,
-                                                        requestBody: {
-                                                            content: {
-                                                                "application/json":
-                                                                    {
-                                                                        schema: {},
-                                                                    },
-                                                            },
-                                                        },
-                                                        responses: {
-                                                            "200": {
-                                                                description:
-                                                                    "Success",
-                                                            },
-                                                        },
-                                                    },
-                                                }
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        collectRestEndpoints(this, services);
 
                         ApplicationLifecycle.setPhase(
                             ApplicationPhase.APPLICATION_READY
