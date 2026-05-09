@@ -46,6 +46,8 @@ import {
     unregisterProcessHandlers as unregisterProcessHandlersFn,
 } from "./app/processHandlers";
 import { runShutdown } from "./app/shutdown";
+import { warmUpPreparedStatementCache as warmUpPreparedStatementCacheFn } from "./app/preparedStatementWarmup";
+import { collectMetrics as collectMetricsFn } from "./app/metricsCollector";
 
 export type CorsConfig = {
     origin?: string | string[] | ((origin: string) => boolean);
@@ -1110,83 +1112,12 @@ export default class App {
         this.maxRequestBodySize = bytes;
     }
 
-    /**
-     * Warm up the prepared statement cache with common query patterns
-     */
     private async warmUpPreparedStatementCache(): Promise<void> {
-        // Get registered components for generating common queries
-        const components = ComponentRegistry.getComponents();
-
-        if (components.length === 0) {
-            logger.trace(
-                "No components registered yet, skipping cache warm-up"
-            );
-            return;
-        }
-
-        const commonQueries: Array<{ sql: string; key: string }> = [];
-
-        // Generate some common query patterns
-        // 1. Simple entity count
-        commonQueries.push({
-            sql: "SELECT COUNT(*) as count FROM (SELECT DISTINCT ec.entity_id as id FROM entity_components ec WHERE ec.deleted_at IS NULL) AS subquery",
-            key: "count_all_entities",
-        });
-
-        // 2. Common component queries (first few components)
-        for (let i = 0; i < Math.min(5, components.length); i++) {
-            const component = components[i];
-            if (component) {
-                const { name, ctor } = component;
-                const typeId = ComponentRegistry.getComponentId(name);
-                if (typeId) {
-                    commonQueries.push({
-                        sql: `SELECT DISTINCT ec.entity_id as id FROM entity_components ec WHERE ec.type_id = '${typeId}' AND ec.deleted_at IS NULL LIMIT 10`,
-                        key: `find_${name.toLowerCase()}_sample`,
-                    });
-                }
-            }
-        }
-
-        // 3. Multi-component queries (if we have multiple components)
-        if (components.length >= 2) {
-            const typeIds = components
-                .slice(0, 3)
-                .map((component: { name: string; ctor: any }) =>
-                    ComponentRegistry.getComponentId(component.name)
-                )
-                .filter((id: string | undefined) => id)
-                .join("','");
-
-            if (typeIds) {
-                commonQueries.push({
-                    sql: `SELECT DISTINCT ec.entity_id as id FROM entity_components ec WHERE ec.type_id IN ('${typeIds}') AND ec.deleted_at IS NULL LIMIT 10`,
-                    key: "find_multi_component_sample",
-                });
-            }
-        }
-
-        await preparedStatementCache.warmUp(commonQueries, db);
+        return warmUpPreparedStatementCacheFn(this);
     }
 
     private async collectMetrics() {
-        let cacheStats = null;
-        try {
-            const { CacheManager } = await import('./cache/CacheManager');
-            cacheStats = await CacheManager.getInstance().getStats();
-        } catch (err) {
-            logger.warn({ err }, 'metrics: cache stats unavailable');
-        }
-
-        return {
-            timestamp: new Date().toISOString(),
-            uptime: process.uptime(),
-            process: process.memoryUsage(),
-            cache: cacheStats,
-            scheduler: SchedulerManager.getInstance().getMetrics(),
-            preparedStatements: preparedStatementCache.getStats(),
-            remote: this.remote ? this.remote.getMetrics() : null,
-        };
+        return collectMetricsFn(this);
     }
 
     async start() {
