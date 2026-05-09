@@ -23,7 +23,6 @@ import { OpenAPISpecGenerator, type SwaggerEndpointMetadata } from "../swagger";
 import type BasePlugin from "../plugins";
 import { preparedStatementCache } from "../database/PreparedStatementCache";
 import db from "../database";
-import studioEndpoint from "../endpoints";
 import { type Middleware, composeMiddleware } from "./Middleware";
 import { validateEnv } from "./validateEnv";
 import {
@@ -52,6 +51,7 @@ import {
     handleReady as handleReadyFn,
     handleRemoteHealth as handleRemoteHealthFn,
 } from "./app/healthEndpoints";
+import { routeStudio } from "./app/studioRouter";
 
 export type CorsConfig = {
     origin?: string | string[] | ((origin: string) => boolean);
@@ -713,97 +713,10 @@ export default class App {
             }
 
             // Studio API endpoints
-            if (this.studioEnabled && url.pathname.startsWith("/studio/api/")) {
+            const studioApiResponse = await routeStudio(this, url, req, method);
+            if (studioApiResponse) {
                 clearTimeout(timeoutId);
-
-                // Studio tables endpoint
-                if (url.pathname === "/studio/api/tables") {
-                    return this.addCorsHeaders(await studioEndpoint.getTables(), req);
-                }
-
-                // Studio stats endpoint
-                if (url.pathname === "/studio/api/stats") {
-                    return this.addCorsHeaders(await studioEndpoint.handleStudioStatsRequest(), req);
-                }
-
-                // Studio components endpoint
-                if (url.pathname === "/studio/api/components") {
-                    return this.addCorsHeaders(await studioEndpoint.handleStudioComponentsRequest(), req);
-                }
-
-                // Studio query endpoint (POST only)
-                if (url.pathname === "/studio/api/query" && method === "POST") {
-                    const body = await req.json();
-                    return this.addCorsHeaders(await studioEndpoint.handleStudioQueryRequest(body), req);
-                }
-
-                const studioApiPath = url.pathname.replace("/studio/api/", "");
-                const pathSegments = studioApiPath.split("/");
-
-                if (pathSegments[0] === "entity" && pathSegments[1]) {
-                    const entityId = pathSegments[1];
-                    return this.addCorsHeaders(
-                        await studioEndpoint.handleEntityInspectorRequest(entityId),
-                        req
-                    );
-                }
-
-                if (pathSegments[0] === "table" && pathSegments[1]) {
-                    const tableName = pathSegments[1];
-
-                    if (method === "DELETE") {
-                        const body = await req.json();
-                        return this.addCorsHeaders(await studioEndpoint.handleStudioTableDeleteRequest(
-                            tableName,
-                            body
-                        ), req);
-                    }
-
-                    const limit = url.searchParams.get("limit");
-                    const offset = url.searchParams.get("offset");
-                    const search = url.searchParams.get("search");
-
-                    return this.addCorsHeaders(await studioEndpoint.handleStudioTableRequest(tableName, {
-                        limit: limit ? parseInt(limit, 10) : undefined,
-                        offset: offset ? parseInt(offset, 10) : undefined,
-                        search: search ?? undefined,
-                    }), req);
-                }
-
-                if (pathSegments[0] === "arche-type" && pathSegments[1]) {
-                    const archeTypeName = pathSegments[1];
-
-                    if (method === "DELETE") {
-                        const body = await req.json();
-                        return this.addCorsHeaders(await studioEndpoint.handleStudioArcheTypeDeleteRequest(
-                            archeTypeName,
-                            body
-                        ), req);
-                    }
-
-                    const limit = url.searchParams.get("limit");
-                    const offset = url.searchParams.get("offset");
-                    const search = url.searchParams.get("search");
-                    const includeDeleted = url.searchParams.get("include_deleted");
-
-                    return this.addCorsHeaders(await studioEndpoint.handleStudioArcheTypeRecordsRequest(
-                        archeTypeName,
-                        {
-                            limit: limit ? parseInt(limit, 10) : undefined,
-                            offset: offset ? parseInt(offset, 10) : undefined,
-                            search: search ?? undefined,
-                            include_deleted: includeDeleted === "true",
-                        }
-                    ), req);
-                }
-
-                return this.addCorsHeaders(new Response(
-                    JSON.stringify({ error: "Studio API endpoint not found" }),
-                    {
-                        status: 404,
-                        headers: { "Content-Type": "application/json" },
-                    }
-                ), req);
+                return this.addCorsHeaders(studioApiResponse, req);
             }
 
             // Studio endpoint - handle both root and all sub-routes
