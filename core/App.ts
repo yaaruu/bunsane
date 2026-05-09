@@ -41,6 +41,10 @@ import {
     getCorsHeaders as getCorsHeadersFn,
     addCorsHeaders as addCorsHeadersFn,
 } from "./app/cors";
+import {
+    registerProcessHandlers as registerProcessHandlersFn,
+    unregisterProcessHandlers as unregisterProcessHandlersFn,
+} from "./app/processHandlers";
 
 export type CorsConfig = {
     origin?: string | string[] | ((origin: string) => boolean);
@@ -1241,45 +1245,11 @@ export default class App {
      * idempotent — safe to call multiple times (e.g. in tests).
      */
     private registerProcessHandlers(): void {
-        if (this.processHandlersRegistered) return;
-
-        // Use arrow-bound handlers so `once` works cleanly.
-        this.sigTermHandler = () => {
-            logger.info({ scope: 'app', component: 'App', msg: 'Received SIGTERM' });
-            this.shutdown().finally(() => process.exit(0));
-        };
-        this.sigIntHandler = () => {
-            logger.info({ scope: 'app', component: 'App', msg: 'Received SIGINT' });
-            this.shutdown().finally(() => process.exit(0));
-        };
-        process.once('SIGTERM', this.sigTermHandler);
-        process.once('SIGINT', this.sigIntHandler);
-
-        // Global error handlers to prevent silent crashes during init AND runtime.
-        this.unhandledRejectionHandler = (reason, promise) => {
-            logger.error({ scope: 'app', component: 'App', reason, msg: 'Unhandled promise rejection' });
-        };
-        this.uncaughtExceptionHandler = (error) => {
-            logger.fatal({ scope: 'app', component: 'App', err: error, msg: 'Uncaught exception — shutting down' });
-            this.shutdown().finally(() => process.exit(1));
-        };
-        process.on('unhandledRejection', this.unhandledRejectionHandler);
-        process.on('uncaughtException', this.uncaughtExceptionHandler);
-
-        this.processHandlersRegistered = true;
+        registerProcessHandlersFn(this);
     }
 
     private unregisterProcessHandlers(): void {
-        if (!this.processHandlersRegistered) return;
-        if (this.sigTermHandler) process.removeListener('SIGTERM', this.sigTermHandler);
-        if (this.sigIntHandler) process.removeListener('SIGINT', this.sigIntHandler);
-        if (this.unhandledRejectionHandler) process.removeListener('unhandledRejection', this.unhandledRejectionHandler);
-        if (this.uncaughtExceptionHandler) process.removeListener('uncaughtException', this.uncaughtExceptionHandler);
-        this.sigTermHandler = null;
-        this.sigIntHandler = null;
-        this.unhandledRejectionHandler = null;
-        this.uncaughtExceptionHandler = null;
-        this.processHandlersRegistered = false;
+        unregisterProcessHandlersFn(this);
     }
 
     /**
