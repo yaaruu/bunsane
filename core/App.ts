@@ -45,6 +45,7 @@ import {
     registerProcessHandlers as registerProcessHandlersFn,
     unregisterProcessHandlers as unregisterProcessHandlersFn,
 } from "./app/processHandlers";
+import { runShutdown } from "./app/shutdown";
 
 export type CorsConfig = {
     origin?: string | string[] | ((origin: string) => boolean);
@@ -1261,115 +1262,6 @@ export default class App {
      * `shutdownGracePeriod`; per-step budgets fall back to reasonable defaults.
      */
     async shutdown(): Promise<void> {
-        if (this.isShuttingDown) return;
-        this.isShuttingDown = true;
-        this.isReady = false;
-
-        const shutdownStart = Date.now();
-        logger.info({ scope: 'app', component: 'App', msg: 'Shutting down application', gracePeriodMs: this.shutdownGracePeriod });
-
-        const budgetRemaining = () => Math.max(500, this.shutdownGracePeriod - (Date.now() - shutdownStart));
-
-        // 1. Stop HTTP server: stop accepting new connections, wait for in-flight
-        //    requests to finish. Bun's server.stop(false) initiates graceful
-        //    drain but does not return a promise — we poll the server's
-        //    pendingRequests count, then force-close on deadline.
-        if (this.server) {
-            try {
-                logger.info({ scope: 'app', component: 'App', msg: 'Draining HTTP connections' });
-                this.server.stop(false);
-                await this.waitForHttpDrain(budgetRemaining());
-                try { this.server.stop(true); } catch {}
-                logger.info({ scope: 'app', component: 'App', msg: 'HTTP server stopped' });
-            } catch (error) {
-                logger.warn({ scope: 'app', component: 'App', msg: 'HTTP server stop error', err: error });
-            }
-        }
-
-        // 2. Stop scheduler (awaits in-flight tasks internally, see C14).
-        try {
-            await SchedulerManager.getInstance().stop(Math.min(budgetRemaining(), 15_000));
-            logger.info({ scope: 'app', component: 'App', msg: 'Scheduler stopped' });
-        } catch (error) {
-            logger.warn({ scope: 'app', component: 'App', msg: 'Scheduler stop error', err: error });
-        }
-
-        // 3. Shutdown RemoteManager (after scheduler, before cache — DB still available).
-        if (this.remote) {
-            try {
-                await this.remote.shutdown();
-                setRemoteManager(null);
-                this.remote = null;
-                logger.info({ scope: 'app', component: 'App', msg: 'RemoteManager shutdown' });
-            } catch (error) {
-                logger.warn({ scope: 'app', component: 'App', msg: 'RemoteManager shutdown error', err: error });
-            }
-        }
-
-        // 4. Drain any fire-and-forget cache ops triggered by entity.set /
-        //    entity.remove before we disconnect the cache (H-CACHE-1).
-        //    Also drain post-commit side effects (cache + hooks scheduled
-        //    via queueMicrotask from save()) so hook-triggered DB work
-        //    doesn't hit a closed pool.
-        try {
-            const { Entity } = await import('./Entity');
-            await Entity.drainPendingCacheOps(Math.min(budgetRemaining(), 5_000));
-            await Entity.drainPendingSideEffects(Math.min(budgetRemaining(), 5_000));
-        } catch (error) {
-            logger.warn({ scope: 'cache', component: 'App', msg: 'Entity cache op drain error', err: error });
-        }
-
-        // 5. Shutdown cache (flush pending writes, unsubscribe pub/sub, disconnect).
-        try {
-            const { CacheManager } = await import('./cache/CacheManager');
-            await CacheManager.getInstance().shutdown();
-            logger.info({ scope: 'cache', component: 'App', msg: 'Cache shutdown completed' });
-        } catch (error) {
-            logger.warn({ scope: 'cache', component: 'App', msg: 'Cache shutdown error', err: error });
-        }
-
-        // 5. Close database pool (last — after all consumers done).
-        try {
-            db.close();
-            logger.info({ scope: 'app', component: 'App', msg: 'Database pool closed' });
-        } catch (error) {
-            logger.warn({ scope: 'app', component: 'App', msg: 'Database pool close error', err: error });
-        }
-
-        // 6. Dispose lifecycle listeners so a subsequent init() (tests) doesn't
-        //    stack handlers on the singleton.
-        try {
-            if (this.phaseListener) {
-                ApplicationLifecycle.removePhaseListener(this.phaseListener);
-                this.phaseListener = null;
-            }
-            SchedulerManager.getInstance().disposeLifecycleIntegration();
-        } catch { /* ignore */ }
-
-        // 7. Unregister process handlers (signals + error handlers) last so
-        //    shutdown errors still surface via them above.
-        this.unregisterProcessHandlers();
-
-        logger.info({ scope: 'app', component: 'App', msg: 'Application shutdown completed', durationMs: Date.now() - shutdownStart });
-    }
-
-    /**
-     * Wait for pending HTTP requests to drain, bounded by `timeoutMs`.
-     * Bun's `Server` exposes `pendingRequests` for this poll. If the field is
-     * unavailable (older Bun), fall back to a fixed sleep.
-     */
-    private async waitForHttpDrain(timeoutMs: number): Promise<void> {
-        if (!this.server) return;
-        const deadline = Date.now() + timeoutMs;
-        // Poll pending request count. Bun exposes this on the Server object.
-        while (Date.now() < deadline) {
-            const pending = (this.server as any).pendingRequests ?? 0;
-            if (pending === 0) return;
-            await new Promise((r) => setTimeout(r, 50));
-        }
-        const leftover = (this.server as any).pendingRequests ?? -1;
-        if (leftover > 0) {
-            logger.warn({ scope: 'app', component: 'App', msg: 'HTTP drain timeout, pending requests remaining', pendingRequests: leftover });
-        }
+        return runShutdown(this);
     }
 }
