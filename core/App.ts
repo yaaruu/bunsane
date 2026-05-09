@@ -25,7 +25,6 @@ import { preparedStatementCache } from "../database/PreparedStatementCache";
 import db from "../database";
 import studioEndpoint from "../endpoints";
 import { type Middleware, composeMiddleware } from "./Middleware";
-import { deepHealthCheck, readinessCheck } from "./health";
 import { validateEnv } from "./validateEnv";
 import {
     RemoteManager,
@@ -48,6 +47,11 @@ import {
 import { runShutdown } from "./app/shutdown";
 import { warmUpPreparedStatementCache as warmUpPreparedStatementCacheFn } from "./app/preparedStatementWarmup";
 import { collectMetrics as collectMetricsFn } from "./app/metricsCollector";
+import {
+    handleHealth as handleHealthFn,
+    handleReady as handleReadyFn,
+    handleRemoteHealth as handleRemoteHealthFn,
+} from "./app/healthEndpoints";
 
 export type CorsConfig = {
     origin?: string | string[] | ((origin: string) => boolean);
@@ -626,20 +630,14 @@ export default class App {
         req = new Request(req, { signal: combinedSignal });
 
         try {
-            // Health check endpoint
             if (url.pathname === "/health") {
-                const health = await deepHealthCheck();
+                const response = await handleHealthFn(this);
                 clearTimeout(timeoutId);
-                return this.addCorsHeaders(new Response(
-                    JSON.stringify(health.result),
-                    {
-                        status: health.httpStatus,
-                        headers: { "Content-Type": "application/json" },
-                    }
-                ), req);
+                return this.addCorsHeaders(response, req);
             }
 
-            // Metrics endpoint
+            // Metrics endpoint stays in router — collectMetrics is not a pure
+            // health probe (dynamic CacheManager import + reads app.remote).
             if (url.pathname === "/metrics") {
                 const metrics = await this.collectMetrics();
                 clearTimeout(timeoutId);
@@ -652,43 +650,16 @@ export default class App {
                 ), req);
             }
 
-            // Remote health check
             if (url.pathname === "/health/remote") {
-                if (!this.remote) {
-                    clearTimeout(timeoutId);
-                    return this.addCorsHeaders(new Response(
-                        JSON.stringify({
-                            healthy: false,
-                            error: "Remote subsystem not enabled",
-                        }),
-                        {
-                            status: 503,
-                            headers: { "Content-Type": "application/json" },
-                        }
-                    ), req);
-                }
-                const health = await this.remote.health();
+                const response = await handleRemoteHealthFn(this);
                 clearTimeout(timeoutId);
-                return this.addCorsHeaders(new Response(
-                    JSON.stringify(health),
-                    {
-                        status: health.healthy ? 200 : 503,
-                        headers: { "Content-Type": "application/json" },
-                    }
-                ), req);
+                return this.addCorsHeaders(response, req);
             }
 
-            // Readiness probe
             if (url.pathname === "/health/ready") {
-                const ready = await readinessCheck(this.isReady, this.isShuttingDown);
+                const response = await handleReadyFn(this);
                 clearTimeout(timeoutId);
-                return this.addCorsHeaders(new Response(
-                    JSON.stringify(ready.result),
-                    {
-                        status: ready.httpStatus,
-                        headers: { "Content-Type": "application/json" },
-                    }
-                ), req);
+                return this.addCorsHeaders(response, req);
             }
 
             // OpenAPI spec endpoint
