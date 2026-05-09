@@ -35,6 +35,12 @@ import {
 import type { RemoteManagerConfig } from "./remote";
 import type { CacheConfig } from "../config/cache.config";
 import { createRequestContextPlugin } from "./RequestContext";
+import {
+    assertValidCorsConfig,
+    validateOrigin as validateOriginFn,
+    getCorsHeaders as getCorsHeadersFn,
+    addCorsHeaders as addCorsHeadersFn,
+} from "./app/cors";
 
 export type CorsConfig = {
     origin?: string | string[] | ((origin: string) => boolean);
@@ -138,14 +144,8 @@ export default class App {
     }
 
     public setCors(cors: CorsConfig) {
-        if (cors.origin === undefined) {
-            throw new Error('[CORS] `origin` is required. Pass an explicit string, array, function, or "*" if you truly want to allow everyone.');
-        }
+        assertValidCorsConfig(cors);
         this.config.cors = cors;
-        // Warn about invalid configuration
-        if (cors.credentials && cors.origin === '*') {
-            console.warn('[CORS] Warning: credentials=true with origin="*" is invalid per spec. Origin will be reflected from request.');
-        }
     }
 
     async init() {
@@ -556,71 +556,11 @@ export default class App {
     }
 
     private validateOrigin(requestOrigin: string | null | undefined): string | null {
-        if (!this.config.cors || !requestOrigin) return null;
-
-        const configOrigin = this.config.cors.origin;
-
-        // origin is required by setCors; undefined here would indicate a
-        // programming error. Treat as deny rather than silent wildcard.
-        if (configOrigin === undefined) return null;
-
-        // Explicit wildcard allows all
-        if (configOrigin === '*') {
-            // If credentials enabled, cannot use wildcard - return actual origin
-            return this.config.cors.credentials ? requestOrigin : '*';
-        }
-
-        // String match
-        if (typeof configOrigin === 'string') {
-            return requestOrigin === configOrigin ? configOrigin : null;
-        }
-
-        // Array - check if origin is in list
-        if (Array.isArray(configOrigin)) {
-            return configOrigin.includes(requestOrigin) ? requestOrigin : null;
-        }
-
-        // Function validator
-        if (typeof configOrigin === 'function') {
-            return configOrigin(requestOrigin) ? requestOrigin : null;
-        }
-
-        return null;
+        return validateOriginFn(this.config.cors, requestOrigin);
     }
 
     private getCorsHeaders(req?: Request): Record<string, string> {
-        if (!this.config.cors) return {};
-
-        const requestOrigin = req?.headers.get('Origin');
-        const allowedOrigin = this.validateOrigin(requestOrigin);
-
-        // If origin not allowed, return empty (no CORS headers)
-        if (requestOrigin && !allowedOrigin) return {};
-
-        // No allowedOrigin means request carried no Origin header. Skip
-        // Access-Control-Allow-Origin rather than falling back to '*'.
-        const headers: Record<string, string> = {
-            'Access-Control-Allow-Methods': this.config.cors.methods?.join(', ') || 'GET, POST, PUT, DELETE, OPTIONS',
-            'Access-Control-Allow-Headers': this.config.cors.allowedHeaders?.join(', ') || 'Content-Type, Authorization',
-            'Vary': 'Origin',
-        };
-        if (allowedOrigin) {
-            headers['Access-Control-Allow-Origin'] = allowedOrigin;
-        }
-
-        if (this.config.cors.credentials) {
-            headers['Access-Control-Allow-Credentials'] = 'true';
-        }
-
-        if (this.config.cors.exposedHeaders?.length) {
-            headers['Access-Control-Expose-Headers'] = this.config.cors.exposedHeaders.join(', ');
-        }
-
-        if (this.config.cors.maxAge !== undefined) {
-            headers['Access-Control-Max-Age'] = String(this.config.cors.maxAge);
-        }
-
-        return headers;
+        return getCorsHeadersFn(this.config.cors, req);
     }
 
     /**
@@ -645,19 +585,7 @@ export default class App {
     }
 
     private addCorsHeaders(response: Response, req?: Request): Response {
-        const corsHeaders = this.getCorsHeaders(req);
-        if (Object.keys(corsHeaders).length === 0) return response;
-
-        const newHeaders = new Headers(response.headers);
-        for (const [key, value] of Object.entries(corsHeaders)) {
-            newHeaders.set(key, value);
-        }
-
-        return new Response(response.body, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: newHeaders,
-        });
+        return addCorsHeadersFn(response, this.config.cors, req);
     }
 
     private async handleRequest(req: Request): Promise<Response> {
