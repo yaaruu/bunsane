@@ -16,20 +16,13 @@ const logger = MainLogger.child({ scope: "App" });
 import ServiceRegistry from "../service/ServiceRegistry";
 import { type Plugin, createPubSub } from "graphql-yoga";
 import * as path from "path";
-import { SchedulerManager } from "./SchedulerManager";
-import { registerScheduledTasks } from "../scheduler";
 import { OpenAPISpecGenerator, type SwaggerEndpointMetadata } from "../swagger";
 import type BasePlugin from "../plugins";
 import { preparedStatementCache } from "../database/PreparedStatementCache";
 import db from "../database";
 import { type Middleware, composeMiddleware } from "./Middleware";
 import { validateEnv } from "./validateEnv";
-import {
-    RemoteManager,
-    registerRemoteHandlers,
-    setRemoteManager,
-} from "./remote";
-import type { RemoteManagerConfig } from "./remote";
+import type { RemoteManager, RemoteManagerConfig } from "./remote";
 import type { CacheConfig } from "../config/cache.config";
 import {
     assertValidCorsConfig,
@@ -50,8 +43,7 @@ import {
     handleRemoteHealth as handleRemoteHealthFn,
 } from "./app/healthEndpoints";
 import { routeStudio } from "./app/studioRouter";
-import { setupGraphQL } from "./app/graphqlSetup";
-import { collectRestEndpoints } from "./app/restRegistry";
+import { createPhaseListener } from "./app/bootstrap";
 
 export type CorsConfig = {
     origin?: string | string[] | ((origin: string) => boolean);
@@ -197,139 +189,7 @@ export default class App {
         if (this.phaseListener) {
             ApplicationLifecycle.removePhaseListener(this.phaseListener);
         }
-        this.phaseListener = async (event: PhaseChangeEvent) => {
-            const phase = event.detail;
-            logger.info(`Application phase changed to: ${phase}`);
-            // Notify plugins of phase change
-            for (const plugin of this.plugins) {
-                if (plugin.onPhaseChange) {
-                    await plugin.onPhaseChange(phase, this);
-                }
-            }
-            switch (phase) {
-                case ApplicationPhase.DATABASE_READY: {
-                    // Warm up prepared statement cache with common query patterns
-                    try {
-                        await this.warmUpPreparedStatementCache();
-                    } catch (error) {
-                        logger.warn(
-                            "Failed to warm up prepared statement cache:",
-                            error as any
-                        );
-                    }
-                    break;
-                }
-                case ApplicationPhase.SYSTEM_READY: {
-                    // Perform cache health check
-                    try {
-                        const { CacheManager } = await import('./cache/CacheManager');
-                        const cacheManager = CacheManager.getInstance();
-                        const config = cacheManager.getConfig();
-                        
-                        if (config.enabled) {
-                            const isHealthy = await cacheManager.getProvider().ping();
-                            if (isHealthy) {
-                                logger.info({ scope: 'cache', component: 'App', msg: 'Cache health check passed' });
-                            } else {
-                                logger.warn({ scope: 'cache', component: 'App', msg: 'Cache health check failed' });
-                            }
-                        }
-                    } catch (error) {
-                        logger.warn({ scope: 'cache', component: 'App', msg: 'Cache health check error', error });
-                    }
-
-                    try {
-                        setupGraphQL(this);
-
-                        // Get all services for processing
-                        const services = ServiceRegistry.getServices();
-
-                        // Initialize Scheduler
-                        const scheduler = SchedulerManager.getInstance();
-                        scheduler.config.enableLogging =
-                            this.config.scheduler.logging;
-
-                        // Register scheduled tasks for all services
-                        for (const service of services) {
-                            try {
-                                registerScheduledTasks(service);
-                            } catch (error) {
-                                logger.warn(
-                                    `Failed to register scheduled tasks for service ${service.constructor.name}`
-                                );
-                                logger.warn(error);
-                            }
-                        }
-                        logger.info(
-                            `Registered scheduled tasks for ${services.length} services`
-                        );
-
-                        // Initialize RemoteManager (opt-in via enableRemote())
-                        if (this.remoteConfig) {
-                            try {
-                                const rmConfig: RemoteManagerConfig = {
-                                    appName:
-                                        this.remoteConfig.appName ||
-                                        this.name,
-                                    ...this.remoteConfig,
-                                };
-                                this.remote = new RemoteManager(rmConfig);
-                                setRemoteManager(this.remote);
-                                await this.remote.start();
-
-                                for (const service of services) {
-                                    try {
-                                        registerRemoteHandlers(service);
-                                    } catch (error) {
-                                        logger.warn(
-                                            `Failed to register remote handlers for service ${service.constructor.name}`
-                                        );
-                                        logger.warn(error);
-                                    }
-                                }
-                                logger.info(
-                                    `RemoteManager initialized for app "${rmConfig.appName}"`
-                                );
-                            } catch (error) {
-                                logger.error(
-                                    "Failed to start RemoteManager:"
-                                );
-                                logger.error(error);
-                            }
-                        }
-
-                        collectRestEndpoints(this, services);
-
-                        ApplicationLifecycle.setPhase(
-                            ApplicationPhase.APPLICATION_READY
-                        );
-                    } catch (error) {
-                        // SYSTEM_READY failures must not be swallowed silently.
-                        // Without this, the app stays forever in SYSTEM_READY
-                        // (isReady=false, /health/ready → 503 forever) and k8s
-                        // rollout hangs with no observable cause. Surface the
-                        // failure so the readiness probe reports it and the
-                        // orchestrator can restart.
-                        this.isReady = false;
-                        logger.fatal({ scope: 'app', component: 'App', err: error }, 'Fatal error during SYSTEM_READY phase — marking app unready');
-                        // In production, exit so k8s can restart the pod.
-                        // In tests, rethrow so the test sees the failure.
-                        if (process.env.NODE_ENV === 'test') {
-                            throw error;
-                        }
-                        // Give the logger a chance to flush, then exit.
-                        setTimeout(() => process.exit(1), 100).unref?.();
-                    }
-                    break;
-                }
-                case ApplicationPhase.APPLICATION_READY: {
-                    if (process.env.NODE_ENV !== "test") {
-                        this.start();
-                    }
-                    break;
-                }
-            }
-        };
+        this.phaseListener = createPhaseListener(this);
         ApplicationLifecycle.addPhaseListener(this.phaseListener);
 
         if (
