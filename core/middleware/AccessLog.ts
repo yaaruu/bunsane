@@ -1,6 +1,7 @@
 import type { Middleware } from '../Middleware';
 import { logger as MainLogger } from '../Logger';
 import { getRequestId } from './RequestId';
+import type { RequestStats } from '../RequestContext';
 
 const logger = MainLogger.child({ scope: 'HTTP' });
 
@@ -37,7 +38,8 @@ export function accessLog(options: AccessLogOptions = {}): Middleware {
         }
 
         const duration = Math.round(performance.now() - start);
-        const logData = {
+        const stats = (req as any).__bunsaneStats as RequestStats | undefined;
+        const logData: Record<string, any> = {
             requestId: getRequestId(),
             method: req.method,
             path: url.pathname,
@@ -45,6 +47,11 @@ export function accessLog(options: AccessLogOptions = {}): Middleware {
             duration,
             msg: `${req.method} ${url.pathname} ${response.status} ${duration}ms`,
         };
+        if (stats) {
+            logData.operationName = stats.operationName;
+            logData.dataLoaderCalls = stats.dataLoaderCalls;
+            logData.dbQueryCount = stats.dbQueryCount;
+        }
 
         if (response.status >= 500) {
             logger.error(logData);

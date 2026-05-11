@@ -8,6 +8,7 @@ import { QueryContext, QueryDAG, SourceNode, ComponentInclusionNode } from "./in
 import { OrQuery } from "./OrQuery";
 import { OrNode } from "./OrNode";
 import { preparedStatementCache } from "../database/PreparedStatementCache";
+import { timedUnsafe, type PerRequestCounters } from "../database/instrumentedDb";
 import { getMetadataStorage } from "../core/metadata";
 import { shouldUseDirectPartition } from "../core/Config";
 import type { SQL } from "bun";
@@ -63,6 +64,21 @@ export interface QueryCacheOptions {
 }
 
 /**
+ * Options accepted by Query terminal methods (`exec`, `count`, `sum`, etc.).
+ * - `signal` cancels in-flight DB queries via Bun's `Query.cancel()` when
+ *   fired. The request-scoped signal from `req.signal` is automatically
+ *   threaded into resolver-level Query instances by the framework's
+ *   GraphQL request context plugin; manual callers pass it explicitly.
+ * - `perRequest` is an opaque counter object incremented by the
+ *   instrumented DB layer so per-request stats (dbQueryCount,
+ *   dataLoaderCalls) are reported on access/timeout logs.
+ */
+export interface QueryExecOptions {
+    signal?: AbortSignal;
+    perRequest?: PerRequestCounters;
+}
+
+/**
  * New Query class that uses DAG internally for better modularity and extensibility.
  *
  * Generic type parameter `TComponents` tracks component types added via `.with()`,
@@ -85,6 +101,8 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
     private trx: SQL | undefined;
     private skipPreparedCache: boolean = false;
     private skipComponentCache: boolean = false;
+    private execSignal?: AbortSignal;
+    private execPerRequest?: PerRequestCounters;
 
     /** Component constructors added to this query for type-safe access */
     private _componentCtors: ComponentConstructor[] = [];
@@ -110,12 +128,12 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         return this;
     }
 
-    public async findOneById(id: string): Promise<TypedEntity<TComponents> | null> {
+    public async findOneById(id: string, opts?: QueryExecOptions): Promise<TypedEntity<TComponents> | null> {
         // Validate ID to prevent PostgreSQL UUID parsing errors
         if (!id || typeof id !== 'string' || id.trim() === '') {
             return null;
         }
-        const entities = await this.findById(id).exec();
+        const entities = await this.findById(id).exec(opts);
         return entities.length > 0 ? entities[0]! : null;
     }
 
@@ -300,7 +318,8 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         return this;
     }
 
-    public count(): Promise<number> {
+    public count(opts?: QueryExecOptions): Promise<number> {
+        this.applyExecOptions(opts);
         return new Promise<number>((resolve, reject) => {
             const timeout = setTimeout(() => {
                 logger.error(`Query count execution timeout`);
@@ -319,6 +338,17 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
     }
 
     /**
+     * Apply terminal-method options to instance fields so internal helpers
+     * (doCount, doExec, populateComponents, doAggregate, …) can read them
+     * without threading parameters through every private method.
+     */
+    private applyExecOptions(opts?: QueryExecOptions): void {
+        if (!opts) return;
+        if (opts.signal !== undefined) this.execSignal = opts.signal;
+        if (opts.perRequest !== undefined) this.execPerRequest = opts.perRequest;
+    }
+
+    /**
      * Get an estimated count using PostgreSQL statistics.
      * Much faster than exact count() for large tables - O(1) instead of O(n).
      * 
@@ -333,7 +363,8 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
      * const approxCount = await new Query().with(User).estimatedCount(User);
      * console.log(`Approximately ${approxCount} users`);
      */
-    public async estimatedCount(component: new (...args: any[]) => BaseComponent): Promise<number> {
+    public async estimatedCount(component: new (...args: any[]) => BaseComponent, opts?: QueryExecOptions): Promise<number> {
+        this.applyExecOptions(opts);
         const typeId = ComponentRegistry.getComponentId(component.name);
         if (!typeId) {
             throw new Error(`Component ${component.name} not registered`);
@@ -354,7 +385,7 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
             ? `SELECT reltuples::bigint AS estimate FROM pg_class WHERE relname = $1`
             : `SELECT reltuples::bigint AS estimate FROM pg_class WHERE relname = 'entity_components'`;
 
-        const result = await dbConn.unsafe(sql, [tableName || 'entity_components']);
+        const result = await timedUnsafe<any[]>(dbConn, sql, [tableName || 'entity_components'], this.execSignal, this.execPerRequest);
 
         if (!result || result.length === 0 || result[0].estimate === null) {
             // Fallback to exact count if statistics not available
@@ -410,13 +441,13 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
 
         if (this.skipPreparedCache) {
             // Bypass cache - execute directly
-            countResult = await dbConn.unsafe(countSql, result.params);
+            countResult = await timedUnsafe<any[]>(dbConn, countSql, result.params, this.execSignal, this.execPerRequest);
         } else {
             // Check prepared statement cache
             // Add 'count:' prefix to differentiate count queries from exec queries
             const cacheKey = 'count:' + this.context.generateCacheKey();
             const { statement, isHit } = await preparedStatementCache.getOrCreate(countSql, cacheKey, dbConn);
-            countResult = await preparedStatementCache.execute(statement, result.params, dbConn);
+            countResult = await preparedStatementCache.execute(statement, result.params, dbConn, this.execSignal, this.execPerRequest);
         }
 
         // Debug logging
@@ -603,11 +634,11 @@ AND c.deleted_at IS NULL`;
         let aggregateResult: any[];
 
         if (this.skipPreparedCache) {
-            aggregateResult = await dbConn.unsafe(aggregateSql, result.params);
+            aggregateResult = await timedUnsafe<any[]>(dbConn, aggregateSql, result.params, this.execSignal, this.execPerRequest);
         } else {
             const cacheKey = `${aggregateType.toLowerCase()}:${typeId}:${field}:` + this.context.generateCacheKey();
             const { statement } = await preparedStatementCache.getOrCreate(aggregateSql, cacheKey, dbConn);
-            aggregateResult = await preparedStatementCache.execute(statement, result.params, dbConn);
+            aggregateResult = await preparedStatementCache.execute(statement, result.params, dbConn, this.execSignal, this.execPerRequest);
         }
 
         // Debug logging
@@ -645,7 +676,8 @@ AND c.deleted_at IS NULL`;
      * @returns Promise resolving to array of TypedEntity with accumulated component types
      */
     @timed("Query.exec")
-    public async exec(): Promise<TypedEntity<TComponents>[]> {
+    public async exec(opts?: QueryExecOptions): Promise<TypedEntity<TComponents>[]> {
+        this.applyExecOptions(opts);
         // Apply default LIMIT so unbounded queries cannot load entire tables
         // into memory. Configurable via BUNSANE_DEFAULT_QUERY_LIMIT, 0 to
         // disable. When the default is applied without an explicit .take(),
@@ -806,12 +838,12 @@ AND c.deleted_at IS NULL`;
         if (this.orQuery || this.skipPreparedCache) {
             // For OR queries or explicit cache bypass, execute directly
             // This avoids potential parameter type inference issues with Bun's SQL
-            entities = await dbConn.unsafe(result.sql, result.params);
+            entities = await timedUnsafe<any[]>(dbConn, result.sql, result.params, this.execSignal, this.execPerRequest);
         } else {
             // Check prepared statement cache for regular queries
             const cacheKey = this.context.generateCacheKey();
             const { statement, isHit } = await preparedStatementCache.getOrCreate(result.sql, cacheKey, dbConn);
-            entities = await preparedStatementCache.execute(statement, result.params, dbConn);
+            entities = await preparedStatementCache.execute(statement, result.params, dbConn, this.execSignal, this.execPerRequest);
         }
 
         // Convert to Entity objects
@@ -871,32 +903,32 @@ AND c.deleted_at IS NULL`;
             // Single component type - use direct partition if available
             const partitionTableName = ComponentRegistry.getPartitionTableName(componentTypeIds[0]!);
             if (partitionTableName) {
-                components = await dbConn.unsafe(`
+                components = await timedUnsafe<any[]>(dbConn, `
                     SELECT id, entity_id, type_id, data
                     FROM ${partitionTableName}
                     WHERE entity_id IN ${entityIdList.sql}
                     AND type_id IN ${typeIdList.sql}
                     AND deleted_at IS NULL
-                `, [...entityIdList.params, ...typeIdList.params]);
+                `, [...entityIdList.params, ...typeIdList.params], this.execSignal, this.execPerRequest);
             } else {
                 // Fallback to parent table
-                components = await dbConn.unsafe(`
+                components = await timedUnsafe<any[]>(dbConn, `
                     SELECT id, entity_id, type_id, data
                     FROM components
                     WHERE entity_id IN ${entityIdList.sql}
                     AND type_id IN ${typeIdList.sql}
                     AND deleted_at IS NULL
-                `, [...entityIdList.params, ...typeIdList.params]);
+                `, [...entityIdList.params, ...typeIdList.params], this.execSignal, this.execPerRequest);
             }
         } else {
             // Multiple types or direct partition disabled - use parent table
-            components = await dbConn.unsafe(`
+            components = await timedUnsafe<any[]>(dbConn, `
                 SELECT id, entity_id, type_id, data
                 FROM components
                 WHERE entity_id IN ${entityIdList.sql}
                 AND type_id IN ${typeIdList.sql}
                 AND deleted_at IS NULL
-            `, [...entityIdList.params, ...typeIdList.params]);
+            `, [...entityIdList.params, ...typeIdList.params], this.execSignal, this.execPerRequest);
         }
 
         // Get metadata storage for Date deserialization
@@ -945,7 +977,8 @@ AND c.deleted_at IS NULL`;
      * Execute query with EXPLAIN ANALYZE for performance debugging
      * Returns the query plan and execution statistics
      */
-    public async explainAnalyze(buffers: boolean = true): Promise<string> {
+    public async explainAnalyze(buffers: boolean = true, opts?: QueryExecOptions): Promise<string> {
+        this.applyExecOptions(opts);
         // Reset context for fresh execution
         this.context.reset();
 
@@ -993,7 +1026,7 @@ AND c.deleted_at IS NULL`;
         }
 
         // Execute the EXPLAIN ANALYZE query
-        const explainResult = await dbConn.unsafe(explainSql, result.params);
+        const explainResult = await timedUnsafe<any[]>(dbConn, explainSql, result.params, this.execSignal, this.execPerRequest);
 
         // Format the result
         return explainResult.map((row: any) => row['QUERY PLAN']).join('\n');

@@ -3,7 +3,7 @@
  * Tests cache configuration and management
  */
 import { describe, test, expect, beforeEach, afterEach, mock } from 'bun:test';
-import { CacheManager } from '../../../core/cache/CacheManager';
+import { CacheManager, COMPONENT_TOMBSTONE } from '../../../core/cache/CacheManager';
 import { MemoryCache } from '../../../core/cache/MemoryCache';
 import { MultiLevelCache } from '../../../core/cache/MultiLevelCache';
 
@@ -207,6 +207,137 @@ describe('CacheManager', () => {
             ]);
             expect(results.length).toBe(2);
             expect(results.every(r => r === null)).toBe(true);
+        });
+    });
+
+    describe('component negative cache (tombstones)', () => {
+        beforeEach(async () => {
+            await cacheManager.initialize({
+                enabled: true,
+                provider: 'memory',
+                strategy: 'write-through',
+                defaultTTL: 3600000,
+                entity: { enabled: true, ttl: 3600000 },
+                component: {
+                    enabled: true,
+                    ttl: 1800000,
+                    negativeCacheEnabled: true,
+                    negativeCacheTtl: 60_000,
+                },
+                query: { enabled: false, ttl: 300000, maxSize: 10000 },
+            });
+        });
+
+        test('setComponentsWriteThrough writes tombstones for absent requested keys', async () => {
+            const requested = [
+                { entityId: 'e1', typeId: 't1' },
+                { entityId: 'e2', typeId: 't2' },
+            ];
+            await cacheManager.setComponentsWriteThrough([], requested);
+            const results = await cacheManager.getComponents(requested);
+            expect(results[0]).toBe(COMPONENT_TOMBSTONE);
+            expect(results[1]).toBe(COMPONENT_TOMBSTONE);
+        });
+
+        test('found rows are written, absent are tombstoned, single setMany', async () => {
+            const requested = [
+                { entityId: 'e1', typeId: 't1' },
+                { entityId: 'e2', typeId: 't2' },
+            ];
+            const found = [{
+                id: 'c1', entityId: 'e1', typeId: 't1',
+                data: { x: 1 }, createdAt: new Date(), updatedAt: new Date(), deletedAt: null,
+            }];
+            await cacheManager.setComponentsWriteThrough(found, requested);
+            const results = await cacheManager.getComponents(requested);
+            expect((results[0] as any)?.id).toBe('c1');
+            expect(results[1]).toBe(COMPONENT_TOMBSTONE);
+        });
+
+        test('invalidateComponent drops tombstone', async () => {
+            await cacheManager.setComponentsWriteThrough([], [{ entityId: 'e1', typeId: 't1' }]);
+            await cacheManager.invalidateComponent('e1', 't1');
+            const results = await cacheManager.getComponents([{ entityId: 'e1', typeId: 't1' }]);
+            expect(results[0]).toBeNull();
+        });
+
+        test('negativeCacheEnabled=false skips tombstone writes (backward compat)', async () => {
+            await cacheManager.initialize({
+                enabled: true,
+                provider: 'memory',
+                strategy: 'write-through',
+                defaultTTL: 3600000,
+                entity: { enabled: true, ttl: 3600000 },
+                component: { enabled: true, ttl: 1800000 },
+                query: { enabled: false, ttl: 300000, maxSize: 10000 },
+            });
+            await cacheManager.setComponentsWriteThrough([], [{ entityId: 'e1', typeId: 't1' }]);
+            const results = await cacheManager.getComponents([{ entityId: 'e1', typeId: 't1' }]);
+            expect(results[0]).toBeNull();
+        });
+
+        test('legacy 2-arg signature (components, ttl) still works', async () => {
+            const data = [{
+                id: 'c1', entityId: 'e1', typeId: 't1',
+                data: { x: 1 }, createdAt: new Date(), updatedAt: new Date(), deletedAt: null,
+            }];
+            await cacheManager.setComponentsWriteThrough(data, 3600_000);
+            const results = await cacheManager.getComponents([{ entityId: 'e1', typeId: 't1' }]);
+            expect((results[0] as any)?.id).toBe('c1');
+        });
+    });
+
+    describe('relation negative cache', () => {
+        beforeEach(async () => {
+            await cacheManager.initialize({
+                enabled: true,
+                provider: 'memory',
+                strategy: 'write-through',
+                defaultTTL: 3600000,
+                entity: { enabled: true, ttl: 3600000 },
+                component: { enabled: true, ttl: 1800000 },
+                relation: { negativeCacheEnabled: true, negativeCacheTtl: 60_000 },
+                query: { enabled: false, ttl: 300000, maxSize: 10000 },
+            });
+        });
+
+        test('setRelationsEmpty + getRelationsEmpty round trip', async () => {
+            const keys = [
+                { entityId: 'u1', relationField: 'orders', relatedType: 'Order', foreignKey: 'user_id' },
+                { entityId: 'u2', relationField: 'orders', relatedType: 'Order', foreignKey: 'user_id' },
+            ];
+            await cacheManager.setRelationsEmpty(keys);
+            const flags = await cacheManager.getRelationsEmpty(keys);
+            expect(flags).toEqual([true, true]);
+        });
+
+        test('getRelationsEmpty returns false for keys never tombstoned', async () => {
+            const flags = await cacheManager.getRelationsEmpty([
+                { entityId: 'u-fresh', relationField: 'orders', relatedType: 'Order', foreignKey: 'user_id' },
+            ]);
+            expect(flags).toEqual([false]);
+        });
+
+        test('invalidateRelation drops tombstone', async () => {
+            const key = { entityId: 'u1', relationField: 'orders', relatedType: 'Order', foreignKey: 'user_id' };
+            await cacheManager.setRelationsEmpty([key]);
+            await cacheManager.invalidateRelation(key.entityId, key.relationField, key.relatedType, key.foreignKey);
+            const flags = await cacheManager.getRelationsEmpty([key]);
+            expect(flags).toEqual([false]);
+        });
+
+        test('relation cache disabled returns all-false (no-op)', async () => {
+            await cacheManager.initialize({
+                enabled: true,
+                provider: 'memory',
+                strategy: 'write-through',
+                defaultTTL: 3600000,
+                relation: { negativeCacheEnabled: false },
+            });
+            const key = { entityId: 'u1', relationField: 'orders', relatedType: 'Order', foreignKey: 'user_id' };
+            await cacheManager.setRelationsEmpty([key]);
+            const flags = await cacheManager.getRelationsEmpty([key]);
+            expect(flags).toEqual([false]);
         });
     });
 

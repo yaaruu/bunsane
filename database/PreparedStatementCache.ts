@@ -1,4 +1,5 @@
 import { logger } from "../core/Logger";
+import { timedUnsafe, type PerRequestCounters } from "./instrumentedDb";
 
 export interface CacheEntry {
     sql: string;
@@ -108,15 +109,23 @@ export class PreparedStatementCache {
     }
 
     /**
-     * Execute a prepared statement with parameters
+     * Execute a prepared statement with parameters. Routes through
+     * `timedUnsafe` so the call is timed and (when a signal is supplied)
+     * cancellable via Bun's `Query.cancel()` on abort.
      */
-    public async execute(statement: any, params: any[], db: any): Promise<any[]> {
+    public async execute(
+        statement: any,
+        params: any[],
+        db: any,
+        signal?: AbortSignal,
+        perRequest?: PerRequestCounters,
+    ): Promise<any[]> {
         // Empty-string params are legitimate for text-field filters
         // (`c.data->>'field' = ''`). UUID-typed params never reach this
         // point empty — callers (Query.findById etc.) guard at entry. PG
         // emits a clear error at execution time if a UUID cast meets an
         // empty string.
-        return await db.unsafe(statement.sql, params);
+        return await timedUnsafe<any[]>(db, statement.sql, params, signal, perRequest);
     }
 
     /**
