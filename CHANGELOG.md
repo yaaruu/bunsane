@@ -4,6 +4,58 @@ All notable changes to bunsane are documented here.
 
 ## Unreleased
 
+### Added (v0.3.2 — AbortSignal propagation + DB observability)
+
+- **AbortSignal threading into `Query.exec` + DataLoaders.** Resolvers
+  invoked from a GraphQL request now receive the request's `AbortSignal`
+  via the request-context plugin. When the framework's 30s wall-clock
+  fires (`core/app/requestRouter.ts`), in-flight `db.unsafe()` queries
+  are cancelled through Bun's `SQL.Query.cancel()`. Without this an
+  aborted request leaked its backend connection into
+  `idle in transaction` under pgbouncer transaction-mode pooling,
+  cascading into pool starvation under sustained timeout pressure.
+  Public surface: `Query.exec({ signal })`, `Query.count({ signal })`,
+  `Query.estimatedCount(component, { signal })`,
+  `Query.findOneById(id, { signal })`,
+  `Query.explainAnalyze(buffers, { signal })`,
+  `createRequestLoaders(db, cache?, signal?, perRequest?)`.
+  Reuses helper `runWithSignal` extracted to `database/cancellable.ts`
+  and shared with the existing `Entity.doSave` / `Entity.doDelete`
+  abort paths.
+
+- **DB roundtrip observability (`database/instrumentedDb.ts`).** Every
+  `db.unsafe()` callsite in `Query.ts`, `RequestLoaders.ts` and the
+  shared `PreparedStatementCache.execute` now routes through
+  `timedUnsafe`. Tracks `totalCount`, `totalMs`, `maxMs`, `avgMs`,
+  `slowCount`, `abortedCount`, `inFlightMax`, plus per-DataLoader-kind
+  counters. Exposed at `/metrics` under the new `db` key. Calls over
+  `BUNSANE_DB_SLOW_MS` (default 500ms, set 0 to disable warn) log a
+  structured `Slow DB call` warning with a SQL snippet.
+
+- **Per-request stats on access + timeout logs.** GraphQL request
+  context now captures `operationName`, `dataLoaderCalls`
+  (entity / component / relation), and `dbQueryCount`. These attach to
+  the underlying `Request` via `__bunsaneStats` so the HTTP router's
+  catch block and `AccessLog` middleware can include them in every
+  log line. The previous `Request failed after 30004ms: POST /graphql`
+  log now carries enough fields to identify the offending operation
+  without re-running production with a debug build. Timeout warn log
+  also includes operation name when reachable.
+
+### Env vars added
+
+- `BUNSANE_DB_SLOW_MS` (default `500`) — per-call DB threshold for
+  slow log + `slowCount` metric. Set `0` to suppress the warn (stats
+  still accumulate).
+
+### Backward compatibility
+
+All additions are opt-in. Existing apps see no behavior change:
+`Query.exec()`, `Query.count()`, `createRequestLoaders(db, cache)`,
+and `preparedStatementCache.execute(s, p, db)` retain their pre-0.3.2
+signatures. `/metrics` gains a `db` key (pure addition). Log lines
+gain fields but preserve existing ones.
+
 ### Added (HR-Screening ticket batch — BUNSANE-002..006)
 
 - **`@ScheduledTask` allows entity-less time-based tasks.** Previously

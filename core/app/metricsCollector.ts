@@ -1,6 +1,7 @@
 import { logger as MainLogger } from "../Logger";
 import { SchedulerManager } from "../SchedulerManager";
 import { preparedStatementCache } from "../../database/PreparedStatementCache";
+import { getDbStats } from "../../database/instrumentedDb";
 
 const logger = MainLogger.child({ scope: "App" });
 
@@ -20,6 +21,7 @@ export async function collectMetrics(app: any) {
         cache: cacheStats,
         scheduler: SchedulerManager.getInstance().getMetrics(),
         preparedStatements: preparedStatementCache.getStats(),
+        db: getDbStats(),
         remote: app.remote ? app.remote.getMetrics() : null,
     };
 }

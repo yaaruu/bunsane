@@ -8,6 +8,8 @@ import {
     handleRemoteHealth,
 } from "./healthEndpoints";
 import { routeStudio } from "./studioRouter";
+import { getDbStats } from "../../database/instrumentedDb";
+import type { RequestStats } from "../RequestContext";
 
 const logger = MainLogger.child({ scope: "App" });
 
@@ -45,7 +47,16 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => {
         controller.abort(new Error(`Request timeout after 30000ms: ${method} ${url.pathname}`));
-        logger.warn(`Request timeout: ${method} ${url.pathname}`);
+        const stats = (req as any).__bunsaneStats as RequestStats | undefined;
+        logger.warn({
+            scope: 'App',
+            method,
+            path: url.pathname,
+            operationName: stats?.operationName,
+            dataLoaderCalls: stats?.dataLoaderCalls,
+            dbQueryCount: stats?.dbQueryCount,
+            msg: 'Request timeout',
+        }, `Request timeout: ${method} ${url.pathname}`);
     }, 30000);
     const combinedSignal = combineSignals([req.signal, controller.signal]);
     req = new Request(req, { signal: combinedSignal });
@@ -260,9 +271,20 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
         return wrap(new Response("Not Found", { status: 404 }));
     } catch (error) {
         const duration = Date.now() - startTime;
+        const stats = (req as any).__bunsaneStats as RequestStats | undefined;
         logger.error(
+            {
+                scope: 'App',
+                method,
+                path: url.pathname,
+                duration,
+                operationName: stats?.operationName,
+                dataLoaderCalls: stats?.dataLoaderCalls,
+                dbQueryCount: stats?.dbQueryCount,
+                dbStats: getDbStats(),
+                err: error,
+            },
             `Request failed after ${duration}ms: ${method} ${url.pathname}`,
-            error as any,
         );
         clearTimeout(timeoutId);
 

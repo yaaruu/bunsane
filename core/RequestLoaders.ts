@@ -2,6 +2,7 @@ import DataLoader from 'dataloader';
 import { Entity } from './Entity';
 import db from '../database';
 import { inList } from '../database/sqlHelpers';
+import { timedUnsafe, incrementDataLoaderCall, type PerRequestCounters } from '../database/instrumentedDb';
 import {logger as MainLogger} from './Logger';
 const logger = MainLogger.child({ module: 'RequestLoaders' });
 import { getMetadataStorage } from './metadata';
@@ -24,8 +25,14 @@ export type RequestLoaders = {
   relationsByEntityField: DataLoader<{ entityId: string; relationField: string; relatedType: string; foreignKey?: string }, Entity[]>;
 };
 
-export function createRequestLoaders(db: any, cacheManager?: CacheManager): RequestLoaders {
+export function createRequestLoaders(
+  db: any,
+  cacheManager?: CacheManager,
+  signal?: AbortSignal,
+  perRequest?: PerRequestCounters,
+): RequestLoaders {
   const entityById = new DataLoader<string, Entity | null>(async (ids: readonly string[]) => {
+    incrementDataLoaderCall('entity', perRequest);
     const startTime = Date.now();
     try {
       // Filter out empty/invalid IDs to prevent PostgreSQL UUID parsing errors
@@ -45,12 +52,12 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
       
       if (missingIds.length > 0) {
         const idList = inList(missingIds, 1);
-        const rows = await db.unsafe(`
+        const rows = await timedUnsafe<any[]>(db, `
           SELECT id
           FROM entities
           WHERE id IN ${idList.sql}
             AND deleted_at IS NULL
-        `, idList.params);
+        `, idList.params, signal, perRequest);
         
         const entities = rows.map((row: any) => {
           const entity = new Entity(row.id);
@@ -90,6 +97,7 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
 
   const componentsByEntityType = new DataLoader<{ entityId: string; typeId: string }, ComponentData | null>(
     async (keys: readonly { entityId: string; typeId: string }[]) => {
+      incrementDataLoaderCall('component', perRequest);
       const startTime = Date.now();
       try {
         // Filter out keys with empty/invalid entity IDs to prevent PostgreSQL UUID parsing errors
@@ -148,13 +156,13 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
           const typeIds = [...new Set(missingKeys.map(k => k.typeId))];
           const entityIdList = inList(entityIds, 1);
           const typeIdList = inList(typeIds, entityIdList.newParamIndex);
-          const rows = await db.unsafe(`
+          const rows = await timedUnsafe<any[]>(db, `
             SELECT id, entity_id, type_id, data, created_at, updated_at, deleted_at
             FROM components
             WHERE entity_id IN ${entityIdList.sql}
               AND type_id IN ${typeIdList.sql}
               AND deleted_at IS NULL
-          `, [...entityIdList.params, ...typeIdList.params]);
+          `, [...entityIdList.params, ...typeIdList.params], signal, perRequest);
           
           const components: ComponentData[] = rows.map((row: any) => ({
             id: row.id,
@@ -208,6 +216,7 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
 
   const relationsByEntityField = new DataLoader<{ entityId: string; relationField: string; relatedType: string; foreignKey?: string }, Entity[]>(
     async (keys: readonly { entityId: string; relationField: string; relatedType: string; foreignKey?: string }[]) => {
+      incrementDataLoaderCall('relation', perRequest);
       const startTime = Date.now();
       try {
         // Filter valid keys
@@ -273,19 +282,19 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
           logger.trace(`[RelationLoader] Batched query for ${groupedKeys.length} keys with foreign key ${foreignKey}`);
 
           // SINGLE BATCHED QUERY for all entities in this group
-          const rows = await db.unsafe(`
-            SELECT DISTINCT 
-              c.entity_id, 
-              c.data, 
+          const rows = await timedUnsafe<any[]>(db, `
+            SELECT DISTINCT
+              c.entity_id,
+              c.data,
               c.type_id,
               c.data->>'${foreignKeyField}' as fk_value,
               COALESCE(c.data->>'user_id', c.data->>'parent_id') as fallback_fk_value
             FROM components c
             INNER JOIN entities e ON c.entity_id = e.id
-            WHERE e.deleted_at IS NULL 
+            WHERE e.deleted_at IS NULL
               AND c.deleted_at IS NULL
               AND ${whereClause}
-          `, [entityIds]);
+          `, [entityIds], signal, perRequest);
 
           logger.trace(`[RelationLoader] Found ${rows.length} total components for ${entityIds.length} entities`);
 
