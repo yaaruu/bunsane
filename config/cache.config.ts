@@ -31,6 +31,29 @@ export interface CacheConfig {
     component?: {
         enabled: boolean;
         ttl: number;
+        /**
+         * Cache "absent" component lookups (negative cache) so repeated reads
+         * of optional components on the same entity do not re-hit the DB.
+         * Default false (opt-in) to preserve prior behavior.
+         */
+        negativeCacheEnabled?: boolean;
+        /**
+         * TTL in ms for tombstone entries written for absent components.
+         * Defaults to min(component.ttl, 60_000). Keep ≤ ttl so a created
+         * row supersedes the tombstone within bounded staleness.
+         */
+        negativeCacheTtl?: number;
+    };
+
+    /**
+     * Negative-only cache for relation lookups (e.g. @HasMany returning []).
+     * Empty results are cached with a short TTL; positive results are not
+     * cached here (cross-entity invalidation is non-trivial — see RFC
+     * H-CACHE-NEG). Bounded staleness window equal to negativeCacheTtl.
+     */
+    relation?: {
+        negativeCacheEnabled?: boolean;
+        negativeCacheTtl?: number;
     };
 
     query?: {
@@ -76,7 +99,18 @@ export const defaultCacheConfig: CacheConfig = {
 
     component: {
         enabled: process.env.CACHE_COMPONENT_ENABLED !== 'false', // Default true
-        ttl: parseInt(process.env.CACHE_COMPONENT_TTL || '1800000') // 30 minutes
+        ttl: parseInt(process.env.CACHE_COMPONENT_TTL || '1800000'), // 30 minutes
+        negativeCacheEnabled: process.env.CACHE_COMPONENT_NEGATIVE_ENABLED === 'true',
+        negativeCacheTtl: process.env.CACHE_COMPONENT_NEGATIVE_TTL
+            ? parseInt(process.env.CACHE_COMPONENT_NEGATIVE_TTL)
+            : undefined
+    },
+
+    relation: {
+        negativeCacheEnabled: process.env.CACHE_RELATION_NEGATIVE_ENABLED === 'true',
+        negativeCacheTtl: process.env.CACHE_RELATION_NEGATIVE_TTL
+            ? parseInt(process.env.CACHE_RELATION_NEGATIVE_TTL)
+            : 60_000
     },
 
     query: {

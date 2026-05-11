@@ -1,6 +1,7 @@
 import type { ComponentDataType, ComponentGetter, BaseComponent } from "./components";
 import { logger } from "./Logger";
 import db, { QUERY_TIMEOUT_MS } from "../database";
+import { runWithSignal } from "../database/cancellable";
 import EntityManager from "./EntityManager";
 import ComponentRegistry from "./components/ComponentRegistry";
 import { uuidv7 } from "../utils/uuid";
@@ -763,26 +764,14 @@ export class Entity implements IEntity {
             return true;
         }
 
-        // Execute a Bun SQL query with AbortSignal support. On abort, the
-        // in-flight query is cancelled (SQL.Query.cancel()) which causes the
-        // transaction callback to throw, triggering Bun's automatic ROLLBACK
-        // and releasing the pooled backend connection. Without this, a wall-
-        // clock timeout leaks backends into `idle in transaction` state —
-        // fatal under pgbouncer transaction-mode pooling.
-        const run = async <T>(q: any): Promise<T> => {
-            if (!signal) return await q;
-            if (signal.aborted) {
-                try { q.cancel?.(); } catch { /* ignore */ }
-                throw signal.reason ?? new Error('Entity.save aborted');
-            }
-            const onAbort = () => { try { q.cancel?.(); } catch { /* ignore */ } };
-            signal.addEventListener('abort', onAbort, { once: true });
-            try {
-                return await q;
-            } finally {
-                signal.removeEventListener('abort', onAbort);
-            }
-        };
+        // Cancellation goes through the shared `runWithSignal` helper so
+        // every db.unsafe / trx`...` callsite in the framework uses the same
+        // pattern: on abort the in-flight Bun SQL Query is cancelled, the
+        // transaction callback throws, Bun emits ROLLBACK, and the pooled
+        // backend connection is released. Without this a wall-clock timeout
+        // leaks the backend into `idle in transaction` under pgbouncer
+        // transaction-mode pooling.
+        const run = <T>(q: any): Promise<T> => runWithSignal<T>(q, signal);
 
         const executeSave = async (saveTrx: SQL) => {
             if (!this._persisted) {
@@ -917,19 +906,7 @@ export class Entity implements IEntity {
         }, timeoutMs);
 
         const signal = controller.signal;
-        const run = async <T>(q: any): Promise<T> => {
-            if (signal.aborted) {
-                try { q.cancel?.(); } catch { /* ignore */ }
-                throw signal.reason ?? new Error('Entity.doDelete aborted');
-            }
-            const onAbort = () => { try { q.cancel?.(); } catch { /* ignore */ } };
-            signal.addEventListener('abort', onAbort, { once: true });
-            try {
-                return await q;
-            } finally {
-                signal.removeEventListener('abort', onAbort);
-            }
-        };
+        const run = <T>(q: any): Promise<T> => runWithSignal<T>(q, signal);
 
         try {
             await db.transaction(async (trx) => {

@@ -2,10 +2,12 @@ import DataLoader from 'dataloader';
 import { Entity } from './Entity';
 import db from '../database';
 import { inList } from '../database/sqlHelpers';
+import { timedUnsafe, incrementDataLoaderCall, type PerRequestCounters } from '../database/instrumentedDb';
 import {logger as MainLogger} from './Logger';
 const logger = MainLogger.child({ module: 'RequestLoaders' });
 import { getMetadataStorage } from './metadata';
 import type { CacheManager } from './cache/CacheManager';
+import { COMPONENT_TOMBSTONE } from './cache/CacheManager';
 
 export type ComponentData = {
   id: string;  // Component ID for updates
@@ -23,8 +25,14 @@ export type RequestLoaders = {
   relationsByEntityField: DataLoader<{ entityId: string; relationField: string; relatedType: string; foreignKey?: string }, Entity[]>;
 };
 
-export function createRequestLoaders(db: any, cacheManager?: CacheManager): RequestLoaders {
+export function createRequestLoaders(
+  db: any,
+  cacheManager?: CacheManager,
+  signal?: AbortSignal,
+  perRequest?: PerRequestCounters,
+): RequestLoaders {
   const entityById = new DataLoader<string, Entity | null>(async (ids: readonly string[]) => {
+    incrementDataLoaderCall('entity', perRequest);
     const startTime = Date.now();
     try {
       // Filter out empty/invalid IDs to prevent PostgreSQL UUID parsing errors
@@ -44,12 +52,12 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
       
       if (missingIds.length > 0) {
         const idList = inList(missingIds, 1);
-        const rows = await db.unsafe(`
+        const rows = await timedUnsafe<any[]>(db, `
           SELECT id
           FROM entities
           WHERE id IN ${idList.sql}
             AND deleted_at IS NULL
-        `, idList.params);
+        `, idList.params, signal, perRequest);
         
         const entities = rows.map((row: any) => {
           const entity = new Entity(row.id);
@@ -89,6 +97,7 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
 
   const componentsByEntityType = new DataLoader<{ entityId: string; typeId: string }, ComponentData | null>(
     async (keys: readonly { entityId: string; typeId: string }[]) => {
+      incrementDataLoaderCall('component', perRequest);
       const startTime = Date.now();
       try {
         // Filter out keys with empty/invalid entity IDs to prevent PostgreSQL UUID parsing errors
@@ -99,16 +108,20 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
 
         const results = new Map<string, ComponentData | null>();
 
-        // Check cache first if cache manager is available
+        // Check cache first if cache manager is available. Tombstone hits
+        // are recorded as null in `results` so the DB-fetch step skips them.
         let cacheHits = 0;
         let cacheMisses = 0;
         if (cacheManager && cacheManager.getConfig().enabled && cacheManager.getConfig().component?.enabled) {
           try {
             const cachedComponents = await cacheManager.getComponents(validKeys);
-            cachedComponents.forEach((component, index) => {
-              if (component) {
-                const key = `${validKeys[index]!.entityId}-${validKeys[index]!.typeId}`;
-                results.set(key, component);
+            cachedComponents.forEach((value, index) => {
+              const key = `${validKeys[index]!.entityId}-${validKeys[index]!.typeId}`;
+              if (value === COMPONENT_TOMBSTONE) {
+                results.set(key, null);
+                cacheHits++;
+              } else if (value) {
+                results.set(key, value);
                 cacheHits++;
               } else {
                 cacheMisses++;
@@ -122,17 +135,16 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
           cacheMisses += validKeys.length;
         }
 
-        // Log cache hit/miss rates for monitoring
         if (validKeys.length > 0) {
           const hitRate = (cacheHits / validKeys.length) * 100;
-          logger.debug({ 
-            scope: 'cache', 
-            component: 'RequestLoaders', 
-            msg: 'Component cache statistics', 
-            total: validKeys.length, 
-            hits: cacheHits, 
-            misses: cacheMisses, 
-            hitRate: `${hitRate.toFixed(1)}%` 
+          logger.trace({
+            scope: 'cache',
+            component: 'RequestLoaders',
+            msg: 'Component cache statistics',
+            total: validKeys.length,
+            hits: cacheHits,
+            misses: cacheMisses,
+            hitRate: `${hitRate.toFixed(1)}%`,
           });
         }
 
@@ -144,13 +156,13 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
           const typeIds = [...new Set(missingKeys.map(k => k.typeId))];
           const entityIdList = inList(entityIds, 1);
           const typeIdList = inList(typeIds, entityIdList.newParamIndex);
-          const rows = await db.unsafe(`
+          const rows = await timedUnsafe<any[]>(db, `
             SELECT id, entity_id, type_id, data, created_at, updated_at, deleted_at
             FROM components
             WHERE entity_id IN ${entityIdList.sql}
               AND type_id IN ${typeIdList.sql}
               AND deleted_at IS NULL
-          `, [...entityIdList.params, ...typeIdList.params]);
+          `, [...entityIdList.params, ...typeIdList.params], signal, perRequest);
           
           const components: ComponentData[] = rows.map((row: any) => ({
             id: row.id,
@@ -162,10 +174,15 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
             deletedAt: row.deleted_at,
           }));
 
-          // Cache the loaded components if cache is enabled
+          // Cache the loaded components + tombstone any requested keys whose
+          // row was absent (single setMany — see CacheManager.setComponentsWriteThrough).
           if (cacheManager && cacheManager.getConfig().enabled && cacheManager.getConfig().component?.enabled) {
             try {
-              await cacheManager.setComponentsWriteThrough(components, cacheManager.getConfig().component!.ttl);
+              await cacheManager.setComponentsWriteThrough(
+                components,
+                missingKeys,
+                cacheManager.getConfig().component!.ttl,
+              );
             } catch (error: any) {
               logger.warn({ scope: 'cache', component: 'RequestLoaders', msg: 'Cache write failed for components', error });
             }
@@ -199,6 +216,7 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
 
   const relationsByEntityField = new DataLoader<{ entityId: string; relationField: string; relatedType: string; foreignKey?: string }, Entity[]>(
     async (keys: readonly { entityId: string; relationField: string; relatedType: string; foreignKey?: string }[]) => {
+      incrementDataLoaderCall('relation', perRequest);
       const startTime = Date.now();
       try {
         // Filter valid keys
@@ -207,17 +225,41 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
           return keys.map(() => []);
         }
 
+        const resultMap = new Map<string, Entity[]>();
+
+        // Negative-cache lookup: skip DB for keys recorded as empty.
+        let keysToQuery = validKeys;
+        const relCacheEnabled = !!(cacheManager
+          && cacheManager.getConfig().enabled
+          && cacheManager.getConfig().relation?.negativeCacheEnabled);
+        if (relCacheEnabled) {
+          try {
+            const tombstones = await cacheManager!.getRelationsEmpty(validKeys);
+            const remaining: typeof validKeys = [];
+            tombstones.forEach((isEmpty, i) => {
+              const k = validKeys[i]!;
+              if (isEmpty) {
+                const mapKey = `${k.entityId}\x00${k.relationField}\x00${k.relatedType}`;
+                resultMap.set(mapKey, []);
+              } else {
+                remaining.push(k);
+              }
+            });
+            keysToQuery = remaining;
+          } catch (error) {
+            logger.warn({ scope: 'cache', component: 'RequestLoaders', msg: 'Cache read failed for relation tombstones', error });
+          }
+        }
+
         // Group keys by foreign key for efficient batching
-        const keysByForeignKey = new Map<string, typeof validKeys>();
-        for (const key of validKeys) {
+        const keysByForeignKey = new Map<string, typeof keysToQuery>();
+        for (const key of keysToQuery) {
           const fk = key.foreignKey || 'default';
           if (!keysByForeignKey.has(fk)) {
             keysByForeignKey.set(fk, []);
           }
           keysByForeignKey.get(fk)!.push(key);
         }
-
-        const resultMap = new Map<string, Entity[]>();
 
         // OPTIMIZED: Batch query for each foreign key type (instead of N separate queries)
         for (const [foreignKey, groupedKeys] of keysByForeignKey) {
@@ -240,19 +282,19 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
           logger.trace(`[RelationLoader] Batched query for ${groupedKeys.length} keys with foreign key ${foreignKey}`);
 
           // SINGLE BATCHED QUERY for all entities in this group
-          const rows = await db.unsafe(`
-            SELECT DISTINCT 
-              c.entity_id, 
-              c.data, 
+          const rows = await timedUnsafe<any[]>(db, `
+            SELECT DISTINCT
+              c.entity_id,
+              c.data,
               c.type_id,
               c.data->>'${foreignKeyField}' as fk_value,
               COALESCE(c.data->>'user_id', c.data->>'parent_id') as fallback_fk_value
             FROM components c
             INNER JOIN entities e ON c.entity_id = e.id
-            WHERE e.deleted_at IS NULL 
+            WHERE e.deleted_at IS NULL
               AND c.deleted_at IS NULL
               AND ${whereClause}
-          `, [entityIds]);
+          `, [entityIds], signal, perRequest);
 
           logger.trace(`[RelationLoader] Found ${rows.length} total components for ${entityIds.length} entities`);
 
@@ -278,6 +320,22 @@ export function createRequestLoaders(db: any, cacheManager?: CacheManager): Requ
             resultMap.set(mapKey, entities);
             
             logger.trace(`[RelationLoader] Mapped ${entities.length} entities for ${key.relationField} on ${key.entityId}`);
+          }
+        }
+
+        // Write tombstones for queried keys whose result was empty.
+        if (relCacheEnabled && keysToQuery.length > 0) {
+          const emptyKeys = keysToQuery.filter(k => {
+            const mapKey = `${k.entityId}\x00${k.relationField}\x00${k.relatedType}`;
+            const r = resultMap.get(mapKey);
+            return !r || r.length === 0;
+          });
+          if (emptyKeys.length > 0) {
+            try {
+              await cacheManager!.setRelationsEmpty(emptyKeys);
+            } catch (error) {
+              logger.warn({ scope: 'cache', component: 'RequestLoaders', msg: 'Cache write failed for relation tombstones', error });
+            }
           }
         }
 

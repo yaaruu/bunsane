@@ -16,6 +16,16 @@ interface InvalidationMessage {
 }
 
 /**
+ * Sentinel value written to the cache to record "known absent" lookups.
+ * String literal (not object) so it round-trips cleanly through
+ * JSON.stringify in RedisCache + CompressionUtils. Callers must treat it
+ * as a cache hit but propagate a `null`/`[]` upstream.
+ */
+export const COMPONENT_TOMBSTONE = '__TOMBSTONE__' as const;
+export const RELATION_TOMBSTONE = '__TOMBSTONE__' as const;
+export type ComponentCacheValue = ComponentData | typeof COMPONENT_TOMBSTONE;
+
+/**
  * High-level cache operations manager
  * Singleton that provides entity and component caching methods
  * Note: Query-level caching has been removed in favor of component-level caching only
@@ -321,16 +331,18 @@ export class CacheManager {
     }
 
     /**
-     * Get components by entity and type from cache (for DataLoader integration)
+     * Get components by entity and type from cache (for DataLoader integration).
+     * Returns COMPONENT_TOMBSTONE for keys whose absence was previously
+     * recorded; callers must treat this as a hit and propagate null upstream.
      */
-    public async getComponents(keys: Array<{ entityId: string; typeId: string }>): Promise<(ComponentData | null)[]> {
+    public async getComponents(keys: Array<{ entityId: string; typeId: string }>): Promise<(ComponentCacheValue | null)[]> {
         if (!this.config.enabled || !this.config.component?.enabled) {
             return keys.map(() => null);
         }
 
         try {
             const cacheKeys = keys.map(k => `component:${k.entityId}:${k.typeId}`);
-            const results = await this.provider.getMany<ComponentData>(cacheKeys);
+            const results = await this.provider.getMany<ComponentCacheValue>(cacheKeys);
             return results;
         } catch (error) {
             logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error getting components from cache', error });
@@ -339,23 +351,128 @@ export class CacheManager {
     }
 
     /**
-     * Set components in cache with write-through strategy (for DataLoader integration)
+     * Set components in cache with write-through strategy (for DataLoader integration).
+     *
+     * When `requestedKeys` is supplied and `component.negativeCacheEnabled` is
+     * true, tombstones are written for any requested key not present in
+     * `components` (within the same setMany call — single round-trip).
      */
-    public async setComponentsWriteThrough(components: ComponentData[], ttl?: number): Promise<void> {
+    public async setComponentsWriteThrough(
+        components: ComponentData[],
+        ttlOrRequested?: number | Array<{ entityId: string; typeId: string }>,
+        ttlIfRequested?: number,
+    ): Promise<void> {
         if (!this.config.enabled || !this.config.component?.enabled) {
             return;
         }
 
+        // Backward-compatible overload: (components, ttl?) or (components, requestedKeys, ttl?)
+        const requestedKeys = Array.isArray(ttlOrRequested) ? ttlOrRequested : undefined;
+        const ttl = Array.isArray(ttlOrRequested) ? ttlIfRequested : ttlOrRequested;
+
         try {
-            const effectiveTTL = ttl ?? this.config.component?.ttl;
-            const entries = components.map(comp => ({
+            const componentTTL = ttl ?? this.config.component.ttl;
+            const entries: Array<{ key: string; value: ComponentCacheValue; ttl: number }> = components.map(comp => ({
                 key: `component:${comp.entityId}:${comp.typeId}`,
                 value: comp,
-                ttl: effectiveTTL
+                ttl: componentTTL,
+            }));
+
+            const negativeEnabled = this.config.component.negativeCacheEnabled === true;
+            if (negativeEnabled && requestedKeys && requestedKeys.length > 0) {
+                const found = new Set(components.map(c => `${c.entityId}-${c.typeId}`));
+                const tombstoneTTL = this.config.component.negativeCacheTtl
+                    ?? Math.min(componentTTL, 60_000);
+                for (const k of requestedKeys) {
+                    const dedupeKey = `${k.entityId}-${k.typeId}`;
+                    if (!found.has(dedupeKey)) {
+                        entries.push({
+                            key: `component:${k.entityId}:${k.typeId}`,
+                            value: COMPONENT_TOMBSTONE,
+                            ttl: tombstoneTTL,
+                        });
+                    }
+                }
+            }
+
+            if (entries.length > 0) {
+                await this.provider.setMany(entries);
+            }
+        } catch (error) {
+            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error setting components in cache', error });
+        }
+    }
+
+    // Relation negative-cache methods
+
+    /**
+     * Build the cache key for a relation tombstone. Null byte separator
+     * prevents collision when relationField contains hyphens or colons.
+     */
+    private static relationCacheKey(entityId: string, relationField: string, relatedType: string, foreignKey?: string): string {
+        const fk = foreignKey ?? '';
+        return `relation:${entityId}\x00${relationField}\x00${relatedType}\x00${fk}`;
+    }
+
+    /**
+     * Bulk-check relation tombstones. Returns true at index i when the
+     * relation at keys[i] was previously recorded as empty.
+     */
+    public async getRelationsEmpty(
+        keys: Array<{ entityId: string; relationField: string; relatedType: string; foreignKey?: string }>,
+    ): Promise<boolean[]> {
+        if (!this.config.enabled || !this.config.relation?.negativeCacheEnabled) {
+            return keys.map(() => false);
+        }
+        try {
+            const cacheKeys = keys.map(k => CacheManager.relationCacheKey(k.entityId, k.relationField, k.relatedType, k.foreignKey));
+            const values = await this.provider.getMany<string>(cacheKeys);
+            return values.map(v => v === RELATION_TOMBSTONE);
+        } catch (error) {
+            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error getting relation tombstones', error });
+            return keys.map(() => false);
+        }
+    }
+
+    /**
+     * Record relation tombstones for keys whose query returned []. TTL
+     * defaults to relation.negativeCacheTtl (60s).
+     */
+    public async setRelationsEmpty(
+        keys: Array<{ entityId: string; relationField: string; relatedType: string; foreignKey?: string }>,
+        ttl?: number,
+    ): Promise<void> {
+        if (!this.config.enabled || !this.config.relation?.negativeCacheEnabled || keys.length === 0) {
+            return;
+        }
+        try {
+            const effectiveTTL = ttl ?? this.config.relation.negativeCacheTtl ?? 60_000;
+            const entries = keys.map(k => ({
+                key: CacheManager.relationCacheKey(k.entityId, k.relationField, k.relatedType, k.foreignKey),
+                value: RELATION_TOMBSTONE,
+                ttl: effectiveTTL,
             }));
             await this.provider.setMany(entries);
         } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error setting components in cache', error });
+            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error setting relation tombstones', error });
+        }
+    }
+
+    /**
+     * Drop a relation tombstone. Call when a target component is created
+     * that may newly satisfy the relation. Pub/sub invalidation is wired
+     * identically to component invalidation.
+     */
+    public async invalidateRelation(entityId: string, relationField: string, relatedType: string, foreignKey?: string): Promise<void> {
+        if (!this.config.enabled || !this.config.relation?.negativeCacheEnabled) {
+            return;
+        }
+        try {
+            const key = CacheManager.relationCacheKey(entityId, relationField, relatedType, foreignKey);
+            await this.provider.delete(key);
+            await this.publishInvalidation('key', [key]);
+        } catch (error) {
+            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error invalidating relation tombstone', error });
         }
     }
 
