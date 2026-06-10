@@ -6,6 +6,7 @@ import { FilterBuilderRegistry } from "./FilterBuilderRegistry";
 import { ComponentRegistry } from "../core/components";
 import { getMetadataStorage } from "../core/metadata";
 import { assertIdentifier } from "./SqlIdentifier";
+import { getMembershipSource, getMembershipTable } from "./membershipSource";
 
 /**
  * Check if a component property is numeric based on metadata
@@ -160,7 +161,7 @@ export class ComponentInclusionNode extends QueryNode {
         // Presence probe per other required component.
         for (const compId of otherComponentIds) {
             conditions.push(`EXISTS (
-                SELECT 1 FROM entity_components ec_r
+                SELECT 1 FROM ${getMembershipTable()} ec_r
                 WHERE ec_r.entity_id = s.entity_id
                 AND ec_r.type_id = $${context.addParam(compId)}::text
                 AND ec_r.deleted_at IS NULL
@@ -174,7 +175,9 @@ export class ComponentInclusionNode extends QueryNode {
                 const condition = this.buildFilterCondition(filter, 'cf', context);
                 const compTable = this.getComponentTableName(compId);
                 const filterDirect = shouldUseDirectPartition() && compTable !== 'components';
-                if (filterDirect) {
+                if (filterDirect || !getMembershipSource().isLegacy) {
+                    // Single-table predicate on the component (partition) table:
+                    // membership lives in the same row, so no junction join.
                     conditions.push(`EXISTS (
                         SELECT 1 FROM ${compTable} cf
                         WHERE cf.entity_id = s.entity_id
@@ -201,7 +204,7 @@ export class ComponentInclusionNode extends QueryNode {
             const excludedPlaceholders = Array.from(context.excludedComponentIds)
                 .map((id) => `$${context.addParam(id)}`).join(', ');
             conditions.push(`NOT EXISTS (
-                SELECT 1 FROM entity_components ec_ex
+                SELECT 1 FROM ${getMembershipTable()} ec_ex
                 WHERE ec_ex.entity_id = s.entity_id
                 AND ec_ex.type_id IN (${excludedPlaceholders})
                 AND ec_ex.deleted_at IS NULL
@@ -216,7 +219,9 @@ export class ComponentInclusionNode extends QueryNode {
         const extraConditions = conditions.length > 0 ? `\n                AND ${conditions.join('\n                AND ')}` : '';
 
         let sql: string;
-        if (driveDirect) {
+        if (driveDirect || !getMembershipSource().isLegacy) {
+            // Drive directly from the sort component (partition) table —
+            // membership and component data are the same row.
             sql = `SELECT s.entity_id as id FROM ${sortTable} s
                 WHERE s.type_id = $${context.addParam(sortTypeId)}::text
                 AND s.deleted_at IS NULL${extraConditions}
@@ -311,14 +316,14 @@ export class ComponentInclusionNode extends QueryNode {
                 // Filter by the specific component type if not already in CTE
                 if (!componentIds.some(id => context.componentIds.has(id))) {
                     sql += ` WHERE EXISTS (
-                        SELECT 1 FROM entity_components ec
+                        SELECT 1 FROM ${getMembershipTable()} ec
                         WHERE ec.entity_id = ${context.cteName}.entity_id
                         AND ec.type_id = $${context.addParam(componentId)}::text
                         AND ec.deleted_at IS NULL
                     )`;
                 }
             } else {
-                sql = `SELECT DISTINCT ec.entity_id as id FROM entity_components ec WHERE ec.type_id = $${context.addParam(componentId)}::text AND ec.deleted_at IS NULL`;
+                sql = `SELECT DISTINCT ec.entity_id as id FROM ${getMembershipTable()} ec WHERE ec.type_id = $${context.addParam(componentId)}::text AND ec.deleted_at IS NULL`;
             }
 
             if (context.withId) {
@@ -333,7 +338,7 @@ export class ComponentInclusionNode extends QueryNode {
                 const whereKeyword = sql.includes('WHERE') ? 'AND' : 'WHERE';
                 const excludedPlaceholders = excludedIds.map((id) => `$${context.addParam(id)}`).join(', ');
                 sql += ` ${whereKeyword} NOT EXISTS (
-                    SELECT 1 FROM entity_components ec_ex
+                    SELECT 1 FROM ${getMembershipTable()} ec_ex
                     WHERE ec_ex.entity_id = ${tableAlias}.entity_id
                     AND ec_ex.type_id IN (${excludedPlaceholders})
                     AND ec_ex.deleted_at IS NULL
@@ -402,7 +407,7 @@ export class ComponentInclusionNode extends QueryNode {
                         componentParamIndices.set(compId, context.addParam(compId));
                     }
                     return `EXISTS (
-                        SELECT 1 FROM entity_components ec
+                        SELECT 1 FROM ${getMembershipTable()} ec
                         WHERE ec.entity_id = ${context.cteName}.entity_id
                         AND ec.type_id = $${componentParamIndices.get(compId)}::text
                         AND ec.deleted_at IS NULL
@@ -417,7 +422,7 @@ export class ComponentInclusionNode extends QueryNode {
                     if (!componentParamIndices.has(compId)) {
                         componentParamIndices.set(compId, context.addParam(compId));
                     }
-                    return `SELECT ec.entity_id FROM entity_components ec WHERE ec.type_id = $${componentParamIndices.get(compId)}::text AND ec.deleted_at IS NULL`;
+                    return `SELECT ec.entity_id FROM ${getMembershipTable()} ec WHERE ec.type_id = $${componentParamIndices.get(compId)}::text AND ec.deleted_at IS NULL`;
                 });
                 sql = `SELECT intersected.entity_id as id FROM (${intersectQueries.join(' INTERSECT ')}) AS intersected`;
             }
@@ -440,7 +445,7 @@ export class ComponentInclusionNode extends QueryNode {
                 const whereKeyword = outerHasWhere ? 'AND' : 'WHERE';
                 const excludedPlaceholders = excludedIds.map((id) => `$${context.addParam(id)}`).join(', ');
                 sql += ` ${whereKeyword} NOT EXISTS (
-                    SELECT 1 FROM entity_components ec_ex
+                    SELECT 1 FROM ${getMembershipTable()} ec_ex
                     WHERE ec_ex.entity_id = ${multiCompAlias}.entity_id
                     AND ec_ex.type_id IN (${excludedPlaceholders})
                     AND ec_ex.deleted_at IS NULL
@@ -554,13 +559,22 @@ export class ComponentInclusionNode extends QueryNode {
                 ? `(sort_c.data->>'${safeProperty}')::numeric`
                 : `sort_c.data->>'${safeProperty}'`;
 
-            const subquery = `(
+            const subquery = getMembershipSource().isLegacy
+                ? `(
                 SELECT ${sortExpr}
                 FROM entity_components sort_ec
                 JOIN ${sortComponentTableName} sort_c ON sort_c.id = sort_ec.component_id
                 WHERE sort_ec.entity_id = base_entities.id
                 AND sort_ec.type_id = $${context.addParam(typeId)}::text
                 AND sort_ec.deleted_at IS NULL
+                AND sort_c.deleted_at IS NULL
+                LIMIT 1
+            )`
+                : `(
+                SELECT ${sortExpr}
+                FROM ${sortComponentTableName} sort_c
+                WHERE sort_c.entity_id = base_entities.id
+                AND sort_c.type_id = $${context.addParam(typeId)}::text
                 AND sort_c.deleted_at IS NULL
                 LIMIT 1
             )`;
@@ -676,8 +690,8 @@ export class ComponentInclusionNode extends QueryNode {
             : `c.data->>'${safeProperty}'`;
 
         let sql: string;
-        if (useDirectPartition) {
-            // Direct partition access - most efficient
+        if (useDirectPartition || !getMembershipSource().isLegacy) {
+            // Direct access on the component (partition) table - most efficient.
             // No DISTINCT needed since each entity has one component of this type
             sql = `SELECT c.entity_id as id FROM ${componentTableName} c
                 WHERE c.type_id = $${context.addParam(sortTypeId)}::text
@@ -884,8 +898,9 @@ export class ComponentInclusionNode extends QueryNode {
                     const componentTableName = this.getComponentTableName(compId);
                     const useDirectPartition = shouldUseDirectPartition() && componentTableName !== 'components';
                     
-                    if (useDirectPartition) {
-                        // Direct partition access - query partition table directly by entity_id
+                    if (useDirectPartition || !getMembershipSource().isLegacy) {
+                        // Single-table predicate on the component (partition)
+                        // table — membership is the same row, no junction join.
                         lateralJoins.push(
                             `CROSS JOIN LATERAL (
                             SELECT 1 FROM ${componentTableName} c
@@ -917,8 +932,9 @@ export class ComponentInclusionNode extends QueryNode {
                     const componentTableName = this.getComponentTableName(compId);
                     const useDirectPartition = shouldUseDirectPartition() && componentTableName !== 'components';
 
-                    if (useDirectPartition) {
-                        // Direct partition access - query partition table directly by entity_id
+                    if (useDirectPartition || !getMembershipSource().isLegacy) {
+                        // Single-table predicate on the component (partition)
+                        // table — membership is the same row, no junction join.
                         sql += ` ${whereKeyword} EXISTS (
                         SELECT 1 FROM ${componentTableName} c
                         WHERE c.entity_id = ${tableAlias}.entity_id

@@ -4,6 +4,7 @@ import { QueryContext } from "./QueryContext";
 import { OrQuery } from "./OrQuery";
 import { ComponentRegistry } from "../core/components";
 import { shouldUseDirectPartition } from "../core/Config";
+import { getMembershipTable } from "./membershipSource";
 
 export class OrNode extends QueryNode {
     private orQuery: OrQuery;
@@ -149,7 +150,7 @@ export class OrNode extends QueryNode {
         if (context.excludedComponentIds.size > 0) {
             const excludedTypes = Array.from(context.excludedComponentIds);
             const placeholders = excludedTypes.map(() => `$${paramIndex++}`).join(', ');
-            conditions.push(`NOT EXISTS (SELECT 1 FROM entity_components ec_ex WHERE ec_ex.entity_id = or_results.id AND ec_ex.type_id IN (${placeholders}) AND ec_ex.deleted_at IS NULL)`);
+            conditions.push(`NOT EXISTS (SELECT 1 FROM ${getMembershipTable()} ec_ex WHERE ec_ex.entity_id = or_results.id AND ec_ex.type_id IN (${placeholders}) AND ec_ex.deleted_at IS NULL)`);
             context.params.push(...excludedTypes);
         }
 
@@ -271,7 +272,7 @@ export class OrNode extends QueryNode {
         if (context.excludedComponentIds.size > 0) {
             const excludedTypes = Array.from(context.excludedComponentIds);
             const placeholders = excludedTypes.map(() => `$${paramIndex++}`).join(', ');
-            conditions.push(`NOT EXISTS (SELECT 1 FROM entity_components ec_ex WHERE ec_ex.entity_id = ${partitionTable}.entity_id AND ec_ex.type_id IN (${placeholders}) AND ec_ex.deleted_at IS NULL)`);
+            conditions.push(`NOT EXISTS (SELECT 1 FROM ${getMembershipTable()} ec_ex WHERE ec_ex.entity_id = ${partitionTable}.entity_id AND ec_ex.type_id IN (${placeholders}) AND ec_ex.deleted_at IS NULL)`);
             context.params.push(...excludedTypes);
         }
 
@@ -368,7 +369,7 @@ export class OrNode extends QueryNode {
                 const componentTableName = this.getComponentTableName(componentId);
                 branchSql = `
                 SELECT ec.entity_id
-                FROM entity_components ec
+                FROM ${getMembershipTable()} ec
                 WHERE ec.type_id = $${componentIdParamIndex} AND ec.deleted_at IS NULL
                 AND EXISTS (
                     SELECT 1 FROM ${componentTableName} c
@@ -458,7 +459,7 @@ export class OrNode extends QueryNode {
             for (const componentType of allComponentTypes) {
                 const componentId = ComponentRegistry.getComponentId(componentType);
                 if (componentId) {
-                    componentConditions.push(`EXISTS (SELECT 1 FROM entity_components ec_all WHERE ec_all.entity_id = or_results.id AND ec_all.type_id = $${paramIndex} AND ec_all.deleted_at IS NULL)`);
+                    componentConditions.push(`EXISTS (SELECT 1 FROM ${getMembershipTable()} ec_all WHERE ec_all.entity_id = or_results.id AND ec_all.type_id = $${paramIndex} AND ec_all.deleted_at IS NULL)`);
                     context.params.push(componentId);
                     paramIndex++;
                 }
@@ -480,7 +481,7 @@ export class OrNode extends QueryNode {
         if (context.excludedComponentIds.size > 0) {
             const excludedTypes = Array.from(context.excludedComponentIds);
             const placeholders = excludedTypes.map(() => `$${paramIndex++}`).join(', ');
-            conditions.push(`NOT EXISTS (SELECT 1 FROM entity_components ec_ex WHERE ec_ex.entity_id = or_results.id AND ec_ex.type_id IN (${placeholders}) AND ec_ex.deleted_at IS NULL)`);
+            conditions.push(`NOT EXISTS (SELECT 1 FROM ${getMembershipTable()} ec_ex WHERE ec_ex.entity_id = or_results.id AND ec_ex.type_id IN (${placeholders}) AND ec_ex.deleted_at IS NULL)`);
             context.params.push(...excludedTypes);
         }
 

@@ -2,6 +2,7 @@ import db from "./index";
 import { logger as MainLogger } from "../core/Logger";
 import { getMetadataStorage } from "../core/metadata";
 import { ensureMultipleJSONBPathIndexes } from "./IndexingStrategy";
+import { getMembershipTable } from "../query/membershipSource";
 const logger = MainLogger.child({ scope: "DatabaseHelper" });
 
 const BUNSANE_RELATION_TYPED_COLUMN = process.env.BUNSANE_RELATION_TYPED_COLUMN === 'true' || false;
@@ -634,10 +635,10 @@ export const BenchmarkPartitionCounts = async (partitionCounts: number[] = [8, 1
         await db.unsafe(`ANALYZE ${tempTableName}`);
         
         // Run benchmark query
-        const explainResult = await db.unsafe(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) 
-            SELECT DISTINCT ec.entity_id as id 
-            FROM entity_components ec 
-            WHERE ec.type_id = (SELECT type_id FROM ${tempTableName} LIMIT 1) 
+        const explainResult = await db.unsafe(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+            SELECT DISTINCT ec.entity_id as id
+            FROM ${getMembershipTable()} ec
+            WHERE ec.type_id = (SELECT type_id FROM ${tempTableName} LIMIT 1)
             AND ec.deleted_at IS NULL`);
         
         const plan = explainResult[0]['QUERY PLAN'] ? JSON.parse(explainResult[0]['QUERY PLAN']) : explainResult[0];

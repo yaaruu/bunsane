@@ -14,6 +14,7 @@ import { shouldUseDirectPartition } from "../core/Config";
 import type { SQL } from "bun";
 import type { ComponentConstructor, TypedEntity, ComponentRecord } from "../types/query.types";
 import { assertComponentTableName, assertFieldPath } from "./SqlIdentifier";
+import { getMembershipSource } from "./membershipSource";
 
 // Parsed once at module load instead of on every exec() (process.env read +
 // parseInt was on the query hot path). 0 disables the default limit.
@@ -392,12 +393,32 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         const dbConn = this.getDb();
 
         // Use PostgreSQL's statistics for fast count estimate
-        // This queries pg_class which is O(1) instead of scanning the table
-        const sql = tableName && tableName !== 'components'
-            ? `SELECT reltuples::bigint AS estimate FROM pg_class WHERE relname = $1`
-            : `SELECT reltuples::bigint AS estimate FROM pg_class WHERE relname = 'entity_components'`;
+        // This queries pg_class which is O(1) instead of scanning the table.
+        // When the component resolves to a specific partition table, read its
+        // reltuples directly. Otherwise fall back to the membership source:
+        // legacy reads `entity_components` reltuples; the components source
+        // sums the LIST-partition child stats (the partitioned parent's
+        // reltuples is unreliable).
+        let sql: string;
+        let params: any[];
+        if (tableName && tableName !== 'components') {
+            sql = `SELECT reltuples::bigint AS estimate FROM pg_class WHERE relname = $1`;
+            params = [tableName];
+        } else if (getMembershipSource().isLegacy) {
+            sql = `SELECT reltuples::bigint AS estimate FROM pg_class WHERE relname = 'entity_components'`;
+            params = [];
+        } else {
+            // No COALESCE: an empty partition set must yield NULL so the
+            // exact-count fallback below triggers, matching the legacy
+            // zero-rows behavior.
+            sql = `SELECT SUM(c.reltuples)::bigint AS estimate
+                   FROM pg_class c
+                   JOIN pg_inherits i ON c.oid = i.inhrelid
+                   WHERE i.inhparent = 'components'::regclass`;
+            params = [];
+        }
 
-        const result = await timedUnsafe<any[]>(dbConn, sql, [tableName || 'entity_components'], this.execSignal, this.execPerRequest);
+        const result = await timedUnsafe<any[]>(dbConn, sql, params, this.execSignal, this.execPerRequest);
 
         if (!result || result.length === 0 || result[0].estimate === null) {
             // Fallback to exact count if statistics not available
