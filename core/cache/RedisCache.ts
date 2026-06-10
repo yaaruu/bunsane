@@ -161,6 +161,8 @@ export class RedisCache implements CacheProvider {
                 logger.error({ error, msg: 'Failed to get Redis memory info' });
             }
         }, 300000); // 5 minutes
+        // Allow the process to exit without waiting for this monitoring timer.
+        this.monitoringInterval?.unref?.();
     }
 
     /**

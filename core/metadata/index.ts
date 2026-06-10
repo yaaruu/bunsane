@@ -3,6 +3,11 @@ import { getMetadataStorage } from "./getMetadataStorage";
 
 export { getMetadataStorage } from "./getMetadataStorage";
 
+// Cached after first call — metadata is fixed after startup so serialization
+// cost is paid only once regardless of how many /studio navigations occur.
+let _metadataCache: ReturnType<typeof getSerializedMetadataStorage> | undefined;
+let _metadataScriptCache: string | undefined;
+
 function toFieldLabel(fieldName: string): string {
     let label = fieldName.replace(/_/g, ' ');
     label = label.split(' ').map(word => word === 'id' ? 'ID' : word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()).join(' ');
@@ -20,6 +25,8 @@ export function getSerializedMetadataStorage(): {
         }[]
     >;
 } {
+    if (_metadataCache) return _metadataCache;
+
     const storage = getMetadataStorage();
     const archeTypes: Record<string, any> = {};
 
@@ -34,11 +41,15 @@ export function getSerializedMetadataStorage(): {
         });
     });
 
-    // console.log(archeTypes, 'archeTypes');
+    _metadataCache = { archeTypes };
+    return _metadataCache;
+}
 
-    return {
-        archeTypes,
-    };
+/** Returns the pre-serialized `<script>` tag for studio injection. */
+export function getMetadataScript(): string {
+    if (_metadataScriptCache) return _metadataScriptCache;
+    _metadataScriptCache = `<script>window.bunsaneMetadata = ${JSON.stringify(getSerializedMetadataStorage())};</script>`;
+    return _metadataScriptCache;
 }
 
 export function Enum() {

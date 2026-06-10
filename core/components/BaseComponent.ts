@@ -79,7 +79,11 @@ export class BaseComponent {
     }
 
     async save(trx: Bun.SQL, entity_id: string) {
-        logger.trace(`Saving component ${this._comp_name} for entity ${entity_id}`);
+        // Level-gated: template literal allocates per component save even
+        // when trace is disabled.
+        if (logger.isLevelEnabled?.('trace')) {
+            logger.trace(`Saving component ${this._comp_name} for entity ${entity_id}`);
+        }
         // Only check readiness if component is not yet registered
         // This optimization avoids 40,000+ unnecessary async calls for bulk operations
         if(!ComponentRegistry.isComponentReady(this._comp_name)) {

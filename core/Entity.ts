@@ -699,17 +699,15 @@ export class Entity implements IEntity {
             const cacheManager = CacheManager.getInstance();
             const config = cacheManager.getConfig();
 
-            if (config.enabled && config.entity?.enabled) {
-                // Always update entity existence cache
-                if (config.strategy === 'write-through') {
-                    await cacheManager.setEntityWriteThrough(this, config.entity.ttl);
-                } else {
-                    await cacheManager.invalidateEntity(this.id);
-                }
+            const entityEnabled = !!(config.enabled && config.entity?.enabled);
+            const componentEnabled = !!(config.enabled && config.component?.enabled);
+
+            if (entityEnabled && config.strategy === 'write-through') {
+                await cacheManager.setEntityWriteThrough(this, config.entity!.ttl);
             }
 
             // Handle component cache invalidation with granular approach
-            if (config.enabled && config.component?.enabled) {
+            if (componentEnabled) {
                 // Use the pre-captured lists instead of re-querying (dirty flags are already cleared by doSave)
 
                 if (config.strategy === 'write-through') {
@@ -723,17 +721,18 @@ export class Entity implements IEntity {
                     if (entries.length > 0) {
                         await cacheManager.setComponentsBatchWriteThrough(entries);
                     }
-                } else if (changedComponentTypeIds.length > 0) {
-                    await Promise.all(changedComponentTypeIds.map(typeId =>
-                        cacheManager.invalidateComponent(this.id, typeId)
-                    ));
-                }
-
-                // Invalidate cache for removed components
-                if (removedComponentTypeIds.length > 0) {
-                    await Promise.all(removedComponentTypeIds.map(typeId =>
-                        cacheManager.invalidateComponent(this.id, typeId)
-                    ));
+                    // Removed components must still drop out of cache.
+                    if (removedComponentTypeIds.length > 0) {
+                        await cacheManager.invalidateEntityComponents(this.id, removedComponentTypeIds);
+                    }
+                } else {
+                    // One deleteMany + ONE pub/sub message for the whole save
+                    // (entity key included) — previously N+1 DEL+PUBLISH pairs
+                    // per save, fanning out to every other instance.
+                    const toInvalidate = [...changedComponentTypeIds, ...removedComponentTypeIds];
+                    if (toInvalidate.length > 0 || entityEnabled) {
+                        await cacheManager.invalidateEntityComponents(this.id, toInvalidate, { includeEntityKey: entityEnabled });
+                    }
                 }
 
                 // Invalidate DataLoader cache for changed + removed components
@@ -745,6 +744,8 @@ export class Entity implements IEntity {
                         });
                     }
                 }
+            } else if (entityEnabled && config.strategy !== 'write-through') {
+                await cacheManager.invalidateEntity(this.id);
             }
         } catch (error) {
             logger.warn({ scope: 'cache', component: 'Entity', msg: 'Cache operation failed after save', error });
@@ -759,47 +760,52 @@ export class Entity implements IEntity {
         }
 
         if (!this._dirty) {
-            let dirtyComponents: string[] = [];
-            try {
-                dirtyComponents = this.getDirtyComponents();
-            } catch {
-                // best-effort diagnostics only
+            // Diagnostics object is non-trivial to build (component walk +
+            // preview mapping) — gate on the active level so the not-dirty
+            // fast path stays allocation-free in production.
+            if (logger.isLevelEnabled?.('trace')) {
+                let dirtyComponents: string[] = [];
+                try {
+                    dirtyComponents = this.getDirtyComponents();
+                } catch {
+                    // best-effort diagnostics only
+                }
+
+                const removedTypeIds = Array.from(this.removedComponents);
+                const entityType = (this as any)?.constructor?.name ?? "Entity";
+                const dirtyComponentPreview = dirtyComponents.slice(0, 10).map((component) => {
+                    const anyComponent = component as any;
+                    return {
+                        type: anyComponent?.constructor?.name ?? "Component",
+                        typeId: typeof anyComponent?.getTypeID === "function" ? anyComponent.getTypeID() : undefined,
+                        id: anyComponent?.id,
+                        persisted: anyComponent?._persisted,
+                        dirty: anyComponent?._dirty,
+                    };
+                });
+
+                logger.trace(
+                    {
+                        component: "Entity",
+                        entity: {
+                            type: entityType,
+                            id: this.id,
+                            persisted: this._persisted,
+                            dirty: this._dirty,
+                        },
+                        components: {
+                            total: this.components.size,
+                            dirtyCount: dirtyComponents.length,
+                            dirtyPreview: dirtyComponentPreview,
+                        },
+                        removedComponents: {
+                            count: removedTypeIds.length,
+                            typeIdsPreview: removedTypeIds.slice(0, 10),
+                        },
+                    },
+                    "[Entity.doSave] Skipping save because entity is not dirty"
+                );
             }
-
-            const removedTypeIds = Array.from(this.removedComponents);
-            const entityType = (this as any)?.constructor?.name ?? "Entity";
-            const dirtyComponentPreview = dirtyComponents.slice(0, 10).map((component) => {
-                const anyComponent = component as any;
-                return {
-                    type: anyComponent?.constructor?.name ?? "Component",
-                    typeId: typeof anyComponent?.getTypeID === "function" ? anyComponent.getTypeID() : undefined,
-                    id: anyComponent?.id,
-                    persisted: anyComponent?._persisted,
-                    dirty: anyComponent?._dirty,
-                };
-            });
-
-            logger.trace(
-                {
-                    component: "Entity",
-                    entity: {
-                        type: entityType,
-                        id: this.id,
-                        persisted: this._persisted,
-                        dirty: this._dirty,
-                    },
-                    components: {
-                        total: this.components.size,
-                        dirtyCount: dirtyComponents.length,
-                        dirtyPreview: dirtyComponentPreview,
-                    },
-                    removedComponents: {
-                        count: removedTypeIds.length,
-                        typeIdsPreview: removedTypeIds.slice(0, 10),
-                    },
-                },
-                "[Entity.doSave] Skipping save because entity is not dirty"
-            );
             return true;
         }
 
@@ -911,13 +917,18 @@ export class Entity implements IEntity {
             // pipeline on the transaction connection instead of paying one
             // serial round-trip per dirty component.
             if (componentsToUpdate.length > 0) {
+                const traceEnabled = logger.isLevelEnabled?.('trace') === true;
                 for (const comp of componentsToUpdate) {
                     // Validate component ID to prevent PostgreSQL UUID parsing errors
                     if (!comp.id || comp.id.trim() === '') {
                         logger.error(`Cannot update component: id is empty or invalid. Component data: ${JSON.stringify(comp.data).substring(0, 200)}`);
                         throw new Error(`Cannot update component: component id is empty or invalid`);
                     }
-                    logger.trace({ componentId: comp.id, data: comp.data }, `[Entity.doSave] Updating component`);
+                    // Level-gated: per-component log-object allocation in the
+                    // write hot path is pure waste when trace is off.
+                    if (traceEnabled) {
+                        logger.trace({ componentId: comp.id, data: comp.data }, `[Entity.doSave] Updating component`);
+                    }
                 }
                 await Promise.all(
                     componentsToUpdate.map(comp =>
@@ -960,14 +971,21 @@ export class Entity implements IEntity {
 
         try {
             await db.transaction(async (trx) => {
+                // Independent tables, no FK constraints — pipeline all three
+                // statements on the transaction connection instead of paying
+                // three serial round-trips while holding the connection.
                 if (force) {
-                    await run(trx`DELETE FROM entity_components WHERE entity_id = ${this.id}`);
-                    await run(trx`DELETE FROM components WHERE entity_id = ${this.id}`);
-                    await run(trx`DELETE FROM entities WHERE id = ${this.id}`);
+                    await Promise.all([
+                        run(trx`DELETE FROM entity_components WHERE entity_id = ${this.id}`),
+                        run(trx`DELETE FROM components WHERE entity_id = ${this.id}`),
+                        run(trx`DELETE FROM entities WHERE id = ${this.id}`),
+                    ]);
                 } else {
-                    await run(trx`UPDATE entities SET deleted_at = CURRENT_TIMESTAMP WHERE id = ${this.id} AND deleted_at IS NULL`);
-                    await run(trx`UPDATE entity_components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`);
-                    await run(trx`UPDATE components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`);
+                    await Promise.all([
+                        run(trx`UPDATE entities SET deleted_at = CURRENT_TIMESTAMP WHERE id = ${this.id} AND deleted_at IS NULL`),
+                        run(trx`UPDATE entity_components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`),
+                        run(trx`UPDATE components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`),
+                    ]);
                 }
             });
             clearTimeout(timeoutHandle);

@@ -25,6 +25,7 @@ export interface OpenAPISpec {
 
 export class OpenAPISpecGenerator {
     private spec: OpenAPISpec;
+    private _jsonCache: string | undefined;
 
     constructor(title: string = "API Documentation", version: string = "1.0.0") {
         this.spec = {
@@ -61,6 +62,7 @@ export class OpenAPISpecGenerator {
                 }
             }
         };
+        this._jsonCache = undefined;
     }
 
     addServer(url: string, description?: string) {
@@ -68,6 +70,7 @@ export class OpenAPISpecGenerator {
             this.spec.servers = [];
         }
         this.spec.servers.push({ url, description });
+        this._jsonCache = undefined;
     }
 
     addSecurityScheme(name: string, scheme: any) {
@@ -78,6 +81,7 @@ export class OpenAPISpecGenerator {
             this.spec.components.securitySchemes = {};
         }
         this.spec.components.securitySchemes[name] = scheme;
+        this._jsonCache = undefined;
     }
 
     addSchema(name: string, schema: any) {
@@ -88,13 +92,19 @@ export class OpenAPISpecGenerator {
             this.spec.components.schemas = {};
         }
         this.spec.components.schemas[name] = schema;
+        this._jsonCache = undefined;
     }
 
     generate(): OpenAPISpec {
         return this.spec;
     }
 
+    // Memoized — spec is frozen after startup so re-serialization per request
+    // is unnecessary. Mutator methods above clear the cache on any post-boot change.
     toJSON(): string {
-        return JSON.stringify(this.spec, null, 2);
+        if (!this._jsonCache) {
+            this._jsonCache = JSON.stringify(this.spec, null, 2);
+        }
+        return this._jsonCache;
     }
 }

@@ -230,6 +230,8 @@ export class MemoryCache implements CacheProvider {
         this.cleanupTimer = setInterval(() => {
             this.cleanupExpired();
         }, this.config.cleanupInterval);
+        // Allow the process to exit without waiting for this maintenance timer.
+        this.cleanupTimer?.unref?.();
     }
 
     private cleanupExpired(): void {

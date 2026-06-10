@@ -8,9 +8,17 @@ export function collectRestEndpoints(app: any, services: any[]): void {
         if (!endpoints) continue;
 
         for (const endpoint of endpoints) {
+            // Precompile the parameterized regex once so the hot-path router
+            // never calls replace + new RegExp per request.
+            const hasParams = endpoint.path.includes(':');
+            const regex = hasParams
+                ? new RegExp(`^${endpoint.path.replace(/:[^/]+/g, '[^/]+')}$`)
+                : undefined;
+
             const endpointInfo = {
                 method: endpoint.method,
                 path: endpoint.path,
+                regex,
                 handler: endpoint.handler.bind(service),
                 service: service,
             };

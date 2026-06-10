@@ -1,4 +1,5 @@
 import type { Middleware } from '../Middleware';
+import { setResponseHeaders } from './headers';
 
 export type SecurityHeadersOptions = {
     /** Enable HSTS header. Default: true in production */
@@ -47,16 +48,6 @@ export function securityHeaders(options: SecurityHeadersOptions = {}): Middlewar
 
     return async (req, next) => {
         const response = await next();
-
-        const newHeaders = new Headers(response.headers);
-        for (const [key, value] of headersToSet) {
-            newHeaders.set(key, value);
-        }
-
-        return new Response(response.body, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: newHeaders,
-        });
+        return setResponseHeaders(response, headersToSet);
     };
 }

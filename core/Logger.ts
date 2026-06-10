@@ -27,3 +27,13 @@ export const logger = pino({
         }
     })
 });
+
+// pino-pretty serializes each log line synchronously on the main thread — 5-10x
+// slower than production JSON output. Warn once so operators don't accidentally
+// ship a pretty-print config to production.
+if (usePretty && process.env.NODE_ENV === 'production') {
+    logger.warn(
+        'LOG_PRETTY=true is set in a production environment. ' +
+        'pino-pretty is 5-10x slower than JSON output and should not run in production.'
+    );
+}

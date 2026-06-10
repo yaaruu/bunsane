@@ -33,13 +33,13 @@ export type ComponentCacheValue = ComponentData | typeof COMPONENT_TOMBSTONE;
 export class CacheManager {
     private static instance: CacheManager;
     private provider: CacheProvider;
-    private config: CacheConfig;
+    private config: Readonly<CacheConfig>;
     private instanceId = crypto.randomUUID();
     private pubSubEnabled = false;
     private static readonly INVALIDATION_CHANNEL = 'bunsane:cache:invalidate';
 
     private constructor() {
-        this.config = defaultCacheConfig;
+        this.config = Object.freeze({ ...defaultCacheConfig });
         this.provider = CacheFactory.create(this.config);
     }
 
@@ -58,7 +58,7 @@ export class CacheManager {
         await this.shutdownProvider();
         this.pubSubEnabled = false;
 
-        this.config = { ...defaultCacheConfig, ...config };
+        this.config = Object.freeze({ ...defaultCacheConfig, ...config });
         this.provider = CacheFactory.create(this.config);
 
         await this.setupPubSub();
@@ -67,10 +67,11 @@ export class CacheManager {
     }
 
     /**
-     * Get the current cache configuration
+     * Get the current cache configuration.
+     * Config is frozen once set so callers may hold the reference safely.
      */
-    public getConfig(): CacheConfig {
-        return { ...this.config };
+    public getConfig(): Readonly<CacheConfig> {
+        return this.config;
     }
 
     /**
@@ -291,6 +292,31 @@ export class CacheManager {
             await this.publishInvalidation('key', [key]);
         } catch (error) {
             logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error invalidating component from cache', error });
+        }
+    }
+
+    /**
+     * Invalidate all listed component types for one entity in a single round-trip.
+     * Optionally includes the entity existence key.
+     * Emits a single pub/sub message carrying all keys rather than one per component.
+     */
+    public async invalidateEntityComponents(
+        entityId: string,
+        componentTypeIds: string[],
+        opts?: { includeEntityKey?: boolean },
+    ): Promise<void> {
+        if (!this.config.enabled) return;
+        if (componentTypeIds.length === 0 && !opts?.includeEntityKey) return;
+
+        try {
+            const keys: string[] = componentTypeIds.map(typeId => `component:${entityId}:${typeId}`);
+            if (opts?.includeEntityKey) {
+                keys.push(`entity:${entityId}`);
+            }
+            await this.provider.deleteMany(keys);
+            await this.publishInvalidation('key', keys);
+        } catch (error) {
+            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error invalidating entity components', entityId, error });
         }
     }
 

@@ -16,6 +16,20 @@ import {
 } from "./events/EntityLifecycleEvents";
 import { logger as MainLogger } from "./Logger";
 import ApplicationLifecycle, { ApplicationPhase, type PhaseChangeEvent } from "./ApplicationLifecycle";
+import { getMetadataStorage } from "./metadata";
+
+// Memoized constructor → typeId. Hook matching runs on every save event for
+// every hook filter; instantiating components (`new compCtor()`) per check
+// was O(hooks × filters) constructor calls per event.
+const typeIdCache = new Map<Function, string>();
+function typeIdOfCtor(compCtor: new () => BaseComponent): string {
+    let id = typeIdCache.get(compCtor);
+    if (id === undefined) {
+        id = getMetadataStorage().getComponentId(compCtor.name);
+        typeIdCache.set(compCtor, id);
+    }
+    return id;
+}
 
 const logger = MainLogger.child({ scope: "EntityHookManager" });
 
@@ -314,6 +328,7 @@ class EntityHookManager {
                             () => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)),
                             hook.options.timeout
                         );
+                        (timerHandle as unknown as { unref?: () => void }).unref?.();
                     });
                     const hookPromise = Promise.resolve().then(() => hook.callback(event));
                     hookPromise.catch((err) => {
@@ -367,6 +382,7 @@ class EntityHookManager {
                                 () => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)),
                                 hook.options.timeout
                             );
+                            (timerHandle as unknown as { unref?: () => void }).unref?.();
                         });
                         try {
                             await Promise.race([hookPromise, timeoutPromise]);
@@ -521,6 +537,7 @@ class EntityHookManager {
                                 () => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)),
                                 hook.options.timeout
                             );
+                            (timerHandle as unknown as { unref?: () => void }).unref?.();
                         });
                         try {
                             await Promise.race([hookPromise, timeoutPromise]);
@@ -585,6 +602,7 @@ class EntityHookManager {
                                         () => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)),
                                         hook.options.timeout
                                     );
+                                    (timerHandle as unknown as { unref?: () => void }).unref?.();
                                 });
                                 try {
                                     await Promise.race([hookPromise, timeoutPromise]);
@@ -801,10 +819,7 @@ class EntityHookManager {
             entityComponents.map(comp => comp.getTypeID())
         );
 
-        const requiredTypeIds = requiredComponents.map(compCtor => {
-            const instance = new compCtor();
-            return instance.getTypeID();
-        });
+        const requiredTypeIds = requiredComponents.map(typeIdOfCtor);
 
         if (requireAll) {
             // ALL required components must be present (AND logic)
@@ -831,10 +846,7 @@ class EntityHookManager {
             entityComponents.map(comp => comp.getTypeID())
         );
 
-        const excludedTypeIds = excludedComponents.map(compCtor => {
-            const instance = new compCtor();
-            return instance.getTypeID();
-        });
+        const excludedTypeIds = excludedComponents.map(typeIdOfCtor);
 
         if (requireAll) {
             // ALL excluded components must be absent (AND logic)
@@ -862,10 +874,7 @@ class EntityHookManager {
         }
 
         const expectedComponentTypes = new Set(
-            Object.values(archetypeComponentMap).map(compCtor => {
-                const instance = new compCtor();
-                return instance.getTypeID();
-            })
+            Object.values(archetypeComponentMap).map(compCtor => typeIdOfCtor(compCtor as any))
         );
 
         const entityComponentTypes = new Set(

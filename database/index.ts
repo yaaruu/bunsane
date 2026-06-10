@@ -39,6 +39,12 @@ function createDatabase(): SQL {
     logger.info(`Connection pool size: ${max} connections`);
     logger.info(`Query timeout: ${QUERY_TIMEOUT_MS}ms`);
 
+    // DB_CONNECTION_TIMEOUT (default 30 s): the pool waits this long for a free
+    // slot before rejecting the caller. At 30 s, pool exhaustion queues HTTP
+    // requests for up to 30 s each, holding sockets and consuming memory.
+    // User-facing services should consider 5 s for fast-fail so clients get
+    // an error quickly rather than a slow timeout. Long-running background
+    // workers (schedulers, outbox, migrations) can keep higher values.
     const connTimeout = parseInt(process.env.DB_CONNECTION_TIMEOUT ?? '30', 10);
 
     return new SQL({

@@ -336,6 +336,7 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
                 logger.error(`Query count execution timeout`);
                 reject(new Error(`Query count execution timeout after ${QUERY_TIMEOUT_MS / 1000} seconds`));
             }, QUERY_TIMEOUT_MS);
+            (timeout as unknown as { unref?: () => void }).unref?.();
             this.doCount()
                 .then(result => {
                     clearTimeout(timeout);
@@ -526,6 +527,7 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
                 logger.error(`Query sum execution timeout`);
                 reject(new Error(`Query sum execution timeout after ${QUERY_TIMEOUT_MS / 1000} seconds`));
             }, QUERY_TIMEOUT_MS);
+            (timeout as unknown as { unref?: () => void }).unref?.();
             this.doAggregate('SUM', componentCtor, field as string)
                 .then(result => {
                     clearTimeout(timeout);
@@ -554,6 +556,7 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
                 logger.error(`Query average execution timeout`);
                 reject(new Error(`Query average execution timeout after ${QUERY_TIMEOUT_MS / 1000} seconds`));
             }, QUERY_TIMEOUT_MS);
+            (timeout as unknown as { unref?: () => void }).unref?.();
             this.doAggregate('AVG', componentCtor, field as string)
                 .then(result => {
                     clearTimeout(timeout);
@@ -725,6 +728,9 @@ AND c.deleted_at IS NULL`;
                 logger.error(`Query execution timeout`);
                 reject(new Error(`Query execution timeout after ${QUERY_TIMEOUT_MS / 1000} seconds`));
             }, QUERY_TIMEOUT_MS); // 30 second timeout
+            // unref: at high QPS thousands of these are live concurrently;
+            // they must not hold the event loop open nor add ref'd-timer churn.
+            (timeout as unknown as { unref?: () => void }).unref?.();
 
             this.doExec()
                 .then(result => {
