@@ -1,12 +1,14 @@
 import { QueryNode } from "./QueryNode";
 import type { QueryResult } from "./QueryNode";
 import { QueryContext } from "./QueryContext";
+import { getMembershipTable } from "./membershipSource";
 
 export class CTENode extends QueryNode {
     public execute(context: QueryContext): QueryResult {
         // Generate CTE for base entity filtering
         const componentIds = Array.from(context.componentIds);
         const excludedIds = Array.from(context.excludedComponentIds);
+        const membershipTable = getMembershipTable();
 
         if (componentIds.length === 0) {
             throw new Error("CTENode requires at least one component type to filter on");
@@ -26,7 +28,7 @@ export class CTENode extends QueryNode {
         if (excludedIds.length > 0) {
             const excludedPlaceholders = excludedIds.map((id) => `$${context.addParam(id)}`).join(', ');
             exclusionCondition = ` AND NOT EXISTS (
-                SELECT 1 FROM entity_components ec_ex
+                SELECT 1 FROM ${membershipTable} ec_ex
                 WHERE ec_ex.entity_id = ec.entity_id
                 AND ec_ex.type_id IN (${excludedPlaceholders})
                 AND ec_ex.deleted_at IS NULL
@@ -45,7 +47,7 @@ export class CTENode extends QueryNode {
             // Single component - simple query, no INTERSECT needed
             const paramIdx = context.addParam(componentIds[0]);
             cteSql += `    SELECT DISTINCT ec.entity_id\n`;
-            cteSql += `    FROM entity_components ec\n`;
+            cteSql += `    FROM ${membershipTable} ec\n`;
             cteSql += `    WHERE ec.type_id = $${paramIdx}::text\n`;
             cteSql += `    AND ec.deleted_at IS NULL\n`;
             if (cursorCondition) cteSql += `    ${cursorCondition.trim()}\n`;
@@ -57,7 +59,7 @@ export class CTENode extends QueryNode {
             // then efficiently merge results, avoiding Cartesian product explosion
             const intersectQueries = componentIds.map((compId) => {
                 const paramIdx = context.addParam(compId);
-                let subquery = `SELECT ec.entity_id FROM entity_components ec WHERE ec.type_id = $${paramIdx}::text AND ec.deleted_at IS NULL`;
+                let subquery = `SELECT ec.entity_id FROM ${membershipTable} ec WHERE ec.type_id = $${paramIdx}::text AND ec.deleted_at IS NULL`;
                 // Add cursor/exclusion conditions to each subquery for efficiency
                 if (cursorCondition) subquery += cursorCondition;
                 if (exclusionCondition) subquery += exclusionCondition;
