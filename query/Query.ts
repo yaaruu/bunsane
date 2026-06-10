@@ -408,7 +408,10 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
             sql = `SELECT reltuples::bigint AS estimate FROM pg_class WHERE relname = 'entity_components'`;
             params = [];
         } else {
-            sql = `SELECT COALESCE(SUM(c.reltuples), 0)::bigint AS estimate
+            // No COALESCE: an empty partition set must yield NULL so the
+            // exact-count fallback below triggers, matching the legacy
+            // zero-rows behavior.
+            sql = `SELECT SUM(c.reltuples)::bigint AS estimate
                    FROM pg_class c
                    JOIN pg_inherits i ON c.oid = i.inhrelid
                    WHERE i.inhparent = 'components'::regclass`;
