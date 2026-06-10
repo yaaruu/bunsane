@@ -2,14 +2,16 @@
 
 **Status:** Backlog / planning
 **Author:** uray@qyubit.io (drafted with Claude)
-**Date:** 2026-05-09
-**Prior work:** `core/ArcheType.ts` split — commit `a886b45`, merged to `staging` (`fd75f21`).
+**Date:** 2026-05-09 (updated 2026-06-10)
+**Prior work:**
+- `core/ArcheType.ts` split — commit `a886b45`, merged to `staging` (`fd75f21`).
+- `core/App.ts` split — branch `refactor/app-split`, merged to `staging` (`c855e04`). See §3.1.
 
 ---
 
 ## 1. Purpose
 
-After `ArcheType.ts` was split (3064 → 1032 LOC across 8 modules under `core/archetype/`), several other files in `core/` remain large and concern-dense. This RFC enumerates them in priority order so future refactor work has a reference.
+After `ArcheType.ts` was split (3064 → 1032 LOC across 8 modules under `core/archetype/`), several other files in `core/` remain large and concern-dense. This RFC enumerates them in priority order so future refactor work has a reference. As of 2026-06-10, target §3.1 (`App.ts`) is complete; §3.2–§3.5 remain.
 
 This is a **planning document**, not an approval-bound RFC. Each target listed here would get its own scoped RFC (like `RFC_APP_REFACTOR.md`) before work starts.
 
@@ -26,9 +28,11 @@ Pure "library leaf" files (formatter helpers, fixed schemas) are excluded even w
 
 ## 3. Targets
 
-### 3.1 `core/App.ts` — 1477 LOC — **highest priority**
+### 3.1 `core/App.ts` — ~~1477 LOC~~ → 386 LOC — **DONE (2026-05-09)**
 
-**Why next:** Most God-class. Mixes:
+**Completed:** branch `refactor/app-split`, merged to `staging` (`c855e04`). 1477 → 386 LOC across 11 modules under `core/app/`: `bootstrap`, `cors`, `graphqlSetup`, `healthEndpoints`, `metricsCollector`, `preparedStatementWarmup`, `processHandlers`, `requestRouter`, `restRegistry`, `shutdown`, `studioRouter`.
+
+Original concern inventory (for reference) — the file mixed:
 
 - Application lifecycle (phase orchestration, DB prep, component registration).
 - HTTP server (Bun.serve setup, request routing, signal/disconnect plumbing).
@@ -44,29 +48,32 @@ Pure "library leaf" files (formatter helpers, fixed schemas) are excluded even w
 - Remote subsystem bootstrap (RemoteManager init, handler registration).
 - Process signal & error handlers (SIGTERM, SIGINT, unhandledRejection, uncaughtException).
 - Graceful shutdown ordering (HTTP → scheduler → remote → cache → DB).
-- Prepared-statement cache warm-up.
+- Prepared-statement cache warm-up (since obsoleted: warm-up is a no-op as of the 2026-06-10 perf overhaul — Bun SQL auto-prepares; `core/app/preparedStatementWarmup.ts` kept as deprecated shell for `/metrics` API stability).
 
-`init()` is a giant `switch (phase)` (lines 198–476) where each case runs 30–80 LOC of business logic. `handleRequest()` is ~430 LOC across 8+ branches.
+**Detailed plan:** see `RFC_APP_REFACTOR.md`.
 
-**Detailed plan:** see `RFC_APP_REFACTOR.md` (drafted, awaiting approval).
-
-**Status:** RFC drafted, not started.
+**Status:** Done. Extraction pattern from §4.1 held up; reuse for remaining targets.
 
 ---
 
-### 3.2 `core/Entity.ts` — 1212 LOC
+### 3.2 `core/Entity.ts` — 1142 LOC (was 1212 at draft time)
 
 **Why next:** `save()` alone likely 300+ LOC. Cache ops inline. Mixes:
 
 - Component add/get/remove (in-memory + persisted).
 - DB persistence (insert/update/delete with abort signal + per-component partitioned writes).
-- Cache write-through / write-invalidate strategies (L1 + L2 + pubsub).
+- Cache write-through / write-invalidate strategies (L1 + L2 + pubsub), batch write-through via `CacheManager.setComponentsBatchWriteThrough` (2026-06-10), negative caching for absent components (`4f3c893`).
 - Hook dispatch (pre-save, post-save, post-delete) via `EntityHookManager`.
-- Pending side-effects queue (`Entity.pendingCacheOps`, `Entity.pendingSideEffects` static drain methods for shutdown).
+- Post-commit side effects (cache, hooks) scheduled via `queueMicrotask` so they don't consume save budget (v0.3.0).
+- Pending side-effects queue (`Entity.pendingCacheOps`, `Entity.pendingSideEffects` static drain methods for shutdown; `trackCacheOp` now public — `populate()` cache warming registers through it).
 - Profile timing (`DB_SAVE_PROFILE`).
 - Abort signal handling (timeout + client disconnect cancellation).
 - Component-ready preflight (`ComponentRegistry.getReadyPromise`).
 - Static finders (`FindById`, etc.).
+
+**⚠ Sequencing dependency (added 2026-06-10):** `docs/ENTITY_COMPONENTS_REMOVAL_PLAN.md` rewrites the same `save()` / `doDelete()` bodies — it removes 5 `entity_components` write sites in this file (`Entity.ts:834,895,911,979,986`). Run the removal plan **first**, then refactor the smaller surviving `save()`. Refactoring first means re-reviewing the split immediately after.
+
+**Known latent bug (file separately per §4.4):** `doSave` sets `_persisted = true` early, making the later `if (!this._persisted)` entity_components-for-existing-components block dead code (affects `MakeRef` path only). The removal plan deletes that block anyway.
 
 **Proposed split direction:**
 
@@ -89,11 +96,11 @@ Class skeleton + public API stays in `Entity.ts`.
 
 **Estimated effort:** larger than App.ts because of perf sensitivity. ~6–8 hours plus benchmark validation.
 
-**Status:** Not started.
+**Status:** Not started. Blocked-soft on `ENTITY_COMPONENTS_REMOVAL_PLAN.md` (see sequencing note above).
 
 ---
 
-### 3.3 `core/SchedulerManager.ts` — 932 LOC
+### 3.3 `core/SchedulerManager.ts` — 806 LOC (was 932 at draft time)
 
 **Why next:** Scheduling logic + distributed lock + hook orchestration in one class.
 
@@ -120,6 +127,8 @@ core/scheduler/
 
 `SchedulerManager` keeps singleton + public API.
 
+Note: `core/scheduler/` already exists and holds `DistributedLock.ts` (the lock itself was never inside `SchedulerManager` — `lockCoordinator.ts` here means only the acquire/release wiring around task runs, a smaller extraction than the name suggests).
+
 **Risks:**
 
 - Concurrency hardening already done in v0.3.0 (H-SCHED-1..5). Refactor must preserve every guard. Property-based tests on the runner would help.
@@ -129,7 +138,7 @@ core/scheduler/
 
 ---
 
-### 3.4 `core/EntityHookManager.ts` — 921 LOC
+### 3.4 `core/EntityHookManager.ts` — 827 LOC (was 921 at draft time)
 
 **Why next:** Hook registry + dispatch + lifecycle in one place.
 
@@ -140,6 +149,7 @@ Concerns:
 - Hook chain with timer leak fixes (memory: H-HOOK-2, H-MEM-2).
 - Re-entry / recursion guard.
 - Integration with `Entity.save()` post-commit microtask scheduling.
+- Memoized `typeIdOfCtor` Map for hook matching (perf, `5eb1f16`) — owned state that must move with the registry.
 
 **Proposed split direction:**
 
@@ -161,7 +171,7 @@ core/hooks/
 
 ---
 
-### 3.5 `core/cache/CacheManager.ts` — 574 LOC
+### 3.5 `core/cache/CacheManager.ts` — 656 LOC (was 574 at draft time — grew via 2026-06-10 perf work)
 
 **Why next:** L1 (memory) + L2 (Redis) + strategies + pub/sub all-in-one. Already smaller than peers, so lower priority.
 
@@ -169,8 +179,9 @@ Concerns:
 
 - Provider initialization (memory + Redis).
 - Strategy dispatch (write-through vs write-invalidate).
+- Batch ops (added 2026-06-10): `setComponentsBatchWriteThrough` (2 pipelined RTTs per save), `invalidateEntityComponents` (one deleteMany + one pub/sub message per save). Belong in `strategies/` when split.
 - Cross-instance invalidation via Redis pub/sub (`instanceId` loop prevention).
-- Cache stats / health (`ping`, `getStats`).
+- Cache stats / health (`ping`, `getStats`); `getConfig()` returns frozen direct ref — tests assert `toBe` + `Object.isFrozen`, preserve on split.
 - Singleton lifecycle (`initialize` async, `shutdown`).
 
 **Proposed split direction:**
@@ -211,7 +222,7 @@ This pattern works well for ECS-style classes where the class is mostly a data b
 
 ### 4.2 Test infrastructure assumed stable
 
-All five targets are exercised by the current 770-test suite (under `bun run test:pglite`). No target requires new test scaffolding before extraction starts; existing tests are sufficient guardrails for behavior preservation.
+All targets are exercised by the existing suite (65 test files under `tests/`, run via `bun run test:pglite`). No target requires new test scaffolding before extraction starts; existing tests are sufficient guardrails for behavior preservation. The App.ts split (§3.1) confirmed this assumption in practice.
 
 ### 4.3 No DI introduction
 
@@ -223,12 +234,12 @@ If a refactor reveals a latent bug (wrong ordering, missing guard, stale comment
 
 ## 5. Recommended Order
 
-1. **`App.ts`** — RFC drafted, ready to start. Highest payoff: every test boots through it.
-2. **`Entity.ts`** — Highest perf sensitivity but biggest readability win. Allocate benchmark time.
+1. ~~**`App.ts`**~~ — **Done** (merged `c855e04`, 2026-05-09).
+2. **`Entity.ts`** — Next, but **after** `ENTITY_COMPONENTS_REMOVAL_PLAN.md` lands (it rewrites/deletes large parts of `save()`; splitting first creates churn). Highest perf sensitivity but biggest readability win. Allocate benchmark time.
 3. **`SchedulerManager.ts`** *or* **`EntityHookManager.ts`** — Either next. They're partially coupled (hooks fire from scheduler-triggered work), so coordinate.
-4. **`CacheManager.ts`** — Last. Smallest of the five, already structured around providers.
+4. **`CacheManager.ts`** — Last. Smallest of the five, already structured around providers (though it grew in the 2026-06-10 perf work).
 
-This ordering minimizes risk because the most heavily-tested file goes first (more guardrails) and the perf-sensitive file goes early-second when there's still energy for benchmarking.
+This ordering minimizes risk because the most heavily-tested file went first (more guardrails) and the perf-sensitive file goes early-second when there's still energy for benchmarking.
 
 ## 6. Anti-Goals
 

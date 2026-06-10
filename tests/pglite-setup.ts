@@ -15,7 +15,7 @@ import { PGlite } from '@electric-sql/pglite';
 import { PGLiteSocketServer } from '@electric-sql/pglite-socket';
 import { spawn } from 'child_process';
 
-const PORT = 54321;
+const PORT = Number(process.env.PGLITE_PORT || 54321);
 
 console.log('[pglite] Starting in-memory PostgreSQL...');
 const pg = new PGlite();
