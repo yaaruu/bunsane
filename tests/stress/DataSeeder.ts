@@ -51,7 +51,6 @@ export class DataSeeder {
             // Build batch data arrays
             const entitiesToInsert: { id: string; created_at: Date; updated_at: Date }[] = [];
             const componentsToInsert: { id: string; entity_id: string; type_id: string; name: string; data: any; created_at: Date; updated_at: Date }[] = [];
-            const entityComponentsToInsert: { entity_id: string; type_id: string; component_id: string; created_at: Date; updated_at: Date }[] = [];
 
             // Generate batch data
             for (let j = 0; j < currentBatch; j++) {
@@ -75,25 +74,14 @@ export class DataSeeder {
                     updated_at: now
                 });
 
-                entityComponentsToInsert.push({
-                    entity_id: entityId,
-                    type_id: typeId,
-                    component_id: componentId,
-                    created_at: now,
-                    updated_at: now
-                });
-
                 entityIds.push(entityId);
             }
 
             // Bulk insert entities using Bun's sql helper
             await db`INSERT INTO entities ${sql(entitiesToInsert, 'id', 'created_at', 'updated_at')}`;
 
-            // Bulk insert components
+            // Bulk insert components (single source of membership truth)
             await db`INSERT INTO components ${sql(componentsToInsert, 'id', 'entity_id', 'type_id', 'name', 'data', 'created_at', 'updated_at')}`;
-
-            // Bulk insert entity_components index
-            await db`INSERT INTO entity_components ${sql(entityComponentsToInsert, 'entity_id', 'type_id', 'component_id', 'created_at', 'updated_at')} ON CONFLICT (entity_id, type_id) DO NOTHING`;
 
             if (onProgress) {
                 onProgress(i + currentBatch, totalEntities, performance.now() - startTime);
@@ -129,7 +117,6 @@ export class DataSeeder {
             const now = new Date();
 
             const componentsToInsert: { id: string; entity_id: string; type_id: string; name: string; data: any; created_at: Date; updated_at: Date }[] = [];
-            const entityComponentsToInsert: { entity_id: string; type_id: string; component_id: string; created_at: Date; updated_at: Date }[] = [];
 
             for (let j = 0; j < batchEntityIds.length; j++) {
                 const entityId = batchEntityIds[j]!;
@@ -145,18 +132,9 @@ export class DataSeeder {
                     created_at: now,
                     updated_at: now
                 });
-
-                entityComponentsToInsert.push({
-                    entity_id: entityId,
-                    type_id: typeId,
-                    component_id: componentId,
-                    created_at: now,
-                    updated_at: now
-                });
             }
 
             await db`INSERT INTO components ${sql(componentsToInsert, 'id', 'entity_id', 'type_id', 'name', 'data', 'created_at', 'updated_at')}`;
-            await db`INSERT INTO entity_components ${sql(entityComponentsToInsert, 'entity_id', 'type_id', 'component_id', 'created_at', 'updated_at')} ON CONFLICT (entity_id, type_id) DO NOTHING`;
         }
     }
 
@@ -177,7 +155,6 @@ export class DataSeeder {
     async optimize(): Promise<void> {
         await db.unsafe('VACUUM ANALYZE entities');
         await db.unsafe('VACUUM ANALYZE components');
-        await db.unsafe('VACUUM ANALYZE entity_components');
     }
 
     /**

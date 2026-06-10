@@ -1,6 +1,6 @@
 # Plan: Remove `entity_components` Table
 
-**Status:** Proposed (2026-06-10)
+**Status:** Phases 1-3 done (2026-06-10); Phase 4 (decommission) pending
 **Goal:** Make `components` (and its LIST partitions) the single source of truth for entity↔component membership. Eliminate the redundant `entity_components` mirror table.
 
 ## Why
@@ -47,7 +47,7 @@
 
 ## Phases (each shippable, each revertable)
 
-### Phase 1 — Redirect reads behind a flag
+### Phase 1 — Redirect reads behind a flag (done 2026-06-10)
 - New helper (e.g. `query/membershipSource.ts`): resolves membership table + whether `component_id` join style is used. Env `BUNSANE_MEMBERSHIP_SOURCE=components|legacy`, default `components`, `legacy` = instant rollback.
 - Swap the straight-swap read sites (identical column semantics: both tables have `UNIQUE(entity_id, type_id)` + partial deleted_at indexes, so DISTINCT/INTERSECT semantics unchanged).
 - Rewrite the 6 `component_id`-join sites to single-table predicates on `components` / partition tables.
@@ -55,19 +55,21 @@
 - **Writes stay dual** — both tables maintained, so `legacy` flag value stays correct.
 - Gate: full test suite (postgres + PGlite) green under both flag values.
 
-### Phase 2 — Prove performance
+### Phase 2 — Prove performance (done 2026-06-10)
 - Benchmarks vs baseline: multi-component INTERSECT at 50k entities (baseline ~120ms), sort-driven scan path, OR queries, and **hash-partition mode** (the `component_id` join fallbacks live there).
 - EXPLAIN checks: expect index-only scans. If INTERSECT loses index-only on `components`, add `(type_id, entity_id) WHERE deleted_at IS NULL` composite — decide from plans, don't pre-add.
 - Stress suite both flag values.
 - Gate: no regression >10% on any benchmarked path.
 
-### Phase 3 — Stop writes
+### Phase 3 — Stop writes (done 2026-06-10)
 - Remove the 7 write statements (save transaction shrinks to one component INSERT batch).
 - `HasValidBaseTable`: drop `entity_components` from required list.
 - `PrepareDatabase`: stop creating the table on fresh installs. Existing DBs: leave table in place, untouched.
 - Update seeders/test fixtures.
 - Verify the PGlite visibility race note in CLAUDE.md — if the race disappears with single-table writes, delete the note and the test mitigations.
 - Keep `PopulateComponentIds` exported as the **rollback/repair tool**: re-running it backfills `entity_components` from `components` if a downgrade is ever needed.
+
+After this phase the writes are no longer dual, so `BUNSANE_MEMBERSHIP_SOURCE=legacy` is only valid after first running `PopulateComponentIds()` to backfill `entity_components` from `components` (it throws if the table is absent — run `CreateEntityComponentTable()` first).
 
 ### Phase 4 — Decommission
 - **Never auto-drop.** On startup, if an orphaned `entity_components` exists, log one-time info: "no longer used; verify upgrade, then run `DROP TABLE entity_components;` manually." (Consistent with the partition-strategy guard policy: framework never destroys user data on boot.)

@@ -50,7 +50,7 @@ export const GetSchema = async () => {
 
 export const HasValidBaseTable = async (): Promise<boolean> => {
     const tables = await GetSchema();
-    const neededTables = ["entities", "components", "entity_components"];
+    const neededTables = ["entities", "components"];
     return neededTables.every(t => tables.includes(t));
 }
 
@@ -74,13 +74,9 @@ export const PrepareDatabase = async () => {
         logger.error(`Failed to create component table: ${error}`);
         throw error;
     }
-    try {
-        await CreateEntityComponentTable();
-        await PopulateComponentIds();
-    } catch (error) {
-        logger.error(`Failed to create entity component table: ${error}`);
-        throw error;
-    }
+    // `entity_components` is no longer created or written. `components`
+    // (UNIQUE(entity_id, type_id)) is the single source of membership truth
+    // as of Phase 3 of docs/ENTITY_COMPONENTS_REMOVAL_PLAN.md.
 }
 
 export const GetDatabaseDataSize = async () => {
@@ -485,59 +481,63 @@ export const CreateEntityComponentTable = async () => {
     }
 }
 
+/**
+ * Rollback/repair tool. Backfills the legacy `entity_components` mirror from
+ * `components` (the single source of truth as of Phase 3). Only needed if you
+ * intend to downgrade to a build that still reads `entity_components`
+ * (BUNSANE_MEMBERSHIP_SOURCE=legacy).
+ *
+ * The framework no longer creates `entity_components` on boot. If the table is
+ * absent this throws a clear error: create it first via
+ * `CreateEntityComponentTable()`, then re-run this.
+ *
+ * Intended for a freshly-created/empty table: ON CONFLICT DO NOTHING skips
+ * pre-existing rows, so `deleted_at` drift on them is not reconciled.
+ */
 export const PopulateComponentIds = async () => {
+    const tableExists = await db.unsafe(`
+        SELECT 1 FROM information_schema.tables
+        WHERE table_name = 'entity_components'
+        AND table_schema = 'public'
+    `);
+    if (tableExists.length === 0) {
+        throw new Error(
+            `Cannot populate entity_components: the table does not exist. ` +
+            `It is no longer created since Phase 3 of the entity_components removal. ` +
+            `If you need the legacy mirror (e.g. for a downgrade), run ` +
+            `CreateEntityComponentTable() first, then re-run PopulateComponentIds().`
+        );
+    }
     try {
-        // Populate component_id for existing rows that don't have it set
-        await db`UPDATE entity_components 
-                 SET component_id = c.id 
-                 FROM components c 
-                 WHERE entity_components.entity_id = c.entity_id 
-                 AND entity_components.type_id = c.type_id 
+        // Backfill membership rows from components, then set component_id for
+        // any rows still missing it.
+        await db`INSERT INTO entity_components (entity_id, type_id, component_id, deleted_at)
+                 SELECT c.entity_id, c.type_id, c.id, c.deleted_at
+                 FROM components c
+                 ON CONFLICT (entity_id, type_id) DO NOTHING`;
+        await db`UPDATE entity_components
+                 SET component_id = c.id
+                 FROM components c
+                 WHERE entity_components.entity_id = c.entity_id
+                 AND entity_components.type_id = c.type_id
                  AND entity_components.component_id IS NULL`;
-        
-        logger.info(`Populated component_id for existing entity_components rows`);
+
+        logger.info(`Backfilled entity_components from components`);
     } catch (error) {
-        logger.warn(`Could not populate component_id for existing rows: ${error}`);
+        logger.warn(`Could not backfill entity_components: ${error}`);
+        throw error;
     }
 }
 
 export const EnsureDatabaseMigrations = async () => {
     logger.trace(`Checking for database migrations...`);
-    
-    try {
-        // First, ensure the table exists and has the basic structure
-        await CreateEntityComponentTable();
-        
-        // Check if entity_components table has component_id column
-        const columnCheck = await db`SELECT column_name FROM information_schema.columns 
-                                     WHERE table_name = 'entity_components' 
-                                     AND column_name = 'component_id' 
-                                     AND table_schema = 'public'`;
-        
-        if (columnCheck.length === 0) {
-            logger.info(`entity_components table missing component_id column, adding it...`);
-            // Add the column
-            await db`ALTER TABLE entity_components ADD COLUMN component_id UUID`;
-            logger.info(`Added component_id column to entity_components table`);
 
-            // ALTER TABLE is transactional + synchronous in PostgreSQL — the
-            // column is visible immediately to the next statement on this
-            // connection. The prior 500ms sleep was dead wait on every
-            // migration boot.
-            await PopulateComponentIds();
-        } else {
-            logger.trace(`entity_components table already has component_id column`);
-        }
-    } catch (error) {
-        logger.error(`Failed during database migration: ${error}`);
-        // Try to add the column anyway in case the check failed
-        try {
-            await db`ALTER TABLE entity_components ADD COLUMN IF NOT EXISTS component_id UUID`;
-            logger.info(`Attempted to add component_id column as fallback`);
-        } catch (fallbackError) {
-            logger.error(`Fallback column addition also failed: ${fallbackError}`);
-        }
-    }
+    // `entity_components` is no longer created, migrated, or written (Phase 3
+    // of docs/ENTITY_COMPONENTS_REMOVAL_PLAN.md). Any pre-existing table is
+    // left in place, untouched — never auto-dropped. Membership now lives
+    // solely in `components` (UNIQUE(entity_id, type_id)). Run
+    // `PopulateComponentIds()` manually to backfill the legacy table if a
+    // downgrade is ever required.
 }
 
 export const AnalyzeAllComponentTables = async (): Promise<void> => {

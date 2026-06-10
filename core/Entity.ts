@@ -824,15 +824,11 @@ export class Entity implements IEntity {
                 this._persisted = true;
             }
 
-            // Delete removed components from database. Independent tables —
-            // pipeline both DELETEs on the transaction connection instead of
-            // paying two serial round-trips.
+            // Delete removed components from database. `components` is the
+            // single source of membership truth — one DELETE per removal batch.
             if (this.removedComponents.size > 0) {
                 const typeIds = Array.from(this.removedComponents);
-                await Promise.all([
-                    run(saveTrx`DELETE FROM components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`),
-                    run(saveTrx`DELETE FROM entity_components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`),
-                ]);
+                await run(saveTrx`DELETE FROM components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`);
                 // Move to savedRemovedComponents so resolvers can still detect removed components
                 // This is needed because DataLoader may have stale cached data for this request
                 for (const typeId of typeIds) {
@@ -848,7 +844,6 @@ export class Entity implements IEntity {
 
             // Batch inserts and updates for better performance
             const componentsToInsert = [];
-            const entityComponentsToInsert = [];
             const componentsToUpdate = [];
 
             for (const comp of this.components.values()) {
@@ -873,11 +868,6 @@ export class Entity implements IEntity {
                         type_id: comp.getTypeID(),
                         data: comp.serializableData()
                     });
-                    entityComponentsToInsert.push({
-                        entity_id: this.id,
-                        type_id: comp.getTypeID(),
-                        component_id: comp.id
-                    });
                     (comp as any).setPersisted(true);
                     (comp as any).setDirty(false);
                 } else if ((comp as any)._dirty) {
@@ -892,24 +882,6 @@ export class Entity implements IEntity {
             // Perform batch inserts
             if (componentsToInsert.length > 0) {
                 await run(saveTrx`INSERT INTO components ${sql(componentsToInsert, 'id', 'entity_id', 'name', 'type_id', 'data')}`);
-                await run(saveTrx`INSERT INTO entity_components ${sql(entityComponentsToInsert, 'entity_id', 'type_id', 'component_id')} ON CONFLICT DO NOTHING`);
-            }
-
-            // Insert entity_components for existing components if entity is new
-            if (!this._persisted) {
-                const existingEntityComponents = [];
-                for (const comp of this.components.values()) {
-                    if ((comp as any)._persisted) {
-                        existingEntityComponents.push({
-                            entity_id: this.id,
-                            type_id: comp.getTypeID(),
-                            component_id: comp.id
-                        });
-                    }
-                }
-                if (existingEntityComponents.length > 0) {
-                    await run(saveTrx`INSERT INTO entity_components ${sql(existingEntityComponents, 'entity_id', 'type_id', 'component_id')} ON CONFLICT DO NOTHING`);
-                }
             }
 
             // Perform updates. Validate all ids up front (synchronous, fails
@@ -971,19 +943,17 @@ export class Entity implements IEntity {
 
         try {
             await db.transaction(async (trx) => {
-                // Independent tables, no FK constraints — pipeline all three
+                // Independent tables, no FK constraints — pipeline the
                 // statements on the transaction connection instead of paying
-                // three serial round-trips while holding the connection.
+                // serial round-trips while holding the connection.
                 if (force) {
                     await Promise.all([
-                        run(trx`DELETE FROM entity_components WHERE entity_id = ${this.id}`),
                         run(trx`DELETE FROM components WHERE entity_id = ${this.id}`),
                         run(trx`DELETE FROM entities WHERE id = ${this.id}`),
                     ]);
                 } else {
                     await Promise.all([
                         run(trx`UPDATE entities SET deleted_at = CURRENT_TIMESTAMP WHERE id = ${this.id} AND deleted_at IS NULL`),
-                        run(trx`UPDATE entity_components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`),
                         run(trx`UPDATE components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`),
                     ]);
                 }
