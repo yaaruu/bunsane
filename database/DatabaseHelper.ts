@@ -490,6 +490,9 @@ export const CreateEntityComponentTable = async () => {
  * The framework no longer creates `entity_components` on boot. If the table is
  * absent this throws a clear error: create it first via
  * `CreateEntityComponentTable()`, then re-run this.
+ *
+ * Intended for a freshly-created/empty table: ON CONFLICT DO NOTHING skips
+ * pre-existing rows, so `deleted_at` drift on them is not reconciled.
  */
 export const PopulateComponentIds = async () => {
     const tableExists = await db.unsafe(`
