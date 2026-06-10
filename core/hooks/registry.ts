@@ -1,6 +1,20 @@
 import type { BaseComponent } from "../components";
 import type ArcheType from "../ArcheType";
 import type { EntityEvent, ComponentEvent, LifecycleEvent } from "../events/EntityLifecycleEvents";
+import { getMetadataStorage } from "../metadata";
+
+// Memoized constructor → typeId. Hook matching runs on every save event for
+// every hook filter; instantiating components (`new compCtor()`) per check
+// was O(hooks × filters) constructor calls per event.
+const typeIdCache = new Map<Function, string>();
+export function typeIdOfCtor(compCtor: new () => BaseComponent): string {
+    let id = typeIdCache.get(compCtor);
+    if (id === undefined) {
+        id = getMetadataStorage().getComponentId(compCtor.name);
+        typeIdCache.set(compCtor, id);
+    }
+    return id;
+}
 
 /**
  * Hook callback function signature for entity events

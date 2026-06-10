@@ -2,6 +2,7 @@ import type { BaseComponent } from "../components";
 import type ArcheType from "../ArcheType";
 import type { LifecycleEvent } from "../events/EntityLifecycleEvents";
 import type { ComponentTargetConfig } from "./registry";
+import { typeIdOfCtor } from "./registry";
 
 /**
  * Check if an event matches the component targeting configuration
@@ -74,10 +75,7 @@ export function checkComponentPresence(
         entityComponents.map(comp => comp.getTypeID())
     );
 
-    const requiredTypeIds = requiredComponents.map(compCtor => {
-        const instance = new compCtor();
-        return instance.getTypeID();
-    });
+    const requiredTypeIds = requiredComponents.map(typeIdOfCtor);
 
     if (requireAll) {
         // ALL required components must be present (AND logic)
@@ -100,10 +98,7 @@ export function checkComponentAbsence(
         entityComponents.map(comp => comp.getTypeID())
     );
 
-    const excludedTypeIds = excludedComponents.map(compCtor => {
-        const instance = new compCtor();
-        return instance.getTypeID();
-    });
+    const excludedTypeIds = excludedComponents.map(typeIdOfCtor);
 
     if (requireAll) {
         // ALL excluded components must be absent (AND logic)
@@ -127,10 +122,7 @@ export function matchesArchetype(entityComponents: BaseComponent[], archetype: A
     }
 
     const expectedComponentTypes = new Set(
-        Object.values(archetypeComponentMap).map(compCtor => {
-            const instance = new compCtor();
-            return instance.getTypeID();
-        })
+        Object.values(archetypeComponentMap).map(compCtor => typeIdOfCtor(compCtor as any))
     );
 
     const entityComponentTypes = new Set(

@@ -144,6 +144,7 @@ export async function executeHooks(registryState: RegistryState, dispatcherState
                         () => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)),
                         hook.options.timeout
                     );
+                    (timerHandle as unknown as { unref?: () => void }).unref?.();
                 });
                 const hookPromise = Promise.resolve().then(() => hook.callback(event));
                 hookPromise.catch((err) => {
@@ -197,6 +198,7 @@ export async function executeHooks(registryState: RegistryState, dispatcherState
                             () => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)),
                             hook.options.timeout
                         );
+                        (timerHandle as unknown as { unref?: () => void }).unref?.();
                     });
                     try {
                         await Promise.race([hookPromise, timeoutPromise]);
@@ -344,6 +346,7 @@ async function executeSyncHooksBatch(dispatcherState: DispatcherState, syncHooks
                             () => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)),
                             hook.options.timeout
                         );
+                        (timerHandle as unknown as { unref?: () => void }).unref?.();
                     });
                     try {
                         await Promise.race([hookPromise, timeoutPromise]);
@@ -405,6 +408,7 @@ async function executeAsyncHooksBatch(dispatcherState: DispatcherState, asyncHoo
                                     () => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)),
                                     hook.options.timeout
                                 );
+                                (timerHandle as unknown as { unref?: () => void }).unref?.();
                             });
                             try {
                                 await Promise.race([hookPromise, timeoutPromise]);
