@@ -11,7 +11,7 @@
 
 ## 1. Purpose
 
-After `ArcheType.ts` was split (3064 → 1032 LOC across 8 modules under `core/archetype/`), several other files in `core/` remain large and concern-dense. This RFC enumerates them in priority order so future refactor work has a reference. As of 2026-06-10, targets §3.1, §3.3, §3.4, §3.5 are complete; only §3.2 (`Entity.ts`) remains, gated on `ENTITY_COMPONENTS_REMOVAL_PLAN.md`.
+After `ArcheType.ts` was split (3064 → 1032 LOC across 8 modules under `core/archetype/`), several other files in `core/` remain large and concern-dense. This RFC enumerates them in priority order so future refactor work has a reference. **As of 2026-06-10 all five targets (§3.1–§3.5) are complete.** This document is now a record; open follow-ups are listed inline per section.
 
 This is a **planning document**, not an approval-bound RFC. Each target listed here would get its own scoped RFC (like `RFC_APP_REFACTOR.md`) before work starts.
 
@@ -56,7 +56,9 @@ Original concern inventory (for reference) — the file mixed:
 
 ---
 
-### 3.2 `core/Entity.ts` — 1142 LOC (was 1212 at draft time)
+### 3.2 `core/Entity.ts` — ~~1142 LOC~~ → 255 LOC — **DONE (2026-06-10)**
+
+**Completed:** merge `e62a34a`, after `ENTITY_COMPONENTS_REMOVAL_PLAN.md` landed (sequencing honored). Split into `core/entity/`: `pendingOps` (72), `cacheStrategies` (97), `saveEntity` (377), `componentAccess` (364), `finders` (202). Save benchmark: 1000-save median +3.8% (p50 3.10→3.28ms — call-frame indirection, within the 10% gate). Promotions: `components`, `removedComponents`, `savedRemovedComponents`, `addComponent` → public `@internal`. Latent gaps found and deliberately NOT fixed (file separately): `doDelete`'s post-delete hooks run via bare `queueMicrotask`, invisible to `drainPendingSideEffects`; `_loadComponent` has no negative-cache write despite changelog wording.
 
 **Why next:** `save()` alone likely 300+ LOC. Cache ops inline. Mixes:
 
@@ -242,9 +244,9 @@ If a refactor reveals a latent bug (wrong ordering, missing guard, stale comment
 
 1. ~~**`App.ts`**~~ — **Done** (merged `c855e04`, 2026-05-09).
 2. ~~**`SchedulerManager.ts`**~~, ~~**`EntityHookManager.ts`**~~, ~~**`CacheManager.ts`**~~ — **Done** (merged `c5f9730`, `b82abe6`, `ef70361` on 2026-06-10; executed in parallel via isolated worktrees, full suite green after each merge).
-3. **`Entity.ts`** — Last remaining target. Gated **after** `ENTITY_COMPONENTS_REMOVAL_PLAN.md` lands (it rewrites/deletes large parts of `save()`; splitting first creates churn). Highest perf sensitivity but biggest readability win. Allocate benchmark time.
+3. ~~**`Entity.ts`**~~ — **Done** (merged `e62a34a`, 2026-06-10, after the `ENTITY_COMPONENTS_REMOVAL_PLAN.md` gate cleared the same day; benchmark-validated).
 
-The original ordering rationale held: the most heavily-tested file went first (more guardrails); the perf-sensitive file goes last with dedicated benchmark time.
+The original ordering rationale held: the most heavily-tested file went first (more guardrails); the perf-sensitive file went last with dedicated benchmark time.
 
 ## 6. Anti-Goals
 
