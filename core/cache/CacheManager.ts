@@ -2,18 +2,38 @@ import { type CacheProvider } from './CacheProvider';
 import { type CacheConfig, defaultCacheConfig } from '../../config/cache.config';
 import { CacheFactory } from './CacheFactory';
 import { MultiLevelCache } from './MultiLevelCache';
-import { RedisCache } from './RedisCache';
 import { logger } from '../Logger';
 import type { Entity } from '../Entity';
 import type { BaseComponent } from '../components';
 import type { ComponentData } from '../RequestLoaders';
-
-interface InvalidationMessage {
-    instanceId: string;
-    type: 'key' | 'pattern';
-    keys?: string[];
-    pattern?: string;
-}
+import {
+    getEntity as _getEntity,
+    setEntityWriteThrough as _setEntityWriteThrough,
+    getEntities as _getEntities,
+    setEntitiesWriteThrough as _setEntitiesWriteThrough,
+    getComponentsByEntity as _getComponentsByEntity,
+    setComponentWriteThrough as _setComponentWriteThrough,
+    setComponentsBatchWriteThrough as _setComponentsBatchWriteThrough,
+    getComponents as _getComponents,
+    setComponentsWriteThrough as _setComponentsWriteThrough,
+} from './strategies/writeThrough';
+import {
+    invalidateEntity as _invalidateEntity,
+    invalidateEntities as _invalidateEntities,
+    invalidateAllEntityComponents as _invalidateAllEntityComponents,
+    invalidateComponent as _invalidateComponent,
+    invalidateComponents as _invalidateComponents,
+    invalidateEntityComponents as _invalidateEntityComponents,
+} from './strategies/writeInvalidate';
+import {
+    setupPubSub as _setupPubSub,
+    handleRemoteInvalidation as _handleRemoteInvalidation,
+    publishInvalidation as _publishInvalidation,
+} from './invalidation';
+import {
+    getStats as _getStats,
+    ping as _ping,
+} from './health';
 
 /**
  * Sentinel value written to the cache to record "known absent" lookups.
@@ -36,7 +56,6 @@ export class CacheManager {
     private config: Readonly<CacheConfig>;
     private instanceId = crypto.randomUUID();
     private pubSubEnabled = false;
-    private static readonly INVALIDATION_CHANNEL = 'bunsane:cache:invalidate';
 
     private constructor() {
         this.config = Object.freeze({ ...defaultCacheConfig });
@@ -88,18 +107,7 @@ export class CacheManager {
      * Returns entity ID if exists, null if not found
      */
     public async getEntity(id: string): Promise<string | null> {
-        if (!this.config.enabled || !this.config.entity?.enabled) {
-            return null;
-        }
-
-        try {
-            const key = `entity:${id}`;
-            const result = await this.provider.get<string>(key);
-            return result || null;
-        } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error getting entity from cache', error });
-            return null;
-        }
+        return _getEntity(this.provider, this.config, id);
     }
 
     /**
@@ -107,35 +115,14 @@ export class CacheManager {
      * Only caches entity ID for existence tracking, not full entity data
      */
     public async setEntityWriteThrough(entity: Entity, ttl?: number): Promise<void> {
-        if (!this.config.enabled || !this.config.entity?.enabled) {
-            return;
-        }
-
-        try {
-            const key = `entity:${entity.id}`;
-            const effectiveTTL = ttl ?? this.config.entity.ttl;
-            // Only cache entity ID for existence check
-            await this.provider.set(key, entity.id, effectiveTTL);
-        } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error setting entity in cache', error });
-        }
+        return _setEntityWriteThrough(this.provider, this.config, entity, ttl);
     }
 
     /**
      * Invalidate an entity from cache
      */
     public async invalidateEntity(id: string): Promise<void> {
-        if (!this.config.enabled || !this.config.entity?.enabled) {
-            return;
-        }
-
-        try {
-            const key = `entity:${id}`;
-            await this.provider.delete(key);
-            await this.publishInvalidation('key', [key]);
-        } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error invalidating entity from cache', error });
-        }
+        return _invalidateEntity(this.provider, this.config, this._publishInvalidation.bind(this), id);
     }
 
     /**
@@ -143,18 +130,7 @@ export class CacheManager {
      * Returns entity IDs if they exist, null if not found
      */
     public async getEntities(ids: string[]): Promise<(string | null)[]> {
-        if (!this.config.enabled || !this.config.entity?.enabled) {
-            return ids.map(() => null);
-        }
-
-        try {
-            const cacheKeys = ids.map(id => `entity:${id}`);
-            const results = await this.provider.getMany<string>(cacheKeys);
-            return results;
-        } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error getting entities from cache', error });
-            return ids.map(() => null);
-        }
+        return _getEntities(this.provider, this.config, ids);
     }
 
     /**
@@ -162,22 +138,7 @@ export class CacheManager {
      * Only caches entity IDs for existence tracking, not full entity data
      */
     public async setEntitiesWriteThrough(entities: Entity[], ttl?: number): Promise<void> {
-        if (!this.config.enabled || !this.config.entity?.enabled) {
-            return;
-        }
-
-        try {
-            const effectiveTTL = ttl ?? this.config.entity?.ttl;
-            const entries = entities.map(entity => ({
-                key: `entity:${entity.id}`,
-                // Only cache entity ID for existence check
-                value: entity.id,
-                ttl: effectiveTTL
-            }));
-            await this.provider.setMany(entries);
-        } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error setting entities in cache', error });
-        }
+        return _setEntitiesWriteThrough(this.provider, this.config, entities, ttl);
     }
 
     // Component caching methods
@@ -186,19 +147,7 @@ export class CacheManager {
      * Get components for an entity from cache
      */
     public async getComponentsByEntity(entityId: string, componentType?: string): Promise<BaseComponent[] | null> {
-        if (!this.config.enabled || !this.config.component?.enabled) {
-            return null;
-        }
-
-        try {
-            const key = componentType
-                ? `component:${entityId}:${componentType}`
-                : `components:${entityId}`;
-            return await this.provider.get<BaseComponent[]>(key);
-        } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error getting components from cache', error });
-            return null;
-        }
+        return _getComponentsByEntity(this.provider, this.config, entityId, componentType);
     }
 
     /**
@@ -207,16 +156,7 @@ export class CacheManager {
      * Delegates to setComponentsBatchWriteThrough for a single-entity, 2-RTT batch.
      */
     public async setComponentWriteThrough(entityId: string, components: BaseComponent[], componentType?: string, ttl?: number): Promise<void> {
-        if (!this.config.enabled || !this.config.component?.enabled) {
-            return;
-        }
-        const entries = components.map(c => ({
-            entityId,
-            typeId: componentType || c.getTypeID(),
-            component: c,
-            ttl,
-        }));
-        await this.setComponentsBatchWriteThrough(entries);
+        return _setComponentWriteThrough(this.provider, this.config, entityId, components, componentType, ttl);
     }
 
     /**
@@ -233,43 +173,7 @@ export class CacheManager {
     public async setComponentsBatchWriteThrough(
         entries: Array<{ entityId: string; typeId: string; component: BaseComponent; ttl?: number }>,
     ): Promise<void> {
-        if (!this.config.enabled || !this.config.component?.enabled || entries.length === 0) {
-            return;
-        }
-
-        try {
-            const effectiveTTL = this.config.component.ttl;
-            const keys = entries.map(e => `component:${e.entityId}:${e.typeId}`);
-
-            // One batched read — preserves createdAt from existing entries (H-CACHE-3).
-            const existing = await this.provider.getMany<ComponentData>(keys);
-
-            const now = new Date();
-            const setEntries = entries.map((e, i) => {
-                const prev = existing[i];
-                const createdAt: Date =
-                    prev && prev.createdAt
-                        ? (prev.createdAt instanceof Date ? prev.createdAt : new Date(prev.createdAt))
-                        : now;
-
-                const componentData: ComponentData = {
-                    id: e.component.id,
-                    entityId: e.entityId,
-                    typeId: e.typeId,
-                    data: e.component.data(),
-                    createdAt,
-                    updatedAt: now,
-                    deletedAt: null,
-                };
-
-                return { key: keys[i]!, value: componentData, ttl: e.ttl ?? effectiveTTL };
-            });
-
-            // One batched write.
-            await this.provider.setMany(setEntries);
-        } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error setting components in cache (batch)', err: error });
-        }
+        return _setComponentsBatchWriteThrough(this.provider, this.config, entries);
     }
 
     /**
@@ -277,22 +181,7 @@ export class CacheManager {
      * More granular than invalidateComponents which can invalidate all components
      */
     public async invalidateComponent(entityId: string, typeId: string): Promise<void> {
-        if (!this.config.enabled || !this.config.component?.enabled) {
-            return;
-        }
-
-        try {
-            logger.trace({
-                msg: 'Invalidating component from cache',
-                entityId,
-                typeId
-            })
-            const key = `component:${entityId}:${typeId}`;
-            await this.provider.delete(key);
-            await this.publishInvalidation('key', [key]);
-        } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error invalidating component from cache', error });
-        }
+        return _invalidateComponent(this.provider, this.config, this._publishInvalidation.bind(this), entityId, typeId);
     }
 
     /**
@@ -305,19 +194,7 @@ export class CacheManager {
         componentTypeIds: string[],
         opts?: { includeEntityKey?: boolean },
     ): Promise<void> {
-        if (!this.config.enabled) return;
-        if (componentTypeIds.length === 0 && !opts?.includeEntityKey) return;
-
-        try {
-            const keys: string[] = componentTypeIds.map(typeId => `component:${entityId}:${typeId}`);
-            if (opts?.includeEntityKey) {
-                keys.push(`entity:${entityId}`);
-            }
-            await this.provider.deleteMany(keys);
-            await this.publishInvalidation('key', keys);
-        } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error invalidating entity components', entityId, error });
-        }
+        return _invalidateEntityComponents(this.provider, this.config, this._publishInvalidation.bind(this), entityId, componentTypeIds, opts);
     }
 
     /**
@@ -325,17 +202,7 @@ export class CacheManager {
      * Useful for bulk invalidation operations
      */
     public async invalidateComponents(components: Array<{ entityId: string; typeId: string }>): Promise<void> {
-        if (!this.config.enabled || !this.config.component?.enabled) {
-            return;
-        }
-
-        try {
-            const keys = components.map(comp => `component:${comp.entityId}:${comp.typeId}`);
-            await this.provider.deleteMany(keys);
-            await this.publishInvalidation('key', keys);
-        } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error invalidating components from cache', error });
-        }
+        return _invalidateComponents(this.provider, this.config, this._publishInvalidation.bind(this), components);
     }
 
     /**
@@ -345,15 +212,7 @@ export class CacheManager {
      * stale L1/L2 cache entries.
      */
     public async invalidateEntities(entityIds: string[]): Promise<void> {
-        if (!this.config.enabled || entityIds.length === 0) {
-            return;
-        }
-        await Promise.all(
-            entityIds.flatMap(id => [
-                this.invalidateEntity(id),
-                this.invalidateAllEntityComponents(id),
-            ])
-        );
+        return _invalidateEntities(this.provider, this.config, this._publishInvalidation.bind(this), entityIds);
     }
 
     /**
@@ -361,17 +220,7 @@ export class CacheManager {
      * Uses pattern matching to efficiently clear all component caches for an entity
      */
     public async invalidateAllEntityComponents(entityId: string): Promise<void> {
-        if (!this.config.enabled || !this.config.component?.enabled) {
-            return;
-        }
-
-        try {
-            const pattern = `component:${entityId}:*`;
-            await this.provider.invalidatePattern(pattern);
-            await this.publishInvalidation('pattern', undefined, pattern);
-        } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error invalidating all entity components from cache', error });
-        }
+        return _invalidateAllEntityComponents(this.provider, this.config, this._publishInvalidation.bind(this), entityId);
     }
 
     /**
@@ -380,18 +229,7 @@ export class CacheManager {
      * recorded; callers must treat this as a hit and propagate null upstream.
      */
     public async getComponents(keys: Array<{ entityId: string; typeId: string }>): Promise<(ComponentCacheValue | null)[]> {
-        if (!this.config.enabled || !this.config.component?.enabled) {
-            return keys.map(() => null);
-        }
-
-        try {
-            const cacheKeys = keys.map(k => `component:${k.entityId}:${k.typeId}`);
-            const results = await this.provider.getMany<ComponentCacheValue>(cacheKeys);
-            return results;
-        } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error getting components from cache', error });
-            return keys.map(() => null);
-        }
+        return _getComponents(this.provider, this.config, keys);
     }
 
     /**
@@ -406,45 +244,7 @@ export class CacheManager {
         ttlOrRequested?: number | Array<{ entityId: string; typeId: string }>,
         ttlIfRequested?: number,
     ): Promise<void> {
-        if (!this.config.enabled || !this.config.component?.enabled) {
-            return;
-        }
-
-        // Backward-compatible overload: (components, ttl?) or (components, requestedKeys, ttl?)
-        const requestedKeys = Array.isArray(ttlOrRequested) ? ttlOrRequested : undefined;
-        const ttl = Array.isArray(ttlOrRequested) ? ttlIfRequested : ttlOrRequested;
-
-        try {
-            const componentTTL = ttl ?? this.config.component.ttl;
-            const entries: Array<{ key: string; value: ComponentCacheValue; ttl: number }> = components.map(comp => ({
-                key: `component:${comp.entityId}:${comp.typeId}`,
-                value: comp,
-                ttl: componentTTL,
-            }));
-
-            const negativeEnabled = this.config.component.negativeCacheEnabled === true;
-            if (negativeEnabled && requestedKeys && requestedKeys.length > 0) {
-                const found = new Set(components.map(c => `${c.entityId}-${c.typeId}`));
-                const tombstoneTTL = this.config.component.negativeCacheTtl
-                    ?? Math.min(componentTTL, 60_000);
-                for (const k of requestedKeys) {
-                    const dedupeKey = `${k.entityId}-${k.typeId}`;
-                    if (!found.has(dedupeKey)) {
-                        entries.push({
-                            key: `component:${k.entityId}:${k.typeId}`,
-                            value: COMPONENT_TOMBSTONE,
-                            ttl: tombstoneTTL,
-                        });
-                    }
-                }
-            }
-
-            if (entries.length > 0) {
-                await this.provider.setMany(entries);
-            }
-        } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error setting components in cache', error });
-        }
+        return _setComponentsWriteThrough(this.provider, this.config, components, ttlOrRequested, ttlIfRequested);
     }
 
     // Relation negative-cache methods
@@ -514,7 +314,7 @@ export class CacheManager {
         try {
             const key = CacheManager.relationCacheKey(entityId, relationField, relatedType, foreignKey);
             await this.provider.delete(key);
-            await this.publishInvalidation('key', [key]);
+            await this._publishInvalidation('key', [key]);
         } catch (error) {
             logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error invalidating relation tombstone', error });
         }
@@ -565,7 +365,7 @@ export class CacheManager {
         try {
             await this.provider.delete(key);
             const keys = Array.isArray(key) ? key : [key];
-            await this.publishInvalidation('key', keys);
+            await this._publishInvalidation('key', keys);
         } catch (error) {
             logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error deleting from cache', error });
         }
@@ -581,7 +381,7 @@ export class CacheManager {
 
         try {
             await this.provider.clear();
-            await this.publishInvalidation('pattern', undefined, '*');
+            await this._publishInvalidation('pattern', undefined, '*');
         } catch (error) {
             logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error clearing cache', error });
         }
@@ -591,30 +391,14 @@ export class CacheManager {
      * Get cache statistics
      */
     public async getStats() {
-        try {
-            return await this.provider.getStats();
-        } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error getting cache stats', error });
-            return {
-                hits: 0,
-                misses: 0,
-                hitRate: 0,
-                size: 0,
-                memoryUsage: 0
-            };
-        }
+        return _getStats(this.provider);
     }
 
     /**
      * Health check for cache
      */
     public async ping(): Promise<boolean> {
-        try {
-            return await this.provider.ping();
-        } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Cache ping failed', error });
-            return false;
-        }
+        return _ping(this.provider);
     }
 
     // --- Cross-instance pub/sub ---
@@ -624,21 +408,11 @@ export class CacheManager {
      * Only activates when using MultiLevel provider with a Redis L2.
      */
     private async setupPubSub(): Promise<void> {
-        if (!(this.provider instanceof MultiLevelCache)) return;
-
-        const l2 = this.provider.getL2Cache();
-        if (!(l2 instanceof RedisCache)) return;
-
-        try {
-            await l2.subscribeInvalidation(
-                CacheManager.INVALIDATION_CHANNEL,
-                (_channel, message) => this.handleRemoteInvalidation(message)
-            );
-            this.pubSubEnabled = true;
-            logger.info({ scope: 'cache', component: 'CacheManager', msg: 'Cross-instance cache invalidation enabled', instanceId: this.instanceId });
-        } catch (error) {
-            logger.warn({ scope: 'cache', component: 'CacheManager', msg: 'Failed to setup pub/sub', error });
-        }
+        this.pubSubEnabled = await _setupPubSub(
+            this.provider,
+            this.instanceId,
+            (raw) => this.handleRemoteInvalidation(raw)
+        );
     }
 
     /**
@@ -646,43 +420,14 @@ export class CacheManager {
      * Ignores messages from self. Invalidates L1 only (L2 is shared Redis).
      */
     private async handleRemoteInvalidation(raw: string): Promise<void> {
-        try {
-            const msg: InvalidationMessage = JSON.parse(raw);
-
-            // Ignore our own messages
-            if (msg.instanceId === this.instanceId) return;
-
-            if (!(this.provider instanceof MultiLevelCache)) return;
-            const l1 = this.provider.getL1Cache();
-
-            if (msg.type === 'key' && msg.keys) {
-                await l1.deleteMany(msg.keys);
-            } else if (msg.type === 'pattern' && msg.pattern) {
-                await l1.invalidatePattern(msg.pattern);
-            }
-
-            logger.debug({ scope: 'cache', component: 'CacheManager', msg: 'Applied remote invalidation', from: msg.instanceId, type: msg.type });
-        } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error handling remote invalidation', error });
-        }
+        return _handleRemoteInvalidation(this.provider, this.instanceId, raw);
     }
 
     /**
      * Publish an invalidation event to other instances via Redis pub/sub.
      */
-    private async publishInvalidation(type: 'key' | 'pattern', keys?: string[], pattern?: string): Promise<void> {
-        if (!this.pubSubEnabled) return;
-        if (!(this.provider instanceof MultiLevelCache)) return;
-
-        const l2 = this.provider.getL2Cache();
-        if (!(l2 instanceof RedisCache)) return;
-
-        try {
-            const msg: InvalidationMessage = { instanceId: this.instanceId, type, keys, pattern };
-            await l2.publishInvalidation(CacheManager.INVALIDATION_CHANNEL, JSON.stringify(msg));
-        } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error publishing invalidation', error });
-        }
+    private async _publishInvalidation(type: 'key' | 'pattern', keys?: string[], pattern?: string): Promise<void> {
+        return _publishInvalidation(this.provider, this.pubSubEnabled, this.instanceId, type, keys, pattern);
     }
 
     /**
