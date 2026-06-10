@@ -24,12 +24,17 @@ export class LocalStorageProvider extends StorageProvider {
         this.basePath = config.basePath || "./public";
         this.baseUrl = config.baseUrl || "";
         this.validateConfig();
+        // Synchronous, idempotent dir creation. Done in the constructor so that
+        // registration is never deferred to a microtask — see BUNSANE-007.
+        this.ensureBaseDir();
     }
 
     public async initialize(): Promise<void> {
-        logger.info("Initializing Local Storage Provider");
-        
-        // Ensure base directory exists
+        // Kept for StorageProvider contract / explicit re-init. Idempotent.
+        this.ensureBaseDir();
+    }
+
+    private ensureBaseDir(): void {
         if (!fs.existsSync(this.basePath)) {
             fs.mkdirSync(this.basePath, { recursive: true });
             logger.info(`Created base directory: ${this.basePath}`);

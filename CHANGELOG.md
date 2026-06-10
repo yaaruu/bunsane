@@ -4,6 +4,22 @@ All notable changes to bunsane are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- **`UploadManager` no longer registers default providers asynchronously
+  (BUNSANE-007).** The constructor previously called an `async`
+  `initializeDefaultProviders()` that suspended on
+  `await localProvider.initialize()`, so the default `"local"` provider
+  was registered in a *later* microtask — after any consumer's
+  synchronous `registerStorageProvider("local", custom)` override — and
+  silently clobbered it. Result: uploads via `"local"` always wrote to
+  the default `./public` regardless of a custom `basePath`/`UPLOAD_ROOT`
+  provider. Default registration is now fully synchronous, and
+  `LocalStorageProvider` creates its base directory in its constructor
+  (`initialize()` retained as an idempotent no-op for the
+  `StorageProvider` contract and S3 parity). A custom `"local"` provider
+  registered immediately after `getInstance()` now survives.
+
 ### Added (v0.3.2 — AbortSignal propagation + DB observability)
 
 - **AbortSignal threading into `Query.exec` + DataLoaders.** Resolvers
