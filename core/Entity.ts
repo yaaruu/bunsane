@@ -1,97 +1,26 @@
-import type { ComponentDataType, ComponentGetter, BaseComponent } from "./components";
-import { logger } from "./Logger";
-import db, { QUERY_TIMEOUT_MS } from "../database";
-import { runWithSignal } from "../database/cancellable";
-import EntityManager from "./EntityManager";
-import ComponentRegistry from "./components/ComponentRegistry";
+import type { ComponentDataType, BaseComponent } from "./components";
 import { uuidv7 } from "../utils/uuid";
-import { sql, SQL } from "bun";
-// import Query from "./Query"; // Lazy import to avoid cycle
+import { SQL } from "bun";
 import { timed } from "./Decorators";
-import EntityHookManager from "./EntityHookManager";
-import { getMetadataStorage } from "./metadata";
-import { EntityCreatedEvent, EntityUpdatedEvent, EntityDeletedEvent, ComponentAddedEvent, ComponentUpdatedEvent, ComponentRemovedEvent } from "./events/EntityLifecycleEvents";
 import type { IEntity } from "./EntityInterface";
-import { getRequestScope } from "./requestScope";
+import EntityManager from "./EntityManager";
+import * as pendingOps from "./entity/pendingOps";
+import * as componentAccess from "./entity/componentAccess";
+import * as saveEntity from "./entity/saveEntity";
+import * as finders from "./entity/finders";
 
 export class Entity implements IEntity {
     id: string;
     public _persisted: boolean = false;
-    private components: Map<string, BaseComponent> = new Map<string, BaseComponent>();
-    private removedComponents: Set<string> = new Set<string>();
+    /** @internal Promoted from private for the core/entity/ submodule split (RFC §3.2). Not part of the public API. */
+    public components: Map<string, BaseComponent> = new Map<string, BaseComponent>();
+    /** @internal Promoted from private for the core/entity/ submodule split (RFC §3.2). Not part of the public API. */
+    public removedComponents: Set<string> = new Set<string>();
     // Track components that were removed and already saved to DB
     // This persists after save() so resolvers can detect removed components
-    private savedRemovedComponents: Set<string> = new Set<string>();
+    /** @internal Promoted from private for the core/entity/ submodule split (RFC §3.2). Not part of the public API. */
+    public savedRemovedComponents: Set<string> = new Set<string>();
     protected _dirty: boolean = false;
-
-    // Drainable set of fire-and-forget cache ops triggered from set/remove.
-    // App.shutdown can await these to avoid losing writes mid-shutdown
-    // (H-CACHE-1).
-    private static pendingCacheOps: Set<Promise<void>> = new Set();
-
-    // Drainable set of post-commit side-effect Promises scheduled via
-    // queueMicrotask from save(). Includes cache invalidation + lifecycle
-    // hooks (EntityCreated / EntityUpdated). Hooks may transitively trigger
-    // more DB work (e.g., entity.save() from a handler), which is why this
-    // is tracked separately from pendingCacheOps. Tests running against
-    // PGlite's single-connection pool should drain this between test files
-    // to prevent background work from prior files queueing behind the
-    // current file's save and masking visibility of recently-committed
-    // rows. See BUNSANE-001.
-    private static pendingSideEffects: Set<Promise<void>> = new Set();
-
-    /**
-     * Await all pending background cache operations. Call during shutdown
-     * after HTTP drain but before cache.disconnect so setImmediate'd cache
-     * writes are not lost. Bounded by `timeoutMs`.
-     */
-    public static async drainPendingCacheOps(timeoutMs: number = 5_000): Promise<void> {
-        if (Entity.pendingCacheOps.size === 0) return;
-        const snapshot = [...Entity.pendingCacheOps];
-        const drainTimer = new Promise<'timeout'>((resolve) => {
-            const t = setTimeout(() => resolve('timeout'), timeoutMs);
-            t.unref?.();
-        });
-        await Promise.race([
-            Promise.allSettled(snapshot).then(() => 'drained' as const),
-            drainTimer,
-        ]);
-    }
-
-    /**
-     * Await all pending post-commit side effects (cache invalidation +
-     * lifecycle hooks scheduled via queueMicrotask from save()). Call from
-     * test setup/teardown hooks under PGlite to guarantee prior-file
-     * background work has settled before the next file's saves run. Bounded
-     * by `timeoutMs`. Safe to call repeatedly; no-op when the set is empty.
-     */
-    public static async drainPendingSideEffects(timeoutMs: number = 5_000): Promise<void> {
-        if (Entity.pendingSideEffects.size === 0) return;
-        const snapshot = [...Entity.pendingSideEffects];
-        const drainTimer = new Promise<'timeout'>((resolve) => {
-            const t = setTimeout(() => resolve('timeout'), timeoutMs);
-            t.unref?.();
-        });
-        await Promise.race([
-            Promise.allSettled(snapshot).then(() => 'drained' as const),
-            drainTimer,
-        ]);
-    }
-
-    /**
-     * Track a fire-and-forget cache promise in the drainable set. Public so
-     * other framework read paths (e.g. Query.populateComponents cache
-     * warming) share the same drain semantics (H-CACHE-1).
-     */
-    public static trackCacheOp(p: Promise<void>): void {
-        Entity.pendingCacheOps.add(p);
-        p.finally(() => Entity.pendingCacheOps.delete(p));
-    }
-
-    private static trackSideEffect(p: Promise<void>): void {
-        Entity.pendingSideEffects.add(p);
-        p.finally(() => Entity.pendingSideEffects.delete(p));
-    }
 
     constructor(id?: string) {
         // Use || instead of ?? to also handle empty strings
@@ -107,56 +36,68 @@ export class Entity implements IEntity {
         return new Entity(id);
     }
 
-    protected addComponent(component: BaseComponent): Entity {
-        this.components.set(component.getTypeID(), component);
-        return this;
+    // --- Drainable background-work delegates (core/entity/pendingOps.ts) ---
+
+    /**
+     * Await all pending background cache operations. Call during shutdown
+     * after HTTP drain but before cache.disconnect so setImmediate'd cache
+     * writes are not lost. Bounded by `timeoutMs`.
+     */
+    public static drainPendingCacheOps(timeoutMs: number = 5_000): Promise<void> {
+        return pendingOps.drainPendingCacheOps(timeoutMs);
     }
 
     /**
-     * Resolve a component constructor to its type id. `getComponentId` is
-     * memoized in metadata storage, so this is an O(1) Map lookup with no
-     * component instantiation — unlike `new ctor().getTypeID()`. The
-     * `components` map is keyed by type id (see addComponent), so callers can
-     * then do `this.components.get(typeId)` instead of allocating an array and
-     * scanning it with `instanceof`.
+     * Await all pending post-commit side effects (cache invalidation +
+     * lifecycle hooks scheduled via queueMicrotask from save()). Call from
+     * test setup/teardown hooks under PGlite to guarantee prior-file
+     * background work has settled before the next file's saves run. Bounded
+     * by `timeoutMs`. Safe to call repeatedly; no-op when the set is empty.
      */
-    private typeIdOf(ctor: new (...args: any[]) => BaseComponent): string {
-        return getMetadataStorage().getComponentId(ctor.name);
+    public static drainPendingSideEffects(timeoutMs: number = 5_000): Promise<void> {
+        return pendingOps.drainPendingSideEffects(timeoutMs);
+    }
+
+    /**
+     * Track a fire-and-forget cache promise in the drainable set. Public so
+     * other framework read paths (e.g. Query.populateComponents cache
+     * warming) share the same drain semantics (H-CACHE-1).
+     */
+    public static trackCacheOp(p: Promise<void>): void {
+        pendingOps.trackCacheOp(p);
+    }
+
+    // --- Component access (core/entity/componentAccess.ts) ---
+
+    /** @internal Promoted from protected for the core/entity/ submodule split (RFC §3.2). Query.ts / RequestLoaders.ts already cast to call this. */
+    public addComponent(component: BaseComponent): Entity {
+        return componentAccess.addComponent(this, component);
     }
 
     public componentList(): BaseComponent[] {
-        return Array.from(this.components.values());
+        return componentAccess.componentList(this);
     }
 
     /**
      * Synchronously check if a component is already loaded in memory.
      * This does NOT trigger a database fetch - use get() for that.
-     * @param ctor Component constructor
-     * @returns Component instance if already in memory, undefined otherwise
      */
     public getInMemory<T extends BaseComponent>(ctor: new (...args: any[]) => T): T | undefined {
-        return this.components.get(this.typeIdOf(ctor)) as T | undefined;
+        return componentAccess.getInMemory(this, ctor);
     }
 
     /**
      * Check if a component exists in memory (synchronous, no DB fetch).
-     * @param ctor Component constructor
-     * @returns true if component is already loaded in memory
      */
     public hasInMemory<T extends BaseComponent>(ctor: new (...args: any[]) => T): boolean {
-        return this.components.has(this.typeIdOf(ctor));
+        return componentAccess.hasInMemory(this, ctor);
     }
 
     /**
      * Check if a component was explicitly removed from this entity (pending or already saved deletion).
-     * Useful in resolvers to avoid returning stale cached data for removed components.
-     * @param ctor Component constructor
-     * @returns true if component was removed (pending or saved)
      */
     public wasRemoved<T extends BaseComponent>(ctor: new (...args: any[]) => T): boolean {
-        const typeId = this.typeIdOf(ctor);
-        // Check both pending removals and already-saved removals
-        return this.removedComponents.has(typeId) || this.savedRemovedComponents.has(typeId);
+        return componentAccess.wasRemoved(this, ctor);
     }
 
     /**
@@ -164,90 +105,15 @@ export class Entity implements IEntity {
      * Use like: entity.add(Component, { value: "Test" })
      */
     public add<T extends BaseComponent>(ctor: new (...args: any[]) => T, data?: Partial<ComponentDataType<T>>): this {
-        const instance = new ctor();
-        if (data) {
-            Object.assign(instance, data);
-        } else {
-            Object.assign(instance, {});
-        }
-        this.addComponent(instance);
-        this._dirty = true;
-        // executeHooks is async; the surrounding try/catch only captures
-        // synchronous throws. Attach a .catch so an async rejection from a
-        // hook handler does not escape as an unhandled rejection (H-HOOK-1).
-        // Add stays sync to preserve the fluent chaining signature; hook
-        // failures are logged and do not fail the add operation.
-        Promise.resolve()
-            .then(() => EntityHookManager.executeHooks(new ComponentAddedEvent(this, instance)))
-            .catch((error) => {
-                logger.error(`Error firing component added hook for ${instance.getTypeID()}: ${error}`);
-            });
-
+        componentAccess.add(this, ctor, data);
         return this;
     }
 
     /**
      * Sets/updates a component on the entity.
-     * If the component exists, it updates its properties.
-     * If it doesn't exist, it adds a new component.
-     * Use like: entity.set(Component, { value: "Test" })
      */
     public async set<T extends BaseComponent>(ctor: new (...args: any[]) => T, data: Partial<ComponentDataType<T>>, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<this> {
-        await this.get(ctor, context);
-
-        const component = this.components.get(this.typeIdOf(ctor)) as T;
-        if (component) {
-            // Store old data for the update event
-            const oldData = { ...component };
-            
-            // Update existing component
-            Object.assign(component, data);
-            component.setDirty(true);
-            this._dirty = true;
-            
-            // Fire component updated event. Await so a hook rejection is
-            // captured by this method's try/catch and does not escape as an
-            // unhandled rejection (H-HOOK-1).
-            try {
-                await EntityHookManager.executeHooks(new ComponentUpdatedEvent(this, component, oldData, component));
-            } catch (error) {
-                logger.error(`Error firing component updated hook for ${component.getTypeID()}: ${error}`);
-                // Don't fail the set operation if hooks fail
-            }
-            
-            // Invalidate DataLoader cache if context is provided
-            if (context?.loaders?.componentsByEntityType) {
-                context.loaders.componentsByEntityType.clear({
-                    entityId: this.id,
-                    typeId: component.getTypeID()
-                });
-            }
-            
-            // Fire-and-forget cache update, tracked via drainable set so
-            // App.shutdown can await it (H-CACHE-1).
-            Entity.trackCacheOp((async () => {
-                try {
-                    const { CacheManager } = await import('./cache/CacheManager');
-                    const cacheManager = CacheManager.getInstance();
-                    const config = cacheManager.getConfig();
-
-                    if (config.enabled && config.component?.enabled) {
-                        if (config.strategy === 'write-through') {
-                            await cacheManager.setComponentWriteThrough(this.id, [component], component.getTypeID(), config.component.ttl);
-                        } else {
-                            await cacheManager.invalidateComponent(this.id, component.getTypeID());
-                        }
-                    }
-                } catch (error) {
-                    logger.warn({ scope: 'cache', component: 'Entity', msg: 'Cache operation failed after set', err: error });
-                }
-            })());
-        } else {
-            // Add new component
-            this.add(ctor, data);
-            this._dirty = true;
-            // Note: add() already fires ComponentAddedEvent, so we don't need to fire it again
-        }
+        await componentAccess.set(this, ctor, data, context);
         return this;
     }
 
@@ -255,754 +121,86 @@ export class Entity implements IEntity {
      * Removes a component from the entity.
      * Use like: entity.remove(Component)
      * WARNING: This will delete the component from the database upon saving the entity.
-     * If you want to keep the component in the database but just remove it from the entity instance,
-     * consider implementing a different method.
      */
     public remove<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): boolean {
-        const component = this.components.get(this.typeIdOf(ctor)) as T;
-
-        if (component) {
-            const typeId = component.getTypeID();
-            
-            // Track the component type for database deletion
-            this.removedComponents.add(typeId);
-            
-            // Remove the component from the map
-            this.components.delete(typeId);
-            this._dirty = true;
-            
-            // Fire component removed event. remove() stays sync to preserve
-            // the boolean return signature used by callers; attach .catch so
-            // async hook rejections do not escape (H-HOOK-1).
-            Promise.resolve()
-                .then(() => EntityHookManager.executeHooks(new ComponentRemovedEvent(this, component)))
-                .catch((error) => {
-                    logger.error(`Error firing component removed hook for ${typeId}: ${error}`);
-                });
-            
-            // Invalidate DataLoader cache if context is provided
-            if (context?.loaders?.componentsByEntityType) {
-                context.loaders.componentsByEntityType.clear({
-                    entityId: this.id,
-                    typeId: typeId
-                });
-            }
-            
-            // Fire-and-forget cache invalidation, tracked for shutdown drain
-            // (H-CACHE-1).
-            Entity.trackCacheOp((async () => {
-                try {
-                    const { CacheManager } = await import('./cache/CacheManager');
-                    const cacheManager = CacheManager.getInstance();
-                    const config = cacheManager.getConfig();
-
-                    if (config.enabled && config.component?.enabled) {
-                        await cacheManager.invalidateComponent(this.id, typeId);
-                    }
-                } catch (error) {
-                    logger.warn({ scope: 'cache', component: 'Entity', msg: 'Cache invalidation failed after remove', err: error });
-                }
-            })());
-            
-            return true;
-        }
-        
-        return false;
+        return componentAccess.remove(this, ctor, context);
     }
 
     /**
      * Get component data from entity. Loads from DB if not cached.
-     * @param ctor Component constructor
-     * @param context Optional DataLoader context and/or transaction
-     * @returns Component data or null
      */
-    public async get<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<ComponentDataType<T> | null> {
-        const comp = await this._loadComponent(ctor, context);
-        return comp ? (comp as ComponentGetter<T>).data() : null;
+    public get<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<ComponentDataType<T> | null> {
+        return componentAccess.get(this, ctor, context);
     }
 
     /**
      * Check if entity has a component (type guard).
      * Uses in-memory check only - does not query database.
-     * Useful for runtime checks before accessing component data.
-     *
-     * @example
-     * ```typescript
-     * if (entity.has(Health)) {
-     *   // TypeScript knows entity has Health component
-     *   const health = entity.getCached(Health); // guaranteed to exist
-     * }
-     * ```
-     *
-     * @param ctor Component constructor
-     * @returns true if component exists in memory
      */
     public has<T extends BaseComponent>(ctor: new (...args: any[]) => T): boolean {
-        return this.hasInMemory(ctor);
+        return componentAccess.has(this, ctor);
     }
 
     /**
      * Get component data or throw if not found.
-     * Use this when you know the component must exist (e.g., after a query that included it).
-     *
-     * @example
-     * ```typescript
-     * // After query that included Position
-     * const pos = await entity.getOrThrow(Position);
-     * // pos is guaranteed to be ComponentDataType<Position>, not null
-     * ```
-     *
-     * @param ctor Component constructor
-     * @param context Optional DataLoader context and/or transaction
-     * @returns Component data (never null)
-     * @throws Error if component not found
      */
-    public async getOrThrow<T extends BaseComponent>(
+    public getOrThrow<T extends BaseComponent>(
         ctor: new (...args: any[]) => T,
         context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }
     ): Promise<ComponentDataType<T>> {
-        const data = await this.get(ctor, context);
-        if (data === null) {
-            throw new Error(`Entity ${this.id} is missing required component ${ctor.name}`);
-        }
-        return data;
+        return componentAccess.getOrThrow(this, ctor, context);
     }
 
     /**
      * Get component data synchronously if already loaded in memory.
      * Does NOT trigger a database fetch - returns undefined if not cached.
-     *
-     * Use this for performance-critical code paths when you know
-     * the component was already loaded (e.g., via query populate).
-     *
-     * @example
-     * ```typescript
-     * // After query with .populate()
-     * const pos = entity.getCached(Position);
-     * if (pos) {
-     *   console.log(pos.x, pos.y);
-     * }
-     * ```
-     *
-     * @param ctor Component constructor
-     * @returns Component data if in memory, undefined otherwise
      */
     public getCached<T extends BaseComponent>(ctor: new (...args: any[]) => T): ComponentDataType<T> | undefined {
-        const comp = this.getInMemory(ctor);
-        return comp ? (comp as ComponentGetter<T>).data() : undefined;
+        return componentAccess.getCached(this, ctor);
     }
 
     /**
      * Get component instance from entity. Loads from DB if not cached.
-     * @param ctor Constructor of the component to fetch
-     * @param context Optional DataLoader context and/or transaction
-     * @returns Component instance or null
      */
-    public async getInstanceOf<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<T | null> {
-        return this._loadComponent(ctor, context);
+    public getInstanceOf<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<T | null> {
+        return componentAccess.getInstanceOf(this, ctor, context);
     }
 
     /**
      * Discard in-memory component state and re-hydrate from the database.
      * Preserves entity identity — callers holding a reference see fresh data
-     * on the same instance. Use after a raw-SQL write that bypassed
-     * `entity.set`/`entity.save`, or when a different `Entity` instance with
-     * the same id mutated persisted data.
-     *
-     * @param opts Optional transaction
+     * on the same instance.
      */
     public async reload(opts?: { trx?: SQL; signal?: AbortSignal }): Promise<this> {
-        if (!this.id || this.id.trim() === '') {
-            return this;
-        }
-        this.components.clear();
-        this.removedComponents.clear();
-        this.savedRemovedComponents.clear();
-
-        const dbConn = opts?.trx ?? db;
-        const rows = await runWithSignal<any[]>(
-            dbConn`
-            SELECT c.id, c.type_id, c.data
-            FROM components c
-            WHERE c.entity_id = ${this.id} AND c.deleted_at IS NULL
-        `,
-            opts?.signal
-        );
-
-        const storage = getMetadataStorage();
-        for (const row of rows) {
-            const ctor = ComponentRegistry.getConstructor(row.type_id);
-            if (!ctor) continue;
-            const comp: any = new ctor();
-            const parsed = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
-            Object.assign(comp, parsed);
-            comp.id = row.id;
-            const props = storage.componentProperties.get(row.type_id);
-            if (props) {
-                for (const prop of props) {
-                    if (prop.propertyType === Date && typeof comp[prop.propertyKey] === 'string') {
-                        comp[prop.propertyKey] = new Date(comp[prop.propertyKey]);
-                    }
-                }
-            }
-            comp.setPersisted(true);
-            comp.setDirty(false);
-            this.addComponent(comp);
-        }
-
-        this.setPersisted(true);
-        this.setDirty(false);
+        await componentAccess.reload(this, opts);
         return this;
     }
 
     /**
      * Ensure the given components are hydrated on this entity's in-memory
-     * componentList. No-op for components already loaded. Batched: one SQL
-     * call for all missing components.
-     *
-     * Required when a later `entity.set(...)` + `entity.save()` may trigger
-     * a `@ComponentTargetHook` whose `includeComponents` lists tag
-     * components. Hook matching reads `componentList()` (in-memory only), so
-     * tags must be loaded first for the hook to fire.
-     *
-     * @param ctors Component constructors to ensure are loaded
+     * componentList. No-op for components already loaded.
      */
-    public async requireComponents(ctors: Array<new (...args: any[]) => BaseComponent>): Promise<void> {
-        if (ctors.length === 0) return;
-        const missing: string[] = [];
-        for (const ctor of ctors) {
-            // components is keyed by type id — O(1) lookup, no instantiation
-            // and no O(K) instanceof scan per constructor.
-            const typeId = this.typeIdOf(ctor);
-            if (!this.components.has(typeId)) {
-                missing.push(typeId);
-            }
-        }
-        if (missing.length === 0) return;
-        await Entity.LoadComponents([this], missing);
+    public requireComponents(ctors: Array<new (...args: any[]) => BaseComponent>): Promise<void> {
+        return componentAccess.requireComponents(this, ctors);
     }
 
-    private async _loadComponent<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<T | null> {
-        const comp = this.components.get(this.typeIdOf(ctor)) as T | undefined;
-        if (typeof comp !== "undefined") {
-            return comp;
-        }
-
-        // Validate entity ID before database query
-        if (!this.id || this.id.trim() === '') {
-            logger.warn(`Cannot load component ${ctor.name}: entity id is empty`);
-            return null;
-        }
-
-        // Memoized metadata lookup — no throwaway component instantiation
-        // just to read the type id.
-        const typeId = this.typeIdOf(ctor);
-
-        // Use transaction if provided, otherwise use default db
-        const dbConn = context?.trx ?? db;
-
-        // Ambient request scope fallback: bare entity.get() calls (e.g.
-        // inside @ArcheTypeFunction bodies or Unwrap()) batch through the
-        // request's DataLoaders instead of firing one SELECT per call.
-        // Never substituted when the caller passed an explicit trx — a
-        // loader read outside the transaction could see stale data.
-        const scope = (!context?.loaders && !context?.trx) ? getRequestScope() : undefined;
-        const loaders = context?.loaders ?? scope?.loaders;
-        const signal = context?.signal ?? scope?.signal;
-
-        try {
-            let componentData: any = null;
-            let componentId: string | null = null;
-
-            if (loaders?.componentsByEntityType) {
-                const loaderResult = await loaders.componentsByEntityType.load({
-                    entityId: this.id,
-                    typeId: typeId
-                });
-                if (loaderResult) {
-                    componentData = loaderResult.data;
-                    componentId = loaderResult.id;
-                }
-            } else {
-                // Route through runWithSignal so a request/wall-clock abort can
-                // cancel this in-flight read. When dbConn is context.trx, an
-                // uncancelled read leaks the backend into `idle in transaction`
-                // on timeout (matches the d1dde84 save/delete fix, which missed
-                // the read path).
-                const rows = await runWithSignal<any[]>(
-                    dbConn`SELECT id, data FROM components WHERE entity_id = ${this.id} AND type_id = ${typeId} AND deleted_at IS NULL`,
-                    signal
-                );
-                if (rows.length > 0) {
-                    componentData = rows[0].data;
-                    componentId = rows[0].id;
-                }
-            }
-
-            if (componentData !== null) {
-                const comp: any = new ctor();
-                if (componentId) {
-                    comp.id = componentId;
-                }
-                const parsedData = typeof componentData === 'string' ? JSON.parse(componentData) : componentData;
-                Object.assign(comp, parsedData);
-                const storage = getMetadataStorage();
-                const props = storage.componentProperties.get(typeId);
-                if (props) {
-                    for (const prop of props) {
-                        if (prop.propertyType === Date && typeof comp[prop.propertyKey] === 'string') {
-                            comp[prop.propertyKey] = new Date(comp[prop.propertyKey]);
-                        }
-                    }
-                }
-                comp.setPersisted(true);
-                comp.setDirty(false);
-                this.addComponent(comp);
-                return comp as T;
-            } else {
-                return null;
-            }
-        } catch (error) {
-            logger.error(`Failed to fetch component ${ctor.name}: ${error}`);
-            return null;
-        }
-    }
+    // --- Persistence (core/entity/saveEntity.ts) ---
 
     @timed("Entity.save")
-    public async save(trx?: SQL, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<boolean> {
-        // Capture pre-save state BEFORE doSave mutates persisted/dirty flags.
-        const wasNew = !this._persisted;
-        const changedComponentTypeIds = this.getDirtyComponents();
-        const removedComponentTypeIds = Array.from(this.removedComponents);
-
-        // Pre-flight: await ComponentRegistry readiness for every component on
-        // this entity BEFORE opening the transaction. Previously doSave awaited
-        // ComponentRegistry.getReadyPromise inside the executeSave loop, so a
-        // slow DDL (partition creation) would keep the PG transaction open and
-        // idle-in-transaction waiting on registry state. (H-DB-4).
-        for (const comp of this.components.values()) {
-            const compName = comp.constructor.name;
-            if (!ComponentRegistry.isComponentReady(compName)) {
-                await ComponentRegistry.getReadyPromise(compName);
-            }
-        }
-
-        const profile = process.env.DB_SAVE_PROFILE === 'true';
-        const phaseStart = profile ? performance.now() : 0;
-        const phases: Record<string, number> = {};
-
-        // AbortController cancels in-flight queries and propagates ROLLBACK
-        // when the wall-clock timer fires. Throwing from inside the transaction
-        // callback triggers Bun SQL's auto-ROLLBACK, releasing the pooled connection.
-        const controller = new AbortController();
-        const timeoutMs = QUERY_TIMEOUT_MS;
-        const timeoutHandle = setTimeout(() => {
-            const err = new Error(`Entity save timeout for entity ${this.id} after ${timeoutMs}ms`);
-            logger.error({ scope: 'Entity.save', entityId: this.id, timeoutMs }, err.message);
-            controller.abort(err);
-        }, timeoutMs);
-
-        try {
-            const dbStart = profile ? performance.now() : 0;
-            if (trx) {
-                await this.doSave(trx, controller.signal);
-            } else {
-                await db.transaction(async (newTrx) => {
-                    await this.doSave(newTrx, controller.signal);
-                });
-            }
-            if (profile) phases.db = performance.now() - dbStart;
-
-            clearTimeout(timeoutHandle);
-
-            // Post-commit side effects are fire-and-forget so Redis / hook
-            // latency cannot consume the save budget or block the caller.
-            // Tracked in pendingSideEffects so tests/shutdown can drain
-            // background work before asserting or tearing down.
-            const sideEffectPromise = new Promise<void>((resolve) => {
-                queueMicrotask(() => {
-                    this.runPostCommitSideEffects(
-                        wasNew,
-                        changedComponentTypeIds,
-                        removedComponentTypeIds,
-                        context,
-                        profile ? phases : undefined,
-                        profile ? phaseStart : undefined,
-                    ).finally(() => resolve());
-                });
-            });
-            Entity.trackSideEffect(sideEffectPromise);
-
-            return true;
-        } catch (error) {
-            clearTimeout(timeoutHandle);
-            if (controller.signal.aborted) {
-                throw controller.signal.reason ?? error;
-            }
-            throw error;
-        } finally {
-            // Ensure AbortController listeners are released even on success.
-            if (!controller.signal.aborted) controller.abort();
-        }
+    public save(trx?: SQL, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<boolean> {
+        return saveEntity.saveEntity(this, trx, context);
     }
 
-    /**
-     * Fire-and-forget post-commit work: cache invalidation + lifecycle hooks.
-     * Runs outside the save budget. Errors are logged and swallowed so cache
-     * or hook failures never surface as save failures.
-     */
-    private async runPostCommitSideEffects(
-        wasNew: boolean,
-        changedComponentTypeIds: string[],
-        removedComponentTypeIds: string[],
-        context: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal } | undefined,
-        phases: Record<string, number> | undefined,
-        phaseStart: number | undefined,
-    ): Promise<void> {
-        const profile = phases !== undefined && phaseStart !== undefined;
-
-        const cacheStart = profile ? performance.now() : 0;
-        try {
-            await this.handleCacheAfterSave(changedComponentTypeIds, removedComponentTypeIds, context);
-        } catch (err) {
-            logger.warn({ scope: 'cache', entityId: this.id, err }, 'post-commit cache invalidation failed');
-        }
-        if (profile) phases!.cache = performance.now() - cacheStart;
-
-        const hookStart = profile ? performance.now() : 0;
-        try {
-            if (wasNew) {
-                await EntityHookManager.executeHooks(new EntityCreatedEvent(this));
-            } else if (changedComponentTypeIds.length > 0) {
-                await EntityHookManager.executeHooks(new EntityUpdatedEvent(this, changedComponentTypeIds));
-            }
-        } catch (err) {
-            logger.error({ scope: 'hooks', entityId: this.id, err }, 'post-commit lifecycle hooks failed');
-        }
-        if (profile) phases!.hooks = performance.now() - hookStart;
-
-        if (profile) {
-            phases!.total = performance.now() - phaseStart!;
-            logger.info({ scope: 'Entity.save.profile', entityId: this.id, phases }, 'Entity.save phase timings');
-        }
-    }
-
-    /**
-     * Handle cache operations after successful save
-     * @param changedComponentTypeIds - Component type IDs that were dirty before save (captured before doSave clears flags)
-     * @param removedComponentTypeIds - Component type IDs that were removed (captured before doSave clears the set)
-     */
-    private async handleCacheAfterSave(changedComponentTypeIds: string[], removedComponentTypeIds: string[], context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<void> {
-        try {
-            // Import CacheManager dynamically to avoid circular dependency
-            const { CacheManager } = await import('./cache/CacheManager');
-            const cacheManager = CacheManager.getInstance();
-            const config = cacheManager.getConfig();
-
-            const entityEnabled = !!(config.enabled && config.entity?.enabled);
-            const componentEnabled = !!(config.enabled && config.component?.enabled);
-
-            if (entityEnabled && config.strategy === 'write-through') {
-                await cacheManager.setEntityWriteThrough(this, config.entity!.ttl);
-            }
-
-            // Handle component cache invalidation with granular approach
-            if (componentEnabled) {
-                // Use the pre-captured lists instead of re-querying (dirty flags are already cleared by doSave)
-
-                if (config.strategy === 'write-through') {
-                    // Single batched write-through (2 pipelined provider
-                    // round-trips total) instead of one GET+SET pair per
-                    // changed component.
-                    const entries = changedComponentTypeIds
-                        .map(typeId => ({ typeId, component: this.components.get(typeId) }))
-                        .filter((e): e is { typeId: string; component: BaseComponent } => !!e.component)
-                        .map(e => ({ entityId: this.id, typeId: e.typeId, component: e.component, ttl: config.component!.ttl }));
-                    if (entries.length > 0) {
-                        await cacheManager.setComponentsBatchWriteThrough(entries);
-                    }
-                    // Removed components must still drop out of cache.
-                    if (removedComponentTypeIds.length > 0) {
-                        await cacheManager.invalidateEntityComponents(this.id, removedComponentTypeIds);
-                    }
-                } else {
-                    // One deleteMany + ONE pub/sub message for the whole save
-                    // (entity key included) — previously N+1 DEL+PUBLISH pairs
-                    // per save, fanning out to every other instance.
-                    const toInvalidate = [...changedComponentTypeIds, ...removedComponentTypeIds];
-                    if (toInvalidate.length > 0 || entityEnabled) {
-                        await cacheManager.invalidateEntityComponents(this.id, toInvalidate, { includeEntityKey: entityEnabled });
-                    }
-                }
-
-                // Invalidate DataLoader cache for changed + removed components
-                if (context?.loaders?.componentsByEntityType) {
-                    for (const typeId of [...changedComponentTypeIds, ...removedComponentTypeIds]) {
-                        context.loaders.componentsByEntityType.clear({
-                            entityId: this.id,
-                            typeId: typeId
-                        });
-                    }
-                }
-            } else if (entityEnabled && config.strategy !== 'write-through') {
-                await cacheManager.invalidateEntity(this.id);
-            }
-        } catch (error) {
-            logger.warn({ scope: 'cache', component: 'Entity', msg: 'Cache operation failed after save', error });
-        }
-    }
-
-    public async doSave(trx: SQL, signal?: AbortSignal): Promise<boolean> {
-        // Validate entity ID to prevent PostgreSQL UUID parsing errors
-        if (!this.id || this.id.trim() === '') {
-            logger.error(`Cannot save entity: id is empty or invalid`);
-            throw new Error(`Cannot save entity: id is empty or invalid`);
-        }
-
-        if (!this._dirty) {
-            // Diagnostics object is non-trivial to build (component walk +
-            // preview mapping) — gate on the active level so the not-dirty
-            // fast path stays allocation-free in production.
-            if (logger.isLevelEnabled?.('trace')) {
-                let dirtyComponents: string[] = [];
-                try {
-                    dirtyComponents = this.getDirtyComponents();
-                } catch {
-                    // best-effort diagnostics only
-                }
-
-                const removedTypeIds = Array.from(this.removedComponents);
-                const entityType = (this as any)?.constructor?.name ?? "Entity";
-                const dirtyComponentPreview = dirtyComponents.slice(0, 10).map((component) => {
-                    const anyComponent = component as any;
-                    return {
-                        type: anyComponent?.constructor?.name ?? "Component",
-                        typeId: typeof anyComponent?.getTypeID === "function" ? anyComponent.getTypeID() : undefined,
-                        id: anyComponent?.id,
-                        persisted: anyComponent?._persisted,
-                        dirty: anyComponent?._dirty,
-                    };
-                });
-
-                logger.trace(
-                    {
-                        component: "Entity",
-                        entity: {
-                            type: entityType,
-                            id: this.id,
-                            persisted: this._persisted,
-                            dirty: this._dirty,
-                        },
-                        components: {
-                            total: this.components.size,
-                            dirtyCount: dirtyComponents.length,
-                            dirtyPreview: dirtyComponentPreview,
-                        },
-                        removedComponents: {
-                            count: removedTypeIds.length,
-                            typeIdsPreview: removedTypeIds.slice(0, 10),
-                        },
-                    },
-                    "[Entity.doSave] Skipping save because entity is not dirty"
-                );
-            }
-            return true;
-        }
-
-        // Cancellation goes through the shared `runWithSignal` helper so
-        // every db.unsafe / trx`...` callsite in the framework uses the same
-        // pattern: on abort the in-flight Bun SQL Query is cancelled, the
-        // transaction callback throws, Bun emits ROLLBACK, and the pooled
-        // backend connection is released. Without this a wall-clock timeout
-        // leaks the backend into `idle in transaction` under pgbouncer
-        // transaction-mode pooling.
-        const run = <T>(q: any): Promise<T> => runWithSignal<T>(q, signal);
-
-        const executeSave = async (saveTrx: SQL) => {
-            if (!this._persisted) {
-                await run(saveTrx`INSERT INTO entities (id) VALUES (${this.id}) ON CONFLICT DO NOTHING`);
-                this._persisted = true;
-            }
-
-            // Delete removed components from database. `components` is the
-            // single source of membership truth — one DELETE per removal batch.
-            if (this.removedComponents.size > 0) {
-                const typeIds = Array.from(this.removedComponents);
-                await run(saveTrx`DELETE FROM components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`);
-                // Move to savedRemovedComponents so resolvers can still detect removed components
-                // This is needed because DataLoader may have stale cached data for this request
-                for (const typeId of typeIds) {
-                    this.savedRemovedComponents.add(typeId);
-                }
-                this.removedComponents.clear();
-            }
-
-            if (this.components.size === 0) {
-                logger.trace(`No components to save for entity ${this.id}`);
-                return;
-            }
-
-            // Batch inserts and updates for better performance
-            const componentsToInsert = [];
-            const componentsToUpdate = [];
-
-            for (const comp of this.components.values()) {
-                const compName = comp.constructor.name;
-                // Registry readiness is pre-flighted in save() before the
-                // transaction starts (H-DB-4). This assert catches a
-                // theoretical race if a caller skipped save() and jumped
-                // straight to doSave — we refuse to await inside the txn so
-                // a slow DDL cannot hold a pg session idle in transaction.
-                if (!ComponentRegistry.isComponentReady(compName)) {
-                    throw new Error(`Component ${compName} not ready; call save() (not doSave) or await registry readiness before the transaction.`);
-                }
-
-                if (!(comp as any)._persisted) {
-                    if (comp.id === "") {
-                        comp.id = uuidv7();
-                    }
-                    componentsToInsert.push({
-                        id: comp.id,
-                        entity_id: this.id,
-                        name: compName,
-                        type_id: comp.getTypeID(),
-                        data: comp.serializableData()
-                    });
-                    (comp as any).setPersisted(true);
-                    (comp as any).setDirty(false);
-                } else if ((comp as any)._dirty) {
-                    componentsToUpdate.push({
-                        id: comp.id,
-                        data: comp.serializableData()
-                    });
-                    (comp as any).setDirty(false);
-                }
-            }
-
-            // Perform batch inserts
-            if (componentsToInsert.length > 0) {
-                await run(saveTrx`INSERT INTO components ${sql(componentsToInsert, 'id', 'entity_id', 'name', 'type_id', 'data')}`);
-            }
-
-            // Perform updates. Validate all ids up front (synchronous, fails
-            // fast), then fire the UPDATEs together via Promise.all so they
-            // pipeline on the transaction connection instead of paying one
-            // serial round-trip per dirty component.
-            if (componentsToUpdate.length > 0) {
-                const traceEnabled = logger.isLevelEnabled?.('trace') === true;
-                for (const comp of componentsToUpdate) {
-                    // Validate component ID to prevent PostgreSQL UUID parsing errors
-                    if (!comp.id || comp.id.trim() === '') {
-                        logger.error(`Cannot update component: id is empty or invalid. Component data: ${JSON.stringify(comp.data).substring(0, 200)}`);
-                        throw new Error(`Cannot update component: component id is empty or invalid`);
-                    }
-                    // Level-gated: per-component log-object allocation in the
-                    // write hot path is pure waste when trace is off.
-                    if (traceEnabled) {
-                        logger.trace({ componentId: comp.id, data: comp.data }, `[Entity.doSave] Updating component`);
-                    }
-                }
-                await Promise.all(
-                    componentsToUpdate.map(comp =>
-                        run(saveTrx`UPDATE components SET data = ${comp.data} WHERE id = ${comp.id}`)
-                    )
-                );
-            }
-        };
-
-        await executeSave(trx);
-
-        this._dirty = false;
-
-        return true;
+    public doSave(trx: SQL, signal?: AbortSignal): Promise<boolean> {
+        return saveEntity.doSave(this, trx, signal);
     }
 
     public delete(force: boolean = false) {
         return EntityManager.deleteEntity(this, force);
     }
 
-    public async doDelete(force: boolean = false): Promise<boolean> {
-        if (!this._persisted) {
-            logger.warn("Entity is not persisted, cannot delete.");
-            return false;
-        }
-
-        // AbortController cancels in-flight queries on wall-clock timeout so a
-        // hanging DELETE cannot leak backends into `idle in transaction` under
-        // pgbouncer transaction pool mode. Same pattern as Entity.save.
-        const controller = new AbortController();
-        const timeoutMs = QUERY_TIMEOUT_MS;
-        const timeoutHandle = setTimeout(() => {
-            const err = new Error(`Entity delete timeout for entity ${this.id} after ${timeoutMs}ms`);
-            logger.error({ scope: 'Entity.doDelete', entityId: this.id, timeoutMs }, err.message);
-            controller.abort(err);
-        }, timeoutMs);
-
-        const signal = controller.signal;
-        const run = <T>(q: any): Promise<T> => runWithSignal<T>(q, signal);
-
-        try {
-            await db.transaction(async (trx) => {
-                // Independent tables, no FK constraints — pipeline the
-                // statements on the transaction connection instead of paying
-                // serial round-trips while holding the connection.
-                if (force) {
-                    await Promise.all([
-                        run(trx`DELETE FROM components WHERE entity_id = ${this.id}`),
-                        run(trx`DELETE FROM entities WHERE id = ${this.id}`),
-                    ]);
-                } else {
-                    await Promise.all([
-                        run(trx`UPDATE entities SET deleted_at = CURRENT_TIMESTAMP WHERE id = ${this.id} AND deleted_at IS NULL`),
-                        run(trx`UPDATE components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${this.id} AND deleted_at IS NULL`),
-                    ]);
-                }
-            });
-            clearTimeout(timeoutHandle);
-
-            // Fire-and-forget post-commit side effects: lifecycle hooks + cache
-            // invalidation. Errors are logged, never propagate to caller.
-            queueMicrotask(() => this.runPostDeleteSideEffects(!force));
-
-            return true;
-        } catch (error) {
-            clearTimeout(timeoutHandle);
-            if (signal.aborted) {
-                logger.error({ scope: 'Entity.doDelete', entityId: this.id }, `Entity delete aborted: ${signal.reason ?? error}`);
-            } else {
-                logger.error({ scope: 'Entity.doDelete', entityId: this.id, err: error }, 'Failed to delete entity');
-            }
-            // Re-throw so callers can distinguish DB failures (pool exhausted,
-            // lock timeout, etc.) from "entity not found" / not persisted,
-            // which still returns `false`. Previously any error produced the
-            // same `false` return, hiding infrastructure problems (H-OBS-4).
-            throw error instanceof Error ? error : new Error(String(error));
-        } finally {
-            if (!signal.aborted) controller.abort();
-        }
-    }
-
-    private async runPostDeleteSideEffects(softDelete: boolean): Promise<void> {
-        try {
-            await EntityHookManager.executeHooks(new EntityDeletedEvent(this, softDelete));
-        } catch (err) {
-            logger.error({ scope: 'hooks', entityId: this.id, err }, 'post-delete lifecycle hooks failed');
-        }
-
-        try {
-            const { CacheManager } = await import('./cache/CacheManager');
-            const cacheManager = CacheManager.getInstance();
-            const config = cacheManager.getConfig();
-
-            if (config.enabled && config.entity?.enabled) {
-                await cacheManager.invalidateEntity(this.id);
-            }
-            if (config.enabled && config.component?.enabled) {
-                await cacheManager.invalidateAllEntityComponents(this.id);
-            }
-        } catch (err) {
-            logger.warn({ scope: 'cache', entityId: this.id, err }, 'post-delete cache invalidation failed');
-        }
+    public doDelete(force: boolean = false): Promise<boolean> {
+        return saveEntity.doDelete(this, force);
     }
 
     public setPersisted(persisted: boolean) {
@@ -1013,216 +211,45 @@ export class Entity implements IEntity {
         this._dirty = dirty;
     }
 
-    /**
-     * Get list of component type IDs that are dirty
-     */
-    private getDirtyComponents(): string[] {
-        const dirtyComponents: string[] = [];
-        for (const component of this.components.values()) {
-            // Include both dirty (modified) components AND new (not persisted) components
-            // New components need to be cached after save, not just modified ones
-            if ((component as any)._dirty || !(component as any)._persisted) {
-                dirtyComponents.push(component.getTypeID());
-            }
-        }
-        return dirtyComponents;
-    }
-
+    // --- Loaders / factories / (de)serialization (core/entity/finders.ts) ---
 
     @timed("Entity.LoadMultiple")
-    public static async LoadMultiple(ids: string[]): Promise<Entity[]> {
-        if (ids.length === 0) return [];
-        
-        // Filter out empty/invalid IDs to prevent PostgreSQL UUID parsing errors
-        const validIds = ids.filter(id => id && id.trim() !== '');
-        if (validIds.length === 0) return [];
-        if (validIds.length !== ids.length) {
-            logger.warn(`LoadMultiple: Filtered out ${ids.length - validIds.length} invalid entity IDs`);
-        }
-
-        const components = await db`
-            SELECT c.id, c.entity_id, c.type_id, c.data
-            FROM components c
-            WHERE c.entity_id IN ${sql(validIds)} AND c.deleted_at IS NULL
-        `;
-
-        const entitiesMap = new Map<string, Entity>();
-
-        for (const id of validIds) {
-            const entity = new Entity();
-            entity.id = id;
-            entity.setPersisted(true);
-            entity.setDirty(false);
-            entitiesMap.set(id, entity);
-        }
-
-        for (const row of components) {
-            const { id, entity_id, type_id, data } = row;
-            const ctor = ComponentRegistry.getConstructor(type_id);
-            if (ctor) {
-                const comp = new ctor();
-                const componentData = typeof data === 'string' ? JSON.parse(data) : data;
-                Object.assign(comp, componentData);
-                comp.id = id;
-                comp.setPersisted(true);
-                comp.setDirty(false);
-                entitiesMap.get(entity_id)?.addComponent(comp);
-            }
-        }
-
-        return Array.from(entitiesMap.values());
+    public static LoadMultiple(ids: string[]): Promise<Entity[]> {
+        return finders.loadMultiple(ids);
     }
 
-    public static async LoadComponents(entities: Entity[], componentIds: string[], skipCache: boolean = false): Promise<void> {
-        if (entities.length === 0 || componentIds.length === 0) return;
-
-        // Filter out entities with empty/invalid IDs to prevent PostgreSQL UUID parsing errors
-        const validEntities = entities.filter(e => e.id && e.id.trim() !== '');
-        if (validEntities.length === 0) return;
-        
-        const entityIds = validEntities.map(e => e.id);
-
-        const components = await db`
-            SELECT c.id, c.entity_id, c.type_id, c.data
-            FROM components c
-            WHERE c.entity_id IN ${sql(entityIds)} AND c.type_id IN ${sql(componentIds)} AND c.deleted_at IS NULL
-        `;
-
-        // Use Map for O(1) lookups instead of O(n) find() - fixes O(n²) performance issue
-        const entityMap = new Map<string, Entity>(validEntities.map(e => [e.id, e]));
-
-        for (const row of components) {
-            const { id, entity_id, type_id, data } = row;
-            const entity = entityMap.get(entity_id);  // O(1) instead of O(n)
-            if (entity) {
-                const ctor = ComponentRegistry.getConstructor(type_id);
-                if (ctor) {
-                    const comp = new ctor();
-                    const componentData = typeof data === 'string' ? JSON.parse(data) : data;
-                    Object.assign(comp, componentData);
-                    comp.id = id;
-                    comp.setPersisted(true);
-                    comp.setDirty(false);
-                    entity.addComponent(comp);
-                }
-            }
-        }
+    public static LoadComponents(entities: Entity[], componentIds: string[], skipCache: boolean = false): Promise<void> {
+        return finders.loadComponents(entities, componentIds, skipCache);
     }
 
     /**
      * Find an entity by its ID. Returning populated with all components. Or null if not found.
-     * @param id Entity ID
-     * @returns Entity | null
      */
-    public static async FindById(id: string, trx?: SQL): Promise<Entity | null> {
-        // Validate ID to prevent PostgreSQL UUID parsing errors
-        if (!id || typeof id !== 'string' || id.trim() === '') {
-            logger.warn(`FindById called with invalid id: "${id}"`);
-            return null;
-        }
-        const { Query } = await import("../query/Query");
-        const entities = await new Query(trx).findById(id).populate().exec()
-        if(entities.length === 1) {
-            return entities[0]!;
-        }
-        return null;
+    public static FindById(id: string, trx?: SQL): Promise<Entity | null> {
+        return finders.findById(id, trx);
     }
 
     public static Clone(entity: Entity): Entity {
-        const clone = new Entity();
-        clone._dirty = true;
-        clone._persisted = false;
-        for (const comp of entity.components.values()) {
-            const newComp = new (comp.constructor as any)();
-            Object.assign(newComp, comp.data());
-            newComp.id = uuidv7();
-            newComp.setDirty(true);
-            newComp.setPersisted(false);
-            clone.addComponent(newComp);
-        }
-        return clone;
+        return finders.clone(entity);
     }
 
     public static MakeRef(entity: Entity): Entity {
-        const ref = new Entity();
-        ref._dirty = true;
-        ref._persisted = false;
-        for (const comp of entity.components.values()) {
-            const refComp = comp;
-            refComp.setDirty(false);
-            refComp.setPersisted(true);
-            ref.addComponent(refComp);
-        }
-        return ref;
+        return finders.makeRef(entity);
     }
 
     /**
      * Serialize the entity with only the currently loaded components
-     * @returns Object containing id and components data
      */
     public serialize(): { id: string; components: Record<string, any> } {
-        const components: Record<string, any> = {};
-        for (const comp of this.components.values()) {
-            components[comp.constructor.name] = comp.serializableData();
-        }
-        return {
-            id: this.id,
-            components
-        };
+        return finders.serialize(this);
     }
 
     /**
      * Deserialize/reconstitute an Entity from cached/serialized data.
-     * Handles both serialized format { id, components } and raw Entity-like objects.
-     * @param data Serialized entity data or Entity-like plain object
-     * @returns Reconstituted Entity instance
      */
     public static deserialize(data: any): Entity {
-        if (data instanceof Entity) {
-            return data;
-        }
-
-        const entity = new Entity(data.id);
-        entity._persisted = true;
-        entity._dirty = false;
-
-        // Handle serialized format: { id, components: { ComponentName: {...data} } }
-        if (data.components && typeof data.components === 'object') {
-            const storage = getMetadataStorage();
-            
-            for (const [componentName, componentData] of Object.entries(data.components)) {
-                // Find the component constructor by name
-                const ComponentCtor = ComponentRegistry.getConstructorByName(componentName);
-                if (!ComponentCtor) {
-                    logger.warn(`Cannot deserialize component: constructor not found for ${componentName}`);
-                    continue;
-                }
-
-                const comp = new ComponentCtor();
-                const parsedData = typeof componentData === 'string' ? JSON.parse(componentData) : componentData;
-                Object.assign(comp, parsedData);
-
-                // Restore Date objects
-                const typeId = comp.getTypeID();
-                const props = storage.componentProperties.get(typeId);
-                if (props) {
-                    for (const prop of props) {
-                        if (prop.propertyType === Date && typeof (comp as any)[prop.propertyKey] === 'string') {
-                            (comp as any)[prop.propertyKey] = new Date((comp as any)[prop.propertyKey]);
-                        }
-                    }
-                }
-
-                comp.setPersisted(true);
-                comp.setDirty(false);
-                entity.addComponent(comp);
-            }
-        }
-
-        return entity;
+        return finders.deserialize(data);
     }
-
-
 }
 
 export default Entity;
