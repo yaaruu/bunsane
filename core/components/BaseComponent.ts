@@ -107,10 +107,9 @@ export class BaseComponent {
         if (!entity_id || entity_id.trim() === '') {
             throw new Error(`Cannot insert component ${this._comp_name}: entity_id is empty or invalid`);
         }
-        await trx`INSERT INTO components 
+        await trx`INSERT INTO components
         (id, entity_id, name, type_id, data)
         VALUES (${this.id}, ${entity_id}, ${this._comp_name}, ${this._typeId}, ${this.serializableData()})`
-        await trx`INSERT INTO entity_components (entity_id, type_id, component_id) VALUES (${entity_id}, ${this._typeId}, ${this.id}) ON CONFLICT DO NOTHING`
     }
 
     async update(trx: Bun.SQL) {

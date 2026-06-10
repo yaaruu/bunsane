@@ -319,19 +319,13 @@ export async function handleStudioArcheTypeDeleteRequest(
             .join(", ");
 
         // Delete in correct order to avoid foreign key constraint violations
-        // 1. Delete from entity_components (junction table)
-        await db.unsafe(
-            `DELETE FROM entity_components WHERE entity_id IN (${idPlaceholders})`,
-            entityIds
-        );
-
-        // 2. Delete from components
+        // 1. Delete from components (membership source of truth)
         await db.unsafe(
             `DELETE FROM components WHERE entity_id IN (${idPlaceholders})`,
             entityIds
         );
 
-        // 3. Delete from entities
+        // 2. Delete from entities
         await db.unsafe(
             `DELETE FROM entities WHERE id IN (${idPlaceholders})`,
             entityIds
