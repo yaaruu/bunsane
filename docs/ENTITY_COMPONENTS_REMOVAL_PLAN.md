@@ -1,6 +1,6 @@
 # Plan: Remove `entity_components` Table
 
-**Status:** Phases 1-3 done (2026-06-10); Phase 4 (decommission) pending
+**Status:** Phases 1-4 done (2026-06-10); legacy-flag removal ("one release later") open — target v0.4.1+
 **Goal:** Make `components` (and its LIST partitions) the single source of truth for entity↔component membership. Eliminate the redundant `entity_components` mirror table.
 
 ## Why
@@ -71,11 +71,12 @@
 
 After this phase the writes are no longer dual, so `BUNSANE_MEMBERSHIP_SOURCE=legacy` is only valid after first running `PopulateComponentIds()` to backfill `entity_components` from `components` (it throws if the table is absent — run `CreateEntityComponentTable()` first).
 
-### Phase 4 — Decommission
-- **Never auto-drop.** On startup, if an orphaned `entity_components` exists, log one-time info: "no longer used; verify upgrade, then run `DROP TABLE entity_components;` manually." (Consistent with the partition-strategy guard policy: framework never destroys user data on boot.)
-- Remove Studio exclusion, docs references.
-- CHANGELOG: breaking for anyone querying `entity_components` directly. Target v0.4.0.
-- One release later: remove `legacy` flag + dead branches.
+### Phase 4 — Decommission (done 2026-06-10)
+- **Never auto-drop.** On startup (`EnsureDatabaseMigrations`), if an orphaned `entity_components` exists, log one-time info: "no longer used; verify upgrade, then run `DROP TABLE entity_components;` manually." (Consistent with the partition-strategy guard policy: framework never destroys user data on boot.) Single `information_schema` query reuses the existing boot path — no extra round trips.
+- Studio exclusion kept (not removed): removing it would expose the orphaned legacy table as a plain general table in Studio, which has no ECS UI support and a confusing schema (no `id` PK, FK to entities). A comment explains why the exclusion persists.
+- Studio docs (`studio/studio-instructions.md`): updated to reflect 2-table ECS model; `entity_components` references removed.
+- CHANGELOG: BREAKING entry added for v0.4.0 — direct queriers must migrate; orphan can be dropped manually; emergency rollback instructions; reconciliation note for pre-dual-write history.
+- One release later: remove `legacy` flag + dead branches — target v0.4.1+.
 
 ## Risks
 | Risk | Mitigation |

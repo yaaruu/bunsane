@@ -179,7 +179,12 @@ export async function handleStudioTableDeleteRequest(
 
 export async function handleGetTables(): Promise<Response> {
     try {
-        // Fetch all tables except ECS tables
+        // Exclude framework-internal tables and the legacy entity_components table.
+        // entity_components is no longer written by the framework (Phase 3 of
+        // docs/ENTITY_COMPONENTS_REMOVAL_PLAN.md) but may still exist as an orphan
+        // in upgraded databases. Keeping it out of the Studio listing avoids
+        // exposing a confusingly schema'd legacy table with no ECS UI support.
+        // Users are directed to drop it via the startup orphan-notice log.
         const ecsTables = ['components', 'entities', 'entity_components', 'spatial_ref_sys'];
         const ecsTablePlaceholders = ecsTables.map((_, index) => `$${index + 1}`).join(", ");
 
