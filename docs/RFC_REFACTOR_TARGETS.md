@@ -11,7 +11,7 @@
 
 ## 1. Purpose
 
-After `ArcheType.ts` was split (3064 → 1032 LOC across 8 modules under `core/archetype/`), several other files in `core/` remain large and concern-dense. This RFC enumerates them in priority order so future refactor work has a reference. As of 2026-06-10, target §3.1 (`App.ts`) is complete; §3.2–§3.5 remain.
+After `ArcheType.ts` was split (3064 → 1032 LOC across 8 modules under `core/archetype/`), several other files in `core/` remain large and concern-dense. This RFC enumerates them in priority order so future refactor work has a reference. As of 2026-06-10, targets §3.1, §3.3, §3.4, §3.5 are complete; only §3.2 (`Entity.ts`) remains, gated on `ENTITY_COMPONENTS_REMOVAL_PLAN.md`.
 
 This is a **planning document**, not an approval-bound RFC. Each target listed here would get its own scoped RFC (like `RFC_APP_REFACTOR.md`) before work starts.
 
@@ -100,7 +100,9 @@ Class skeleton + public API stays in `Entity.ts`.
 
 ---
 
-### 3.3 `core/SchedulerManager.ts` — 806 LOC (was 932 at draft time)
+### 3.3 `core/SchedulerManager.ts` — ~~806 LOC~~ → 310 LOC — **DONE (2026-06-10)**
+
+**Completed:** merge `c5f9730`. Split into `core/scheduler/`: `cronEvaluator`, `taskRunner`, `lockCoordinator`, `lifecycleHooks`, `metrics`. Full suite green (829 pass / 0 fail), guards H-SCHED-1..5 + C14 preserved. Follow-ups noted in review (non-blocking): dead imports in `SchedulerManager.ts`, internals promoted public for the instance-parameter pattern (mark `@internal`), `(manager as any).executeTask` casts.
 
 **Why next:** Scheduling logic + distributed lock + hook orchestration in one class.
 
@@ -138,7 +140,9 @@ Note: `core/scheduler/` already exists and holds `DistributedLock.ts` (the lock 
 
 ---
 
-### 3.4 `core/EntityHookManager.ts` — 827 LOC (was 921 at draft time)
+### 3.4 `core/EntityHookManager.ts` — ~~827 LOC~~ → 200 LOC — **DONE (2026-06-10)**
+
+**Completed:** merge `b82abe6`. Split into `core/hooks/`: `registry` (owns `typeIdOfCtor` memo), `dispatcher` (timer unref paths), `guards` (component-target matching). Hook ordering (C13, H-HOOK-1..3) verified by suite (829 pass / 0 fail); `typeIdOfCtor` byte-identical to `5eb1f16`. Note: `guards.ts` ended up holding component-target matching rather than timer logic (lives inline in dispatcher) — naming diverges from plan below, functionally fine.
 
 **Why next:** Hook registry + dispatch + lifecycle in one place.
 
@@ -171,7 +175,9 @@ core/hooks/
 
 ---
 
-### 3.5 `core/cache/CacheManager.ts` — 656 LOC (was 574 at draft time — grew via 2026-06-10 perf work)
+### 3.5 `core/cache/CacheManager.ts` — ~~656 LOC~~ → 431 LOC — **DONE (2026-06-10)**
+
+**Completed:** merge `ef70361`. Split into `core/cache/strategies/writeThrough.ts` (incl. `setComponentsBatchWriteThrough`), `strategies/writeInvalidate.ts` (incl. `invalidateEntityComponents`), `invalidation.ts` (pub/sub, `instanceId` loop prevention), `health.ts`. Contracts verified by suite: async `initialize`, frozen `getConfig()` identity, L1-only remote invalidation.
 
 **Why next:** L1 (memory) + L2 (Redis) + strategies + pub/sub all-in-one. Already smaller than peers, so lower priority.
 
@@ -235,11 +241,10 @@ If a refactor reveals a latent bug (wrong ordering, missing guard, stale comment
 ## 5. Recommended Order
 
 1. ~~**`App.ts`**~~ — **Done** (merged `c855e04`, 2026-05-09).
-2. **`Entity.ts`** — Next, but **after** `ENTITY_COMPONENTS_REMOVAL_PLAN.md` lands (it rewrites/deletes large parts of `save()`; splitting first creates churn). Highest perf sensitivity but biggest readability win. Allocate benchmark time.
-3. **`SchedulerManager.ts`** *or* **`EntityHookManager.ts`** — Either next. They're partially coupled (hooks fire from scheduler-triggered work), so coordinate.
-4. **`CacheManager.ts`** — Last. Smallest of the five, already structured around providers (though it grew in the 2026-06-10 perf work).
+2. ~~**`SchedulerManager.ts`**~~, ~~**`EntityHookManager.ts`**~~, ~~**`CacheManager.ts`**~~ — **Done** (merged `c5f9730`, `b82abe6`, `ef70361` on 2026-06-10; executed in parallel via isolated worktrees, full suite green after each merge).
+3. **`Entity.ts`** — Last remaining target. Gated **after** `ENTITY_COMPONENTS_REMOVAL_PLAN.md` lands (it rewrites/deletes large parts of `save()`; splitting first creates churn). Highest perf sensitivity but biggest readability win. Allocate benchmark time.
 
-This ordering minimizes risk because the most heavily-tested file went first (more guardrails) and the perf-sensitive file goes early-second when there's still energy for benchmarking.
+The original ordering rationale held: the most heavily-tested file went first (more guardrails); the perf-sensitive file goes last with dedicated benchmark time.
 
 ## 6. Anti-Goals
 
