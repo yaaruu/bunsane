@@ -4,6 +4,7 @@ import type { RequestLoaders } from './RequestLoaders';
 import db from '../database';
 import { CacheManager } from './cache/CacheManager';
 import { getRequestId } from './middleware/RequestId';
+import { runWithRequestScope } from './requestScope';
 
 export interface RequestStats {
   operationName: string;
@@ -43,7 +44,7 @@ declare module 'graphql-yoga' {
  */
 export function createRequestContextPlugin(): Plugin {
   return {
-    onExecute: ({ args }) => {
+    onExecute: ({ args, executeFn, setExecuteFn }) => {
       const cacheManager = CacheManager.getInstance();
       const ctx: any = (args as any).contextValue;
       const request: Request | undefined = ctx?.request;
@@ -80,6 +81,14 @@ export function createRequestContextPlugin(): Plugin {
       if (request) {
         (request as any).__bunsaneStats = stats;
       }
+
+      // Run the whole execution inside an AsyncLocalStorage scope so bare
+      // `entity.get(Component)` calls (e.g. inside @ArcheTypeFunction
+      // bodies, Unwrap(), service helpers) pick up the request's batching
+      // DataLoaders + AbortSignal without explicit context threading.
+      const scope = { loaders: ctx.loaders as RequestLoaders, signal, perRequest: stats };
+      setExecuteFn(((execArgs: any) =>
+        runWithRequestScope(scope, () => (executeFn as any)(execArgs))) as any);
     },
   };
 }

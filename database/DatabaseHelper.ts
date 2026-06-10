@@ -505,11 +505,11 @@ export const EnsureDatabaseMigrations = async () => {
             // Add the column
             await db`ALTER TABLE entity_components ADD COLUMN component_id UUID`;
             logger.info(`Added component_id column to entity_components table`);
-            
-            // Wait a bit for the column to be available
-            await new Promise(resolve => setTimeout(resolve, 500));
-            
-            // Populate existing data
+
+            // ALTER TABLE is transactional + synchronous in PostgreSQL — the
+            // column is visible immediately to the next statement on this
+            // connection. The prior 500ms sleep was dead wait on every
+            // migration boot.
             await PopulateComponentIds();
         } else {
             logger.trace(`entity_components table already has component_id column`);

@@ -12,8 +12,8 @@ function formatBytes(bytes: number): string {
 interface CacheEntry<T> {
     value: T;
     expiresAt?: number;
-    lastAccessed: number;
     accessCount: number;
+    size: number; // Estimated bytes (key + value + metadata), cached for O(1) memory accounting
 }
 
 export interface MemoryCacheConfig {
@@ -36,7 +36,6 @@ export class MemoryCache implements CacheProvider {
         size: 0,
         memoryUsage: 0
     };
-    private accessCounter = 0; // For LRU ordering
 
     constructor(config: MemoryCacheConfig = {}) {
         this.config = {
@@ -60,13 +59,15 @@ export class MemoryCache implements CacheProvider {
         // Check if expired
         if (entry.expiresAt && Date.now() > entry.expiresAt) {
             this.cache.delete(key);
+            this.stats.size--;
+            this.stats.memoryUsage = Math.max(0, this.stats.memoryUsage - entry.size);
             this.stats.misses++;
-            this.updateMemoryUsage();
             return null;
         }
 
-        // Update access tracking for LRU
-        entry.lastAccessed = ++this.accessCounter;
+        // Move to end of Map iteration order (most recently used) for O(1) LRU.
+        this.cache.delete(key);
+        this.cache.set(key, entry);
         entry.accessCount++;
 
         this.stats.hits++;
@@ -76,21 +77,27 @@ export class MemoryCache implements CacheProvider {
     async set<T>(key: string, value: T, ttl?: number): Promise<void> {
         const expiresAt = ttl ? Date.now() + ttl : (this.config.defaultTTL ? Date.now() + this.config.defaultTTL : undefined);
 
+        const size = this.entrySize(key, value);
         const entry: CacheEntry<T> = {
             value,
             expiresAt,
-            lastAccessed: ++this.accessCounter,
-            accessCount: 1
+            accessCount: 1,
+            size
         };
 
-        const wasNew = !this.cache.has(key);
-        this.cache.set(key, entry);
-
-        if (wasNew) {
+        // Incremental memory accounting: adjust by the delta instead of
+        // re-walking the entire cache on every write.
+        // Delete before set so the key moves to the end of Map iteration
+        // order (most recently used position for LRU eviction).
+        const existing = this.cache.get(key);
+        if (existing) {
+            this.stats.memoryUsage = Math.max(0, this.stats.memoryUsage - existing.size);
+            this.cache.delete(key);
+        } else {
             this.stats.size++;
         }
-
-        this.updateMemoryUsage();
+        this.cache.set(key, entry);
+        this.stats.memoryUsage += size;
 
         // Evict if necessary
         await this.evictIfNeeded();
@@ -98,16 +105,15 @@ export class MemoryCache implements CacheProvider {
 
     async delete(key: string | string[]): Promise<void> {
         const keys = Array.isArray(key) ? key : [key];
-        let deletedCount = 0;
 
         for (const k of keys) {
-            if (this.cache.delete(k)) {
-                deletedCount++;
+            const entry = this.cache.get(k);
+            if (entry) {
+                this.cache.delete(k);
+                this.stats.size--;
+                this.stats.memoryUsage = Math.max(0, this.stats.memoryUsage - entry.size);
             }
         }
-
-        this.stats.size -= deletedCount;
-        this.updateMemoryUsage();
     }
 
     async clear(): Promise<void> {
@@ -144,7 +150,7 @@ export class MemoryCache implements CacheProvider {
         const regex = new RegExp(pattern.replace(/\*/g, '.*').replace(/\?/g, '.'));
 
         const keysToDelete: string[] = [];
-        for (const key of Array.from(this.cache.keys())) {
+        for (const key of this.cache.keys()) {
             if (regex.test(key)) {
                 keysToDelete.push(key);
             }
@@ -171,16 +177,9 @@ export class MemoryCache implements CacheProvider {
         };
     }
 
-    private updateMemoryUsage(): void {
-        // Rough estimation of memory usage
-        // Each entry has overhead for the key, value, and metadata
-        let memoryUsage = 0;
-        for (const [key, entry] of Array.from(this.cache.entries())) {
-            memoryUsage += key.length * 2; // Rough string overhead
-            memoryUsage += this.estimateValueSize(entry.value);
-            memoryUsage += 100; // Overhead for entry metadata
-        }
-        this.stats.memoryUsage = memoryUsage;
+    private entrySize(key: string, value: any): number {
+        // key string overhead + value estimate + fixed per-entry metadata
+        return key.length * 2 + this.estimateValueSize(value) + 100;
     }
 
     private estimateValueSize(value: any): number {
@@ -214,14 +213,16 @@ export class MemoryCache implements CacheProvider {
     }
 
     private async evictLRU(count: number): Promise<void> {
-        // Sort entries by last accessed time (oldest first)
-        const entries = Array.from(this.cache.entries())
-            .map(([key, entry]) => ({ key, entry }))
-            .sort((a, b) => a.entry.lastAccessed - b.entry.lastAccessed);
+        // Map iteration order is insertion order. get() and set() move accessed/
+        // updated keys to the end, so keys at the front are least recently used.
+        // Collect the first `count` keys without sorting or materialising a full array.
+        const keysToDelete: string[] = [];
+        for (const key of this.cache.keys()) {
+            if (keysToDelete.length >= count) break;
+            keysToDelete.push(key);
+        }
 
-        const keysToDelete = entries.slice(0, count).map(item => item.key);
         await this.delete(keysToDelete);
-
         logger.debug(`Evicted ${keysToDelete.length} entries from cache due to LRU policy`);
     }
 
@@ -235,7 +236,7 @@ export class MemoryCache implements CacheProvider {
         const now = Date.now();
         const keysToDelete: string[] = [];
 
-        for (const [key, entry] of Array.from(this.cache.entries())) {
+        for (const [key, entry] of this.cache) {
             if (entry.expiresAt && now > entry.expiresAt) {
                 keysToDelete.push(key);
             }

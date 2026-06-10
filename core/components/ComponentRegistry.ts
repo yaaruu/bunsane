@@ -8,6 +8,7 @@ import {
     GenerateTableName,
     UpdateComponentIndexes,
     AnalyzeAllComponentTables,
+    CreateRelationIndexes,
     GetPartitionStrategy,
 } from "../../database/DatabaseHelper";
 import { ensureMultipleJSONBPathIndexes } from "../../database/IndexingStrategy";
@@ -345,6 +346,19 @@ class ComponentRegistry {
             }
         }
         logger.info(`Registered hooks for ${services.length} services`);
+
+        // Create btree indexes on archetype relation foreign-key fields
+        // (data->>'fk'). Without these, @BelongsTo/@HasMany resolver queries
+        // sequentially scan the relation component partition tables. Runs
+        // before ANALYZE so the planner picks up fresh stats for the new
+        // indexes. Idempotent (IF NOT EXISTS) and CONCURRENTLY on LIST
+        // partitions, so it is safe to re-run on every startup against live
+        // tables.
+        try {
+            await CreateRelationIndexes();
+        } catch (error) {
+            logger.warn(`Failed to create relation FK indexes: ${error}`);
+        }
 
         // Run ANALYZE on all component tables to update query planner statistics
         await AnalyzeAllComponentTables();

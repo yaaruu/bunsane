@@ -52,11 +52,16 @@ export class BaseComponent {
         const data: Record<string, any> = {};
         const storage = getMetadataStorage();
         const props = storage.componentProperties.get(this._typeId);
-        this.properties().forEach((prop: string) => {
+        if (!props) return data;
+        // Iterate the property metadata directly — avoids the prior O(n²)
+        // pattern (properties().forEach + props.find per property) and the
+        // redundant second metadata lookup inside properties(). Hot write path:
+        // runs for every dirty component on every save.
+        for (const propMeta of props) {
+            const prop = propMeta.propertyKey;
             let value = (this as any)[prop];
-            const propMeta = props?.find(p => p.propertyKey === prop);
             if (value !== null && value !== undefined) {
-                if (propMeta?.propertyType === Date) {
+                if (propMeta.propertyType === Date) {
                     if (!(value instanceof Date)) {
                         throw new Error(`Type mismatch for property '${prop}' on component '${this._comp_name}': expected Date, got ${typeof value}`);
                     }
@@ -64,12 +69,12 @@ export class BaseComponent {
                         throw new Error(`Invalid Date for property '${prop}' on component '${this._comp_name}'`);
                     }
                     value = value.toISOString();
-                } else if (propMeta?.propertyType === Number && typeof value === 'number' && !Number.isFinite(value)) {
+                } else if (propMeta.propertyType === Number && typeof value === 'number' && !Number.isFinite(value)) {
                     throw new Error(`Invalid number for property '${prop}' on component '${this._comp_name}': ${value}`);
                 }
             }
             data[prop] = value;
-        });
+        }
         return data;
     }
 

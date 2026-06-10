@@ -14,8 +14,14 @@ function createDatabase(): SQL {
         url = process.env.DB_CONNECTION_URL;
     }
 
-    // Add statement_timeout only when explicitly configured (opt-in)
-    // Note: PgBouncer rejects statement_timeout as a startup parameter
+    // DB_STATEMENT_TIMEOUT (opt-in, server-side query cancellation):
+    //   - Skipped under PgBouncer because it rejects startup parameters.
+    //   - DB_QUERY_TIMEOUT (default 30 s) is JS-side only: it raises a client error
+    //     after the deadline but does NOT cancel the in-flight PostgreSQL query,
+    //     which continues running and holds locks until the server decides to stop it.
+    //   - Production deployments NOT behind PgBouncer should set DB_STATEMENT_TIMEOUT
+    //     (e.g. DB_STATEMENT_TIMEOUT=30000) so the server itself kills runaway queries
+    //     and releases locks promptly.
     if (process.env.USE_PGLITE !== 'true' && process.env.DB_STATEMENT_TIMEOUT) {
         try {
             const urlObj = new URL(url);
@@ -29,7 +35,7 @@ function createDatabase(): SQL {
     const redactedUrl = url.replace(/:\/\/([^:]+):([^@]+)@/, '://$1:****@');
     logger.info(`Database connection URL: ${redactedUrl}`);
 
-    const max = parseInt(process.env.POSTGRES_MAX_CONNECTIONS ?? '10', 10);
+    const max = parseInt(process.env.POSTGRES_MAX_CONNECTIONS ?? '20', 10);
     logger.info(`Connection pool size: ${max} connections`);
     logger.info(`Query timeout: ${QUERY_TIMEOUT_MS}ms`);
 

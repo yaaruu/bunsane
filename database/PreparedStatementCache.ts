@@ -20,8 +20,14 @@ export interface CacheStats {
 }
 
 /**
- * LRU Cache for prepared statements to eliminate PostgreSQL planning overhead
- * for repeated query patterns in the Bunsane Query system.
+ * @deprecated No longer used on the query hot path. This cache never called
+ * a prepare API — it stored `{ sql, _isPrepared: true }` placeholders and
+ * every "hit" still executed `db.unsafe(sql, params)`, so PostgreSQL
+ * re-planned regardless. Bun SQL auto-prepares parameterized statements per
+ * connection (prepare:true default), providing real server-side plan reuse
+ * at the driver layer. The class is kept so `Query.getCacheStats()`,
+ * `/metrics`, and registry invalidation call sites remain stable; it now
+ * reports an idle cache.
  */
 export class PreparedStatementCache {
     private cache: Map<string, CacheEntry> = new Map();

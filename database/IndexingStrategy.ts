@@ -11,7 +11,7 @@ const validateIdentifier = (str: string, maxLength: number = 64): string => {
     return str;
 };
 
-export type IndexType = 'gin' | 'btree' | 'hash' | 'numeric';
+export type IndexType = 'gin' | 'btree' | 'hash' | 'numeric' | 'fulltext';
 
 export interface IndexDefinition {
     tableName: string;
@@ -140,8 +140,9 @@ export const ensureMultipleJSONBPathIndexes = async (
 ): Promise<void> => {
     for (const def of indexDefinitions) {
         if (def.indexType === 'numeric') {
-            // Use numeric index for range queries
             await ensureNumericIndex(def.tableName, def.field);
+        } else if (def.indexType === 'fulltext') {
+            await ensureFullTextIndex(def.tableName, def.field);
         } else {
             await ensureJSONBPathIndex(
                 def.tableName,
@@ -237,6 +238,75 @@ export const ensureNumericIndex = async (
             return;
         }
         logger.error(`Failed to create numeric index on ${tableName} for field ${field}: ${error}`);
+        throw error;
+    }
+};
+
+/**
+ * Creates a GIN index on a JSONB field for full-text search using to_tsvector.
+ *
+ * The index expression MUST match FullTextSearchBuilder's vectorSql exactly:
+ *   to_tsvector('<language>', <alias>.data->'<field>')
+ * so PostgreSQL can use this index for those predicates.
+ *
+ * @param tableName The table name to create index on
+ * @param field The JSONB field path containing text for full-text search
+ * @param language PostgreSQL text search language (default 'english')
+ */
+export const ensureFullTextIndex = async (
+    tableName: string,
+    field: string,
+    language: string = 'english'
+): Promise<void> => {
+    tableName = validateIdentifier(tableName);
+    field = validateIdentifier(field);
+
+    const indexName = `idx_${tableName}_${field}_fts`;
+
+    try {
+        logger.trace(`Ensuring full-text GIN index ${indexName} on ${tableName} for field ${field} (language: ${language})`);
+
+        const existingIndexes = await db.unsafe(`
+            SELECT indexname
+            FROM pg_indexes
+            WHERE tablename = '${tableName}' AND indexname = '${indexName}'
+        `);
+
+        if (existingIndexes.length > 0) {
+            logger.trace(`Index ${indexName} already exists`);
+            return;
+        }
+
+        const partitionCheck = await db.unsafe(`
+            SELECT relkind
+            FROM pg_class
+            WHERE relname = '${tableName}' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+        `);
+
+        const isPartitioned = partitionCheck.length > 0 && partitionCheck[0].relkind === 'p';
+        const useConcurrently = !isPartitioned && !process.env.USE_PGLITE;
+
+        // Expression matches FullTextSearchBuilder.vectorSql: to_tsvector('<lang>', data->'<field>')
+        // The -> operator (not ->>) returns jsonb; PostgreSQL casts jsonb text to tsvector input.
+        const indexSQL = `CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} IF NOT EXISTS ${indexName} ON ${tableName} USING GIN (to_tsvector('${language}', data->'${field}'))`;
+
+        logger.trace(`Creating full-text index with SQL: ${indexSQL}`);
+        await db.unsafe(indexSQL);
+        logger.info(`Created full-text GIN index ${indexName} on ${tableName}${useConcurrently ? ' (concurrently)' : ' (blocking)'}`);
+
+    } catch (error: any) {
+        if (error.message && (
+            error.message.includes('already exists') ||
+            error.code === '42P07'
+        )) {
+            logger.trace(`Index ${indexName} already exists (confirmed by error), skipping creation`);
+            return;
+        }
+        if (error.code === '40P01' || (error.message && error.message.includes('deadlock'))) {
+            logger.warn(`Deadlock detected while creating index ${indexName}, skipping`);
+            return;
+        }
+        logger.error(`Failed to create full-text index on ${tableName} for field ${field}: ${error}`);
         throw error;
     }
 };

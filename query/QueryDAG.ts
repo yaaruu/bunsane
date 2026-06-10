@@ -90,8 +90,13 @@ export class QueryDAG {
             totalFilters += filters.length;
         }
 
-        // If we have multiple component filters (>= 2), use CTE for optimization
-        const useCTE = totalFilters >= 2 && context.componentIds.size > 0;
+        // If we have multiple component filters (>= 2), use CTE for optimization.
+        // Exception: sorted multi-component queries take the sort-driven scan
+        // in ComponentInclusionNode, which replaces both the CTE base set and
+        // the post-hoc sort — building the CTE first would add orphan params.
+        const useCTE = totalFilters >= 2
+            && context.componentIds.size > 0
+            && !ComponentInclusionNode.canUseSortDrivenScan(context);
 
         if (useCTE) {
             // Create CTE node as root

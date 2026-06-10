@@ -36,6 +36,11 @@ export class QueryContext {
     public cteName: string = "";
     public eagerComponents: Set<string> = new Set();
     public paginationAppliedInCTE: boolean = false;
+    // Set by Query when an OrQuery participates. OrNode embeds its
+    // ComponentInclusionNode dependency's SQL as a base set, so base-level
+    // optimizations that bake in ORDER BY/LIMIT (sort-driven scan) must be
+    // suppressed.
+    public hasOrQuery: boolean = false;
 
     private trx: SQL | undefined;
     constructor(trx?: SQL) {
@@ -165,6 +170,7 @@ export class QueryContext {
         clone.cteName = this.cteName;
         clone.eagerComponents = new Set(this.eagerComponents);
         clone.paginationAppliedInCTE = this.paginationAppliedInCTE;
+        clone.hasOrQuery = this.hasOrQuery;
         return clone;
     }
 }

@@ -23,6 +23,7 @@ export type RequestLoaders = {
   entityById: DataLoader<string, Entity | null>;
   componentsByEntityType: DataLoader<{ entityId: string; typeId: string }, ComponentData | null>;
   relationsByEntityField: DataLoader<{ entityId: string; relationField: string; relatedType: string; foreignKey?: string }, Entity[]>;
+  relationsByComponentFk: DataLoader<{ entityId: string; componentTypeId: string; foreignKeyField: string }, Entity[]>;
 };
 
 export function createRequestLoaders(
@@ -95,7 +96,7 @@ export function createRequestLoaders(
     maxBatchSize: 100 // Prevent extremely large batches
   });
 
-  const componentsByEntityType = new DataLoader<{ entityId: string; typeId: string }, ComponentData | null>(
+  const componentsByEntityType = new DataLoader<{ entityId: string; typeId: string }, ComponentData | null, string>(
     async (keys: readonly { entityId: string; typeId: string }[]) => {
       incrementDataLoaderCall('component', perRequest);
       const startTime = Date.now();
@@ -210,11 +211,15 @@ export function createRequestLoaders(
       }
     },
     {
-      maxBatchSize: 100 // Prevent extremely large batches
+      maxBatchSize: 100, // Prevent extremely large batches
+      // Object keys default to identity (===) comparison, which never dedups
+      // distinct literals — collapse to a stable string so sibling resolvers
+      // requesting the same (entity, type) share one load within a request.
+      cacheKeyFn: (k: { entityId: string; typeId: string }) => `${k.entityId}\x00${k.typeId}`,
     }
   );
 
-  const relationsByEntityField = new DataLoader<{ entityId: string; relationField: string; relatedType: string; foreignKey?: string }, Entity[]>(
+  const relationsByEntityField = new DataLoader<{ entityId: string; relationField: string; relatedType: string; foreignKey?: string }, Entity[], string>(
     async (keys: readonly { entityId: string; relationField: string; relatedType: string; foreignKey?: string }[]) => {
       incrementDataLoaderCall('relation', perRequest);
       const startTime = Date.now();
@@ -364,9 +369,97 @@ export function createRequestLoaders(
     },
     {
       // Add batch size limit to prevent extremely large queries
-      maxBatchSize: 50
+      maxBatchSize: 50,
+      // Stable string key (null-byte separated, matches the result-map key) so
+      // identical relation requests dedup within a request instead of being
+      // treated as distinct object identities.
+      cacheKeyFn: (k: { entityId: string; relationField: string; relatedType: string; foreignKey?: string }) =>
+        `${k.entityId}\x00${k.relationField}\x00${k.relatedType}\x00${k.foreignKey ?? ''}`,
     }
   );
 
-  return { entityById, componentsByEntityType, relationsByEntityField };
+  // Type-scoped foreign-key relation loader. Backs @HasMany/@BelongsToMany
+  // array relations that declare a `foreignKey`. Previously those resolved one
+  // `new Query().exec()` PER PARENT ROW (a hard N+1). This batches all parents
+  // sharing a (componentType, fkField) into a single `data->>'fk' = ANY($2)`
+  // query. Unlike relationsByEntityField it pins `type_id`, preserving the
+  // exact semantics of the per-parent Query (which filtered by the specific
+  // component type) rather than matching any component sharing the field name.
+  const relationsByComponentFk = new DataLoader<{ entityId: string; componentTypeId: string; foreignKeyField: string }, Entity[], string>(
+    async (keys: readonly { entityId: string; componentTypeId: string; foreignKeyField: string }[]) => {
+      incrementDataLoaderCall('relation', perRequest);
+      const startTime = Date.now();
+      try {
+        const validKeys = keys.filter(k => k.entityId && typeof k.entityId === 'string' && k.entityId.trim() !== '');
+        if (validKeys.length === 0) return keys.map(() => []);
+
+        const resultMap = new Map<string, Entity[]>();
+
+        // Group by (componentTypeId, foreignKeyField) so each distinct relation
+        // shape is one batched query.
+        const groups = new Map<string, typeof validKeys>();
+        for (const key of validKeys) {
+          const gk = `${key.componentTypeId}\x00${key.foreignKeyField}`;
+          if (!groups.has(gk)) groups.set(gk, []);
+          groups.get(gk)!.push(key);
+        }
+
+        for (const [gk, groupedKeys] of groups) {
+          const sep = gk.indexOf('\x00');
+          const componentTypeId = gk.slice(0, sep);
+          const foreignKeyField = gk.slice(sep + 1);
+          const entityIds = [...new Set(groupedKeys.map(k => k.entityId))];
+          if (entityIds.length === 0) continue;
+
+          // type_id + entity ids are parameterized via inList (the proven
+          // pattern — passing a JS array to `= ANY($n)` is serialized as a
+          // comma-string by the Bun SQL driver and fails). foreignKeyField
+          // comes from trusted relation decorator metadata.
+          const entityList = inList(entityIds, 2);
+          const rows = await timedUnsafe<any[]>(db, `
+            SELECT c.entity_id, c.data->>'${foreignKeyField}' AS fk_value
+            FROM components c
+            INNER JOIN entities e ON c.entity_id = e.id
+            WHERE c.type_id = $1
+              AND c.deleted_at IS NULL
+              AND e.deleted_at IS NULL
+              AND c.data->>'${foreignKeyField}' IN ${entityList.sql}
+          `, [componentTypeId, ...entityList.params], signal, perRequest);
+
+          for (const key of groupedKeys) {
+            const relatedIds = [...new Set(
+              rows.filter((r: any) => r.fk_value === key.entityId).map((r: any) => r.entity_id)
+            )];
+            const entities = relatedIds.map(id => {
+              const e = new Entity(id as string);
+              e.setPersisted(true);
+              return e;
+            });
+            resultMap.set(`${key.entityId}\x00${componentTypeId}\x00${foreignKeyField}`, entities);
+          }
+        }
+
+        const duration = Date.now() - startTime;
+        if (duration > 1000) {
+          logger.warn(`Slow relationsByComponentFk query: ${duration}ms for ${keys.length} keys`);
+        }
+
+        return keys.map(k => {
+          if (!k.entityId || typeof k.entityId !== 'string' || k.entityId.trim() === '') return [];
+          return resultMap.get(`${k.entityId}\x00${k.componentTypeId}\x00${k.foreignKeyField}`) || [];
+        });
+      } catch (error) {
+        logger.error(`Error in relationsByComponentFk DataLoader:`);
+        logger.error(error);
+        return keys.map(() => []);
+      }
+    },
+    {
+      maxBatchSize: 50,
+      cacheKeyFn: (k: { entityId: string; componentTypeId: string; foreignKeyField: string }) =>
+        `${k.entityId}\x00${k.componentTypeId}\x00${k.foreignKeyField}`,
+    }
+  );
+
+  return { entityById, componentsByEntityType, relationsByEntityField, relationsByComponentFk };
 }

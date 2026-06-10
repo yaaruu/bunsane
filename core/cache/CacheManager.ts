@@ -203,53 +203,71 @@ export class CacheManager {
     /**
      * Set components for an entity in cache with write-through strategy.
      * Converts BaseComponent instances to ComponentData format for cache compatibility with DataLoader.
+     * Delegates to setComponentsBatchWriteThrough for a single-entity, 2-RTT batch.
      */
     public async setComponentWriteThrough(entityId: string, components: BaseComponent[], componentType?: string, ttl?: number): Promise<void> {
         if (!this.config.enabled || !this.config.component?.enabled) {
             return;
         }
+        const entries = components.map(c => ({
+            entityId,
+            typeId: componentType || c.getTypeID(),
+            component: c,
+            ttl,
+        }));
+        await this.setComponentsBatchWriteThrough(entries);
+    }
+
+    /**
+     * Batch write-through for BaseComponent instances across any number of
+     * entities. Performs exactly 2 Redis round-trips regardless of entry count:
+     *   1. pipelined getMany  — reads existing entries to preserve createdAt (H-CACHE-3)
+     *   2. pipelined setMany  — writes all updated entries
+     *
+     * Signature:
+     *   setComponentsBatchWriteThrough(
+     *     entries: Array<{ entityId: string; typeId: string; component: BaseComponent; ttl?: number }>
+     *   ): Promise<void>
+     */
+    public async setComponentsBatchWriteThrough(
+        entries: Array<{ entityId: string; typeId: string; component: BaseComponent; ttl?: number }>,
+    ): Promise<void> {
+        if (!this.config.enabled || !this.config.component?.enabled || entries.length === 0) {
+            return;
+        }
 
         try {
-            const effectiveTTL = ttl ?? this.config.component.ttl;
+            const effectiveTTL = this.config.component.ttl;
+            const keys = entries.map(e => `component:${e.entityId}:${e.typeId}`);
 
-            // Convert BaseComponent to ComponentData format for cache
-            // compatibility with DataLoader. BaseComponent does not track
-            // createdAt/updatedAt today (data-model gap), but we preserve an
-            // existing cache entry's createdAt when available and stamp
-            // updatedAt=now, so consumers see monotonic update times rather
-            // than a reset on every write-through (H-CACHE-3 — full fix
-            // requires BaseComponent timestamp tracking).
-            for (const component of components) {
-                const typeId = componentType || component.getTypeID();
-                const key = `component:${entityId}:${typeId}`;
+            // One batched read — preserves createdAt from existing entries (H-CACHE-3).
+            const existing = await this.provider.getMany<ComponentData>(keys);
 
-                const now = new Date();
-                let createdAt: Date = now;
-                try {
-                    const existing = await this.provider.get<ComponentData>(key);
-                    if (existing && existing.createdAt) {
-                        createdAt = existing.createdAt instanceof Date
-                            ? existing.createdAt
-                            : new Date(existing.createdAt);
-                    }
-                } catch {
-                    // Cache miss or provider error — fall through to now.
-                }
+            const now = new Date();
+            const setEntries = entries.map((e, i) => {
+                const prev = existing[i];
+                const createdAt: Date =
+                    prev && prev.createdAt
+                        ? (prev.createdAt instanceof Date ? prev.createdAt : new Date(prev.createdAt))
+                        : now;
 
                 const componentData: ComponentData = {
-                    id: component.id,
-                    entityId: entityId,
-                    typeId: typeId,
-                    data: component.data(),
+                    id: e.component.id,
+                    entityId: e.entityId,
+                    typeId: e.typeId,
+                    data: e.component.data(),
                     createdAt,
                     updatedAt: now,
-                    deletedAt: null
+                    deletedAt: null,
                 };
 
-                await this.provider.set(key, componentData, effectiveTTL);
-            }
+                return { key: keys[i]!, value: componentData, ttl: e.ttl ?? effectiveTTL };
+            });
+
+            // One batched write.
+            await this.provider.setMany(setEntries);
         } catch (error) {
-            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error setting components in cache', err: error });
+            logger.error({ scope: 'cache', component: 'CacheManager', msg: 'Error setting components in cache (batch)', err: error });
         }
     }
 

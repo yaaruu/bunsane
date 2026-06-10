@@ -12,6 +12,7 @@ import EntityHookManager from "./EntityHookManager";
 import { getMetadataStorage } from "./metadata";
 import { EntityCreatedEvent, EntityUpdatedEvent, EntityDeletedEvent, ComponentAddedEvent, ComponentUpdatedEvent, ComponentRemovedEvent } from "./events/EntityLifecycleEvents";
 import type { IEntity } from "./EntityInterface";
+import { getRequestScope } from "./requestScope";
 
 export class Entity implements IEntity {
     id: string;
@@ -77,7 +78,12 @@ export class Entity implements IEntity {
         ]);
     }
 
-    private static trackCacheOp(p: Promise<void>): void {
+    /**
+     * Track a fire-and-forget cache promise in the drainable set. Public so
+     * other framework read paths (e.g. Query.populateComponents cache
+     * warming) share the same drain semantics (H-CACHE-1).
+     */
+    public static trackCacheOp(p: Promise<void>): void {
         Entity.pendingCacheOps.add(p);
         p.finally(() => Entity.pendingCacheOps.delete(p));
     }
@@ -106,6 +112,18 @@ export class Entity implements IEntity {
         return this;
     }
 
+    /**
+     * Resolve a component constructor to its type id. `getComponentId` is
+     * memoized in metadata storage, so this is an O(1) Map lookup with no
+     * component instantiation — unlike `new ctor().getTypeID()`. The
+     * `components` map is keyed by type id (see addComponent), so callers can
+     * then do `this.components.get(typeId)` instead of allocating an array and
+     * scanning it with `instanceof`.
+     */
+    private typeIdOf(ctor: new (...args: any[]) => BaseComponent): string {
+        return getMetadataStorage().getComponentId(ctor.name);
+    }
+
     public componentList(): BaseComponent[] {
         return Array.from(this.components.values());
     }
@@ -117,7 +135,7 @@ export class Entity implements IEntity {
      * @returns Component instance if already in memory, undefined otherwise
      */
     public getInMemory<T extends BaseComponent>(ctor: new (...args: any[]) => T): T | undefined {
-        return Array.from(this.components.values()).find(comp => comp instanceof ctor) as T | undefined;
+        return this.components.get(this.typeIdOf(ctor)) as T | undefined;
     }
 
     /**
@@ -126,7 +144,7 @@ export class Entity implements IEntity {
      * @returns true if component is already loaded in memory
      */
     public hasInMemory<T extends BaseComponent>(ctor: new (...args: any[]) => T): boolean {
-        return Array.from(this.components.values()).some(comp => comp instanceof ctor);
+        return this.components.has(this.typeIdOf(ctor));
     }
 
     /**
@@ -136,8 +154,7 @@ export class Entity implements IEntity {
      * @returns true if component was removed (pending or saved)
      */
     public wasRemoved<T extends BaseComponent>(ctor: new (...args: any[]) => T): boolean {
-        const temp = new ctor();
-        const typeId = temp.getTypeID();
+        const typeId = this.typeIdOf(ctor);
         // Check both pending removals and already-saved removals
         return this.removedComponents.has(typeId) || this.savedRemovedComponents.has(typeId);
     }
@@ -175,10 +192,10 @@ export class Entity implements IEntity {
      * If it doesn't exist, it adds a new component.
      * Use like: entity.set(Component, { value: "Test" })
      */
-    public async set<T extends BaseComponent>(ctor: new (...args: any[]) => T, data: Partial<ComponentDataType<T>>, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }): Promise<this> {
+    public async set<T extends BaseComponent>(ctor: new (...args: any[]) => T, data: Partial<ComponentDataType<T>>, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<this> {
         await this.get(ctor, context);
-        
-        const component = Array.from(this.components.values()).find(comp => comp instanceof ctor) as T;
+
+        const component = this.components.get(this.typeIdOf(ctor)) as T;
         if (component) {
             // Store old data for the update event
             const oldData = { ...component };
@@ -241,9 +258,9 @@ export class Entity implements IEntity {
      * If you want to keep the component in the database but just remove it from the entity instance,
      * consider implementing a different method.
      */
-    public remove<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }): boolean {
-        const component = Array.from(this.components.values()).find(comp => comp instanceof ctor) as T;
-        
+    public remove<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): boolean {
+        const component = this.components.get(this.typeIdOf(ctor)) as T;
+
         if (component) {
             const typeId = component.getTypeID();
             
@@ -299,7 +316,7 @@ export class Entity implements IEntity {
      * @param context Optional DataLoader context and/or transaction
      * @returns Component data or null
      */
-    public async get<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }): Promise<ComponentDataType<T> | null> {
+    public async get<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<ComponentDataType<T> | null> {
         const comp = await this._loadComponent(ctor, context);
         return comp ? (comp as ComponentGetter<T>).data() : null;
     }
@@ -342,7 +359,7 @@ export class Entity implements IEntity {
      */
     public async getOrThrow<T extends BaseComponent>(
         ctor: new (...args: any[]) => T,
-        context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }
+        context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }
     ): Promise<ComponentDataType<T>> {
         const data = await this.get(ctor, context);
         if (data === null) {
@@ -381,7 +398,7 @@ export class Entity implements IEntity {
      * @param context Optional DataLoader context and/or transaction
      * @returns Component instance or null
      */
-    public async getInstanceOf<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }): Promise<T | null> {
+    public async getInstanceOf<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<T | null> {
         return this._loadComponent(ctor, context);
     }
 
@@ -394,7 +411,7 @@ export class Entity implements IEntity {
      *
      * @param opts Optional transaction
      */
-    public async reload(opts?: { trx?: SQL }): Promise<this> {
+    public async reload(opts?: { trx?: SQL; signal?: AbortSignal }): Promise<this> {
         if (!this.id || this.id.trim() === '') {
             return this;
         }
@@ -403,11 +420,14 @@ export class Entity implements IEntity {
         this.savedRemovedComponents.clear();
 
         const dbConn = opts?.trx ?? db;
-        const rows = await dbConn`
+        const rows = await runWithSignal<any[]>(
+            dbConn`
             SELECT c.id, c.type_id, c.data
             FROM components c
             WHERE c.entity_id = ${this.id} AND c.deleted_at IS NULL
-        `;
+        `,
+            opts?.signal
+        );
 
         const storage = getMetadataStorage();
         for (const row of rows) {
@@ -451,17 +471,19 @@ export class Entity implements IEntity {
         if (ctors.length === 0) return;
         const missing: string[] = [];
         for (const ctor of ctors) {
-            const existing = Array.from(this.components.values()).find(c => c instanceof ctor);
-            if (existing) continue;
-            const typeId = new ctor().getTypeID();
-            missing.push(typeId);
+            // components is keyed by type id — O(1) lookup, no instantiation
+            // and no O(K) instanceof scan per constructor.
+            const typeId = this.typeIdOf(ctor);
+            if (!this.components.has(typeId)) {
+                missing.push(typeId);
+            }
         }
         if (missing.length === 0) return;
         await Entity.LoadComponents([this], missing);
     }
 
-    private async _loadComponent<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }): Promise<T | null> {
-        const comp = Array.from(this.components.values()).find(comp => comp instanceof ctor) as T | undefined;
+    private async _loadComponent<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<T | null> {
+        const comp = this.components.get(this.typeIdOf(ctor)) as T | undefined;
         if (typeof comp !== "undefined") {
             return comp;
         }
@@ -472,18 +494,28 @@ export class Entity implements IEntity {
             return null;
         }
 
-        const temp = new ctor();
-        const typeId = temp.getTypeID();
-        
+        // Memoized metadata lookup — no throwaway component instantiation
+        // just to read the type id.
+        const typeId = this.typeIdOf(ctor);
+
         // Use transaction if provided, otherwise use default db
         const dbConn = context?.trx ?? db;
-        
+
+        // Ambient request scope fallback: bare entity.get() calls (e.g.
+        // inside @ArcheTypeFunction bodies or Unwrap()) batch through the
+        // request's DataLoaders instead of firing one SELECT per call.
+        // Never substituted when the caller passed an explicit trx — a
+        // loader read outside the transaction could see stale data.
+        const scope = (!context?.loaders && !context?.trx) ? getRequestScope() : undefined;
+        const loaders = context?.loaders ?? scope?.loaders;
+        const signal = context?.signal ?? scope?.signal;
+
         try {
             let componentData: any = null;
             let componentId: string | null = null;
 
-            if (context?.loaders?.componentsByEntityType) {
-                const loaderResult = await context.loaders.componentsByEntityType.load({
+            if (loaders?.componentsByEntityType) {
+                const loaderResult = await loaders.componentsByEntityType.load({
                     entityId: this.id,
                     typeId: typeId
                 });
@@ -492,7 +524,15 @@ export class Entity implements IEntity {
                     componentId = loaderResult.id;
                 }
             } else {
-                const rows = await dbConn`SELECT id, data FROM components WHERE entity_id = ${this.id} AND type_id = ${typeId} AND deleted_at IS NULL`;
+                // Route through runWithSignal so a request/wall-clock abort can
+                // cancel this in-flight read. When dbConn is context.trx, an
+                // uncancelled read leaks the backend into `idle in transaction`
+                // on timeout (matches the d1dde84 save/delete fix, which missed
+                // the read path).
+                const rows = await runWithSignal<any[]>(
+                    dbConn`SELECT id, data FROM components WHERE entity_id = ${this.id} AND type_id = ${typeId} AND deleted_at IS NULL`,
+                    signal
+                );
                 if (rows.length > 0) {
                     componentData = rows[0].data;
                     componentId = rows[0].id;
@@ -529,7 +569,7 @@ export class Entity implements IEntity {
     }
 
     @timed("Entity.save")
-    public async save(trx?: SQL, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }): Promise<boolean> {
+    public async save(trx?: SQL, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<boolean> {
         // Capture pre-save state BEFORE doSave mutates persisted/dirty flags.
         const wasNew = !this._persisted;
         const changedComponentTypeIds = this.getDirtyComponents();
@@ -615,7 +655,7 @@ export class Entity implements IEntity {
         wasNew: boolean,
         changedComponentTypeIds: string[],
         removedComponentTypeIds: string[],
-        context: { loaders?: { componentsByEntityType?: any }; trx?: SQL } | undefined,
+        context: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal } | undefined,
         phases: Record<string, number> | undefined,
         phaseStart: number | undefined,
     ): Promise<void> {
@@ -652,7 +692,7 @@ export class Entity implements IEntity {
      * @param changedComponentTypeIds - Component type IDs that were dirty before save (captured before doSave clears flags)
      * @param removedComponentTypeIds - Component type IDs that were removed (captured before doSave clears the set)
      */
-    private async handleCacheAfterSave(changedComponentTypeIds: string[], removedComponentTypeIds: string[], context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL }): Promise<void> {
+    private async handleCacheAfterSave(changedComponentTypeIds: string[], removedComponentTypeIds: string[], context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<void> {
         try {
             // Import CacheManager dynamically to avoid circular dependency
             const { CacheManager } = await import('./cache/CacheManager');
@@ -672,34 +712,33 @@ export class Entity implements IEntity {
             if (config.enabled && config.component?.enabled) {
                 // Use the pre-captured lists instead of re-querying (dirty flags are already cleared by doSave)
 
-                // Invalidate cache for changed components
-                for (const typeId of changedComponentTypeIds) {
-                    if (config.strategy === 'write-through') {
-                        // Update component cache with new data
-                        const component = this.components.get(typeId);
-                        if (component) {
-                            await cacheManager.setComponentWriteThrough(this.id, [component], typeId, config.component.ttl);
-                        }
-                    } else {
-                        // Invalidate component cache
-                        await cacheManager.invalidateComponent(this.id, typeId);
+                if (config.strategy === 'write-through') {
+                    // Single batched write-through (2 pipelined provider
+                    // round-trips total) instead of one GET+SET pair per
+                    // changed component.
+                    const entries = changedComponentTypeIds
+                        .map(typeId => ({ typeId, component: this.components.get(typeId) }))
+                        .filter((e): e is { typeId: string; component: BaseComponent } => !!e.component)
+                        .map(e => ({ entityId: this.id, typeId: e.typeId, component: e.component, ttl: config.component!.ttl }));
+                    if (entries.length > 0) {
+                        await cacheManager.setComponentsBatchWriteThrough(entries);
                     }
-                    
-                    // Invalidate DataLoader cache for changed component
-                    if (context?.loaders?.componentsByEntityType) {
-                        context.loaders.componentsByEntityType.clear({
-                            entityId: this.id,
-                            typeId: typeId
-                        });
-                    }
+                } else if (changedComponentTypeIds.length > 0) {
+                    await Promise.all(changedComponentTypeIds.map(typeId =>
+                        cacheManager.invalidateComponent(this.id, typeId)
+                    ));
                 }
 
                 // Invalidate cache for removed components
-                for (const typeId of removedComponentTypeIds) {
-                    await cacheManager.invalidateComponent(this.id, typeId);
-                    
-                    // Invalidate DataLoader cache for removed component
-                    if (context?.loaders?.componentsByEntityType) {
+                if (removedComponentTypeIds.length > 0) {
+                    await Promise.all(removedComponentTypeIds.map(typeId =>
+                        cacheManager.invalidateComponent(this.id, typeId)
+                    ));
+                }
+
+                // Invalidate DataLoader cache for changed + removed components
+                if (context?.loaders?.componentsByEntityType) {
+                    for (const typeId of [...changedComponentTypeIds, ...removedComponentTypeIds]) {
                         context.loaders.componentsByEntityType.clear({
                             entityId: this.id,
                             typeId: typeId
@@ -779,11 +818,15 @@ export class Entity implements IEntity {
                 this._persisted = true;
             }
 
-            // Delete removed components from database
+            // Delete removed components from database. Independent tables —
+            // pipeline both DELETEs on the transaction connection instead of
+            // paying two serial round-trips.
             if (this.removedComponents.size > 0) {
                 const typeIds = Array.from(this.removedComponents);
-                await run(saveTrx`DELETE FROM components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`);
-                await run(saveTrx`DELETE FROM entity_components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`);
+                await Promise.all([
+                    run(saveTrx`DELETE FROM components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`),
+                    run(saveTrx`DELETE FROM entity_components WHERE entity_id = ${this.id} AND type_id IN ${sql(typeIds)}`),
+                ]);
                 // Move to savedRemovedComponents so resolvers can still detect removed components
                 // This is needed because DataLoader may have stale cached data for this request
                 for (const typeId of typeIds) {
@@ -863,7 +906,10 @@ export class Entity implements IEntity {
                 }
             }
 
-            // Perform batch updates
+            // Perform updates. Validate all ids up front (synchronous, fails
+            // fast), then fire the UPDATEs together via Promise.all so they
+            // pipeline on the transaction connection instead of paying one
+            // serial round-trip per dirty component.
             if (componentsToUpdate.length > 0) {
                 for (const comp of componentsToUpdate) {
                     // Validate component ID to prevent PostgreSQL UUID parsing errors
@@ -872,8 +918,12 @@ export class Entity implements IEntity {
                         throw new Error(`Cannot update component: component id is empty or invalid`);
                     }
                     logger.trace({ componentId: comp.id, data: comp.data }, `[Entity.doSave] Updating component`);
-                    await run(saveTrx`UPDATE components SET data = ${comp.data} WHERE id = ${comp.id}`);
                 }
+                await Promise.all(
+                    componentsToUpdate.map(comp =>
+                        run(saveTrx`UPDATE components SET data = ${comp.data} WHERE id = ${comp.id}`)
+                    )
+                );
             }
         };
 
