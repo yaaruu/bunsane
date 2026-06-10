@@ -4,6 +4,38 @@ All notable changes to bunsane are documented here.
 
 ## Unreleased
 
+### BREAKING — v0.4.0
+
+- **`entity_components` table is no longer written or created by the framework.**
+  `components` (via `UNIQUE(entity_id, type_id)`) is now the single source of
+  entity↔component membership. The `entity_components` table receives no further
+  INSERTs, UPDATEs, or DELETEs on any save, delete, or soft-delete path.
+
+  **Impact on consumers:**
+  - Any application querying `entity_components` directly (e.g. raw `db.unsafe`
+    calls, external analytics, custom reports) must migrate those queries to
+    `components` — see the inventory in `docs/ENTITY_COMPONENTS_REMOVAL_PLAN.md`.
+  - Orphaned `entity_components` tables in upgraded databases can be dropped
+    manually after verifying the upgrade succeeded:
+    ```sql
+    DROP TABLE entity_components;
+    ```
+    The framework emits a one-time info log at startup when the orphaned table is
+    detected, directing the operator to drop it.
+  - Databases with pre-dual-write history (written before Phase 1 of this plan)
+    or with external writers to `entity_components` may have membership records
+    that differ from `components`. Reconcile those differences before upgrading
+    by running a diff query (`SELECT entity_id, type_id FROM entity_components
+    EXCEPT SELECT entity_id, type_id FROM components`).
+
+  **Emergency rollback:** `BUNSANE_MEMBERSHIP_SOURCE=legacy` re-routes all
+  membership reads to `entity_components`. However this only works if the table
+  is populated. After Phase 3, that requires a manual backfill:
+  1. `CreateEntityComponentTable()` — recreates the DDL.
+  2. `PopulateComponentIds()` — backfills rows from `components`.
+
+  Both functions are exported from `database/DatabaseHelper.ts`.
+
 ### Fixed
 
 - **`UploadManager` no longer registers default providers asynchronously

@@ -538,6 +538,19 @@ export const EnsureDatabaseMigrations = async () => {
     // solely in `components` (UNIQUE(entity_id, type_id)). Run
     // `PopulateComponentIds()` manually to backfill the legacy table if a
     // downgrade is ever required.
+    const orphanCheck = await db.unsafe(`
+        SELECT 1 FROM information_schema.tables
+        WHERE table_name = 'entity_components'
+        AND table_schema = 'public'
+    `);
+    if (orphanCheck.length > 0) {
+        logger.info(
+            `[entity_components] Orphaned table detected. ` +
+            `This table is no longer used by the framework (see docs/ENTITY_COMPONENTS_REMOVAL_PLAN.md). ` +
+            `Verify your upgrade succeeded (run a smoke-test query against the 'components' table), ` +
+            `then drop the orphan manually: DROP TABLE entity_components;`
+        );
+    }
 }
 
 export const AnalyzeAllComponentTables = async (): Promise<void> => {
