@@ -2,7 +2,34 @@
 
 All notable changes to bunsane are documented here.
 
-## Unreleased
+## 0.4.0 — 2026-06-11
+
+### Performance (2026-06-10 overhaul)
+
+- **ALS request scope** (`core/requestScope.ts`) — bare `entity.get()` calls inside
+  `@ArcheTypeFunction`, `Unwrap`, and `populateRelations` are now batched
+  automatically per request.
+- **Sort-driven scan** for multi-component `sortBy` queries — LIMIT pushdown into
+  the sort component scan (excluded for OR filters and cursor pagination).
+- **`Query.count()` fixes** — no longer capped by `BUNSANE_DEFAULT_QUERY_LIMIT`;
+  missing builder reset fixed.
+- **`populate()` warms the component cache** (≤1000 components per query).
+- **O(1) MemoryCache LRU** eviction.
+- **Batched write-through** — 2 cache round-trips per `entity.save()` regardless of
+  component count.
+- **Framework `PreparedStatementCache` removed from the query hot path** — Bun SQL
+  auto-prepares. `Query.noCache()` with no arguments is now a no-op; use
+  `noCache({ component: true })` to bypass the component cache.
+- **Default pool size 10 → 20** (`POSTGRES_MAX_CONNECTIONS`).
+- **New `'fulltext'` index type** for `@IndexedField` (tsvector GIN).
+
+### Internal refactors
+
+- `core/Entity.ts` split into `core/entity/` submodules (pendingOps,
+  componentAccess, saveEntity, finders). Public API and import paths unchanged.
+- Package now publishes with a `files` whitelist — tests, internal docs, and tooling
+  configs no longer ship to npm; `studio/dist` is now included so `enableStudio()`
+  works from the published package (run `bun run build` before `npm publish`).
 
 ### BREAKING — v0.4.0
 

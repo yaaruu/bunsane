@@ -116,7 +116,7 @@ const maskError = (error: any, message: string): GraphQLError => {
     }
     
     // Pass through known application-level GraphQL error codes
-    const isGQLError = (e: any): e is GraphQLError =>
+    const isGQLError = (e: any): e is { message: string; extensions?: Record<string, unknown> } =>
         e instanceof GraphQLError ||
         (e !== null && typeof e === 'object' && 'extensions' in e && 'message' in e && typeof e.message === 'string');
     const knownCodes = ['FORBIDDEN', 'NOT_FOUND', 'BAD_USER_INPUT', 'BAD_REQUEST'];
