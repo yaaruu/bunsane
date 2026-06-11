@@ -57,13 +57,22 @@ export function buildFieldResolvers(archetype: any): FieldResolverEntry[] {
 
         const isUnwrapped = shouldUnwrapComponent(componentProps, fieldType);
 
+        // Detect whether the unwrapped 'value' prop is a Date so we can
+        // normalize Date instances to ISO strings before they reach
+        // gqloom's GraphQLString coercion (which would call .valueOf() and
+        // emit epoch ms instead).
+        const unwrappedValueProp = componentProps.find(p => p.propertyKey === 'value');
+        const isUnwrappedDate = isUnwrapped && unwrappedValueProp?.propertyType === Date;
+        const normalizeDateValue = (v: any) =>
+            isUnwrappedDate && v instanceof Date ? v.toISOString() : v;
+
         if (isUnwrapped) {
             resolvers.push({
                 typeName: archetypeName,
                 fieldName: field,
                 resolver: async (parent: any, args: any, context: any) => {
                     const entityId = parent?.id;
-                    if (!entityId) return (parent as any)[field];
+                    if (!entityId) return normalizeDateValue((parent as any)[field]);
 
                     if (parent instanceof Entity) {
                         if (parent.wasRemoved(componentCtor)) {
@@ -71,7 +80,7 @@ export function buildFieldResolvers(archetype: any): FieldResolverEntry[] {
                         }
                         const inMemoryComp = parent.getInMemory(componentCtor);
                         if (inMemoryComp) {
-                            return (inMemoryComp as any)?.value;
+                            return normalizeDateValue((inMemoryComp as any)?.value);
                         }
                     }
 
@@ -82,13 +91,13 @@ export function buildFieldResolvers(archetype: any): FieldResolverEntry[] {
                                 typeId: typeIdHex,
                             });
                         if (componentData?.data?.value !== undefined) {
-                            return componentData.data.value;
+                            return normalizeDateValue(componentData.data.value);
                         }
                     }
 
                     const entity = await ensureEntity(parent, context);
                     const comp = await entity.get(componentCtor);
-                    return (comp as any)?.value;
+                    return normalizeDateValue((comp as any)?.value);
                 },
             });
         } else {
@@ -129,10 +138,17 @@ export function buildFieldResolvers(archetype: any): FieldResolverEntry[] {
             const componentTypeName = compNameToFieldName(componentName);
 
             for (const prop of componentProps) {
+                const isDateProp = prop.propertyType === Date;
                 resolvers.push({
                     typeName: componentTypeName,
                     fieldName: prop.propertyKey,
-                    resolver: (parent: any) => parent[prop.propertyKey],
+                    resolver: (parent: any) => {
+                        const v = parent[prop.propertyKey];
+                        if (isDateProp && v instanceof Date) {
+                            return v.toISOString();
+                        }
+                        return v;
+                    },
                 });
             }
         }
@@ -313,6 +329,54 @@ export function buildFieldResolvers(archetype: any): FieldResolverEntry[] {
                 },
             });
         } else if (isArray) {
+            // Resolve the FK-bearing component + field ONCE (lazily, then
+            // memoized) rather than re-instantiating the related archetype and
+            // walking its component metadata on every parent row. The result is
+            // captured in the resolver closure.
+            let fkResolution:
+                | { componentCtor: any; componentTypeId: string; foreignKeyField: string }
+                | null
+                | undefined;
+            const resolveFk = () => {
+                if (fkResolution !== undefined) return fkResolution;
+                fkResolution = null;
+                if (!relationOptions?.foreignKey) return fkResolution;
+
+                let relatedArchetypeInstance: any = null;
+                if (typeof relatedArcheType === "function") {
+                    relatedArchetypeInstance = new (relatedArcheType as any)();
+                } else if (typeof relatedArcheType === "string") {
+                    const meta = storage.archetypes.find((a) => a.name === relatedArcheType);
+                    if (meta) relatedArchetypeInstance = new (meta.target as any)();
+                }
+                if (!relatedArchetypeInstance) return fkResolution;
+
+                let componentCtor: any = null;
+                let foreignKeyField: string = relationOptions.foreignKey;
+                if (relationOptions.foreignKey.includes('.')) {
+                    const [fieldName, propName] = relationOptions.foreignKey.split('.');
+                    componentCtor = relatedArchetypeInstance.componentMap[fieldName!];
+                    foreignKeyField = propName!;
+                } else {
+                    for (const comp of Object.values(relatedArchetypeInstance.componentMap) as any[]) {
+                        const typeId = storage.getComponentId(comp.name);
+                        const props = storage.getComponentProperties(typeId);
+                        if (props.some(p => p.propertyKey === relationOptions.foreignKey)) {
+                            componentCtor = comp;
+                            break;
+                        }
+                    }
+                }
+                if (componentCtor) {
+                    fkResolution = {
+                        componentCtor,
+                        componentTypeId: storage.getComponentId(componentCtor.name),
+                        foreignKeyField,
+                    };
+                }
+                return fkResolution;
+            };
+
             resolvers.push({
                 typeName: archetypeName,
                 fieldName: field,
@@ -321,44 +385,25 @@ export function buildFieldResolvers(archetype: any): FieldResolverEntry[] {
                     if (!entityId) return [];
 
                     if (relationOptions?.foreignKey) {
-                        let componentCtor: any = null;
-                        let foreignKeyField: string = relationOptions.foreignKey;
-                        let relatedArchetypeInstance: any = null;
-
-                        if (typeof relatedArcheType === "function") {
-                            relatedArchetypeInstance = new (relatedArcheType as any)();
-                        } else if (typeof relatedArcheType === "string") {
-                            const relatedArchetypeMetadata = storage.archetypes.find((a) => a.name === relatedArcheType);
-                            if (relatedArchetypeMetadata) {
-                                relatedArchetypeInstance = new (relatedArchetypeMetadata.target as any)();
-                            }
-                        }
-
-                        if (relatedArchetypeInstance) {
-                            if (relationOptions.foreignKey.includes('.')) {
-                                const [fieldName, propName] = relationOptions.foreignKey.split('.');
-                                componentCtor = relatedArchetypeInstance.componentMap[fieldName!];
-                                foreignKeyField = propName!;
-                            } else {
-                                for (const comp of Object.values(relatedArchetypeInstance.componentMap) as any[]) {
-                                    const typeId = storage.getComponentId(comp.name);
-                                    const props = storage.getComponentProperties(typeId);
-                                    if (props.some(p => p.propertyKey === relationOptions.foreignKey)) {
-                                        componentCtor = comp;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        if (componentCtor) {
-                            const query = new Query();
-                            query.with(componentCtor, Query.filters(Query.filter(foreignKeyField, Query.filterOp.EQ, entityId)));
-                            return await query.exec();
-                        } else {
+                        const r = resolveFk();
+                        if (!r) {
                             console.warn(`No component found with foreign key ${relationOptions.foreignKey} in ${relatedTypeName}`);
                             return [];
                         }
+                        // Batched path: dedups across sibling parents in the
+                        // same request via the type-scoped FK loader (was N+1).
+                        if (context?.loaders?.relationsByComponentFk) {
+                            return await context.loaders.relationsByComponentFk.load({
+                                entityId,
+                                componentTypeId: r.componentTypeId,
+                                foreignKeyField: r.foreignKeyField,
+                            });
+                        }
+                        // Fallback for non-request contexts (direct service
+                        // calls with no loaders mounted): single query.
+                        const query = new Query();
+                        query.with(r.componentCtor, Query.filters(Query.filter(r.foreignKeyField, Query.filterOp.EQ, entityId)));
+                        return await query.exec();
                     } else {
                         if (context?.loaders?.relationsByEntityField) {
                             return context.loaders.relationsByEntityField.load({

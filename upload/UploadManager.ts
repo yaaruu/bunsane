@@ -21,7 +21,7 @@ export class UploadManager {
     private constructor() {
         this.fileValidator = new FileValidator();
         this.globalConfig = this.getDefaultConfiguration();
-        this.initializeDefaultProviders();
+        this.registerDefaultProviders();
     }
 
     public static getInstance(): UploadManager {
@@ -185,11 +185,13 @@ export class UploadManager {
         return { ...this.globalConfig };
     }
 
-    private async initializeDefaultProviders(): Promise<void> {
-        // Register default local storage provider
-        const localProvider = new LocalStorageProvider();
-        await localProvider.initialize();
-        this.registerStorageProvider("local", localProvider);
+    private registerDefaultProviders(): void {
+        // Synchronous registration. Must NOT be async/awaited: any await here
+        // would defer registration to a later microtask, after which a caller's
+        // post-construction `registerStorageProvider("local", custom)` would be
+        // silently clobbered by the default. See BUNSANE-007.
+        // LocalStorageProvider creates its base directory in its constructor.
+        this.registerStorageProvider("local", new LocalStorageProvider());
     }
 
     private getDefaultConfiguration(): UploadConfiguration {

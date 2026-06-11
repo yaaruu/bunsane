@@ -143,7 +143,6 @@ describe('Complex Query Performance Analysis', () => {
             console.log('Running ANALYZE to update statistics...');
             await db.unsafe(`ANALYZE entities`);
             await db.unsafe(`ANALYZE components`);
-            await db.unsafe(`ANALYZE entity_components`);
             console.log('Statistics updated.\n');
         }
     }, 600000); // 10 minute timeout for large datasets

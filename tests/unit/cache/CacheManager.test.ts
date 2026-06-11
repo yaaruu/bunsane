@@ -68,11 +68,14 @@ describe('CacheManager', () => {
             expect(typeof config.enabled).toBe('boolean');
         });
 
-        test('returns copy of configuration', () => {
+        test('returns frozen configuration reference', () => {
+            // getConfig() used to spread-clone per call — called 6+ times per
+            // request, pure allocation churn. Contract is now a frozen direct
+            // reference: same object, immutable.
             const config1 = cacheManager.getConfig();
             const config2 = cacheManager.getConfig();
-            expect(config1).not.toBe(config2);
-            expect(config1).toEqual(config2);
+            expect(config1).toBe(config2);
+            expect(Object.isFrozen(config1)).toBe(true);
         });
     });
 

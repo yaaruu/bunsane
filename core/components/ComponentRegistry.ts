@@ -8,6 +8,7 @@ import {
     GenerateTableName,
     UpdateComponentIndexes,
     AnalyzeAllComponentTables,
+    CreateRelationIndexes,
     GetPartitionStrategy,
 } from "../../database/DatabaseHelper";
 import { ensureMultipleJSONBPathIndexes } from "../../database/IndexingStrategy";
@@ -34,6 +35,7 @@ class ComponentRegistry {
     private readinessPromises = new Map<string, Promise<void>>();
     private readinessResolvers = new Map<string, () => void>();
     private componentsRegistered: boolean = false;
+    private cachedPartitionStrategy: string | null = null;
 
     constructor() {}
 
@@ -200,6 +202,18 @@ class ComponentRegistry {
     }
 
     register(name: string, typeid: string, ctor: ComponentConstructor) {
+        // Warn when a LIST partition is being attached after startup registration
+        // completed. CREATE TABLE ... PARTITION OF takes ACCESS EXCLUSIVE on the
+        // parent `components` table, stalling all component I/O during the lock.
+        // Fine at boot; dangerous if a request triggers first use of a new type.
+        if (this.componentsRegistered && this.cachedPartitionStrategy === 'list') {
+            logger.warn(
+                `Runtime partition attach for component "${name}" takes ACCESS EXCLUSIVE on the ` +
+                `components table, stalling all component reads and writes until the DDL completes. ` +
+                `Pre-register all components at startup, or set BUNSANE_PARTITION_STRATEGY=hash ` +
+                `to avoid per-component partitions.`
+            );
+        }
         return new Promise<boolean>(async (resolve) => {
             const partitionTableName = GenerateTableName(name);
             // await this.populateCurrentTables();
@@ -289,6 +303,7 @@ class ComponentRegistry {
 
         // Check partitioning strategy for index creation
         const partitionStrategy = await GetPartitionStrategy();
+        this.cachedPartitionStrategy = partitionStrategy;
 
         // Update component indexes for components that have indexed properties
         // NOTE: Index operations are serialized to prevent deadlocks with ANALYZE
@@ -345,6 +360,19 @@ class ComponentRegistry {
             }
         }
         logger.info(`Registered hooks for ${services.length} services`);
+
+        // Create btree indexes on archetype relation foreign-key fields
+        // (data->>'fk'). Without these, @BelongsTo/@HasMany resolver queries
+        // sequentially scan the relation component partition tables. Runs
+        // before ANALYZE so the planner picks up fresh stats for the new
+        // indexes. Idempotent (IF NOT EXISTS) and CONCURRENTLY on LIST
+        // partitions, so it is safe to re-run on every startup against live
+        // tables.
+        try {
+            await CreateRelationIndexes();
+        } catch (error) {
+            logger.warn(`Failed to create relation FK indexes: ${error}`);
+        }
 
         // Run ANALYZE on all component tables to update query planner statistics
         await AnalyzeAllComponentTables();

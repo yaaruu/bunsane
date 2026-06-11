@@ -135,6 +135,8 @@ export interface RemoteManagerConfig {
     outboxPollIntervalMs?: number;
     /** Max rows processed per outbox tick (default: 100) */
     outboxBatchSize?: number;
+    /** How long to keep published outbox rows before deletion in ms (default: 86400000 / 24h, 0 disables) */
+    outboxRetentionMs?: number;
     /** Circuit breaker failure threshold before opening (default: 5) */
     circuitBreakerThreshold?: number;
     /** Circuit breaker reset timeout in ms (default: 30000) */

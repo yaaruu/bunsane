@@ -284,6 +284,7 @@ export class RemoteManager {
                             this.config.outboxPollIntervalMs ?? 1000,
                         batchSize: this.config.outboxBatchSize ?? 100,
                         enableLogging: this.config.enableLogging ?? false,
+                        retentionMs: this.config.outboxRetentionMs ?? 86_400_000,
                     },
                     this.metrics
                 );

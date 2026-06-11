@@ -11,7 +11,7 @@ import { getMetadataStorage } from '../metadata';
  *   - 'numeric': BTREE index with numeric cast for range queries (>, <, BETWEEN)
  * @param isDateField Whether this field contains date values (affects BTREE index casting)
  */
-export function IndexedField(indexType: 'gin' | 'btree' | 'hash' | 'numeric' = 'gin', isDateField: boolean = false) {
+export function IndexedField(indexType: 'gin' | 'btree' | 'hash' | 'numeric' | 'fulltext' = 'gin', isDateField: boolean = false) {
     return function(target: any, propertyKey: string) {
         const storage = getMetadataStorage();
         const componentId = storage.getComponentId(target.constructor.name);

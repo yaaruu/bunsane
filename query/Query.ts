@@ -14,6 +14,12 @@ import { shouldUseDirectPartition } from "../core/Config";
 import type { SQL } from "bun";
 import type { ComponentConstructor, TypedEntity, ComponentRecord } from "../types/query.types";
 import { assertComponentTableName, assertFieldPath } from "./SqlIdentifier";
+import { getMembershipSource } from "./membershipSource";
+
+// Parsed once at module load instead of on every exec() (process.env read +
+// parseInt was on the query hot path). 0 disables the default limit.
+const DEFAULT_QUERY_LIMIT = parseInt(process.env.BUNSANE_DEFAULT_QUERY_LIMIT ?? '10000', 10);
+let warnedDefaultLimit = false;
 
 export type FilterOperator = "=" | ">" | "<" | ">=" | "<=" | "!=" | "LIKE" | "ILIKE" | "IN" | "NOT IN" | string;
 
@@ -154,6 +160,9 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         if (componentCtorOrComponentsOrOrQuery instanceof OrQuery) {
             // Handle OR query
             this.orQuery = componentCtorOrComponentsOrOrQuery;
+            // Suppress base-level scan optimizations that bake ORDER/LIMIT
+            // into the SQL OrNode later embeds as its base set.
+            this.context.hasOrQuery = true;
             return this;
         }
 
@@ -300,6 +309,9 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
     /**
      * Bypass cache for this query.
      * @param options Cache options to bypass. If not provided, bypasses prepared statement cache.
+     * Note: the prepared-statement option is now a no-op (queries always
+     * execute directly; Bun SQL handles statement preparation). The
+     * `component` option still controls the component cache.
      */
     public noCache(): this;
     public noCache(options: QueryCacheOptions): this;
@@ -325,6 +337,7 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
                 logger.error(`Query count execution timeout`);
                 reject(new Error(`Query count execution timeout after ${QUERY_TIMEOUT_MS / 1000} seconds`));
             }, QUERY_TIMEOUT_MS);
+            (timeout as unknown as { unref?: () => void }).unref?.();
             this.doCount()
                 .then(result => {
                     clearTimeout(timeout);
@@ -380,12 +393,32 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         const dbConn = this.getDb();
 
         // Use PostgreSQL's statistics for fast count estimate
-        // This queries pg_class which is O(1) instead of scanning the table
-        const sql = tableName && tableName !== 'components'
-            ? `SELECT reltuples::bigint AS estimate FROM pg_class WHERE relname = $1`
-            : `SELECT reltuples::bigint AS estimate FROM pg_class WHERE relname = 'entity_components'`;
+        // This queries pg_class which is O(1) instead of scanning the table.
+        // When the component resolves to a specific partition table, read its
+        // reltuples directly. Otherwise fall back to the membership source:
+        // legacy reads `entity_components` reltuples; the components source
+        // sums the LIST-partition child stats (the partitioned parent's
+        // reltuples is unreliable).
+        let sql: string;
+        let params: any[];
+        if (tableName && tableName !== 'components') {
+            sql = `SELECT reltuples::bigint AS estimate FROM pg_class WHERE relname = $1`;
+            params = [tableName];
+        } else if (getMembershipSource().isLegacy) {
+            sql = `SELECT reltuples::bigint AS estimate FROM pg_class WHERE relname = 'entity_components'`;
+            params = [];
+        } else {
+            // No COALESCE: an empty partition set must yield NULL so the
+            // exact-count fallback below triggers, matching the legacy
+            // zero-rows behavior.
+            sql = `SELECT SUM(c.reltuples)::bigint AS estimate
+                   FROM pg_class c
+                   JOIN pg_inherits i ON c.oid = i.inhrelid
+                   WHERE i.inhparent = 'components'::regclass`;
+            params = [];
+        }
 
-        const result = await timedUnsafe<any[]>(dbConn, sql, [tableName || 'entity_components'], this.execSignal, this.execPerRequest);
+        const result = await timedUnsafe<any[]>(dbConn, sql, params, this.execSignal, this.execPerRequest);
 
         if (!result || result.length === 0 || result[0].estimate === null) {
             // Fallback to exact count if statistics not available
@@ -396,6 +429,32 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
     }
 
     private async doCount(): Promise<number> {
+        // Fresh params for re-execution. doExec/doAggregate already reset;
+        // missing here meant stale params (wrong bindings) on Query reuse.
+        this.context.reset();
+
+        // count() must return total matching cardinality. Pagination and
+        // sort must not leak into the counted subquery — a LIMIT inside the
+        // subquery caps the count (after a prior exec() the framework
+        // default LIMIT silently capped every count at
+        // BUNSANE_DEFAULT_QUERY_LIMIT), and ORDER BY is wasted work under
+        // COUNT(*). Save/restore so exec() after count() behaves unchanged.
+        const savedLimit = this.context.limit;
+        const savedOffset = this.context.offsetValue;
+        const savedSorts = this.context.sortOrders;
+        this.context.limit = null;
+        this.context.offsetValue = 0;
+        this.context.sortOrders = [];
+        try {
+            return await this.doCountInner();
+        } finally {
+            this.context.limit = savedLimit;
+            this.context.offsetValue = savedOffset;
+            this.context.sortOrders = savedSorts;
+        }
+    }
+
+    private async doCountInner(): Promise<number> {
         // Build the DAG
         const dag = new QueryDAG();
 
@@ -437,18 +496,11 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         // Get the database connection (transaction or default)
         const dbConn = this.getDb();
 
-        let countResult: any[];
-
-        if (this.skipPreparedCache) {
-            // Bypass cache - execute directly
-            countResult = await timedUnsafe<any[]>(dbConn, countSql, result.params, this.execSignal, this.execPerRequest);
-        } else {
-            // Check prepared statement cache
-            // Add 'count:' prefix to differentiate count queries from exec queries
-            const cacheKey = 'count:' + this.context.generateCacheKey();
-            const { statement, isHit } = await preparedStatementCache.getOrCreate(countSql, cacheKey, dbConn);
-            countResult = await preparedStatementCache.execute(statement, result.params, dbConn, this.execSignal, this.execPerRequest);
-        }
+        // Execute directly. Bun SQL auto-prepares parameterized statements
+        // per connection (prepare:true default) — the former framework-level
+        // "prepared statement cache" never called a prepare API and only
+        // added cache-key string building on the hot path.
+        const countResult: any[] = await timedUnsafe<any[]>(dbConn, countSql, result.params, this.execSignal, this.execPerRequest);
 
         // Debug logging
         if (this.debug) {
@@ -496,6 +548,7 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
                 logger.error(`Query sum execution timeout`);
                 reject(new Error(`Query sum execution timeout after ${QUERY_TIMEOUT_MS / 1000} seconds`));
             }, QUERY_TIMEOUT_MS);
+            (timeout as unknown as { unref?: () => void }).unref?.();
             this.doAggregate('SUM', componentCtor, field as string)
                 .then(result => {
                     clearTimeout(timeout);
@@ -524,6 +577,7 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
                 logger.error(`Query average execution timeout`);
                 reject(new Error(`Query average execution timeout after ${QUERY_TIMEOUT_MS / 1000} seconds`));
             }, QUERY_TIMEOUT_MS);
+            (timeout as unknown as { unref?: () => void }).unref?.();
             this.doAggregate('AVG', componentCtor, field as string)
                 .then(result => {
                     clearTimeout(timeout);
@@ -631,15 +685,9 @@ AND c.deleted_at IS NULL`;
         // Get the database connection
         const dbConn = this.getDb();
 
-        let aggregateResult: any[];
-
-        if (this.skipPreparedCache) {
-            aggregateResult = await timedUnsafe<any[]>(dbConn, aggregateSql, result.params, this.execSignal, this.execPerRequest);
-        } else {
-            const cacheKey = `${aggregateType.toLowerCase()}:${typeId}:${field}:` + this.context.generateCacheKey();
-            const { statement } = await preparedStatementCache.getOrCreate(aggregateSql, cacheKey, dbConn);
-            aggregateResult = await preparedStatementCache.execute(statement, result.params, dbConn, this.execSignal, this.execPerRequest);
-        }
+        // Direct execution — see doCountInner for why the framework-level
+        // prepared statement cache was removed from the hot path.
+        const aggregateResult: any[] = await timedUnsafe<any[]>(dbConn, aggregateSql, result.params, this.execSignal, this.execPerRequest);
 
         // Debug logging
         if (this.debug) {
@@ -684,10 +732,14 @@ AND c.deleted_at IS NULL`;
         // warn once at execution so developers notice runaway queries
         // (H-QUERY-1).
         if (this.context.limit === null || this.context.limit === undefined) {
-            const envLimit = parseInt(process.env.BUNSANE_DEFAULT_QUERY_LIMIT ?? '10000', 10);
-            if (envLimit > 0) {
-                this.context.limit = envLimit;
-                logger.warn({ scope: 'Query.exec', defaultLimit: envLimit }, 'Query executed without explicit .take() — applying framework default LIMIT. Call .take(N) to suppress this warning.');
+            if (DEFAULT_QUERY_LIMIT > 0) {
+                this.context.limit = DEFAULT_QUERY_LIMIT;
+                // Warn once per process — this fires on every unbounded query,
+                // so logging per-call floods logs and allocates on the hot path.
+                if (!warnedDefaultLimit) {
+                    warnedDefaultLimit = true;
+                    logger.warn({ scope: 'Query.exec', defaultLimit: DEFAULT_QUERY_LIMIT }, 'Query executed without explicit .take() — applying framework default LIMIT. Call .take(N) to suppress this warning.');
+                }
             }
         }
 
@@ -697,6 +749,9 @@ AND c.deleted_at IS NULL`;
                 logger.error(`Query execution timeout`);
                 reject(new Error(`Query execution timeout after ${QUERY_TIMEOUT_MS / 1000} seconds`));
             }, QUERY_TIMEOUT_MS); // 30 second timeout
+            // unref: at high QPS thousands of these are live concurrently;
+            // they must not hold the event loop open nor add ref'd-timer churn.
+            (timeout as unknown as { unref?: () => void }).unref?.();
 
             this.doExec()
                 .then(result => {
@@ -833,18 +888,13 @@ AND c.deleted_at IS NULL`;
             }
         }
 
-        let entities: any[];
-
-        if (this.orQuery || this.skipPreparedCache) {
-            // For OR queries or explicit cache bypass, execute directly
-            // This avoids potential parameter type inference issues with Bun's SQL
-            entities = await timedUnsafe<any[]>(dbConn, result.sql, result.params, this.execSignal, this.execPerRequest);
-        } else {
-            // Check prepared statement cache for regular queries
-            const cacheKey = this.context.generateCacheKey();
-            const { statement, isHit } = await preparedStatementCache.getOrCreate(result.sql, cacheKey, dbConn);
-            entities = await preparedStatementCache.execute(statement, result.params, dbConn, this.execSignal, this.execPerRequest);
-        }
+        // Execute directly. Bun SQL auto-prepares parameterized statements
+        // per connection (prepare:true default), so server-side plan reuse
+        // already happens at the driver layer. The former framework-level
+        // "prepared statement cache" stored a placeholder object and
+        // re-executed db.unsafe anyway — pure cache-key/bookkeeping overhead
+        // on every exec.
+        const entities: any[] = await timedUnsafe<any[]>(dbConn, result.sql, result.params, this.execSignal, this.execPerRequest);
 
         // Convert to Entity objects
         const entityIds: string[] = entities.map((row: any) => row.id);
@@ -898,13 +948,15 @@ AND c.deleted_at IS NULL`;
         // Get the database connection (transaction or default)
         const dbConn = this.getDb();
 
+        // created_at/updated_at included so results can warm the component
+        // cache below with full ComponentData entries.
         let components: any[];
         if (shouldUseDirectPartition() && componentTypeIds.length === 1) {
             // Single component type - use direct partition if available
             const partitionTableName = ComponentRegistry.getPartitionTableName(componentTypeIds[0]!);
             if (partitionTableName) {
                 components = await timedUnsafe<any[]>(dbConn, `
-                    SELECT id, entity_id, type_id, data
+                    SELECT id, entity_id, type_id, data, created_at, updated_at
                     FROM ${partitionTableName}
                     WHERE entity_id IN ${entityIdList.sql}
                     AND type_id IN ${typeIdList.sql}
@@ -913,7 +965,7 @@ AND c.deleted_at IS NULL`;
             } else {
                 // Fallback to parent table
                 components = await timedUnsafe<any[]>(dbConn, `
-                    SELECT id, entity_id, type_id, data
+                    SELECT id, entity_id, type_id, data, created_at, updated_at
                     FROM components
                     WHERE entity_id IN ${entityIdList.sql}
                     AND type_id IN ${typeIdList.sql}
@@ -923,7 +975,7 @@ AND c.deleted_at IS NULL`;
         } else {
             // Multiple types or direct partition disabled - use parent table
             components = await timedUnsafe<any[]>(dbConn, `
-                SELECT id, entity_id, type_id, data
+                SELECT id, entity_id, type_id, data, created_at, updated_at
                 FROM components
                 WHERE entity_id IN ${entityIdList.sql}
                 AND type_id IN ${typeIdList.sql}
@@ -971,6 +1023,62 @@ AND c.deleted_at IS NULL`;
             // Add component to entity (using protected method)
             (entity as any).addComponent(component);
         }
+
+        this.warmComponentCache(components, entityIds, componentTypeIds);
+    }
+
+    /**
+     * Fire-and-forget warm of the L1/L2 component cache from populate()
+     * results, so subsequent `entity.get(X)` calls (same or later request)
+     * hit cache instead of re-querying. Previously populate() bypassed the
+     * cache entirely — only the DataLoader read path warmed it.
+     *
+     * Tracked via Entity.trackCacheOp so shutdown/tests can drain it.
+     * Skipped for large result sets to avoid hammering the cache provider
+     * with bulk-scan output.
+     */
+    private warmComponentCache(components: any[], entityIds: string[], componentTypeIds: string[]): void {
+        const WARM_CACHE_MAX = 1000;
+        if (this.skipComponentCache || this.trx) return;
+        if (components.length === 0 || components.length > WARM_CACHE_MAX) return;
+
+        Entity.trackCacheOp((async () => {
+            try {
+                const { CacheManager } = await import('../core/cache/CacheManager');
+                const cacheManager = CacheManager.getInstance();
+                const config = cacheManager.getConfig();
+                if (!config.enabled || !config.component?.enabled) return;
+
+                // Requested (entity × type) pairs let the cache tombstone
+                // known-absent components. Only built when the pair count is
+                // bounded — tombstoning a huge scan is not worth the writes.
+                let requested: Array<{ entityId: string; typeId: string }> | undefined;
+                if (entityIds.length * componentTypeIds.length <= WARM_CACHE_MAX) {
+                    requested = [];
+                    for (const entityId of entityIds) {
+                        for (const typeId of componentTypeIds) {
+                            requested.push({ entityId, typeId });
+                        }
+                    }
+                }
+
+                await cacheManager.setComponentsWriteThrough(
+                    components.map((row: any) => ({
+                        id: row.id,
+                        entityId: row.entity_id,
+                        typeId: row.type_id,
+                        data: row.data,
+                        createdAt: row.created_at,
+                        updatedAt: row.updated_at,
+                        deletedAt: null,
+                    })),
+                    requested,
+                    config.component.ttl,
+                );
+            } catch (error) {
+                logger.warn({ scope: 'cache', component: 'Query', msg: 'populate() component cache warm failed', error });
+            }
+        })());
     }
 
     /**
@@ -1033,7 +1141,10 @@ AND c.deleted_at IS NULL`;
     }
 
     /**
-     * Get prepared statement cache statistics
+     * Get prepared statement cache statistics.
+     * @deprecated The framework-level prepared statement cache is no longer
+     * used on the query hot path (Bun SQL auto-prepares at the driver
+     * layer). Stats remain for API compatibility and report an idle cache.
      */
     public static getCacheStats() {
         return preparedStatementCache.getStats();

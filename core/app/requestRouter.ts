@@ -1,6 +1,6 @@
 import * as path from "path";
 import { logger as MainLogger } from "../Logger";
-import { getSerializedMetadataStorage } from "../metadata";
+import { getMetadataScript } from "../metadata";
 import { addCorsHeaders, getCorsHeaders } from "./cors";
 import {
     handleHealth,
@@ -24,6 +24,8 @@ function combineSignals(signals: AbortSignal[]): AbortSignal {
             controller.abort((s as any).reason);
             return controller.signal;
         }
+        // { once: true } auto-removes the listener after first fire, so no
+        // explicit removeEventListener is needed; GC cleans up the rest.
         s.addEventListener('abort', () => controller.abort((s as any).reason), { once: true });
     }
     return controller.signal;
@@ -58,6 +60,8 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
             msg: 'Request timeout',
         }, `Request timeout: ${method} ${url.pathname}`);
     }, 30000);
+    // Prevent the timer from keeping the Bun event loop alive at high concurrency.
+    (timeoutId as any).unref?.();
     const combinedSignal = combineSignals([req.signal, controller.signal]);
     req = new Request(req, { signal: combinedSignal });
 
@@ -172,9 +176,7 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
                     const studioFile = Bun.file(studioIndexPath);
                     if (await studioFile.exists()) {
                         let html = await studioFile.text();
-                        const metadata = getSerializedMetadataStorage();
-                        const metadataScript = `<script>window.bunsaneMetadata = ${JSON.stringify(metadata)};</script>`;
-                        html = html.replace("</head>", `${metadataScript}</head>`);
+                        html = html.replace("</head>", `${getMetadataScript()}</head>`);
                         return wrap(new Response(html, {
                             headers: { "Content-Type": "text/html" },
                         }));
@@ -214,11 +216,10 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
         let endpoint = app.restEndpointMap.get(endpointKey);
 
         if (!endpoint) {
+            // Only iterate endpoints that have params (regex precompiled at registration).
             for (const ep of app.restEndpoints) {
-                if (ep.method !== method) continue;
-                const pattern = ep.path.replace(/:[^/]+/g, '[^/]+');
-                const regex = new RegExp(`^${pattern}$`);
-                if (regex.test(url.pathname)) {
+                if (!ep.regex || ep.method !== method) continue;
+                if (ep.regex.test(url.pathname)) {
                     endpoint = ep;
                     break;
                 }

@@ -161,6 +161,8 @@ export class RedisCache implements CacheProvider {
                 logger.error({ error, msg: 'Failed to get Redis memory info' });
             }
         }, 300000); // 5 minutes
+        // Allow the process to exit without waiting for this monitoring timer.
+        this.monitoringInterval?.unref?.();
     }
 
     /**
@@ -192,8 +194,7 @@ export class RedisCache implements CacheProvider {
     async set<T>(key: string, value: T, ttl?: number): Promise<void> {
         try {
             const prefixedKey = this.prefixKey(key);
-            const compressedValue = await CompressionUtils.compress(value);
-            const serializedValue = JSON.stringify(compressedValue);
+            const serializedValue = await CompressionUtils.compressForStorage(value);
 
             if (ttl) {
                 await this.client.setex(prefixedKey, Math.floor(ttl / 1000), serializedValue);
@@ -273,8 +274,7 @@ export class RedisCache implements CacheProvider {
 
             for (const entry of entries) {
                 const prefixedKey = this.prefixKey(entry.key);
-                const compressedValue = await CompressionUtils.compress(entry.value);
-                const serializedValue = JSON.stringify(compressedValue);
+                const serializedValue = await CompressionUtils.compressForStorage(entry.value);
 
                 if (entry.ttl) {
                     pipeline.setex(prefixedKey, Math.floor(entry.ttl / 1000), serializedValue);

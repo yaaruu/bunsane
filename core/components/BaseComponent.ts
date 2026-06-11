@@ -52,11 +52,16 @@ export class BaseComponent {
         const data: Record<string, any> = {};
         const storage = getMetadataStorage();
         const props = storage.componentProperties.get(this._typeId);
-        this.properties().forEach((prop: string) => {
+        if (!props) return data;
+        // Iterate the property metadata directly — avoids the prior O(n²)
+        // pattern (properties().forEach + props.find per property) and the
+        // redundant second metadata lookup inside properties(). Hot write path:
+        // runs for every dirty component on every save.
+        for (const propMeta of props) {
+            const prop = propMeta.propertyKey;
             let value = (this as any)[prop];
-            const propMeta = props?.find(p => p.propertyKey === prop);
             if (value !== null && value !== undefined) {
-                if (propMeta?.propertyType === Date) {
+                if (propMeta.propertyType === Date) {
                     if (!(value instanceof Date)) {
                         throw new Error(`Type mismatch for property '${prop}' on component '${this._comp_name}': expected Date, got ${typeof value}`);
                     }
@@ -64,17 +69,21 @@ export class BaseComponent {
                         throw new Error(`Invalid Date for property '${prop}' on component '${this._comp_name}'`);
                     }
                     value = value.toISOString();
-                } else if (propMeta?.propertyType === Number && typeof value === 'number' && !Number.isFinite(value)) {
+                } else if (propMeta.propertyType === Number && typeof value === 'number' && !Number.isFinite(value)) {
                     throw new Error(`Invalid number for property '${prop}' on component '${this._comp_name}': ${value}`);
                 }
             }
             data[prop] = value;
-        });
+        }
         return data;
     }
 
     async save(trx: Bun.SQL, entity_id: string) {
-        logger.trace(`Saving component ${this._comp_name} for entity ${entity_id}`);
+        // Level-gated: template literal allocates per component save even
+        // when trace is disabled.
+        if (logger.isLevelEnabled?.('trace')) {
+            logger.trace(`Saving component ${this._comp_name} for entity ${entity_id}`);
+        }
         // Only check readiness if component is not yet registered
         // This optimization avoids 40,000+ unnecessary async calls for bulk operations
         if(!ComponentRegistry.isComponentReady(this._comp_name)) {
@@ -98,10 +107,9 @@ export class BaseComponent {
         if (!entity_id || entity_id.trim() === '') {
             throw new Error(`Cannot insert component ${this._comp_name}: entity_id is empty or invalid`);
         }
-        await trx`INSERT INTO components 
+        await trx`INSERT INTO components
         (id, entity_id, name, type_id, data)
         VALUES (${this.id}, ${entity_id}, ${this._comp_name}, ${this._typeId}, ${this.serializableData()})`
-        await trx`INSERT INTO entity_components (entity_id, type_id, component_id) VALUES (${entity_id}, ${this._typeId}, ${this.id}) ON CONFLICT DO NOTHING`
     }
 
     async update(trx: Bun.SQL) {

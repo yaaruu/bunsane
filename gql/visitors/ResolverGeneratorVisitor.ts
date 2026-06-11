@@ -18,16 +18,34 @@ export class ResolverGeneratorVisitor extends GraphVisitor {
         this.services = services;
         this.resolverBuilder = new ResolverBuilder();
         
-        // Add Date scalar resolver
+        // Add Date scalar resolver.
+        // Safety net: gqloom's `z.date()` currently maps to GraphQLString
+        // (see @gqloom/zod isZodDate → GraphQLString), so this custom Date
+        // scalar is rarely wired by the auto-generated archetype schema.
+        // Component-prop leaf resolvers normalize Date → ISO string upstream
+        // (core/archetype/fieldResolvers.ts) so GraphQLString coercion does
+        // not call Date.valueOf() and emit epoch ms. We still harden this
+        // serializer to accept Date, number, and numeric-string inputs in
+        // case a downstream user types a field as the `Date` scalar
+        // directly.
         this.resolverBuilder.addScalarResolver('Date', {
             serialize: (value: any) => {
-                if (value instanceof Date) {
-                    return value.toISOString();
+                if (value === null || value === undefined) return value;
+                if (value instanceof Date) return value.toISOString();
+                if (typeof value === 'number') return new Date(value).toISOString();
+                if (typeof value === 'string') {
+                    if (/^\d+$/.test(value)) {
+                        return new Date(Number(value)).toISOString();
+                    }
+                    return value;
                 }
-                return value;
+                throw new Error(`Date scalar cannot serialize ${typeof value}`);
             },
             parseValue: (value: any) => {
                 if (typeof value === 'string') {
+                    return new Date(value);
+                }
+                if (typeof value === 'number') {
                     return new Date(value);
                 }
                 return value;
@@ -35,6 +53,9 @@ export class ResolverGeneratorVisitor extends GraphVisitor {
             parseLiteral: (ast: any) => {
                 if (ast.kind === 'StringValue') {
                     return new Date(ast.value);
+                }
+                if (ast.kind === 'IntValue') {
+                    return new Date(Number(ast.value));
                 }
                 return null;
             }

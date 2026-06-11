@@ -1,5 +1,6 @@
 import type { Middleware } from '../Middleware';
 import { logger as MainLogger } from '../Logger';
+import { setResponseHeaders } from './headers';
 
 const logger = MainLogger.child({ scope: 'RateLimit' });
 
@@ -92,14 +93,10 @@ export function rateLimit(options: RateLimitOptions = {}): Middleware {
         }
 
         const response = await next();
-        const newHeaders = new Headers(response.headers);
-        newHeaders.set('X-RateLimit-Limit', String(max));
-        newHeaders.set('X-RateLimit-Remaining', String(remaining));
-        newHeaders.set('X-RateLimit-Reset', String(Math.floor(bucket.resetAt / 1000)));
-        return new Response(response.body, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: newHeaders,
-        });
+        return setResponseHeaders(response, [
+            ['X-RateLimit-Limit', String(max)],
+            ['X-RateLimit-Remaining', String(remaining)],
+            ['X-RateLimit-Reset', String(Math.floor(bucket.resetAt / 1000))],
+        ]);
     };
 }

@@ -20,6 +20,6 @@ export interface ComponentPropertyMetadata {
 export interface IndexedFieldMetadata {
     componentId: string;
     propertyKey: string;
-    indexType: 'gin' | 'btree' | 'hash' | 'numeric';
+    indexType: 'gin' | 'btree' | 'hash' | 'numeric' | 'fulltext';
     isDateField: boolean;
 }

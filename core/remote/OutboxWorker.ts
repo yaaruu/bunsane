@@ -25,6 +25,8 @@ export interface OutboxWorkerConfig {
     pollIntervalMs: number;
     batchSize: number;
     enableLogging: boolean;
+    /** Retention window for published rows in ms. 0 disables trimming. Default 24h. */
+    retentionMs: number;
 }
 
 interface OutboxRow {
@@ -43,6 +45,7 @@ export class OutboxWorker {
     private timer: ReturnType<typeof setTimeout> | null = null;
     private currentTick: Promise<void> | null = null;
     private metrics?: RemoteMetrics;
+    private lastTrimAt = 0;
 
     constructor(
         db: SQL,
@@ -100,10 +103,37 @@ export class OutboxWorker {
         if (!this.running) return;
         try {
             await this.processBatch();
+            await this.maybeTrimPublished();
         } catch (error: any) {
             loggerInstance.error(
                 { err: error, msg: "OutboxWorker tick error" }
             );
+        }
+    }
+
+    private async maybeTrimPublished(): Promise<void> {
+        const { retentionMs } = this.config;
+        if (!retentionMs) return;
+
+        const now = Date.now();
+        // At most once per hour to avoid frequent lock contention
+        if (now - this.lastTrimAt < 3_600_000) return;
+        this.lastTrimAt = now;
+
+        const cutoff = new Date(now - retentionMs);
+        const db = this.db as any;
+        const result = await db`
+            DELETE FROM remote_outbox
+            WHERE id IN (
+                SELECT id FROM remote_outbox
+                WHERE published_at IS NOT NULL
+                  AND published_at < ${cutoff}
+                LIMIT 10000
+            )
+        `;
+        const count = result.count ?? result.length ?? 0;
+        if (count > 0) {
+            loggerInstance.debug(`Trimmed ${count} published outbox rows older than ${cutoff.toISOString()}`);
         }
     }
 

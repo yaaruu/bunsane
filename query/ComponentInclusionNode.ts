@@ -6,6 +6,7 @@ import { FilterBuilderRegistry } from "./FilterBuilderRegistry";
 import { ComponentRegistry } from "../core/components";
 import { getMetadataStorage } from "../core/metadata";
 import { assertIdentifier } from "./SqlIdentifier";
+import { getMembershipSource, getMembershipTable } from "./membershipSource";
 
 /**
  * Check if a component property is numeric based on metadata
@@ -40,6 +41,209 @@ export class ComponentInclusionNode extends QueryNode {
         return 'components';
     }
 
+    /**
+     * Whether the multi-component sort-driven scan applies. Must be pure
+     * (no param side effects) — QueryDAG consults it to skip CTE planning
+     * and execute() consults it before building any SQL.
+     *
+     * Eligible shape: exactly one sort order on a required component, two or
+     * more required components, no findById, no cursor pagination. Filters
+     * on any component are supported (applied inline / via EXISTS).
+     */
+    public static canUseSortDrivenScan(context: QueryContext): boolean {
+        if (context.sortOrders.length !== 1) return false;
+        if (context.componentIds.size < 2) return false;
+        if (context.withId) return false;
+        if (context.cursorId !== null) return false;
+        if (context.hasOrQuery) return false;
+        const sortTypeId = ComponentRegistry.getComponentId(context.sortOrders[0]!.component);
+        if (!sortTypeId || !context.componentIds.has(sortTypeId)) return false;
+        return true;
+    }
+
+    /**
+     * Build a filter condition against `<alias>.data`. Mirrors the default
+     * logic in applyComponentFiltersWithState but with a configurable alias
+     * so the sort-driven scan can filter the driving table (`s`) and EXISTS
+     * probes (`cf`) without string surgery.
+     */
+    private buildFilterCondition(filter: { field: string; operator: string; value: any }, alias: string, context: QueryContext): string {
+        if (FilterBuilderRegistry.has(filter.operator)) {
+            const options = FilterBuilderRegistry.getOptions(filter.operator);
+            if (options?.validate && !options.validate(filter as any)) {
+                throw new Error(`Invalid filter value for operator '${filter.operator}': ${JSON.stringify(filter.value)}`);
+            }
+            return FilterBuilderRegistry.get(filter.operator)!(filter as any, alias, context).sql;
+        }
+
+        let jsonPath: string;
+        if (filter.field.includes('.')) {
+            const parts = filter.field.split('.');
+            const lastPart = parts.pop()!;
+            const nestedPath = parts.map(p => `'${p}'`).join('->');
+            jsonPath = `${alias}.data->${nestedPath}->>'${lastPart}'`;
+        } else {
+            jsonPath = `${alias}.data->>'${filter.field}'`;
+        }
+
+        const valueStr = String(filter.value);
+        const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(valueStr);
+
+        if (isUUID && filter.operator === '=') {
+            return `${jsonPath} = $${context.addParam(filter.value)}`;
+        } else if (filter.operator === 'LIKE' || filter.operator === 'NOT LIKE' || filter.operator === 'ILIKE') {
+            return `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
+        } else if (filter.operator === 'IN' || filter.operator === 'NOT IN') {
+            if (Array.isArray(filter.value) && filter.value.length > 0) {
+                const placeholders = filter.value.map((v: any) => `$${context.addParam(v)}`).join(', ');
+                return `${jsonPath} ${filter.operator} (${placeholders})`;
+            } else if (Array.isArray(filter.value) && filter.value.length === 0) {
+                return filter.operator === 'IN' ? 'FALSE' : 'TRUE';
+            }
+            throw new Error(`${filter.operator} operator requires an array of values`);
+        } else if (typeof filter.value === 'number') {
+            return `(${jsonPath})::numeric ${filter.operator} $${context.addParam(filter.value)}::numeric`;
+        } else if (typeof filter.value === 'boolean') {
+            return `(${jsonPath})::boolean ${filter.operator} $${context.addParam(filter.value)}`;
+        }
+        return `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
+    }
+
+    /**
+     * Sort-driven scan for multi-component sorted queries.
+     *
+     * The previous shape (INTERSECT/CTE base set + correlated scalar
+     * subquery ORDER BY) forces PostgreSQL to materialize EVERY matching
+     * entity, run one correlated lookup per row for the sort key, sort the
+     * whole set, then apply LIMIT. This shape instead drives the scan from
+     * the sort component's table so the planner can walk the functional
+     * index on the sort expression and stop after LIMIT rows, probing the
+     * other component requirements with cheap EXISTS lookups per visited
+     * row:
+     *
+     *   SELECT s.entity_id AS id FROM <sort component table> s
+     *   WHERE s.type_id = $1 AND s.deleted_at IS NULL
+     *     AND <filters on sort component (inline on s)>
+     *     AND EXISTS (... other required component ...)   -- per component
+     *     AND EXISTS (... other component filter ...)     -- per filter
+     *   ORDER BY (s.data->>'prop')::numeric ASC NULLS LAST
+     *   LIMIT $n OFFSET $m
+     *
+     * The form leaves the planner free to fall back to filter-first +
+     * sort when the predicate is highly selective — unlike the correlated
+     * subquery ORDER BY, which can never use an index for ordering.
+     */
+    private applySortDrivenScan(context: QueryContext): string | null {
+        if (!ComponentInclusionNode.canUseSortDrivenScan(context)) return null;
+
+        const sortOrder = context.sortOrders[0]!;
+        const sortTypeId = ComponentRegistry.getComponentId(sortOrder.component)!;
+        const componentIds = Array.from(context.componentIds);
+        const otherComponentIds = componentIds.filter(id => id !== sortTypeId);
+
+        const safeProperty = assertIdentifier(sortOrder.property, 'sortOrder.property');
+        const isNumeric = isNumericProperty(sortOrder.component, sortOrder.property);
+        const sortExpr = isNumeric
+            ? `(s.data->>'${safeProperty}')::numeric`
+            : `s.data->>'${safeProperty}'`;
+        const nullsClause = sortOrder.nullsFirst ? 'NULLS FIRST' : 'NULLS LAST';
+
+        const sortTable = this.getComponentTableName(sortTypeId);
+        const driveDirect = shouldUseDirectPartition() && sortTable !== 'components';
+
+        const conditions: string[] = [];
+
+        // Filters on the sort component apply inline on the driving table.
+        for (const filter of context.componentFilters.get(sortTypeId) ?? []) {
+            conditions.push(this.buildFilterCondition(filter, 's', context));
+        }
+
+        // Presence probe per other required component.
+        for (const compId of otherComponentIds) {
+            conditions.push(`EXISTS (
+                SELECT 1 FROM ${getMembershipTable()} ec_r
+                WHERE ec_r.entity_id = s.entity_id
+                AND ec_r.type_id = $${context.addParam(compId)}::text
+                AND ec_r.deleted_at IS NULL
+            )`);
+        }
+
+        // Filters on other components probe their own table.
+        for (const compId of otherComponentIds) {
+            const filters = context.componentFilters.get(compId) ?? [];
+            for (const filter of filters) {
+                const condition = this.buildFilterCondition(filter, 'cf', context);
+                const compTable = this.getComponentTableName(compId);
+                const filterDirect = shouldUseDirectPartition() && compTable !== 'components';
+                if (filterDirect || !getMembershipSource().isLegacy) {
+                    // Single-table predicate on the component (partition) table:
+                    // membership lives in the same row, so no junction join.
+                    conditions.push(`EXISTS (
+                        SELECT 1 FROM ${compTable} cf
+                        WHERE cf.entity_id = s.entity_id
+                        AND cf.type_id = $${context.addParam(compId)}::text
+                        AND ${condition}
+                        AND cf.deleted_at IS NULL
+                    )`);
+                } else {
+                    conditions.push(`EXISTS (
+                        SELECT 1 FROM entity_components ec_f
+                        JOIN ${compTable} cf ON ec_f.component_id = cf.id
+                        WHERE ec_f.entity_id = s.entity_id
+                        AND ec_f.type_id = $${context.addParam(compId)}::text
+                        AND ${condition}
+                        AND ec_f.deleted_at IS NULL
+                        AND cf.deleted_at IS NULL
+                    )`);
+                }
+            }
+        }
+
+        // Excluded components / entities.
+        if (context.excludedComponentIds.size > 0) {
+            const excludedPlaceholders = Array.from(context.excludedComponentIds)
+                .map((id) => `$${context.addParam(id)}`).join(', ');
+            conditions.push(`NOT EXISTS (
+                SELECT 1 FROM ${getMembershipTable()} ec_ex
+                WHERE ec_ex.entity_id = s.entity_id
+                AND ec_ex.type_id IN (${excludedPlaceholders})
+                AND ec_ex.deleted_at IS NULL
+            )`);
+        }
+        if (context.excludedEntityIds.size > 0) {
+            const entityPlaceholders = Array.from(context.excludedEntityIds)
+                .map((id) => `$${context.addParam(id)}`).join(', ');
+            conditions.push(`s.entity_id NOT IN (${entityPlaceholders})`);
+        }
+
+        const extraConditions = conditions.length > 0 ? `\n                AND ${conditions.join('\n                AND ')}` : '';
+
+        let sql: string;
+        if (driveDirect || !getMembershipSource().isLegacy) {
+            // Drive directly from the sort component (partition) table —
+            // membership and component data are the same row.
+            sql = `SELECT s.entity_id as id FROM ${sortTable} s
+                WHERE s.type_id = $${context.addParam(sortTypeId)}::text
+                AND s.deleted_at IS NULL${extraConditions}
+                ORDER BY ${sortExpr} ${sortOrder.direction} ${nullsClause}`;
+        } else {
+            sql = `SELECT s.entity_id as id FROM entity_components ec
+                JOIN ${sortTable} s ON s.id = ec.component_id AND s.deleted_at IS NULL
+                WHERE ec.type_id = $${context.addParam(sortTypeId)}::text
+                AND ec.deleted_at IS NULL${extraConditions}
+                ORDER BY ${sortExpr} ${sortOrder.direction} ${nullsClause}`;
+        }
+
+        if (context.limit !== null) {
+            sql += ` LIMIT $${context.addParam(context.limit)}`;
+        }
+        if (context.offsetValue > 0 || context.limit !== null) {
+            sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
+        }
+
+        return sql;
+    }
+
     public execute(context: QueryContext): QueryResult {
         const componentIds = Array.from(context.componentIds);
         const excludedIds = Array.from(context.excludedComponentIds);
@@ -71,6 +275,18 @@ export class ComponentInclusionNode extends QueryNode {
         // Check if we need custom sorting (sortOrders specified)
         const hasSortOrders = context.sortOrders.length > 0;
 
+        // Multi-component sorted queries: drive the scan from the sort
+        // component so the planner can use the sort-expression index and
+        // stop at LIMIT, instead of materializing the full INTERSECT set and
+        // sorting it via correlated subqueries. Checked before any params
+        // are added so a null fallback leaves the context clean.
+        if (!useCTE && hasSortOrders && ComponentInclusionNode.canUseSortDrivenScan(context)) {
+            const sortDriven = this.applySortDrivenScan(context);
+            if (sortDriven) {
+                return { sql: sortDriven, params: context.params, context };
+            }
+        }
+
         if (componentCount === 1) {
             // Single component case
             const componentId = componentIds[0]!;
@@ -100,14 +316,14 @@ export class ComponentInclusionNode extends QueryNode {
                 // Filter by the specific component type if not already in CTE
                 if (!componentIds.some(id => context.componentIds.has(id))) {
                     sql += ` WHERE EXISTS (
-                        SELECT 1 FROM entity_components ec
+                        SELECT 1 FROM ${getMembershipTable()} ec
                         WHERE ec.entity_id = ${context.cteName}.entity_id
                         AND ec.type_id = $${context.addParam(componentId)}::text
                         AND ec.deleted_at IS NULL
                     )`;
                 }
             } else {
-                sql = `SELECT DISTINCT ec.entity_id as id FROM entity_components ec WHERE ec.type_id = $${context.addParam(componentId)}::text AND ec.deleted_at IS NULL`;
+                sql = `SELECT DISTINCT ec.entity_id as id FROM ${getMembershipTable()} ec WHERE ec.type_id = $${context.addParam(componentId)}::text AND ec.deleted_at IS NULL`;
             }
 
             if (context.withId) {
@@ -122,7 +338,7 @@ export class ComponentInclusionNode extends QueryNode {
                 const whereKeyword = sql.includes('WHERE') ? 'AND' : 'WHERE';
                 const excludedPlaceholders = excludedIds.map((id) => `$${context.addParam(id)}`).join(', ');
                 sql += ` ${whereKeyword} NOT EXISTS (
-                    SELECT 1 FROM entity_components ec_ex
+                    SELECT 1 FROM ${getMembershipTable()} ec_ex
                     WHERE ec_ex.entity_id = ${tableAlias}.entity_id
                     AND ec_ex.type_id IN (${excludedPlaceholders})
                     AND ec_ex.deleted_at IS NULL
@@ -191,7 +407,7 @@ export class ComponentInclusionNode extends QueryNode {
                         componentParamIndices.set(compId, context.addParam(compId));
                     }
                     return `EXISTS (
-                        SELECT 1 FROM entity_components ec
+                        SELECT 1 FROM ${getMembershipTable()} ec
                         WHERE ec.entity_id = ${context.cteName}.entity_id
                         AND ec.type_id = $${componentParamIndices.get(compId)}::text
                         AND ec.deleted_at IS NULL
@@ -206,7 +422,7 @@ export class ComponentInclusionNode extends QueryNode {
                     if (!componentParamIndices.has(compId)) {
                         componentParamIndices.set(compId, context.addParam(compId));
                     }
-                    return `SELECT ec.entity_id FROM entity_components ec WHERE ec.type_id = $${componentParamIndices.get(compId)}::text AND ec.deleted_at IS NULL`;
+                    return `SELECT ec.entity_id FROM ${getMembershipTable()} ec WHERE ec.type_id = $${componentParamIndices.get(compId)}::text AND ec.deleted_at IS NULL`;
                 });
                 sql = `SELECT intersected.entity_id as id FROM (${intersectQueries.join(' INTERSECT ')}) AS intersected`;
             }
@@ -229,7 +445,7 @@ export class ComponentInclusionNode extends QueryNode {
                 const whereKeyword = outerHasWhere ? 'AND' : 'WHERE';
                 const excludedPlaceholders = excludedIds.map((id) => `$${context.addParam(id)}`).join(', ');
                 sql += ` ${whereKeyword} NOT EXISTS (
-                    SELECT 1 FROM entity_components ec_ex
+                    SELECT 1 FROM ${getMembershipTable()} ec_ex
                     WHERE ec_ex.entity_id = ${multiCompAlias}.entity_id
                     AND ec_ex.type_id IN (${excludedPlaceholders})
                     AND ec_ex.deleted_at IS NULL
@@ -343,13 +559,22 @@ export class ComponentInclusionNode extends QueryNode {
                 ? `(sort_c.data->>'${safeProperty}')::numeric`
                 : `sort_c.data->>'${safeProperty}'`;
 
-            const subquery = `(
+            const subquery = getMembershipSource().isLegacy
+                ? `(
                 SELECT ${sortExpr}
                 FROM entity_components sort_ec
                 JOIN ${sortComponentTableName} sort_c ON sort_c.id = sort_ec.component_id
                 WHERE sort_ec.entity_id = base_entities.id
                 AND sort_ec.type_id = $${context.addParam(typeId)}::text
                 AND sort_ec.deleted_at IS NULL
+                AND sort_c.deleted_at IS NULL
+                LIMIT 1
+            )`
+                : `(
+                SELECT ${sortExpr}
+                FROM ${sortComponentTableName} sort_c
+                WHERE sort_c.entity_id = base_entities.id
+                AND sort_c.type_id = $${context.addParam(typeId)}::text
                 AND sort_c.deleted_at IS NULL
                 LIMIT 1
             )`;
@@ -465,8 +690,8 @@ export class ComponentInclusionNode extends QueryNode {
             : `c.data->>'${safeProperty}'`;
 
         let sql: string;
-        if (useDirectPartition) {
-            // Direct partition access - most efficient
+        if (useDirectPartition || !getMembershipSource().isLegacy) {
+            // Direct access on the component (partition) table - most efficient.
             // No DISTINCT needed since each entity has one component of this type
             sql = `SELECT c.entity_id as id FROM ${componentTableName} c
                 WHERE c.type_id = $${context.addParam(sortTypeId)}::text
@@ -673,8 +898,9 @@ export class ComponentInclusionNode extends QueryNode {
                     const componentTableName = this.getComponentTableName(compId);
                     const useDirectPartition = shouldUseDirectPartition() && componentTableName !== 'components';
                     
-                    if (useDirectPartition) {
-                        // Direct partition access - query partition table directly by entity_id
+                    if (useDirectPartition || !getMembershipSource().isLegacy) {
+                        // Single-table predicate on the component (partition)
+                        // table — membership is the same row, no junction join.
                         lateralJoins.push(
                             `CROSS JOIN LATERAL (
                             SELECT 1 FROM ${componentTableName} c
@@ -706,8 +932,9 @@ export class ComponentInclusionNode extends QueryNode {
                     const componentTableName = this.getComponentTableName(compId);
                     const useDirectPartition = shouldUseDirectPartition() && componentTableName !== 'components';
 
-                    if (useDirectPartition) {
-                        // Direct partition access - query partition table directly by entity_id
+                    if (useDirectPartition || !getMembershipSource().isLegacy) {
+                        // Single-table predicate on the component (partition)
+                        // table — membership is the same row, no junction join.
                         sql += ` ${whereKeyword} EXISTS (
                         SELECT 1 FROM ${componentTableName} c
                         WHERE c.entity_id = ${tableAlias}.entity_id

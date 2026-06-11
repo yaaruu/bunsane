@@ -19,7 +19,11 @@ export class CompressionUtils {
   private static readonly COMPRESSION_PREFIX = '__COMPRESSED__';
 
   /**
-   * Compresses data if it exceeds the threshold size
+   * Compresses data if it exceeds the threshold size.
+   * Returns the original value (unmodified) when below threshold, or a
+   * compressed wrapper object when above. Callers that need the final
+   * storage string should use compressForStorage() to avoid a second
+   * JSON.stringify pass.
    */
   static async compress(data: any): Promise<any> {
     try {
@@ -33,7 +37,6 @@ export class CompressionUtils {
       const compressed = await gzipAsync(serialized);
       const compressedData = compressed.toString('base64');
 
-      // Return compressed data with metadata
       return {
         [this.COMPRESSION_PREFIX]: true,
         data: compressedData,
@@ -41,9 +44,37 @@ export class CompressionUtils {
         compressedSize: compressed.length
       };
     } catch (error) {
-      // Fallback to uncompressed data on compression error
       console.warn('Compression failed, using uncompressed data:', error);
       return data;
+    }
+  }
+
+  /**
+   * Serializes data to the final string written to Redis.
+   * Reuses the JSON.stringify pass done for size measurement so values
+   * below the compression threshold are never stringified twice.
+   * Values above the threshold are gzip-compressed and then stringified once.
+   */
+  static async compressForStorage(data: any): Promise<string> {
+    try {
+      const serialized = JSON.stringify(data);
+      const size = Buffer.byteLength(serialized, 'utf8');
+
+      if (size <= this.COMPRESSION_THRESHOLD) {
+        return serialized;
+      }
+
+      const compressed = await gzipAsync(serialized);
+      const wrapper = {
+        [this.COMPRESSION_PREFIX]: true,
+        data: compressed.toString('base64'),
+        originalSize: size,
+        compressedSize: compressed.length,
+      };
+      return JSON.stringify(wrapper);
+    } catch (error) {
+      console.warn('Compression failed, using uncompressed data:', error);
+      return JSON.stringify(data);
     }
   }
 

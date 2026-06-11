@@ -10,9 +10,8 @@ the project is to create PostgreSQL database management
 with support for ECS (Entity Component System) model
 
 there are some tables that we need to pay attention, i.e:
-- components (ECS table)
+- components (ECS table — single source of entity↔component membership)
 - entities (ECS table)
-- entity_components (ECS table)
 - spatial_ref_sys (postgis table)
 
 the tables displays will be devided by 3 part, i.e general table, ECS table, invisible table
@@ -30,10 +29,9 @@ therefore lets use word table for general table, and entity for ECS table.
 ECS system design explanation:
 - Entity can be anything e.g user, payment, item, .etc (it can be called as table in traditional design system) it also can be called ArcheType
 - fields that usually used in normal system e.g email, phone (for user) or price (for item) .etc in ECS is a Component
-- there is 3 table dedicated for ECS i.e entities, components, and entity_components (intermediate table for entities and components)
+- there are 2 tables dedicated for ECS: entities and components. (The old entity_components intermediate table has been removed — components is now the single source of entity↔component membership via UNIQUE(entity_id, type_id).)
 - entities table contain all entities that exist in the system. the table contain id, created_at, updated_at, and deleted_at
-- components table contain the all useful data that user consume, the table contain id, entity_id, type_id, name, data, created_at, updated_at, and deleted_at (data is jsonb that contain the actual useful data)
-- entity_components is intermediate table. the table contain, entity_id, type_id, component_id, created_at, updated_at, and deleted_at
+- components table contain all useful data that users consume AND encodes membership directly via entity_id + type_id (UNIQUE). The table contains id, entity_id, type_id, name, data, created_at, updated_at, and deleted_at (data is jsonb that contains the actual useful data)
 
 ## Feature
 - for now I only need Read feature, but in the future all CRUD should be supported so we can show the edit/delete ui but can disable it for now

@@ -96,20 +96,9 @@ async function initializeSchema(pg: PGlite): Promise<void> {
             deleted_at TIMESTAMPTZ DEFAULT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS entity_components (
-            entity_id UUID NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
-            type_id VARCHAR(64) NOT NULL,
-            component_id UUID NOT NULL REFERENCES components(id) ON DELETE CASCADE,
-            created_at TIMESTAMPTZ DEFAULT NOW(),
-            updated_at TIMESTAMPTZ DEFAULT NOW(),
-            deleted_at TIMESTAMPTZ DEFAULT NULL,
-            PRIMARY KEY (entity_id, type_id)
-        );
-
         CREATE INDEX IF NOT EXISTS idx_components_entity_id ON components(entity_id);
         CREATE INDEX IF NOT EXISTS idx_components_type_id ON components(type_id);
         CREATE INDEX IF NOT EXISTS idx_components_name ON components(name);
-        CREATE INDEX IF NOT EXISTS idx_entity_components_type_id ON entity_components(type_id);
         CREATE INDEX IF NOT EXISTS idx_entities_deleted_null ON entities(id) WHERE deleted_at IS NULL;
     `);
 }
@@ -132,7 +121,6 @@ async function seedComponent(
 
         let entitiesValues = '';
         let componentsValues = '';
-        let entityComponentsValues = '';
 
         for (let j = 0; j < batchSize; j++) {
             const entityId = uuidv7();
@@ -148,12 +136,10 @@ async function seedComponent(
             const sep = j > 0 ? ',' : '';
             entitiesValues += `${sep}('${entityId}', '${now}', '${now}')`;
             componentsValues += `${sep}('${componentId}', '${entityId}', '${typeId}', '${componentName}', '${JSON.stringify(data).replace(/'/g, "''")}', '${now}', '${now}')`;
-            entityComponentsValues += `${sep}('${entityId}', '${typeId}', '${componentId}', '${now}', '${now}')`;
         }
 
         await pg.exec(`INSERT INTO entities (id, created_at, updated_at) VALUES ${entitiesValues}`);
         await pg.exec(`INSERT INTO components (id, entity_id, type_id, name, data, created_at, updated_at) VALUES ${componentsValues}`);
-        await pg.exec(`INSERT INTO entity_components (entity_id, type_id, component_id, created_at, updated_at) VALUES ${entityComponentsValues} ON CONFLICT (entity_id, type_id) DO NOTHING`);
 
         if (onProgress) {
             onProgress(i + batchSize);
@@ -278,7 +264,6 @@ async function generateDatabase(tier: Tier, force: boolean): Promise<GenerationR
     console.log('\nRunning VACUUM ANALYZE...');
     await pg.exec('VACUUM ANALYZE entities');
     await pg.exec('VACUUM ANALYZE components');
-    await pg.exec('VACUUM ANALYZE entity_components');
 
     console.log('Syncing to disk...');
     await pg.close();

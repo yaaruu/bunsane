@@ -26,10 +26,19 @@ interface BatchLoaderConfig {
 /**
  * LRU-bounded cache for relation lookups.
  * Prevents unbounded memory growth under high cardinality.
+ *
+ * LRU strategy: a flat `lruOrder` Map keyed by `cacheKey\x00parentId` is kept
+ * in access order (delete + re-insert on every read/write). Eviction simply
+ * iterates from the front — O(k) where k = eviction batch, not O(n log n).
+ * Per-type `lastAccess` timestamp enables O(types) evictOldestType without
+ * scanning all entries.
  */
 class BoundedRelationCache {
     private cache = new Map<string, Map<string, CachedRelation>>();
-    private accessOrder: string[] = []; // Tracks global access order for LRU eviction
+    /** Global LRU order: composite key → true. Oldest entries at the front. */
+    private lruOrder = new Map<string, true>();
+    /** Per-type most-recent access timestamp for O(types) type eviction. */
+    private typeLastAccess = new Map<string, number>();
     private totalEntries = 0;
     private config: BatchLoaderConfig;
 
@@ -56,8 +65,13 @@ class BoundedRelationCache {
 
         const entry = typeCache.get(parentId);
         if (entry) {
-            // Update access time for LRU
-            entry.lastAccessed = Date.now();
+            const now = Date.now();
+            entry.lastAccessed = now;
+            // Move to end of lruOrder (most recently used)
+            const lk = `${cacheKey}\x00${parentId}`;
+            this.lruOrder.delete(lk);
+            this.lruOrder.set(lk, true);
+            this.typeLastAccess.set(cacheKey, now);
         }
         return entry;
     }
@@ -70,10 +84,15 @@ class BoundedRelationCache {
             this.evictLRUEntries(this.config.evictionBatchSize);
         }
 
-        if (!typeCache.has(parentId)) {
-            this.totalEntries++;
-        }
+        const isNew = !typeCache.has(parentId);
+        if (isNew) this.totalEntries++;
         typeCache.set(parentId, entry);
+
+        // Move / insert into lruOrder end
+        const lk = `${cacheKey}\x00${parentId}`;
+        this.lruOrder.delete(lk);
+        this.lruOrder.set(lk, true);
+        this.typeLastAccess.set(cacheKey, entry.lastAccessed);
     }
 
     delete(cacheKey: string, parentId: string): boolean {
@@ -83,13 +102,18 @@ class BoundedRelationCache {
         const existed = typeCache.delete(parentId);
         if (existed) {
             this.totalEntries--;
+            this.lruOrder.delete(`${cacheKey}\x00${parentId}`);
+            if (typeCache.size === 0) {
+                this.typeLastAccess.delete(cacheKey);
+            }
         }
         return existed;
     }
 
     clear(): void {
         this.cache.clear();
-        this.accessOrder = [];
+        this.lruOrder.clear();
+        this.typeLastAccess.clear();
         this.totalEntries = 0;
     }
 
@@ -120,20 +144,13 @@ class BoundedRelationCache {
     }
 
     private evictOldestType(): void {
-        // Find the type cache with oldest average access time
+        // O(types) scan using per-type lastAccess timestamp — no entry-level iteration.
         let oldestKey: string | null = null;
-        let oldestAvgAccess = Infinity;
+        let oldestAccess = Infinity;
 
-        for (const [key, typeCache] of this.cache) {
-            let totalAccess = 0;
-            let count = 0;
-            for (const [, entry] of typeCache) {
-                totalAccess += entry.lastAccessed;
-                count++;
-            }
-            const avgAccess = count > 0 ? totalAccess / count : 0;
-            if (avgAccess < oldestAvgAccess) {
-                oldestAvgAccess = avgAccess;
+        for (const [key, ts] of this.typeLastAccess) {
+            if (ts < oldestAccess) {
+                oldestAccess = ts;
                 oldestKey = key;
             }
         }
@@ -141,28 +158,33 @@ class BoundedRelationCache {
         if (oldestKey) {
             const evictedCache = this.cache.get(oldestKey);
             if (evictedCache) {
+                // Remove all lruOrder entries for this type
+                for (const parentId of evictedCache.keys()) {
+                    this.lruOrder.delete(`${oldestKey}\x00${parentId}`);
+                }
                 this.totalEntries -= evictedCache.size;
             }
             this.cache.delete(oldestKey);
+            this.typeLastAccess.delete(oldestKey);
         }
     }
 
     private evictLRUEntries(count: number): void {
-        // Collect all entries with their access times
-        const entries: Array<{ cacheKey: string; parentId: string; lastAccessed: number }> = [];
-
-        for (const [cacheKey, typeCache] of this.cache) {
-            for (const [parentId, entry] of typeCache) {
-                entries.push({ cacheKey, parentId, lastAccessed: entry.lastAccessed });
-            }
+        // lruOrder is in insertion order — front entries are least recently used.
+        // Collect up to `count` keys without materialising the entire map.
+        const toEvict: string[] = [];
+        for (const lk of this.lruOrder.keys()) {
+            if (toEvict.length >= count) break;
+            toEvict.push(lk);
         }
 
-        // Sort by lastAccessed ascending (oldest first)
-        entries.sort((a, b) => a.lastAccessed - b.lastAccessed);
-
-        // Evict the oldest entries
-        const toEvict = entries.slice(0, count);
-        for (const { cacheKey, parentId } of toEvict) {
+        for (const lk of toEvict) {
+            // cacheKey = typeId\x00fieldName, parentId = UUID — split at the last \x00
+            // so fieldNames with no null bytes are handled correctly.
+            const sep = lk.lastIndexOf('\x00');
+            if (sep === -1) continue;
+            const cacheKey = lk.slice(0, sep);
+            const parentId = lk.slice(sep + 1);
             this.delete(cacheKey, parentId);
         }
     }
@@ -178,6 +200,7 @@ class BoundedRelationCache {
             for (const [parentId, entry] of typeCache) {
                 if (now > entry.expiresAt) {
                     typeCache.delete(parentId);
+                    this.lruOrder.delete(`${cacheKey}\x00${parentId}`);
                     this.totalEntries--;
                     prunedCount++;
                 }
@@ -185,6 +208,7 @@ class BoundedRelationCache {
             // Remove empty type caches
             if (typeCache.size === 0) {
                 this.cache.delete(cacheKey);
+                this.typeLastAccess.delete(cacheKey);
             }
         }
 

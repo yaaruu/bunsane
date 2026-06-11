@@ -2,7 +2,82 @@
 
 All notable changes to bunsane are documented here.
 
-## Unreleased
+## 0.4.0 — 2026-06-11
+
+### Performance (2026-06-10 overhaul)
+
+- **ALS request scope** (`core/requestScope.ts`) — bare `entity.get()` calls inside
+  `@ArcheTypeFunction`, `Unwrap`, and `populateRelations` are now batched
+  automatically per request.
+- **Sort-driven scan** for multi-component `sortBy` queries — LIMIT pushdown into
+  the sort component scan (excluded for OR filters and cursor pagination).
+- **`Query.count()` fixes** — no longer capped by `BUNSANE_DEFAULT_QUERY_LIMIT`;
+  missing builder reset fixed.
+- **`populate()` warms the component cache** (≤1000 components per query).
+- **O(1) MemoryCache LRU** eviction.
+- **Batched write-through** — 2 cache round-trips per `entity.save()` regardless of
+  component count.
+- **Framework `PreparedStatementCache` removed from the query hot path** — Bun SQL
+  auto-prepares. `Query.noCache()` with no arguments is now a no-op; use
+  `noCache({ component: true })` to bypass the component cache.
+- **Default pool size 10 → 20** (`POSTGRES_MAX_CONNECTIONS`).
+- **New `'fulltext'` index type** for `@IndexedField` (tsvector GIN).
+
+### Internal refactors
+
+- `core/Entity.ts` split into `core/entity/` submodules (pendingOps,
+  componentAccess, saveEntity, finders). Public API and import paths unchanged.
+- Package now publishes with a `files` whitelist — tests, internal docs, and tooling
+  configs no longer ship to npm; `studio/dist` is now included so `enableStudio()`
+  works from the published package (run `bun run build` before `npm publish`).
+
+### BREAKING — v0.4.0
+
+- **`entity_components` table is no longer written or created by the framework.**
+  `components` (via `UNIQUE(entity_id, type_id)`) is now the single source of
+  entity↔component membership. The `entity_components` table receives no further
+  INSERTs, UPDATEs, or DELETEs on any save, delete, or soft-delete path.
+
+  **Impact on consumers:**
+  - Any application querying `entity_components` directly (e.g. raw `db.unsafe`
+    calls, external analytics, custom reports) must migrate those queries to
+    `components` — see the inventory in `docs/ENTITY_COMPONENTS_REMOVAL_PLAN.md`.
+  - Orphaned `entity_components` tables in upgraded databases can be dropped
+    manually after verifying the upgrade succeeded:
+    ```sql
+    DROP TABLE entity_components;
+    ```
+    The framework emits a one-time info log at startup when the orphaned table is
+    detected, directing the operator to drop it.
+  - Databases with pre-dual-write history (written before Phase 1 of this plan)
+    or with external writers to `entity_components` may have membership records
+    that differ from `components`. Reconcile those differences before upgrading
+    by running a diff query (`SELECT entity_id, type_id FROM entity_components
+    EXCEPT SELECT entity_id, type_id FROM components`).
+
+  **Emergency rollback:** `BUNSANE_MEMBERSHIP_SOURCE=legacy` re-routes all
+  membership reads to `entity_components`. However this only works if the table
+  is populated. After Phase 3, that requires a manual backfill:
+  1. `CreateEntityComponentTable()` — recreates the DDL.
+  2. `PopulateComponentIds()` — backfills rows from `components`.
+
+  Both functions are exported from `database/DatabaseHelper.ts`.
+
+### Fixed
+
+- **`UploadManager` no longer registers default providers asynchronously
+  (BUNSANE-007).** The constructor previously called an `async`
+  `initializeDefaultProviders()` that suspended on
+  `await localProvider.initialize()`, so the default `"local"` provider
+  was registered in a *later* microtask — after any consumer's
+  synchronous `registerStorageProvider("local", custom)` override — and
+  silently clobbered it. Result: uploads via `"local"` always wrote to
+  the default `./public` regardless of a custom `basePath`/`UPLOAD_ROOT`
+  provider. Default registration is now fully synchronous, and
+  `LocalStorageProvider` creates its base directory in its constructor
+  (`initialize()` retained as an idempotent no-op for the
+  `StorageProvider` contract and S3 parity). A custom `"local"` provider
+  registered immediately after `getInstance()` now survives.
 
 ### Added (v0.3.2 — AbortSignal propagation + DB observability)
 
