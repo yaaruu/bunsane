@@ -21,6 +21,40 @@ import { getMembershipSource } from "./membershipSource";
 const DEFAULT_QUERY_LIMIT = parseInt(process.env.BUNSANE_DEFAULT_QUERY_LIMIT ?? '10000', 10);
 let warnedDefaultLimit = false;
 
+// Gated once — dev keeps param diagnostics, production skips the loop entirely.
+const DEBUG_PARAMS = process.env.NODE_ENV !== 'production';
+
+// Shared across all TypedEntity instances — avoids one closure allocation per row.
+// Must be called as a method (entity.getTyped(Ctor)) so `this` resolves correctly.
+async function sharedGetTyped(
+    this: any,
+    ctor: any
+): Promise<any> {
+    const data = await this.get(ctor);
+    if (!data) {
+        throw new Error(`Component ${ctor.name} not found on entity ${this.id}, but it was expected from query`);
+    }
+    return data;
+}
+
+// Hoisted descriptor for _queriedComponents — non-enumerable by design (hidden from
+// Object.keys / spreads). Descriptor is reused; only `value` is patched per row.
+const queriedComponentsDescriptor: PropertyDescriptor = {
+    value: undefined as any,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+};
+
+// getTyped stays non-enumerable like the original defineProperty version; the value
+// never varies, so the descriptor is fully static.
+const getTypedDescriptor: PropertyDescriptor = {
+    value: sharedGetTyped,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+};
+
 export type FilterOperator = "=" | ">" | "<" | ">=" | "<=" | "!=" | "LIKE" | "ILIKE" | "IN" | "NOT IN" | string;
 
 export const FilterOp = {
@@ -786,34 +820,16 @@ AND c.deleted_at IS NULL`;
         // Create typed entity wrapper
         const typedEntity = entity as TypedEntity<TComponents>;
 
-        // Define componentData property
-        Object.defineProperty(typedEntity, 'componentData', {
-            value: componentData as ComponentRecord<TComponents>,
-            writable: false,
-            enumerable: true
-        });
+        // Plain assignment — enumerable: true matches prior behavior; no defineProperty overhead.
+        (typedEntity as any).componentData = componentData as ComponentRecord<TComponents>;
 
-        // Define _queriedComponents property for runtime reflection
-        Object.defineProperty(typedEntity, '_queriedComponents', {
-            value: componentCtors as unknown as TComponents,
-            writable: false,
-            enumerable: false
-        });
+        // _queriedComponents must stay non-enumerable (hidden from Object.keys / spreads).
+        queriedComponentsDescriptor.value = componentCtors as unknown as TComponents;
+        Object.defineProperty(typedEntity, '_queriedComponents', queriedComponentsDescriptor);
+        queriedComponentsDescriptor.value = undefined; // don't retain ref
 
-        // Define getTyped method
-        Object.defineProperty(typedEntity, 'getTyped', {
-            value: async function<T extends TComponents[number]>(
-                ctor: T
-            ): Promise<T extends ComponentConstructor<infer C> ? C extends BaseComponent ? ComponentDataType<C> : never : never> {
-                const data = await entity.get(ctor as any);
-                if (!data) {
-                    throw new Error(`Component ${(ctor as any).name} not found on entity ${entity.id}, but it was expected from query`);
-                }
-                return data as any;
-            },
-            writable: false,
-            enumerable: false
-        });
+        // Shared function — one allocation per module, not per row.
+        Object.defineProperty(typedEntity, 'getTyped', getTypedDescriptor);
 
         return typedEntity;
     }
@@ -878,13 +894,15 @@ AND c.deleted_at IS NULL`;
         // originate from saved entities. PG emits a clear error at
         // execution time if a UUID cast meets an empty string.
 
-        // Validate parameters before execution
-        for (let i = 0; i < result.params.length; i++) {
-            if (result.params[i] === undefined || result.params[i] === null) {
-                console.error(`❌ Query parameter $${i + 1} is undefined/null`);
-                console.error(`SQL: ${result.sql}`);
-                console.error(`All params: ${JSON.stringify(result.params)}`);
-                throw new Error(`Query parameter $${i + 1} is undefined/null. SQL: ${result.sql.substring(0, 100)}...`);
+        // Validate parameters before execution (dev only — skipped in production)
+        if (DEBUG_PARAMS) {
+            for (let i = 0; i < result.params.length; i++) {
+                if (result.params[i] === undefined || result.params[i] === null) {
+                    console.error(`❌ Query parameter $${i + 1} is undefined/null`);
+                    console.error(`SQL: ${result.sql}`);
+                    console.error(`All params: ${JSON.stringify(result.params)}`);
+                    throw new Error(`Query parameter $${i + 1} is undefined/null. SQL: ${result.sql.substring(0, 100)}...`);
+                }
             }
         }
 

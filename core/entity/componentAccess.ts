@@ -14,10 +14,15 @@ import { getMetadataStorage } from "../metadata";
 import { ComponentAddedEvent, ComponentUpdatedEvent, ComponentRemovedEvent } from "../events/EntityLifecycleEvents";
 import { getRequestScope } from "../requestScope";
 import { trackCacheOp } from "./pendingOps";
+import { getCacheManager } from "./getCacheManager";
 import type { Entity } from "../Entity";
 
 export function addComponent(entity: Entity, component: BaseComponent): Entity {
-    entity.components.set(component.getTypeID(), component);
+    const typeId = component.getTypeID();
+    entity.components.set(typeId, component);
+    // A component that just arrived can never be "missing" — clear any
+    // previously recorded absence so future get() calls see the new data.
+    entity._missingComponents.delete(typeId);
     return entity;
 }
 
@@ -55,8 +60,6 @@ export function add<T extends BaseComponent>(entity: Entity, ctor: new (...args:
     const instance = new ctor();
     if (data) {
         Object.assign(instance, data);
-    } else {
-        Object.assign(instance, {});
     }
     addComponent(entity, instance);
     entity.setDirty(true);
@@ -109,7 +112,7 @@ export async function set<T extends BaseComponent>(entity: Entity, ctor: new (..
         // App.shutdown can await it (H-CACHE-1).
         trackCacheOp((async () => {
             try {
-                const { CacheManager } = await import('../cache/CacheManager');
+                const CacheManager = getCacheManager();
                 const cacheManager = CacheManager.getInstance();
                 const config = cacheManager.getConfig();
 
@@ -167,7 +170,7 @@ export function remove<T extends BaseComponent>(entity: Entity, ctor: new (...ar
         // (H-CACHE-1).
         trackCacheOp((async () => {
             try {
-                const { CacheManager } = await import('../cache/CacheManager');
+                const CacheManager = getCacheManager();
                 const cacheManager = CacheManager.getInstance();
                 const config = cacheManager.getConfig();
 
@@ -222,6 +225,7 @@ export async function reload(entity: Entity, opts?: { trx?: SQL; signal?: AbortS
     entity.components.clear();
     entity.removedComponents.clear();
     entity.savedRemovedComponents.clear();
+    entity._missingComponents.clear();
 
     const dbConn = opts?.trx ?? db;
     const rows = await runWithSignal<any[]>(
@@ -291,6 +295,15 @@ async function loadComponent<T extends BaseComponent>(entity: Entity, ctor: new 
     // just to read the type id.
     const typeId = typeIdOf(ctor);
 
+    // Negative-cache short-circuit: if we previously confirmed this component
+    // is absent from the DB (and no explicit transaction is in scope that
+    // could see a different snapshot), skip the SELECT entirely.
+    // Skipped when a trx is provided — within a transaction the visibility
+    // horizon may differ from the outer read (stale-read hazard).
+    if (!context?.trx && entity._missingComponents.has(typeId)) {
+        return null;
+    }
+
     // Use transaction if provided, otherwise use default db
     const dbConn = context?.trx ?? db;
 
@@ -353,6 +366,12 @@ async function loadComponent<T extends BaseComponent>(entity: Entity, ctor: new 
             addComponent(entity, comp);
             return comp as T;
         } else {
+            // Record the confirmed absence so repeated probes skip the DB.
+            // Only when no explicit trx — within a transaction the caller
+            // may insert the component and probe again in the same scope.
+            if (!context?.trx) {
+                entity._missingComponents.add(typeId);
+            }
             return null;
         }
     } catch (error) {

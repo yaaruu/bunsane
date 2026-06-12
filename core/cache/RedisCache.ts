@@ -270,18 +270,19 @@ export class RedisCache implements CacheProvider {
      */
     async setMany<T>(entries: Array<{key: string, value: T, ttl?: number}>): Promise<void> {
         try {
+            const compressed = await Promise.all(entries.map(e => CompressionUtils.compressForStorage(e.value)));
+
             const pipeline = this.client.pipeline();
 
-            for (const entry of entries) {
+            entries.forEach((entry, i) => {
                 const prefixedKey = this.prefixKey(entry.key);
-                const serializedValue = await CompressionUtils.compressForStorage(entry.value);
-
+                const serializedValue = compressed[i] as string;
                 if (entry.ttl) {
                     pipeline.setex(prefixedKey, Math.floor(entry.ttl / 1000), serializedValue);
                 } else {
                     pipeline.set(prefixedKey, serializedValue);
                 }
-            }
+            });
 
             await pipeline.exec();
         } catch (error) {

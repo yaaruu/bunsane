@@ -20,6 +20,14 @@ export class Entity implements IEntity {
     // This persists after save() so resolvers can detect removed components
     /** @internal Promoted from private for the core/entity/ submodule split (RFC §3.2). Not part of the public API. */
     public savedRemovedComponents: Set<string> = new Set<string>();
+    /**
+     * @internal Type IDs confirmed absent from the DB during this entity's
+     * lifetime. Used as a negative cache in loadComponent() so repeated
+     * get() probes for optional components skip the SELECT. Invalidated
+     * whenever a component is added (addComponent) or the entity is
+     * reloaded. Not part of the public API.
+     */
+    public _missingComponents: Set<string> = new Set<string>();
     protected _dirty: boolean = false;
 
     constructor(id?: string) {

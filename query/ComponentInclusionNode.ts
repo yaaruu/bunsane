@@ -862,7 +862,11 @@ export class ComponentInclusionNode extends QueryNode {
                     } else if (filter.operator === 'IN' || filter.operator === 'NOT IN') {
                         // IN/NOT IN comparison - handle arrays properly
                         if (Array.isArray(filter.value) && filter.value.length > 0) {
-                            const placeholders = Array.from({length: filter.value.length}, (_, i) => `$${context.addParam(filter.value[i])}`).join(', ');
+                            let placeholders = '';
+                            for (let i = 0; i < filter.value.length; i++) {
+                                if (i) placeholders += ', ';
+                                placeholders += '$' + context.addParam(filter.value[i]);
+                            }
                             condition = `${jsonPath} ${filter.operator} (${placeholders})`;
                         } else if (Array.isArray(filter.value) && filter.value.length === 0) {
                             // Empty array: IN () is always false, NOT IN () is always true

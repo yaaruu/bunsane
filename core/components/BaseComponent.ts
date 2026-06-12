@@ -7,6 +7,10 @@ import { uuidv7 } from '../../utils/uuid';
 import { getMetadataStorage } from '../metadata';
 const logger = MainLogger.child({ scope: "Components" });
 
+// Cached property-name arrays keyed by typeId. Metadata is immutable after
+// decorator registration, so allocating once per class is safe.
+const _propNamesCache = new Map<string, string[]>();
+
 export class BaseComponent {
     public id: string = "";
     protected _comp_name: string = "";
@@ -26,10 +30,13 @@ export class BaseComponent {
     }
 
     properties(): string[] {
+        const cached = _propNamesCache.get(this._typeId);
+        if (cached) return cached;
         const storage = getMetadataStorage();
         const props = storage.componentProperties.get(this._typeId);
-        if(!props) return [];
-        return props.map(p => p.propertyKey);
+        const names = Object.freeze(props ? props.map(p => p.propertyKey) : []) as string[];
+        _propNamesCache.set(this._typeId, names);
+        return names;
     }
 
     /**

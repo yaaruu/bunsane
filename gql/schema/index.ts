@@ -406,6 +406,12 @@ export function isSchemaInput(
 
 // ─── Validation ─────────────────────────────────────────────────────────────────
 
+// Keyed by schema object identity. Safe only when field builders inside the
+// schema are not mutated (via .required()/.optional()/.nullable()) after the
+// first validateInput call for that schema. Module-level schema constants
+// satisfy this constraint; inline schemas constructed per-call simply miss.
+const _zodCache = new WeakMap<object, ZodType>();
+
 export class SchemaValidationError extends Error {
     readonly fieldErrors: Array<{ path: string; message: string }>;
 
@@ -424,11 +430,16 @@ export function validateInput<T extends Record<string, SchemaType>>(
     data: unknown,
     operationName: string = "input",
 ): InferInput<T> {
-    const zodShape: Record<string, ZodType> = {};
-    for (const [key, field] of Object.entries(schema)) {
-        zodShape[key] = field.toZod();
+    let zodObject = _zodCache.get(schema);
+    if (!zodObject) {
+        const zodShape: Record<string, ZodType> = {};
+        for (const [key, field] of Object.entries(schema)) {
+            zodShape[key] = field.toZod();
+        }
+        zodObject = z.object(zodShape);
+        _zodCache.set(schema, zodObject);
     }
-    const result = z.object(zodShape).safeParse(data);
+    const result = zodObject.safeParse(data);
     if (result.success) {
         return result.data as InferInput<T>;
     }

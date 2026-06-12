@@ -6,6 +6,7 @@ import { logger } from "../Logger";
 import EntityHookManager from "../EntityHookManager";
 import { EntityDeletedEvent } from "../events/EntityLifecycleEvents";
 import type { SQL } from "bun";
+import { getCacheManager } from "./getCacheManager";
 import type { Entity } from "../Entity";
 
 /**
@@ -15,8 +16,7 @@ import type { Entity } from "../Entity";
  */
 export async function handleCacheAfterSave(entity: Entity, changedComponentTypeIds: string[], removedComponentTypeIds: string[], context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<void> {
     try {
-        // Import CacheManager dynamically to avoid circular dependency
-        const { CacheManager } = await import('../cache/CacheManager');
+        const CacheManager = getCacheManager();
         const cacheManager = CacheManager.getInstance();
         const config = cacheManager.getConfig();
 
@@ -81,7 +81,7 @@ export async function runPostDeleteSideEffects(entity: Entity, softDelete: boole
     }
 
     try {
-        const { CacheManager } = await import('../cache/CacheManager');
+        const CacheManager = getCacheManager();
         const cacheManager = CacheManager.getInstance();
         const config = cacheManager.getConfig();
 

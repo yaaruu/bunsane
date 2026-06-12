@@ -12,6 +12,8 @@ export function inList<T>(values: T[], paramIndex: number): { sql: string, param
   
   if (filteredValues.length === 0) return { sql: '()', params: [], newParamIndex: paramIndex };
   
-  const placeholders = Array.from({length: filteredValues.length}, (_, i) => `$${paramIndex + i}`).join(', ');
+  const n = filteredValues.length;
+  let placeholders = '';
+  for (let i = 0; i < n; i++) { placeholders += (i ? ', $' : '$') + (paramIndex + i); }
   return { sql: `(${placeholders})`, params: filteredValues, newParamIndex: paramIndex + filteredValues.length };
 }
