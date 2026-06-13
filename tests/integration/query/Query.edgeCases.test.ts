@@ -5,6 +5,7 @@
 import { describe, test, expect, beforeAll, beforeEach } from 'bun:test';
 import { Entity } from '../../../core/Entity';
 import { Query, FilterOp } from '../../../query/Query';
+import { OrQuery } from '../../../query/OrQuery';
 import { TestUser, TestProduct, TestOrder } from '../../fixtures/components';
 import { createTestContext, ensureComponentsRegistered } from '../../utils';
 
@@ -590,6 +591,121 @@ describe('Query Edge Cases', () => {
                 .exec();
 
             expect(Array.isArray(results)).toBe(true);
+        });
+    });
+
+    // ---------------------------------------------------------------------------
+    // OR query parity tests — row-count correctness for OrNode fallback path
+    // The fallback path in OrNode runs when ComponentInclusionNode dependencies
+    // are present (Query.with(BaseComp).with(orQuery)) regardless of partition
+    // strategy. Fix #2 removed dead MAX(created_at) correlated subqueries from
+    // this path; these tests verify the result set is correct and has no dupes.
+    // ---------------------------------------------------------------------------
+    describe('OR query parity (OrNode fallback path)', () => {
+        // unique prefix so tests don't collide with other test runs
+        const prefix = `orparity-${Date.now()}`;
+
+        // Create three test entities:
+        //  entityA  → TestUser + TestProduct (price=10)
+        //  entityB  → TestUser + TestProduct (price=200)
+        //  entityC  → TestUser only (no TestProduct)
+        let entityAId: string;
+        let entityBId: string;
+        let entityCId: string;
+
+        beforeEach(async () => {
+            const entityA = ctx.tracker.create();
+            entityA.add(TestUser, { name: `${prefix}-alice`, email: `alice-${prefix}@test.com`, age: 25 });
+            entityA.add(TestProduct, { sku: `${prefix}-cheap`, name: 'Cheap', price: 10, inStock: true });
+            await entityA.save();
+            entityAId = entityA.id;
+
+            const entityB = ctx.tracker.create();
+            entityB.add(TestUser, { name: `${prefix}-bob`, email: `bob-${prefix}@test.com`, age: 35 });
+            entityB.add(TestProduct, { sku: `${prefix}-expensive`, name: 'Expensive', price: 200, inStock: false });
+            await entityB.save();
+            entityBId = entityB.id;
+
+            const entityC = ctx.tracker.create();
+            entityC.add(TestUser, { name: `${prefix}-carol`, email: `carol-${prefix}@test.com`, age: 45 });
+            await entityC.save();
+            entityCId = entityC.id;
+        });
+
+        test('standalone OR with same-component branches (string filters) returns correct entities, no duplicates', async () => {
+            // OrQuery: TestProduct(sku=cheap) OR TestProduct(sku=expensive)
+            // Uses string-equality filters so no numeric type-cast issues.
+            // entityA sku=${prefix}-cheap    → matches branch 1
+            // entityB sku=${prefix}-expensive → matches branch 2
+            // entityC has no TestProduct    → matches neither
+            const orQ = new OrQuery([
+                { component: TestProduct, filters: [Query.filter('sku', FilterOp.EQ, `${prefix}-cheap`)] },
+                { component: TestProduct, filters: [Query.filter('sku', FilterOp.EQ, `${prefix}-expensive`)] },
+            ]);
+
+            const results = await new Query()
+                .with(orQ)
+                .take(1000)
+                .exec();
+
+            const ids = results.map(e => e.id);
+            expect(ids).toContain(entityAId);
+            expect(ids).toContain(entityBId);
+            expect(ids).not.toContain(entityCId);
+
+            // No duplicates
+            expect(ids.length).toBe(new Set(ids).size);
+        });
+
+        test('OR combined with base component (fallback path) returns correct entities, no duplicates', async () => {
+            // Query.with(TestUser).with(orQuery) forces the fallback path in OrNode
+            // (ComponentInclusionNode dependency present).
+            // OrQuery: TestProduct(price<50) OR TestProduct(price>100)
+            // entityA: TestUser + Product(price=10)  → matches branch 1 (price<50)
+            // entityB: TestUser + Product(price=200) → matches branch 2 (price>100)
+            // entityC: TestUser only → no TestProduct → matches neither
+            const orQ = new OrQuery([
+                { component: TestProduct, filters: [Query.filter('price', FilterOp.LT, 50)] },
+                { component: TestProduct, filters: [Query.filter('price', FilterOp.GT, 100)] },
+            ]);
+
+            const results = await new Query()
+                .with(TestUser)
+                .with(orQ)
+                .take(1000)
+                .exec();
+
+            const ids = results.map(e => e.id);
+            expect(ids).toContain(entityAId);
+            expect(ids).toContain(entityBId);
+            expect(ids).not.toContain(entityCId);
+
+            // No duplicates even if entity satisfies both OR branches
+            expect(ids.length).toBe(new Set(ids).size);
+        });
+
+        test('OR with two different component types returns union of matching entities', async () => {
+            // OrQuery: TestUser(name=alice) OR TestProduct(sku=expensive)
+            // Uses string-equality filters to avoid numeric type-cast issues.
+            // entityA  → has TestUser name=alice → matches branch 1
+            // entityB  → has TestProduct sku=expensive → matches branch 2
+            // entityC  → TestUser carol, no TestProduct → matches neither
+            const orQ = new OrQuery([
+                { component: TestUser, filters: [Query.filter('name', FilterOp.EQ, `${prefix}-alice`)] },
+                { component: TestProduct, filters: [Query.filter('sku', FilterOp.EQ, `${prefix}-expensive`)] },
+            ]);
+
+            const results = await new Query()
+                .with(orQ)
+                .take(1000)
+                .exec();
+
+            const ids = results.map(e => e.id);
+            expect(ids).toContain(entityAId);
+            expect(ids).toContain(entityBId);
+
+            // No duplicates
+            expect(ids.length).toBe(new Set(ids).size);
         });
     });
 });

@@ -357,13 +357,7 @@ export class OrNode extends QueryNode {
                 WHERE EXISTS (
                     SELECT 1 FROM ${componentTableName} c
                     WHERE c.entity_id = base.id
-                    AND c.type_id = $${componentIdParamIndex}                    AND c.deleted_at IS NULL
-                    AND c.created_at = (
-                        SELECT MAX(c2.created_at)
-                        FROM ${componentTableName} c2
-                        WHERE c2.entity_id = c.entity_id
-                        AND c2.type_id = $${componentIdParamIndex}                        AND c2.deleted_at IS NULL
-                    )`;
+                    AND c.type_id = $${componentIdParamIndex}                    AND c.deleted_at IS NULL`;
             } else {
                 // Use original query without base
                 const componentTableName = this.getComponentTableName(componentId);
@@ -374,13 +368,7 @@ export class OrNode extends QueryNode {
                 AND EXISTS (
                     SELECT 1 FROM ${componentTableName} c
                     WHERE c.entity_id = ec.entity_id
-                    AND c.type_id = $${componentIdParamIndex}                    AND c.deleted_at IS NULL
-                    AND c.created_at = (
-                        SELECT MAX(c2.created_at)
-                        FROM ${componentTableName} c2
-                        WHERE c2.entity_id = c.entity_id
-                        AND c2.type_id = $${componentIdParamIndex}                        AND c2.deleted_at IS NULL
-                    )`;
+                    AND c.type_id = $${componentIdParamIndex}                    AND c.deleted_at IS NULL`;
             }
 
             context.params.push(componentId);

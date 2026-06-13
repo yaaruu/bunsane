@@ -251,7 +251,7 @@ export class StreamConsumer {
         // DLQ check: if this message has been redelivered too many times,
         // move it to the DLQ and ACK the original so the consumer group can
         // progress past it. Disabled when dlqMaxDeliveries is 0.
-        if (this.config.dlqMaxDeliveries > 0) {
+        if (reclaimed && this.config.dlqMaxDeliveries > 0) {
             const deliveryCount = await this.getDeliveryCount(msgId);
             if (deliveryCount >= this.config.dlqMaxDeliveries) {
                 await this.sendToDlq(msgId, fields, deliveryCount);
