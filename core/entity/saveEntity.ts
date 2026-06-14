@@ -268,9 +268,11 @@ export async function doSave(entity: Entity, trx: SQL, signal?: AbortSignal): Pr
         }
 
         // Perform updates. Validate all ids up front (synchronous, fails
-        // fast), then fire the UPDATEs together via Promise.all so they
-        // pipeline on the transaction connection instead of paying one
-        // serial round-trip per dirty component.
+        // fast), then issue the UPDATEs sequentially. They were previously
+        // fired together via Promise.all to "pipeline" on the transaction
+        // connection, but multiple concurrent in-flight queries on one
+        // connection deadlock single-backend servers (PGlite test harness),
+        // and a single wire serializes them regardless — no real gain.
         if (componentsToUpdate.length > 0) {
             const traceEnabled = logger.isLevelEnabled?.('trace') === true;
             for (const comp of componentsToUpdate) {
@@ -285,11 +287,9 @@ export async function doSave(entity: Entity, trx: SQL, signal?: AbortSignal): Pr
                     logger.trace({ componentId: comp.id, data: comp.data }, `[Entity.doSave] Updating component`);
                 }
             }
-            await Promise.all(
-                componentsToUpdate.map(comp =>
-                    run(saveTrx`UPDATE components SET data = ${comp.data} WHERE id = ${comp.id}`)
-                )
-            );
+            for (const comp of componentsToUpdate) {
+                await run(saveTrx`UPDATE components SET data = ${comp.data} WHERE id = ${comp.id}`);
+            }
         }
     };
 
@@ -322,19 +322,17 @@ export async function doDelete(entity: Entity, force: boolean = false): Promise<
 
     try {
         await db.transaction(async (trx) => {
-            // Independent tables, no FK constraints — pipeline the
-            // statements on the transaction connection instead of paying
-            // serial round-trips while holding the connection.
+            // Independent tables, no FK constraints. Issued sequentially:
+            // multiple concurrent in-flight queries on one connection
+            // deadlock single-backend servers (PGlite test harness), and a
+            // single wire serializes them anyway — Promise.all gave no real
+            // pipelining here.
             if (force) {
-                await Promise.all([
-                    run(trx`DELETE FROM components WHERE entity_id = ${entity.id}`),
-                    run(trx`DELETE FROM entities WHERE id = ${entity.id}`),
-                ]);
+                await run(trx`DELETE FROM components WHERE entity_id = ${entity.id}`);
+                await run(trx`DELETE FROM entities WHERE id = ${entity.id}`);
             } else {
-                await Promise.all([
-                    run(trx`UPDATE entities SET deleted_at = CURRENT_TIMESTAMP WHERE id = ${entity.id} AND deleted_at IS NULL`),
-                    run(trx`UPDATE components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${entity.id} AND deleted_at IS NULL`),
-                ]);
+                await run(trx`UPDATE entities SET deleted_at = CURRENT_TIMESTAMP WHERE id = ${entity.id} AND deleted_at IS NULL`);
+                await run(trx`UPDATE components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${entity.id} AND deleted_at IS NULL`);
             }
         });
         clearTimeout(timeoutHandle);
