@@ -47,12 +47,26 @@ function createDatabase(): SQL {
     // workers (schedulers, outbox, migrations) can keep higher values.
     const connTimeout = parseInt(process.env.DB_CONNECTION_TIMEOUT ?? '30', 10);
 
+    // DB_DISABLE_PREPARE (opt-in): turn off Bun SQL's automatic server-side
+    // prepared statements (driver default `prepare: true`). REQUIRED behind
+    // PgBouncer in transaction pooling mode — each transaction may land on a
+    // different backend, so a prepared statement created on one connection is
+    // absent on the next, yielding `prepared statement "..." does not exist`
+    // errors that can poison the pooled client and wedge the write path. Costs
+    // a little per-query planning; negligible next to the failure it prevents.
+    const disablePrepare = process.env.DB_DISABLE_PREPARE === 'true';
+    if (disablePrepare) {
+        logger.info('Prepared statements disabled (DB_DISABLE_PREPARE=true) — required for PgBouncer transaction pooling');
+    }
+
     return new SQL({
         url,
         max,
         idleTimeout: 30000,
         maxLifetime: 600000,
         connectionTimeout: connTimeout,
+        // Only override when disabling; otherwise leave Bun's default (true).
+        ...(disablePrepare ? { prepare: false } : {}),
         onclose: (err) => {
             if (err) {
                 const errCode = (err as unknown as { code: string }).code;

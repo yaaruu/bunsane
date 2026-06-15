@@ -67,6 +67,9 @@ const envSchema = z
         HEALTH_DB_WRITE_PROBE: z
             .enum(["true", "false"])
             .optional(),
+        DB_DISABLE_PREPARE: z
+            .enum(["true", "false"])
+            .optional(),
     })
     .refine(
         (env) => {

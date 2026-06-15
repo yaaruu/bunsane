@@ -2,6 +2,32 @@
 
 All notable changes to bunsane are documented here.
 
+## 0.5.0 — 2026-06-15
+
+### Added
+
+- **`/health` write probe** — the deep health check now exercises a real write
+  through the same `db.transaction()` path `Entity.save` uses (a temp-table
+  insert dropped on commit, no persistent side effect), instead of a read-only
+  `SELECT 1`. A wedged write pool — one where reads stay healthy but writes hang
+  — now fails liveness so orchestrators restart the container instead of it
+  serving timeouts indefinitely. Configurable via `HEALTH_DB_WRITE_PROBE`
+  (default on) and `DB_HEALTH_WRITE_TIMEOUT` (default 5000 ms). When the probe
+  fails or times out, `/health` returns 503.
+- **`DB_DISABLE_PREPARE`** — set to `true` to disable Bun SQL's automatic
+  server-side prepared statements (`prepare: false`). **Required behind PgBouncer
+  in transaction pooling mode**, where per-connection prepared statements break
+  across pooled backends and can wedge the write path. Default behavior is
+  unchanged (prepared statements remain on).
+- **`docs/CONFIGURATION.md`** — full environment-variable reference, including a
+  PgBouncer deployment section and the health-check/liveness guidance above.
+
+### Behavior change
+
+- `/health` now performs a database write by default. If you point a liveness
+  probe at `/health`, ensure the write path is reachable, or set
+  `HEALTH_DB_WRITE_PROBE=false` to keep the previous read-only behavior.
+
 ## 0.4.0 — 2026-06-11
 
 ### Performance (2026-06-10 overhaul)

@@ -103,6 +103,13 @@ class UserService extends BaseService {
 - Auto-migrations on startup for base tables
 - Component data stored as JSONB
 - Indexed fields create GIN indexes automatically
+- **Behind PgBouncer transaction pooling**: set `DB_DISABLE_PREPARE=true` (Bun auto-prepares per-connection, which breaks under transaction pooling and can wedge the write path). See `docs/CONFIGURATION.md`.
+
+### Configuration
+
+- All environment variables are documented in `docs/CONFIGURATION.md` (DB, cache, GraphQL, health, S3, logging).
+- `core/validateEnv.ts` validates a subset on startup.
+- `/health` runs a real DB **write** probe (not just `SELECT 1`) so a wedged write path fails liveness → container restart. Point liveness probes at `/health`.
 
 ### Caching
 
