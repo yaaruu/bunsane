@@ -60,6 +60,13 @@ const envSchema = z
             .string()
             .regex(/^\d+$/, "DB_CONNECTION_TIMEOUT must be numeric (seconds)")
             .optional(),
+        DB_HEALTH_WRITE_TIMEOUT: z
+            .string()
+            .regex(/^\d+$/, "DB_HEALTH_WRITE_TIMEOUT must be numeric (milliseconds)")
+            .optional(),
+        HEALTH_DB_WRITE_PROBE: z
+            .enum(["true", "false"])
+            .optional(),
     })
     .refine(
         (env) => {
