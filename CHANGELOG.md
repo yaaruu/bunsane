@@ -2,6 +2,35 @@
 
 All notable changes to bunsane are documented here.
 
+## 0.5.1 — 2026-06-16
+
+### Added
+
+- **Transaction-aware cache invalidation** — component writes made via
+  `comp.save(trx, id)` inside the new `transaction()` wrapper now bust the
+  component cache on commit, using the same
+  `CacheManager.invalidateEntityComponents` path (L1 + L2 + cross-instance
+  pub/sub) that `Entity.save` uses. Touched `(entityId, typeId)` pairs are
+  tracked automatically (keyed by the transaction handle), then flushed after
+  the transaction commits. The `tx` context also exposes `tx.markDirty(entityId,
+  component)` for components not saved directly and `tx.onCommit(cb)` for
+  post-commit side effects. Exported from `bunsane/core/cache` as `transaction`,
+  `txMarkDirty`, `txOnCommit`. No behavior change for `comp.save` outside the
+  wrapper — tracking is a no-op there.
+- **`ArcheTypeQuery.select(...fields)`** — opt-in projection for archetype
+  queries. Loads data only for the selected component fields instead of every
+  component in the archetype, cutting JSONB wire + parse cost for wide
+  archetypes read with narrow selections. Membership filtering is unaffected
+  (matching still requires all components); unselected fields remain
+  lazy-loadable. Backward-compatible — without `select()`, all components load as
+  before.
+
+### Fixed
+
+- **RedisCache test connects on `127.0.0.1`** instead of `localhost`, which
+  resolves to IPv6 `::1` first on Windows and times out against an IPv4-only
+  Redis. Test-only change.
+
 ## 0.5.0 — 2026-06-15
 
 ### Added
