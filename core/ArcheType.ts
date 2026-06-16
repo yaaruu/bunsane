@@ -160,6 +160,7 @@ export class ArcheTypeQuery<T extends BaseArcheType> {
     private innerQuery: Query<any>;
     private archetypeInstance: T;
     private archetypeCtor: new () => T;
+    private selectedFields: string[] | null = null;
 
     constructor(archetypeCtor: new () => T) {
         this.archetypeCtor = archetypeCtor;
@@ -242,6 +243,50 @@ export class ArcheTypeQuery<T extends BaseArcheType> {
     }
 
     /**
+     * Project: load data only for the given archetype fields (components).
+     *
+     * Membership filtering is unaffected — matching the archetype still requires
+     * all its components. This only limits which component DATA is fetched, so a
+     * wide archetype read with a narrow selection skips the JSONB wire+parse cost
+     * of unselected components. Unselected fields are absent from results; they
+     * remain lazy-loadable later via entity.get() under a request scope.
+     *
+     * Backward-compatible: without select(), exec()/first() load all components.
+     *
+     * @example
+     * ```typescript
+     * const players = await Player.query().select('position', 'health').exec();
+     * // only position + health component data loaded; velocity etc. skipped
+     * ```
+     */
+    public select<K extends keyof ArcheTypeOwnProperties<T>>(...fields: K[]): this {
+        this.selectedFields = fields.map((f) => {
+            const name = String(f);
+            if (!this.archetypeInstance.componentMap[name]) {
+                throw new Error(`Field '${name}' is not a component field on this archetype`);
+            }
+            return name;
+        });
+        return this;
+    }
+
+    private selectedComponentCtors(): Array<new () => BaseComponent> {
+        return (this.selectedFields ?? []).map(
+            (f) => this.archetypeInstance.componentMap[f] as unknown as new () => BaseComponent
+        );
+    }
+
+    /**
+     * Apply the load strategy: projected (eager-load selected components) when
+     * select() was used, otherwise populate() all archetype components.
+     */
+    private withLoadStrategy(): Query<any> {
+        return this.selectedFields
+            ? this.innerQuery.eagerLoadComponents(this.selectedComponentCtors())
+            : this.innerQuery.populate();
+    }
+
+    /**
      * Enable populate mode to load all component data
      */
     public populate(): this {
@@ -261,7 +306,7 @@ export class ArcheTypeQuery<T extends BaseArcheType> {
      * Execute the query and return typed archetype results
      */
     public async exec(): Promise<ArcheTypeResult<T>[]> {
-        const entities = await this.innerQuery.populate().exec();
+        const entities = await this.withLoadStrategy().exec();
         return entities.map(entity => this.wrapAsArchetype(entity as Entity));
     }
 
@@ -269,7 +314,7 @@ export class ArcheTypeQuery<T extends BaseArcheType> {
      * Execute the query and return the first result (or null)
      */
     public async first(): Promise<ArcheTypeResult<T> | null> {
-        const results = await this.innerQuery.take(1).populate().exec();
+        const results = await this.withLoadStrategy().take(1).exec();
         return results[0] ? this.wrapAsArchetype(results[0] as Entity) : null;
     }
 

@@ -5,6 +5,7 @@ import ComponentRegistry from "./ComponentRegistry";
 import { type ComponentDataType } from './Interfaces';
 import { uuidv7 } from '../../utils/uuid';
 import { getMetadataStorage } from '../metadata';
+import { trackComponentDirty } from '../cache/txInvalidation';
 const logger = MainLogger.child({ scope: "Components" });
 
 // Cached property-name arrays keyed by typeId. Metadata is immutable after
@@ -104,6 +105,10 @@ export class BaseComponent {
             await this.insert(trx, entity_id);
             this._persisted = true;
         }
+        // Transaction-aware cache invalidation: record this write so the
+        // transaction() wrapper can bust the component cache on commit.
+        // No-op outside a tracked transaction (cheap WeakMap miss).
+        trackComponentDirty(trx, entity_id, this._typeId);
     }
 
     async insert(trx: Bun.SQL, entity_id: string) {

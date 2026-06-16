@@ -13,7 +13,7 @@ describe('RedisCache', () => {
 
     beforeAll(async () => {
         cache = new RedisCache({
-            host: 'localhost',
+            host: '127.0.0.1', // IPv4 explicit: 'localhost' → ::1 on Windows, Redis often binds IPv4-only
             port: 6379,
             keyPrefix: TEST_PREFIX,
             lazyConnect: false,
