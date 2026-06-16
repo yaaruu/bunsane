@@ -149,8 +149,19 @@ export interface YogaInstanceOptions {
     maxComplexity?: number;
 }
 
+/**
+ * A schema provider may be a concrete `GraphQLSchema` or a factory returning
+ * the current schema. A factory is read per-request by Yoga, which lets the
+ * schema be swapped at runtime (e.g. ServiceRegistry.rebuildSchema()) without
+ * recreating the Yoga instance. Returning `null`/`undefined` falls back to the
+ * static placeholder schema.
+ */
+export type SchemaProvider =
+    | GraphQLSchema
+    | (() => GraphQLSchema | null | undefined);
+
 export function createYogaInstance(
-    schema?: GraphQLSchema,
+    schema?: SchemaProvider,
     plugins: Plugin[] = [],
     contextFactory?: (context: any) => any,
     options?: YogaInstanceOptions
@@ -188,16 +199,30 @@ export function createYogaInstance(
         yogaConfig.context = contextFactory;
     }
 
-    if (schema) {
+    // Memoized static placeholder schema. Kept stable so Yoga's per-schema
+    // internal caches (parse/validate) are not thrashed when a factory falls
+    // back to it across requests.
+    let fallbackSchema: GraphQLSchema | undefined;
+    const getFallback = (): GraphQLSchema => {
+        if (!fallbackSchema) {
+            fallbackSchema = createSchema({
+                typeDefs: staticTypeDefs,
+                resolvers: staticResolvers,
+            });
+        }
+        return fallbackSchema;
+    };
+
+    if (typeof schema === "function") {
+        // Factory form: read per request so runtime swaps reflect live.
+        // Stable refs keep Yoga's caches warm; only a changed ref re-primes.
+        yogaConfig.schema = () => schema() ?? getFallback();
+    } else if (schema) {
         yogaConfig.schema = schema;
-        return createYoga(yogaConfig);
     } else {
-        yogaConfig.schema = createSchema({
-            typeDefs: staticTypeDefs,
-            resolvers: staticResolvers,
-        });
-        return createYoga(yogaConfig);
+        yogaConfig.schema = getFallback();
     }
+    return createYoga(yogaConfig);
 }
 
 export const Upload = z.union([z.literal("Upload"), z.any()]);

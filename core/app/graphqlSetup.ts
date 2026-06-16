@@ -4,7 +4,10 @@ import { createYogaInstance } from "../../gql";
 import { createRequestContextPlugin } from "../RequestContext";
 
 export function setupGraphQL(app: any): void {
-    const schema = ServiceRegistry.getSchema();
+    // Provide the schema as a live factory rather than a fixed reference, so
+    // ServiceRegistry.rebuildSchema() is observed by the next request without
+    // recreating Yoga. Falls back to the static placeholder while null.
+    const schemaProvider = () => ServiceRegistry.getSchema();
 
     const wrappedContextFactory = app.contextFactory
         ? async (yogaContext: any) => {
@@ -38,19 +41,10 @@ export function setupGraphQL(app: any): void {
         ? [createRequestContextPlugin(), ...app.yogaPlugins]
         : [...app.yogaPlugins];
 
-    if (schema) {
-        app.yoga = createYogaInstance(
-            schema,
-            effectivePlugins,
-            wrappedContextFactory,
-            yogaOptions,
-        );
-    } else {
-        app.yoga = createYogaInstance(
-            undefined,
-            effectivePlugins,
-            wrappedContextFactory,
-            yogaOptions,
-        );
-    }
+    app.yoga = createYogaInstance(
+        schemaProvider,
+        effectivePlugins,
+        wrappedContextFactory,
+        yogaOptions,
+    );
 }

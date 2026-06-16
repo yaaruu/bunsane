@@ -11,7 +11,20 @@ import {
 } from "../database/DatabaseHelper";
 import { ComponentRegistry } from "./components";
 import { logger as MainLogger } from "./Logger";
+import { readFileSync } from "fs";
 const logger = MainLogger.child({ scope: "App" });
+
+// BunSane framework version, read from the package's own package.json at module
+// load. Resolved relative to this module file so it works regardless of cwd or
+// how the consumer installs the package.
+let BUNSANE_VERSION = "unknown";
+try {
+    BUNSANE_VERSION = JSON.parse(
+        readFileSync(new URL("../package.json", import.meta.url), "utf8")
+    ).version;
+} catch {
+    // version stays "unknown" if package.json can't be read
+}
 import ServiceRegistry from "../service/ServiceRegistry";
 import { type Plugin, createPubSub } from "graphql-yoga";
 import * as path from "path";
@@ -351,6 +364,20 @@ export default class App {
         this.maxRequestBodySize = bytes;
     }
 
+    /**
+     * Re-weave the GraphQL schema from the currently registered services and
+     * swap it into the live Yoga instance — no restart, no Yoga recreation.
+     * The next request observes the new schema (Yoga reads it via a factory).
+     *
+     * Phase 0 primitive for runtime schema mutation: register/modify a service
+     * (or its @GraphQLOperation metadata), then call this to reflect it live.
+     * Returns the new schema version number (monotonic, starts at 1).
+     */
+    public rebuildGraphQLSchema(): number {
+        ServiceRegistry.rebuildSchema();
+        return ServiceRegistry.getSchemaVersion();
+    }
+
     private async warmUpPreparedStatementCache(): Promise<void> {
         return warmUpPreparedStatementCacheFn(this);
     }
@@ -396,7 +423,7 @@ export default class App {
             `Server is running on ${new URL(
                 this.yoga?.graphqlEndpoint || "/graphql",
                 `http://${this.server.hostname}:${this.server.port}`
-            )}`
+            )} (BunSane v${BUNSANE_VERSION})`
         );
 
         // Signal handlers now registered in init() via registerProcessHandlers()
