@@ -77,6 +77,41 @@ export const PrepareDatabase = async () => {
     // `entity_components` is no longer created or written. `components`
     // (UNIQUE(entity_id, type_id)) is the single source of membership truth
     // as of Phase 3 of docs/ENTITY_COMPONENTS_REMOVAL_PLAN.md.
+    try {
+        await MigrateTimestampsToTimestamptz();
+    } catch (error) {
+        logger.error(`Failed to migrate timestamp columns to timestamptz: ${error}`);
+        throw error;
+    }
+}
+
+/**
+ * Auto-migrate base-table timestamp columns from `timestamp without time zone`
+ * to `timestamptz`. Idempotent: only ALTERs columns still typed as bare
+ * timestamp, so fresh DBs (created with TIMESTAMPTZ DDL) and already-migrated
+ * DBs are no-ops. Existing bare-timestamp values are interpreted as UTC — the
+ * framework only ever writes them via NOW()/CURRENT_TIMESTAMP, which assume the
+ * DB session timezone; UTC is the correct assumption for any DB run in UTC.
+ * `components` is partitioned — PostgreSQL propagates the type change to every
+ * partition (a rewrite that briefly locks the table; one-time cost).
+ */
+export const MigrateTimestampsToTimestamptz = async () => {
+    const targets: Array<{ table: string; columns: string[] }> = [
+        { table: "entities", columns: ["created_at", "updated_at", "deleted_at"] },
+        { table: "components", columns: ["created_at", "updated_at", "deleted_at"] },
+    ];
+    for (const { table, columns } of targets) {
+        for (const col of columns) {
+            const rows = await db.unsafe(`
+                SELECT data_type FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = '${table}' AND column_name = '${col}'
+            `);
+            if (rows.length === 0) continue; // table or column absent
+            if ((rows[0] as any).data_type !== "timestamp without time zone") continue; // already timestamptz
+            logger.warn(`Migrating ${table}.${col} timestamp → timestamptz (assuming stored values are UTC)...`);
+            await db.unsafe(`ALTER TABLE ${table} ALTER COLUMN ${col} TYPE timestamptz USING ${col} AT TIME ZONE 'UTC'`);
+        }
+    }
 }
 
 export const GetDatabaseDataSize = async () => {
@@ -101,9 +136,9 @@ export const SetupDatabaseExtensions = async () => {
 export const CreateEntityTable = async () => {
     await db`CREATE TABLE IF NOT EXISTS entities (
         id UUID PRIMARY KEY,
-        created_at TIMESTAMP DEFAULT NOW(),
-        updated_at TIMESTAMP DEFAULT NOW(),
-        deleted_at TIMESTAMP
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        deleted_at TIMESTAMPTZ
     );`;
 
     // Add partial index for soft-delete queries - critical for 1M+ scale
@@ -148,9 +183,9 @@ export const CreateComponentTable = async () => {
             type_id varchar(64) NOT NULL,
             name varchar(128),
             data jsonb,
-            created_at TIMESTAMP DEFAULT NOW(),
-            updated_at TIMESTAMP DEFAULT NOW(),
-            deleted_at TIMESTAMP,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
+            deleted_at TIMESTAMPTZ,
             PRIMARY KEY (id, type_id),
             UNIQUE(entity_id, type_id)
         ) PARTITION BY LIST (type_id);`;
@@ -257,9 +292,9 @@ export const CreateHashPartitionedComponentTable = async (partitionCount: number
         type_id varchar(64) NOT NULL,
         name varchar(128),
         data jsonb,
-        created_at TIMESTAMP DEFAULT NOW(),
-        updated_at TIMESTAMP DEFAULT NOW(),
-        deleted_at TIMESTAMP,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        deleted_at TIMESTAMPTZ,
         PRIMARY KEY (id, type_id),
         UNIQUE(entity_id, type_id)
     ) PARTITION BY HASH (type_id);`;
@@ -483,9 +518,9 @@ export const CreateEntityComponentTable = async () => {
         entity_id UUID REFERENCES entities(id) ON DELETE CASCADE,
         type_id VARCHAR(64) NOT NULL,
         component_id UUID,
-        created_at TIMESTAMP DEFAULT NOW(),
-        updated_at TIMESTAMP DEFAULT NOW(),
-        deleted_at TIMESTAMP,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        deleted_at TIMESTAMPTZ,
         UNIQUE(entity_id, type_id)
     );`;
     const concurrently = process.env.USE_PGLITE ? '' : ' CONCURRENTLY';
@@ -646,9 +681,9 @@ export const BenchmarkPartitionCounts = async (partitionCounts: number[] = [8, 1
             type_id varchar(64) NOT NULL,
             name varchar(128),
             data jsonb,
-            created_at TIMESTAMP DEFAULT NOW(),
-            updated_at TIMESTAMP DEFAULT NOW(),
-            deleted_at TIMESTAMP,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
+            deleted_at TIMESTAMPTZ,
             PRIMARY KEY (id, type_id),
             UNIQUE(entity_id, type_id)
         ) PARTITION BY HASH (type_id);`);

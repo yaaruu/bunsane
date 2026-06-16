@@ -226,8 +226,8 @@ export async function doSave(entity: Entity, trx: SQL, signal?: AbortSignal): Pr
         }
 
         // Batch inserts and updates for better performance
-        const componentsToInsert = [];
-        const componentsToUpdate = [];
+        const componentsToInsert: Array<{ id: string; entity_id: string; name: string; type_id: string; data: Record<string, any> }> = [];
+        const componentsToUpdate: Array<{ id: string; entity_id: string; name: string; type_id: string; data: Record<string, any> }> = [];
 
         for (const comp of entity.components.values()) {
             const compName = comp.constructor.name;

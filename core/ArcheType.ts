@@ -1035,7 +1035,7 @@ export class BaseArcheType {
 
     public buildFilterBranches(filter?: FilterSchema<any>): any[] {
         if (!filter) return [];
-        const branches = [];
+        const branches: Array<{ component: any; filters: Array<{ field: string; operator: any; value: any }> }> = [];
 
         for (const [fieldName, componentCtor] of Object.entries(this.componentMap)) {
             const fieldOption = this.fieldOptions[fieldName];

@@ -2,11 +2,12 @@ import { logger as MainLogger } from "../Logger";
 import { SchedulerManager } from "../SchedulerManager";
 import { preparedStatementCache } from "../../database/PreparedStatementCache";
 import { getDbStats } from "../../database/instrumentedDb";
+import type { CacheManager } from "../cache/CacheManager";
 
 const logger = MainLogger.child({ scope: "App" });
 
 export async function collectMetrics(app: any) {
-    let cacheStats = null;
+    let cacheStats: Awaited<ReturnType<CacheManager["getStats"]>> | null = null;
     try {
         const { CacheManager } = await import('../cache/CacheManager');
         cacheStats = await CacheManager.getInstance().getStats();
