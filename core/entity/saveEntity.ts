@@ -254,8 +254,13 @@ export async function doSave(entity: Entity, trx: SQL, signal?: AbortSignal): Pr
                 (comp as any).setPersisted(true);
                 (comp as any).setDirty(false);
             } else if ((comp as any)._dirty) {
+                // Full columns so the batched upsert below can encode every row
+                // through the same sql(arr, cols) path as the INSERT batch.
                 componentsToUpdate.push({
                     id: comp.id,
+                    entity_id: entity.id,
+                    name: compName,
+                    type_id: comp.getTypeID(),
                     data: comp.serializableData()
                 });
                 (comp as any).setDirty(false);
@@ -267,12 +272,15 @@ export async function doSave(entity: Entity, trx: SQL, signal?: AbortSignal): Pr
             await run(saveTrx`INSERT INTO components ${sql(componentsToInsert, 'id', 'entity_id', 'name', 'type_id', 'data')}`);
         }
 
-        // Perform updates. Validate all ids up front (synchronous, fails
-        // fast), then issue the UPDATEs sequentially. They were previously
-        // fired together via Promise.all to "pipeline" on the transaction
-        // connection, but multiple concurrent in-flight queries on one
-        // connection deadlock single-backend servers (PGlite test harness),
-        // and a single wire serializes them regardless — no real gain.
+        // Perform updates as a SINGLE batched upsert. Dirty components already
+        // exist (persisted, live), so the ON CONFLICT path always fires and
+        // updates `data` for every row in one round-trip — replacing the
+        // previous N sequential UPDATEs (N wire round-trips inside the txn).
+        // Conflict target is the (id, type_id) PRIMARY KEY, which contains the
+        // partition key `type_id` — required for ON CONFLICT on the partitioned
+        // `components` table. Reuses the same sql(arr, cols) encoder as the
+        // INSERT batch, so jsonb encoding is identical across PostgreSQL and
+        // PGlite. `created_at` is preserved (DO UPDATE only touches `data`).
         if (componentsToUpdate.length > 0) {
             const traceEnabled = logger.isLevelEnabled?.('trace') === true;
             for (const comp of componentsToUpdate) {
@@ -287,9 +295,7 @@ export async function doSave(entity: Entity, trx: SQL, signal?: AbortSignal): Pr
                     logger.trace({ componentId: comp.id, data: comp.data }, `[Entity.doSave] Updating component`);
                 }
             }
-            for (const comp of componentsToUpdate) {
-                await run(saveTrx`UPDATE components SET data = ${comp.data} WHERE id = ${comp.id}`);
-            }
+            await run(saveTrx`INSERT INTO components ${sql(componentsToUpdate, 'id', 'entity_id', 'name', 'type_id', 'data')} ON CONFLICT (id, type_id) DO UPDATE SET data = EXCLUDED.data`);
         }
     };
 

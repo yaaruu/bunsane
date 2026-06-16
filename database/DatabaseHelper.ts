@@ -156,7 +156,7 @@ export const CreateComponentTable = async () => {
         ) PARTITION BY LIST (type_id);`;
         await db`CREATE INDEX IF NOT EXISTS idx_components_entity_id ON components (entity_id)`;
         await db`CREATE INDEX IF NOT EXISTS idx_components_type_id ON components (type_id)`;
-        await db`CREATE INDEX IF NOT EXISTS idx_components_data_gin ON components USING GIN (data)`;
+        await ensureDataGinIndex();
         await db`CREATE INDEX IF NOT EXISTS idx_components_entity_type_deleted ON components (entity_id, type_id, deleted_at)`;
         await db`CREATE INDEX IF NOT EXISTS idx_components_type_deleted ON components (type_id, deleted_at) WHERE deleted_at IS NULL`;
         await db`CREATE INDEX IF NOT EXISTS idx_components_deleted_entity ON components (deleted_at, entity_id) WHERE deleted_at IS NULL`;
@@ -226,6 +226,30 @@ const dropOrphanedPartitionTables = async () => {
     }
 }
 
+/**
+ * The whole-`data` GIN index (`idx_components_data_gin`) only serves top-level
+ * JSONB containment / existence on the entire `data` column (`data @> ...`,
+ * `data ? key`, `data ?| / ?&`). The Query layer never emits those forms — it
+ * uses per-field text extraction (`data->>'field'`, served by per-field
+ * btree/expression indexes) and sub-path containment (`data->'field' @> ...`,
+ * served by per-field sub-path GIN). So this index is pure write amplification
+ * for framework queries AND it blocks HOT updates (any `data` write must touch
+ * it). It is therefore OPT-IN. Set BUNSANE_COMPONENTS_DATA_GIN=true only if you
+ * run raw SQL doing top-level containment on the whole component payload.
+ */
+const ensureDataGinIndex = async (): Promise<void> => {
+    if (process.env.BUNSANE_COMPONENTS_DATA_GIN === 'true') {
+        await db`CREATE INDEX IF NOT EXISTS idx_components_data_gin ON components USING GIN (data)`;
+        logger.info("Created whole-data GIN index idx_components_data_gin (BUNSANE_COMPONENTS_DATA_GIN=true).");
+    } else {
+        logger.info(
+            "Skipped whole-data GIN index idx_components_data_gin to cut write amplification and enable HOT updates " +
+            "(BUNSANE_COMPONENTS_DATA_GIN!=true). Per-field indexes serve all framework queries. A pre-existing DB " +
+            "that still has it can drop it manually: DROP INDEX CONCURRENTLY IF EXISTS idx_components_data_gin;"
+        );
+    }
+};
+
 export const CreateHashPartitionedComponentTable = async (partitionCount: number = 16) => {
     await db`CREATE TABLE IF NOT EXISTS components (
         id UUID,
@@ -249,7 +273,7 @@ export const CreateHashPartitionedComponentTable = async (partitionCount: number
 
     await db`CREATE INDEX IF NOT EXISTS idx_components_entity_id ON components (entity_id)`;
     await db`CREATE INDEX IF NOT EXISTS idx_components_type_id ON components (type_id)`;
-    await db`CREATE INDEX IF NOT EXISTS idx_components_data_gin ON components USING GIN (data)`;
+    await ensureDataGinIndex();
     await db`CREATE INDEX IF NOT EXISTS idx_components_entity_type_deleted ON components (entity_id, type_id, deleted_at)`;
     await db`CREATE INDEX IF NOT EXISTS idx_components_type_deleted ON components (type_id, deleted_at) WHERE deleted_at IS NULL`;
     await db`CREATE INDEX IF NOT EXISTS idx_components_deleted_entity ON components (deleted_at, entity_id) WHERE deleted_at IS NULL`;
