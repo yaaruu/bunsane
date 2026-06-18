@@ -4,8 +4,15 @@ import type {
     ComponentPropertyMetadata,
     IndexedFieldMetadata
  } from "./definitions/Component";
-import type { ArcheTypeMetadata, ArcheTypeFieldOptions } from './definitions/ArcheType';
+import type { ArcheTypeMetadata, ArcheTypeFieldOptions, ArcheTypeFunctionMetadata } from './definitions/ArcheType';
 import type { RelationOptions } from '../ArcheType';
+
+// Mirror of decorators.archetypeFunctionsSymbol — referenced via the global symbol
+// registry to avoid a circular import between metadata-storage and archetype/decorators.
+const archetypeFunctionsSymbol = Symbol.for("bunsane:archetypeFunctions");
+
+type ArcheTypeFunctionOptions = ArcheTypeFunctionMetadata["options"];
+type ArcheTypeFunctionHandler = (entity: any, ...args: any[]) => any;
 
 function generateTypeId(name: string): string {
   return createHash('sha256').update(name).digest('hex');
@@ -85,6 +92,57 @@ export class MetadataStorage {
             this.archetypes_relations_map.set(archetype_id, []);
         }
         this.archetypes_relations_map.get(archetype_id)!.push({fieldName, relatedArcheType, relationType, options, type});
+    }
+
+    /**
+     * Register a computed (@ArcheTypeFunction-equivalent) field at runtime, with no decorator.
+     *
+     * Wires all three sites the decorator path touches in one call:
+     *  - prototype symbol array → instances pick it up via `this.functions`
+     *  - prototype method → resolver invokes `archetype[propertyKey](entity, ...)`
+     *  - archetype metadata.functions → weaver emits the field in the SDL
+     *
+     * The archetype must already be registered (via @ArcheType or runtime registration)
+     * so its target class is known; throws otherwise.
+     */
+    collectArchetypeFunction(
+        name: string,
+        propertyKey: string,
+        handler: ArcheTypeFunctionHandler,
+        options?: ArcheTypeFunctionOptions
+    ) {
+        const metadata = this.archetypes.find(a => a.name === name);
+        if (!metadata) {
+            throw new Error(`Cannot register function '${propertyKey}': archetype '${name}' is not registered`);
+        }
+
+        const prototype = (metadata.target as any).prototype;
+
+        // 1. prototype symbol array (consumed by BaseArcheType ctor → this.functions)
+        if (!prototype[archetypeFunctionsSymbol]) {
+            prototype[archetypeFunctionsSymbol] = [];
+        }
+        const protoFns: ArcheTypeFunctionMetadata[] = prototype[archetypeFunctionsSymbol];
+        const protoIdx = protoFns.findIndex(f => f.propertyKey === propertyKey);
+        if (protoIdx !== -1) {
+            protoFns[protoIdx] = { propertyKey, options };
+        } else {
+            protoFns.push({ propertyKey, options });
+        }
+
+        // 2. prototype method (invoked by the field resolver)
+        prototype[propertyKey] = handler;
+
+        // 3. metadata.functions (read by the weaver to build SDL)
+        if (!metadata.functions) {
+            metadata.functions = [];
+        }
+        const metaIdx = metadata.functions.findIndex(f => f.propertyKey === propertyKey);
+        if (metaIdx !== -1) {
+            metadata.functions[metaIdx] = { propertyKey, options };
+        } else {
+            metadata.functions.push({ propertyKey, options });
+        }
     }
 
     collectArcheTypeMetadata(metadata: ArcheTypeMetadata) {

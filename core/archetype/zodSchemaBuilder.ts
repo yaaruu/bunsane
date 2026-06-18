@@ -521,7 +521,12 @@ export function buildZodObjectSchema(
         graphqlSchema: graphqlSchemaString,
     });
 
-    allArchetypeZodObjects.set(nameFromStorage, r);
+    // Only cache the canonical full variant in the shared map. Function-less /
+    // relation-less variants (e.g. from getInputSchema) must not overwrite it,
+    // or weaveAllArchetypes welds SDL missing @ArcheTypeFunction fields → resolver/schema mismatch.
+    if (!excludeRelations && !excludeFunctions) {
+        allArchetypeZodObjects.set(nameFromStorage, r);
+    }
 
     return r;
 }

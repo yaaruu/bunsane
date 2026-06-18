@@ -7,7 +7,7 @@ import {
     handleStudioArcheTypeRecordsRequest,
     handleStudioArcheTypeDeleteRequest,
 } from "./archetypes";
-import { handleEntityInspectorRequest } from "./entity";
+import { handleEntityInspectorRequest, handleEntityListRequest } from "./entity";
 import { handleStudioStatsRequest } from "./stats";
 import { handleStudioComponentsRequest } from "./components";
 import { handleStudioQueryRequest } from "./query";
@@ -18,6 +18,7 @@ const studioEndpoint = {
     handleStudioTableDeleteRequest,
     handleStudioArcheTypeDeleteRequest,
     handleEntityInspectorRequest,
+    handleEntityListRequest,
     handleStudioStatsRequest,
     handleStudioComponentsRequest,
     handleStudioQueryRequest,

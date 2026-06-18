@@ -128,6 +128,43 @@ export async function fetchComponents(): Promise<ComponentTypeInfo[]> {
   return data.components
 }
 
+export interface EntityListItem {
+  id: string
+  created_at: string
+  updated_at: string
+  deleted_at: string | null
+  component_count: number
+}
+
+export interface EntityListData {
+  entities: EntityListItem[]
+  total: number
+  hasMore: boolean
+}
+
+export async function fetchEntities(
+  params: { limit?: number; offset?: number; search?: string; include_deleted?: boolean } = {}
+): Promise<EntityListData> {
+  const searchParams = new URLSearchParams()
+  if (params.limit) searchParams.set('limit', params.limit.toString())
+  if (params.offset) searchParams.set('offset', params.offset.toString())
+  if (params.search) searchParams.set('search', params.search)
+  if (params.include_deleted) searchParams.set('include_deleted', 'true')
+
+  const response = await fetch(`${API_BASE}/entities?${searchParams}`)
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: 'Failed to fetch entities' }))
+    throw new Error(error.error || 'Failed to fetch entities')
+  }
+  const result = await response.json()
+  const entities: EntityListItem[] = result.entities || []
+  return {
+    entities,
+    total: result.total ?? 0,
+    hasMore: entities.length === (params.limit || 50),
+  }
+}
+
 export async function fetchEntity(entityId: string): Promise<EntityInspectorData> {
   const response = await fetch(`${API_BASE}/entity/${entityId}`)
   if (!response.ok) {

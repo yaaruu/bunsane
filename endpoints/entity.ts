@@ -1,7 +1,92 @@
 import db from "../database";
-import type { EntityInspectorResponse } from "./types";
+import type {
+    EntityInspectorResponse,
+    StudioEntityListQueryParams,
+    StudioEntityListResponse,
+    EntityListItem,
+} from "./types";
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export async function handleEntityListRequest(
+    params: StudioEntityListQueryParams = {}
+): Promise<Response> {
+    const limit = Math.min(Math.max(params.limit ?? 50, 1), 1000);
+    const offset = Math.max(params.offset ?? 0, 0);
+    const searchTerm = params.search?.trim() ?? "";
+    const includeDeleted = params.include_deleted ?? false;
+
+    const deletedFilter = includeDeleted ? "" : "AND e.deleted_at IS NULL";
+
+    try {
+        let rows: Record<string, unknown>[];
+        let totalResult: { count: number }[];
+
+        if (searchTerm) {
+            const searchPattern = `%${searchTerm}%`;
+            rows = await db.unsafe(
+                `SELECT e.id, e.created_at, e.updated_at, e.deleted_at,
+                        (SELECT COUNT(*) FROM components c
+                         WHERE c.entity_id = e.id AND c.deleted_at IS NULL) AS component_count
+                 FROM entities e
+                 WHERE e.id::text ILIKE $1 ${deletedFilter}
+                 ORDER BY e.created_at DESC NULLS LAST
+                 LIMIT $2 OFFSET $3`,
+                [searchPattern, limit, offset]
+            );
+            totalResult = await db.unsafe(
+                `SELECT COUNT(*) AS count FROM entities e
+                 WHERE e.id::text ILIKE $1 ${deletedFilter}`,
+                [searchPattern]
+            );
+        } else {
+            rows = await db.unsafe(
+                `SELECT e.id, e.created_at, e.updated_at, e.deleted_at,
+                        (SELECT COUNT(*) FROM components c
+                         WHERE c.entity_id = e.id AND c.deleted_at IS NULL) AS component_count
+                 FROM entities e
+                 WHERE TRUE ${deletedFilter}
+                 ORDER BY e.created_at DESC NULLS LAST
+                 LIMIT $1 OFFSET $2`,
+                [limit, offset]
+            );
+            totalResult = await db.unsafe(
+                `SELECT COUNT(*) AS count FROM entities e WHERE TRUE ${deletedFilter}`
+            );
+        }
+
+        const entities: EntityListItem[] = rows.map((row) => ({
+            id: row.id as string,
+            created_at: row.created_at as string,
+            updated_at: row.updated_at as string,
+            deleted_at: (row.deleted_at as string) ?? null,
+            component_count: Number(row.component_count ?? 0),
+        }));
+
+        const responseData: StudioEntityListResponse = {
+            entities,
+            total: Number(totalResult[0]?.count ?? 0),
+            limit,
+            offset,
+        };
+
+        return new Response(JSON.stringify(responseData), {
+            headers: { "Content-Type": "application/json" },
+        });
+    } catch (error) {
+        const errorMessage =
+            error instanceof Error ? error.message : "Unknown error";
+        return new Response(
+            JSON.stringify({
+                error: `Failed to fetch entities: ${errorMessage}`,
+            }),
+            {
+                status: 500,
+                headers: { "Content-Type": "application/json" },
+            }
+        );
+    }
+}
 
 export async function handleEntityInspectorRequest(
     entityId: string

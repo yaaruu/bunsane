@@ -7,7 +7,12 @@ import { PageHeader } from "../components/PageHeader";
 import { SearchBar } from "../components/SearchBar";
 import { DataTable } from '../components/DataTable'
 import { useDataTable } from '../hooks/useDataTable'
-import { createSelectColumn, createTextColumn } from '../utils/columnHelpers'
+import {
+  createSelectColumn,
+  createTextColumn,
+  createDateColumn,
+  isTimestampColumn,
+} from '../utils/columnHelpers'
 
 interface TableRecord {
   [key: string]: any
@@ -44,7 +49,9 @@ export function Table() {
       const newColumns: ColumnDef<TableRecord>[] = [
         createSelectColumn<TableRecord>(),
         ...Object.keys(sampleRecord).map(key =>
-          createTextColumn<TableRecord>(key, key)
+          isTimestampColumn(key)
+            ? createDateColumn<TableRecord>(key, key)
+            : createTextColumn<TableRecord>(key, key)
         ),
       ]
       setColumns(newColumns)

@@ -61,6 +61,42 @@ export function renderCellValue(
     );
 }
 
+/** Column keys that hold ECS timestamps (now timestamptz as of framework 0.5.1). */
+const TIMESTAMP_KEYS = new Set([
+  'created_at',
+  'updated_at',
+  'deleted_at',
+])
+
+export function isTimestampColumn(key: string): boolean {
+  return TIMESTAMP_KEYS.has(key)
+}
+
+/**
+ * Formats a timestamptz/ISO string to the viewer's locale.
+ * Falls back to the raw value when it isn't a parseable date.
+ */
+export function formatTimestamp(value: unknown): string {
+  if (value === null || value === undefined || value === '') return '-'
+  const date = new Date(value as string)
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString()
+}
+
+/**
+ * Creates a timestamp column that renders timestamptz values in locale format.
+ */
+export function createDateColumn<T>(key: string, header: string): ColumnDef<T> {
+  return {
+    accessorKey: key,
+    header,
+    cell: ({ getValue }) => (
+      <span className="font-mono text-xs text-muted-foreground whitespace-nowrap">
+        {formatTimestamp(getValue())}
+      </span>
+    ),
+  }
+}
+
 /**
  * Creates a standard text column with proper rendering
  */

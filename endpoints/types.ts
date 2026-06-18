@@ -88,6 +88,28 @@ interface EntityInspectorResponse {
     components: EntityComponent[];
 }
 
+interface StudioEntityListQueryParams {
+    limit?: number;
+    offset?: number;
+    search?: string;
+    include_deleted?: boolean;
+}
+
+interface EntityListItem {
+    id: string;
+    created_at: string;
+    updated_at: string;
+    deleted_at: string | null;
+    component_count: number;
+}
+
+interface StudioEntityListResponse {
+    entities: EntityListItem[];
+    total: number;
+    limit: number;
+    offset: number;
+}
+
 interface ComponentTypeStats {
     name: string;
     count: number;
@@ -145,6 +167,9 @@ export type {
     DeleteResponse,
     EntityComponent,
     EntityInspectorResponse,
+    StudioEntityListQueryParams,
+    EntityListItem,
+    StudioEntityListResponse,
     ComponentTypeStats,
     ArcheTypeStats,
     StudioStatsResponse,

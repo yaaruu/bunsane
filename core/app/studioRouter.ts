@@ -20,6 +20,20 @@ export async function routeStudio(
         return await studioEndpoint.handleStudioComponentsRequest();
     }
 
+    if (url.pathname === "/studio/api/entities") {
+        const limit = url.searchParams.get("limit");
+        const offset = url.searchParams.get("offset");
+        const search = url.searchParams.get("search");
+        const includeDeleted = url.searchParams.get("include_deleted");
+
+        return await studioEndpoint.handleEntityListRequest({
+            limit: limit ? parseInt(limit, 10) : undefined,
+            offset: offset ? parseInt(offset, 10) : undefined,
+            search: search ?? undefined,
+            include_deleted: includeDeleted === "true",
+        });
+    }
+
     if (url.pathname === "/studio/api/query" && method === "POST") {
         const body = await req.json();
         return await studioEndpoint.handleStudioQueryRequest(body);
