@@ -198,16 +198,45 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
 
         for (const [route, folder] of app.staticAssets) {
             if (url.pathname.startsWith(route)) {
-                const relativePath = url.pathname.slice(route.length);
-                const filePath = path.join(folder, relativePath);
+                const rawRelative = url.pathname.slice(route.length);
+                // Decode percent-encoding first so encoded traversal sequences
+                // (e.g. %2e%2e%2f) can't slip past the containment check.
+                let decodedRelative: string;
                 try {
-                    const file = Bun.file(filePath);
+                    decodedRelative = decodeURIComponent(rawRelative);
+                } catch {
+                    clearTimeout(timeoutId);
+                    return wrap(new Response("Bad request", {
+                        status: 400,
+                        headers: { "Content-Type": "text/plain" },
+                    }));
+                }
+                // Resolve absolutely and confirm the target stays inside the
+                // served folder — blocks path traversal (../) out of the dir.
+                // Strip leading slashes so path.resolve treats the request as
+                // relative to the folder (an absolute-looking arg would reset
+                // to the filesystem root and bypass containment).
+                const relForResolve = decodedRelative.replace(/^[/\\]+/, "");
+                const resolvedBase = path.resolve(folder);
+                const resolvedFile = path.resolve(resolvedBase, relForResolve);
+                if (
+                    resolvedFile !== resolvedBase &&
+                    !resolvedFile.startsWith(resolvedBase + path.sep)
+                ) {
+                    clearTimeout(timeoutId);
+                    return wrap(new Response("Forbidden", {
+                        status: 403,
+                        headers: { "Content-Type": "text/plain" },
+                    }));
+                }
+                try {
+                    const file = Bun.file(resolvedFile);
                     if (await file.exists()) {
                         clearTimeout(timeoutId);
                         return wrap(new Response(file));
                     }
                 } catch (error) {
-                    logger.error(`Error serving static file ${filePath}:`, error as any);
+                    logger.error(`Error serving static file ${resolvedFile}:`, error as any);
                 }
             }
         }

@@ -91,6 +91,25 @@ export function buildJSONBPath(field: string, alias: string): string {
 }
 
 /**
+ * Determine the type cast for an `IN` / `NOT IN` value list against a JSONB
+ * text-extracted field (`data->>'x'` always yields text). Without a cast a
+ * numeric/boolean list produces `text IN (1, 2)` → PostgreSQL "operator does
+ * not exist: text = integer". When every element is a number (or boolean) we
+ * cast both the field and each parameter, mirroring the scalar `=` path. Mixed
+ * or string lists stay as plain text comparison (the correct default).
+ *
+ * @returns `lhs(path)` wraps the field expression; `param` is the per-parameter
+ *          cast suffix (e.g. `::numeric`), `''` for text.
+ */
+export function jsonbInListCast(values: any[]): { lhs: (path: string) => string; param: string } {
+    const allNumbers = values.length > 0 && values.every(v => typeof v === 'number');
+    if (allNumbers) return { lhs: (p) => `(${p})::numeric`, param: '::numeric' };
+    const allBooleans = values.length > 0 && values.every(v => typeof v === 'boolean');
+    if (allBooleans) return { lhs: (p) => `(${p})::boolean`, param: '::boolean' };
+    return { lhs: (p) => p, param: '' };
+}
+
+/**
  * Compose multiple filter builders into a single builder that applies all conditions
  *
  * This allows chaining multiple custom filters together (e.g., spatial proximity AND full-text search).

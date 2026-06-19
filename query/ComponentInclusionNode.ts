@@ -3,6 +3,7 @@ import type { QueryResult } from "./QueryNode";
 import { QueryContext } from "./QueryContext";
 import { shouldUseLateralJoins, shouldUseDirectPartition } from "../core/Config";
 import { FilterBuilderRegistry } from "./FilterBuilderRegistry";
+import { jsonbInListCast } from "./FilterBuilder";
 import { ComponentRegistry } from "../core/components";
 import { getMetadataStorage } from "../core/metadata";
 import { assertIdentifier } from "./SqlIdentifier";
@@ -95,8 +96,9 @@ export class ComponentInclusionNode extends QueryNode {
             return `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
         } else if (filter.operator === 'IN' || filter.operator === 'NOT IN') {
             if (Array.isArray(filter.value) && filter.value.length > 0) {
-                const placeholders = filter.value.map((v: any) => `$${context.addParam(v)}`).join(', ');
-                return `${jsonPath} ${filter.operator} (${placeholders})`;
+                const cast = jsonbInListCast(filter.value);
+                const placeholders = filter.value.map((v: any) => `$${context.addParam(v)}${cast.param}`).join(', ');
+                return `${cast.lhs(jsonPath)} ${filter.operator} (${placeholders})`;
             } else if (Array.isArray(filter.value) && filter.value.length === 0) {
                 return filter.operator === 'IN' ? 'FALSE' : 'TRUE';
             }
@@ -665,8 +667,9 @@ export class ComponentInclusionNode extends QueryNode {
                 condition = `(${jsonPath})::boolean ${filter.operator} $${context.addParam(filter.value)}`;
             } else if (filter.operator === 'IN' || filter.operator === 'NOT IN') {
                 if (Array.isArray(filter.value) && filter.value.length > 0) {
-                    const placeholders = filter.value.map((v: any) => `$${context.addParam(v)}`).join(', ');
-                    condition = `${jsonPath} ${filter.operator} (${placeholders})`;
+                    const cast = jsonbInListCast(filter.value);
+                    const placeholders = filter.value.map((v: any) => `$${context.addParam(v)}${cast.param}`).join(', ');
+                    condition = `${cast.lhs(jsonPath)} ${filter.operator} (${placeholders})`;
                 } else {
                     return null; // Invalid or empty array - fall back to normal path
                 }
@@ -860,14 +863,17 @@ export class ComponentInclusionNode extends QueryNode {
                         // String LIKE/ILIKE comparison - no casting
                         condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
                     } else if (filter.operator === 'IN' || filter.operator === 'NOT IN') {
-                        // IN/NOT IN comparison - handle arrays properly
+                        // IN/NOT IN comparison - handle arrays properly. Numeric/
+                        // boolean lists need a cast on both the JSONB text field
+                        // and each parameter, else `text IN (1, 2)` errors.
                         if (Array.isArray(filter.value) && filter.value.length > 0) {
+                            const cast = jsonbInListCast(filter.value);
                             let placeholders = '';
                             for (let i = 0; i < filter.value.length; i++) {
                                 if (i) placeholders += ', ';
-                                placeholders += '$' + context.addParam(filter.value[i]);
+                                placeholders += '$' + context.addParam(filter.value[i]) + cast.param;
                             }
-                            condition = `${jsonPath} ${filter.operator} (${placeholders})`;
+                            condition = `${cast.lhs(jsonPath)} ${filter.operator} (${placeholders})`;
                         } else if (Array.isArray(filter.value) && filter.value.length === 0) {
                             // Empty array: IN () is always false, NOT IN () is always true
                             condition = filter.operator === 'IN' ? 'FALSE' : 'TRUE';

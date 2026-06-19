@@ -5,6 +5,7 @@ import { OrQuery } from "./OrQuery";
 import { ComponentRegistry } from "../core/components";
 import { shouldUseDirectPartition } from "../core/Config";
 import { getMembershipTable } from "./membershipSource";
+import { jsonbInListCast } from "./FilterBuilder";
 
 export class OrNode extends QueryNode {
     private orQuery: OrQuery;
@@ -111,15 +112,17 @@ export class OrNode extends QueryNode {
                             break;
                         case "IN":
                             if (Array.isArray(value)) {
-                                const placeholders = value.map(() => `$${paramIndex++}`).join(', ');
-                                branchSql += ` AND ${jsonPath} IN (${placeholders})`;
+                                const cast = jsonbInListCast(value);
+                                const placeholders = value.map(() => `$${paramIndex++}${cast.param}`).join(', ');
+                                branchSql += ` AND ${cast.lhs(jsonPath)} IN (${placeholders})`;
                                 context.params.push(...value);
                             }
                             break;
                         case "NOT IN":
                             if (Array.isArray(value)) {
-                                const placeholders = value.map(() => `$${paramIndex++}`).join(', ');
-                                branchSql += ` AND ${jsonPath} NOT IN (${placeholders})`;
+                                const cast = jsonbInListCast(value);
+                                const placeholders = value.map(() => `$${paramIndex++}${cast.param}`).join(', ');
+                                branchSql += ` AND ${cast.lhs(jsonPath)} NOT IN (${placeholders})`;
                                 context.params.push(...value);
                             }
                             break;
@@ -150,7 +153,7 @@ export class OrNode extends QueryNode {
         if (context.excludedComponentIds.size > 0) {
             const excludedTypes = Array.from(context.excludedComponentIds);
             const placeholders = excludedTypes.map(() => `$${paramIndex++}`).join(', ');
-            conditions.push(`NOT EXISTS (SELECT 1 FROM ${getMembershipTable()} ec_ex WHERE ec_ex.entity_id = or_results.id AND ec_ex.type_id IN (${placeholders}) AND ec_ex.deleted_at IS NULL)`);
+            conditions.push(`NOT EXISTS (SELECT 1 FROM ${getMembershipTable()} ec_ex WHERE ec_ex.entity_id = or_results.entity_id AND ec_ex.type_id IN (${placeholders}) AND ec_ex.deleted_at IS NULL)`);
             context.params.push(...excludedTypes);
         }
 
@@ -232,15 +235,17 @@ export class OrNode extends QueryNode {
                             break;
                         case "IN":
                             if (Array.isArray(value)) {
-                                const placeholders = value.map(() => `$${paramIndex++}`).join(', ');
-                                conditions.push(`${jsonPath} IN (${placeholders})`);
+                                const cast = jsonbInListCast(value);
+                                const placeholders = value.map(() => `$${paramIndex++}${cast.param}`).join(', ');
+                                conditions.push(`${cast.lhs(jsonPath)} IN (${placeholders})`);
                                 context.params.push(...value);
                             }
                             break;
                         case "NOT IN":
                             if (Array.isArray(value)) {
-                                const placeholders = value.map(() => `$${paramIndex++}`).join(', ');
-                                conditions.push(`${jsonPath} NOT IN (${placeholders})`);
+                                const cast = jsonbInListCast(value);
+                                const placeholders = value.map(() => `$${paramIndex++}${cast.param}`).join(', ');
+                                conditions.push(`${cast.lhs(jsonPath)} NOT IN (${placeholders})`);
                                 context.params.push(...value);
                             }
                             break;
@@ -329,10 +334,29 @@ export class OrNode extends QueryNode {
         let baseEntityQuery = "";
 
         if (hasComponentDependency) {
-            // Get base entities from ComponentInclusionNode
+            // Get base entities from ComponentInclusionNode.
+            //
+            // CRITICAL: the base set must be UNBOUNDED. OrNode embeds this SQL
+            // as `FROM (base) WHERE EXISTS (<or filter>)` and applies LIMIT/
+            // OFFSET to the *final* OR-filtered result below. If the base node
+            // bakes the caller's LIMIT/OFFSET into its own SQL, the EXISTS OR
+            // filter only ever sees the first page of base entities (ordered by
+            // entity_id), so any match beyond that page silently vanishes —
+            // e.g. a search whose only hits live on page 2+ returns 0 rows
+            // while count() (which strips pagination) reports them. Null out
+            // pagination around the base build, then restore so the final
+            // pagination below is unaffected. cursorId is left intact: it
+            // constrains the candidate set (entity_id > cursor) which composes
+            // correctly with the final LIMIT.
             const componentNode = this.dependencies[0];
             if (componentNode) {
+                const savedLimit = context.limit;
+                const savedOffset = context.offsetValue;
+                context.limit = null;
+                context.offsetValue = 0;
                 const baseResult = componentNode.execute(context);
+                context.limit = savedLimit;
+                context.offsetValue = savedOffset;
                 baseEntityQuery = baseResult.sql;
                 paramIndex = baseResult.context.paramIndex;
             }
@@ -408,15 +432,17 @@ export class OrNode extends QueryNode {
                             break;
                         case "IN":
                             if (Array.isArray(value)) {
-                                const placeholders = value.map(() => `$${paramIndex++}`).join(', ');
-                                filterConditions.push(`${jsonPath} IN (${placeholders})`);
+                                const cast = jsonbInListCast(value);
+                                const placeholders = value.map(() => `$${paramIndex++}${cast.param}`).join(', ');
+                                filterConditions.push(`${cast.lhs(jsonPath)} IN (${placeholders})`);
                                 context.params.push(...value);
                             }
                             break;
                         case "NOT IN":
                             if (Array.isArray(value)) {
-                                const placeholders = value.map(() => `$${paramIndex++}`).join(', ');
-                                filterConditions.push(`${jsonPath} NOT IN (${placeholders})`);
+                                const cast = jsonbInListCast(value);
+                                const placeholders = value.map(() => `$${paramIndex++}${cast.param}`).join(', ');
+                                filterConditions.push(`${cast.lhs(jsonPath)} NOT IN (${placeholders})`);
                                 context.params.push(...value);
                             }
                             break;
@@ -447,7 +473,7 @@ export class OrNode extends QueryNode {
             for (const componentType of allComponentTypes) {
                 const componentId = ComponentRegistry.getComponentId(componentType);
                 if (componentId) {
-                    componentConditions.push(`EXISTS (SELECT 1 FROM ${getMembershipTable()} ec_all WHERE ec_all.entity_id = or_results.id AND ec_all.type_id = $${paramIndex} AND ec_all.deleted_at IS NULL)`);
+                    componentConditions.push(`EXISTS (SELECT 1 FROM ${getMembershipTable()} ec_all WHERE ec_all.entity_id = or_results.entity_id AND ec_all.type_id = $${paramIndex} AND ec_all.deleted_at IS NULL)`);
                     context.params.push(componentId);
                     paramIndex++;
                 }
@@ -469,7 +495,7 @@ export class OrNode extends QueryNode {
         if (context.excludedComponentIds.size > 0) {
             const excludedTypes = Array.from(context.excludedComponentIds);
             const placeholders = excludedTypes.map(() => `$${paramIndex++}`).join(', ');
-            conditions.push(`NOT EXISTS (SELECT 1 FROM ${getMembershipTable()} ec_ex WHERE ec_ex.entity_id = or_results.id AND ec_ex.type_id IN (${placeholders}) AND ec_ex.deleted_at IS NULL)`);
+            conditions.push(`NOT EXISTS (SELECT 1 FROM ${getMembershipTable()} ec_ex WHERE ec_ex.entity_id = or_results.entity_id AND ec_ex.type_id IN (${placeholders}) AND ec_ex.deleted_at IS NULL)`);
             context.params.push(...excludedTypes);
         }
 
