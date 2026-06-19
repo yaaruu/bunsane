@@ -13,3 +13,9 @@ export {
     type DistributedLockConfig,
     type LockResult,
 } from './DistributedLock';
+
+export {
+    withLock,
+    type WithLockOptions,
+    type LockOutcome,
+} from './withLock';

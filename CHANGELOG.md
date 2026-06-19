@@ -2,6 +2,28 @@
 
 All notable changes to bunsane are documented here.
 
+## 0.5.2 — 2026-06-19
+
+### Added
+
+- **`withLock(key, fn, options?)`** — public distributed-lock primitive,
+  exported from `bunsane/core`. Runs `fn` while holding a PostgreSQL advisory
+  lock and always releases it (even if `fn` throws); only one holder of a given
+  `key` runs `fn` at a time across every process pointed at the same database.
+  Returns `{ acquired: true, result }`, or `{ acquired: false }` when the lock
+  is held elsewhere (`fn` does not run). Wraps the same `DistributedLock`
+  singleton and PostgreSQL session the scheduler uses for task exclusion, now
+  surfaced for app-level "run once cluster-wide" work — reindex, migration,
+  cache rebuild. `options.wait` (ms, default `0` = try once) blocks for the lock
+  instead of skipping; `options.retryInterval` (default 100 ms) sets the poll
+  cadence. Layers an in-process guard over the advisory lock because PostgreSQL
+  advisory locks are reentrant per session — without it, two concurrent
+  same-key callers in one process would both win. Not reentrant; crash-safe
+  (session-scoped); honors `distributedLocking: false` (then always reports
+  `acquired: true` with no real lock). Also re-exported from
+  `bunsane/core/scheduler`. A new `core/index.ts` barrel establishes
+  `bunsane/core` as a public entry point.
+
 ## 0.5.1 — 2026-06-16
 
 ### Added
