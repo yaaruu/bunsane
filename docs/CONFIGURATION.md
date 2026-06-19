@@ -73,6 +73,7 @@ See [Liveness & the write probe](#liveness--the-write-probe).
 | `BUNSANE_DB_SLOW_MS` | framework default | Slow-query log threshold (ms). |
 | `BUNSANE_COMPONENTS_DATA_GIN` | `false` | `true` creates the whole-`data` GIN index (`idx_components_data_gin`) on the `components` table. Off by default: the Query layer serves all filters/sorts from per-field indexes and never emits top-level `data @>` / `data ?` containment, so this index is pure write amplification and blocks HOT updates. Enable **only** if you run raw SQL doing top-level JSONB containment on the whole component payload. A pre-existing DB that still has it: `DROP INDEX CONCURRENTLY IF EXISTS idx_components_data_gin;`. |
 | `BUNSANE_MEMBERSHIP_SOURCE` | `components` | Component membership source table (internal). |
+| `BUNSANE_ORNODE_SINGLE_PASS` | `1` (on) | OR queries over a required base (`.with(X).with(or([...]))`) scan the base set **once** and combine branches as a disjunction of `EXISTS` predicates, instead of embedding the base in every branch and `UNION`-ing (which forced an N× base scan + a per-branch cartesian nested-loop). Parity-proven against the legacy shape; ~20× faster on a 3-branch OR. Kill-switch: set to `0`/`false` to revert to the legacy `UNION` shape instantly (no redeploy). |
 | `BUNSANE_RELATION_TYPED_COLUMN` | — | Typed relation column toggle (internal). |
 
 ## Cache

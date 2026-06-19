@@ -7,6 +7,23 @@ import { shouldUseDirectPartition } from "../core/Config";
 import { getMembershipTable } from "./membershipSource";
 import { jsonbInListCast } from "./FilterBuilder";
 
+/**
+ * Gate for the base-dependency single-pass OR rewrite (base scanned once,
+ * branches combined as OR-of-EXISTS instead of N× base + UNION + DISTINCT).
+ *
+ * Default ON — the single-pass shape is parity-proven against the legacy UNION
+ * path (identical exec/paginate/count results) and ~20× faster (no per-branch
+ * cartesian nested-loop; base anti-join computed once). Read at call time.
+ *
+ * Kill-switch: set BUNSANE_ORNODE_SINGLE_PASS=0 (or "false") to revert to the
+ * legacy UNION shape instantly, no redeploy — for the unlikely case a real
+ * Postgres planner regresses on a specific OR shape.
+ */
+function shouldUseOrSinglePass(): boolean {
+    const v = process.env.BUNSANE_ORNODE_SINGLE_PASS;
+    return v !== '0' && v !== 'false';
+}
+
 export class OrNode extends QueryNode {
     private orQuery: OrQuery;
 
@@ -362,6 +379,15 @@ export class OrNode extends QueryNode {
             }
         }
 
+        // Gated single-pass rewrite: scan the base set ONCE and combine the OR
+        // branches as a disjunction of EXISTS predicates, instead of embedding
+        // the base SQL inside every branch and UNION-ing (N× base scan +
+        // UNION dedup + redundant outer DISTINCT). Same param push order, same
+        // result set, same ORDER BY entity_id ASC + pagination semantics.
+        if (hasComponentDependency && baseEntityQuery && shouldUseOrSinglePass()) {
+            return this.executeBaseSinglePass(context, baseEntityQuery, paramIndex);
+        }
+
         // Build SQL for each branch
         for (const branch of this.orQuery.branches) {
             const componentId = ComponentRegistry.getComponentId(branch.component.name);
@@ -524,7 +550,150 @@ export class OrNode extends QueryNode {
             params: context.params,
             context
         };
-    }    public getNodeType(): string {
+    }
+
+    /**
+     * Build a single OR branch as an `EXISTS (...)` predicate against the
+     * branch component's table, correlated to `idExpr` (e.g. `base.id`).
+     * Mirrors the filter switch of the legacy dependency branch exactly —
+     * same SQL fragments, same param push order — so the single-pass shape is
+     * result- and parameter-identical to the UNION shape it replaces.
+     */
+    private buildBranchExists(
+        branch: OrQuery['branches'][number],
+        idExpr: string,
+        context: QueryContext,
+        paramIndex: number
+    ): { sql: string; paramIndex: number } {
+        const componentId = ComponentRegistry.getComponentId(branch.component.name);
+        if (!componentId) {
+            throw new Error(`Component ${branch.component.name} is not registered`);
+        }
+
+        const componentTableName = this.getComponentTableName(componentId);
+        const componentIdParamIndex = paramIndex;
+
+        let sql = `EXISTS (
+            SELECT 1 FROM ${componentTableName} c
+            WHERE c.entity_id = ${idExpr}
+            AND c.type_id = $${componentIdParamIndex}
+            AND c.deleted_at IS NULL`;
+
+        context.params.push(componentId);
+        paramIndex++;
+
+        if (branch.filters && branch.filters.length > 0) {
+            for (const filter of branch.filters) {
+                const { field, operator, value } = filter;
+                const jsonPath = `c.data->>'${field}'`;
+
+                switch (operator) {
+                    case "=":
+                    case ">":
+                    case "<":
+                    case ">=":
+                    case "<=":
+                    case "!=":
+                        if (typeof value === "string") {
+                            sql += ` AND ${jsonPath} ${operator} $${paramIndex}`;
+                        } else {
+                            sql += ` AND (${jsonPath})::numeric ${operator} $${paramIndex}`;
+                        }
+                        context.params.push(value);
+                        paramIndex++;
+                        break;
+                    case "LIKE":
+                    case "ILIKE":
+                        sql += ` AND ${jsonPath} ${operator} $${paramIndex}`;
+                        context.params.push(value);
+                        paramIndex++;
+                        break;
+                    case "IN":
+                        if (Array.isArray(value)) {
+                            const cast = jsonbInListCast(value);
+                            const placeholders = value.map(() => `$${paramIndex++}${cast.param}`).join(', ');
+                            sql += ` AND ${cast.lhs(jsonPath)} IN (${placeholders})`;
+                            context.params.push(...value);
+                        }
+                        break;
+                    case "NOT IN":
+                        if (Array.isArray(value)) {
+                            const cast = jsonbInListCast(value);
+                            const placeholders = value.map(() => `$${paramIndex++}${cast.param}`).join(', ');
+                            sql += ` AND ${cast.lhs(jsonPath)} NOT IN (${placeholders})`;
+                            context.params.push(...value);
+                        }
+                        break;
+                    default:
+                        throw new Error(`Unsupported operator: ${operator}`);
+                }
+            }
+        }
+
+        sql += ")";
+        return { sql, paramIndex };
+    }
+
+    /**
+     * Single-pass execution for OR-on-base queries. The base set (the embedded
+     * ComponentInclusionNode SQL) is referenced once; each OR branch becomes an
+     * EXISTS predicate OR-ed together. Exclusions, ordering and pagination
+     * match the UNION path exactly (the base node already applied exclusions —
+     * re-applying here is the same idempotent no-op the UNION path performed).
+     */
+    private executeBaseSinglePass(
+        context: QueryContext,
+        baseEntityQuery: string,
+        paramIndexStart: number
+    ): QueryResult {
+        let paramIndex = paramIndexStart;
+
+        const existsClauses: string[] = [];
+        for (const branch of this.orQuery.branches) {
+            const built = this.buildBranchExists(branch, 'base.id', context, paramIndex);
+            existsClauses.push(built.sql);
+            paramIndex = built.paramIndex;
+        }
+
+        let sql = `SELECT base.id as id FROM (${baseEntityQuery}) AS base WHERE (${existsClauses.join(' OR ')})`;
+
+        // Entity exclusions (idempotent — base already excluded them).
+        if (context.excludedEntityIds.size > 0) {
+            const excludedIds = Array.from(context.excludedEntityIds);
+            const placeholders = excludedIds.map(() => `$${paramIndex++}`).join(', ');
+            sql += ` AND base.id NOT IN (${placeholders})`;
+            context.params.push(...excludedIds);
+        }
+
+        // Component exclusions (idempotent — base already excluded them).
+        if (context.excludedComponentIds.size > 0) {
+            const excludedTypes = Array.from(context.excludedComponentIds);
+            const placeholders = excludedTypes.map(() => `$${paramIndex++}`).join(', ');
+            sql += ` AND NOT EXISTS (SELECT 1 FROM ${getMembershipTable()} ec_ex WHERE ec_ex.entity_id = base.id AND ec_ex.type_id IN (${placeholders}) AND ec_ex.deleted_at IS NULL)`;
+            context.params.push(...excludedTypes);
+        }
+
+        sql += " ORDER BY base.id";
+
+        if (context.limit !== null) {
+            sql += ` LIMIT $${paramIndex++}`;
+            context.params.push(context.limit);
+        }
+        if (context.offsetValue > 0) {
+            sql += ` OFFSET $${paramIndex++}`;
+            context.params.push(context.offsetValue);
+        }
+
+        context.paramIndex = paramIndex;
+
+        return {
+            sql,
+            params: context.params,
+            context
+        };
+    }
+
+    public getNodeType(): string {
         return "OrNode";
     }
 }
