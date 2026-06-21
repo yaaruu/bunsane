@@ -13,8 +13,9 @@ import { getMetadataStorage } from "../core/metadata";
 import { shouldUseDirectPartition } from "../core/Config";
 import type { SQL } from "bun";
 import type { ComponentConstructor, TypedEntity, ComponentRecord } from "../types/query.types";
-import { assertComponentTableName, assertFieldPath } from "./SqlIdentifier";
+import { assertComponentTableName, assertFieldPath, assertIdentifier } from "./SqlIdentifier";
 import { getMembershipSource } from "./membershipSource";
+import { isNumericProperty } from "./ComponentInclusionNode";
 
 // Parsed once at module load instead of on every exec() (process.env read +
 // parseInt was on the query hot path). 0 disables the default limit.
@@ -926,15 +927,6 @@ AND c.deleted_at IS NULL`;
         // Reset context for fresh execution
         this.context.reset();
 
-        // Composite keyset cursors are incompatible with OR queries (OrNode always
-        // emits ORDER BY entity_id only — documented gap #3 in QUERY_SORT_PAGINATION_PLAN).
-        if (this.context.compositeCursor && this.orQuery) {
-            throw new Error(
-                'sortedCursor() cannot be combined with OR queries (.with(or(...))). ' +
-                'OR + sortBy ordering is a known limitation (gap #3). Use OFFSET pagination instead.'
-            );
-        }
-
         // Entity-column sort (sortByCreatedAt/sortByUpdatedAt) and component
         // sortBy() cannot be combined: the outer wrapper re-orders solely by
         // the entity column, silently overriding the component sort.
@@ -953,11 +945,24 @@ AND c.deleted_at IS NULL`;
         // wrapper below.
         const entitySorts = this.context.entitySortOrders;
         const useEntitySort = entitySorts.length > 0;
+        // Component sortBy() on an OR query is also resolved by an outer
+        // wrapper: OrNode produces an unordered id-set, then we JOIN the sort
+        // component's data table and ORDER BY it (mirrors the entity-sort
+        // wrapper). The non-OR component sort path lives inside
+        // ComponentInclusionNode/CTE and is untouched.
+        const componentSorts = this.context.sortOrders;
+        const useOrComponentSort = !!this.orQuery && componentSorts.length > 0;
+        const useOuterSortWrapper = useEntitySort || useOrComponentSort;
+
         let savedLimit: number | null = null;
         let savedOffset = 0;
         let savedCursorId: string | null = null;
         let savedCompositeCursor: { v: string | null; id: string } | null = null;
-        if (useEntitySort) {
+        const savedSuppressNodeOrdering = this.context.suppressNodeOrdering;
+        // Captured by reference before any neutralization below, so the wrapper
+        // still sees the requested sort keys after we clear context.sortOrders.
+        const savedSortOrders = this.context.sortOrders;
+        if (useOuterSortWrapper) {
             savedLimit = this.context.limit;
             savedOffset = this.context.offsetValue;
             savedCursorId = this.context.cursorId;
@@ -966,6 +971,17 @@ AND c.deleted_at IS NULL`;
             this.context.offsetValue = 0;
             this.context.cursorId = null;
             this.context.compositeCursor = null;
+            // Only OrNode honours this; the inner OR id-set need not self-sort
+            // because the wrapper re-orders the full set. Non-OR inner nodes
+            // ignore the flag.
+            this.context.suppressNodeOrdering = true;
+            // For OR + component sortBy, clear the component sort keys for the
+            // inner build so the OR base node (ComponentInclusionNode) emits a
+            // plain unordered id-set — the wrapper below owns all ordering and
+            // its keyset/param accounting. (Entity sorts leave sortOrders empty.)
+            if (useOrComponentSort) {
+                this.context.sortOrders = [];
+            }
         }
 
         // Inner DAG build + entity-sort wrapper run with pagination
@@ -1107,15 +1123,123 @@ AND c.deleted_at IS NULL`;
                 }
 
                 result.sql = wrapped;
+            } else if (useOrComponentSort) {
+                // OR + component sortBy(): wrap the unordered OR id-set with a
+                // JOIN to each sort component's data table and an outer ORDER
+                // BY. The sort component is always a required `.with()`
+                // component (sortBy validates this), and the OR base node
+                // guarantees every result entity has all required components,
+                // so the INNER JOIN never drops a row. Composite keyset
+                // pagination is supported for a single sort key; OFFSET for
+                // any number of keys.
+                if (savedCompositeCursor && componentSorts.length > 1) {
+                    throw new Error(
+                        'sortedCursor() does not support multi-key sorts. ' +
+                        'Only a single sortBy() key is supported with composite keyset pagination on OR queries.'
+                    );
+                }
+
+                const joins: string[] = [];
+                const orderClauses: string[] = [];
+                componentSorts.forEach((s, i) => {
+                    const sortTypeId = ComponentRegistry.getComponentId(s.component);
+                    if (!sortTypeId) {
+                        throw new Error(`Component ${s.component} is not registered.`);
+                    }
+                    const table = shouldUseDirectPartition()
+                        ? (ComponentRegistry.getPartitionTableName(sortTypeId) || 'components')
+                        : 'components';
+                    const safeTable = assertComponentTableName(table, 'orSort.componentTable');
+                    const alias = `s${i}`;
+                    const typeParamIdx = result.params.push(sortTypeId);
+                    joins.push(
+                        `JOIN ${safeTable} ${alias} ON ${alias}.entity_id = base.id ` +
+                        `AND ${alias}.type_id = $${typeParamIdx} AND ${alias}.deleted_at IS NULL`
+                    );
+                    const safeProp = assertIdentifier(s.property, 'sortOrder.property');
+                    const numeric = isNumericProperty(s.component, s.property);
+                    const expr = numeric
+                        ? `(${alias}.data->>'${safeProp}')::numeric`
+                        : `${alias}.data->>'${safeProp}'`;
+                    const dir = s.direction === "DESC" ? "DESC" : "ASC";
+                    const nulls = s.nullsFirst ? "NULLS FIRST" : "NULLS LAST";
+                    orderClauses.push(`${expr} ${dir} ${nulls}`);
+                });
+
+                let whereClause = '';
+                if (savedCompositeCursor) {
+                    const isBefore = this.context.cursorDirection === 'before';
+                    if (isBefore) {
+                        throw new Error(
+                            "sortedCursor(token, 'before') is not supported for OR + sortBy(). " +
+                            'Use OFFSET pagination or walk pages forward only.'
+                        );
+                    }
+                    // Single-key keyset (guarded above). Re-derive the sort
+                    // expression on alias s0; the keyset shape mirrors
+                    // ComponentInclusionNode.buildCompositeCursorWhere exactly.
+                    const s = componentSorts[0]!;
+                    // NULLS FIRST + keyset cannot advance past the leading
+                    // null-block onto non-null rows (the (expr,id) comparison
+                    // never re-admits the front nulls), silently dropping rows.
+                    // Throw a clear error instead of returning wrong pages.
+                    if (s.nullsFirst) {
+                        throw new Error(
+                            'sortedCursor() does not support NULLS FIRST sorts. ' +
+                            'Use the default (NULLS LAST) or OFFSET pagination.'
+                        );
+                    }
+                    const safeProp = assertIdentifier(s.property, 'sortOrder.property');
+                    const numeric = isNumericProperty(s.component, s.property);
+                    const expr = numeric
+                        ? `(s0.data->>'${safeProp}')::numeric`
+                        : `s0.data->>'${safeProp}'`;
+                    const cast = numeric ? '::numeric' : '::text';
+                    const isDesc = s.direction === "DESC";
+                    const nullsLast = !s.nullsFirst;
+                    const { v, id: cursorId } = savedCompositeCursor;
+
+                    if (v === null) {
+                        const idIdx = result.params.push(cursorId);
+                        whereClause = ` WHERE (${expr} IS NULL AND base.id > $${idIdx}::uuid)`;
+                    } else if (!isDesc) {
+                        const vIdx = result.params.push(v);
+                        const idIdx = result.params.push(cursorId);
+                        const nullInclude = nullsLast ? ` OR ${expr} IS NULL` : '';
+                        whereClause = ` WHERE ((${expr}, base.id) > ($${vIdx}${cast}, $${idIdx}::uuid)${nullInclude})`;
+                    } else {
+                        const vLtIdx = result.params.push(v);
+                        const vEqIdx = result.params.push(v);
+                        const idGtIdx = result.params.push(cursorId);
+                        whereClause = ` WHERE (${expr} < $${vLtIdx}${cast} OR (${expr} = $${vEqIdx}${cast} AND base.id > $${idGtIdx}::uuid))`;
+                    }
+                }
+
+                let wrapped = `SELECT base.id FROM (${result.sql}) AS base
+                    ${joins.join(' ')}${whereClause}
+                    ORDER BY ${orderClauses.join(', ')}, base.id ASC`;
+
+                if (savedLimit !== null) {
+                    result.params.push(savedLimit);
+                    wrapped += ` LIMIT $${result.params.length}`;
+                }
+                if (!savedCompositeCursor && (savedOffset > 0 || savedLimit !== null)) {
+                    result.params.push(savedOffset);
+                    wrapped += ` OFFSET $${result.params.length}`;
+                }
+
+                result.sql = wrapped;
             }
         } finally {
-            if (useEntitySort) {
+            if (useOuterSortWrapper) {
                 // Restore so the Query instance stays reusable, even if the
-                // DAG build/execute or an entity-sort guard threw above.
+                // DAG build/execute or a sort guard threw above.
                 this.context.limit = savedLimit;
                 this.context.offsetValue = savedOffset;
                 this.context.cursorId = savedCursorId;
                 this.context.compositeCursor = savedCompositeCursor;
+                this.context.suppressNodeOrdering = savedSuppressNodeOrdering;
+                this.context.sortOrders = savedSortOrders;
             }
         }
 

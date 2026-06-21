@@ -343,15 +343,74 @@ describe('Composite keyset cursor pagination for sorted queries', () => {
         expect(() => Query.decodeSortedCursor(bad)).toThrow('Invalid sorted cursor token');
     });
 
-    test('sortedCursor() + OR query throws a clear error', async () => {
+    test('sortedCursor() + OR query + sortBy: keyset pages recover the same ordered set (with ties)', async () => {
         const { or } = await import('../../../query/Query');
-        const token = Query.encodeSortedCursor(42, 'a1b2c3d4-e5f6-7890-abcd-ef1234567890');
+        // OR over the base KCData component: score<8 (unique 0..7) OR score>=100
+        // (the 10 rows tied at 100). Sorted ASC by score → tie region exercises
+        // the id-tiebreak keyset path on an OR query.
+        const makeQuery = () =>
+            base()
+                .with(or([
+                    { component: KCData, filters: [Query.filter('score', FilterOp.LT, 8)] },
+                    { component: KCData, filters: [Query.filter('score', FilterOp.GTE, 100)] },
+                ]))
+                .sortBy(KCData, 'score', 'ASC');
+
+        const unbounded = await makeQuery().take(N * 2).exec();
+        const expectedIds = unbounded.map((e: any) => e.id);
+        expect(expectedIds.length).toBe(8 + 10); // 0..7 plus the ten tied at 100
+
+        const paged = await walkSortedPages(makeQuery, PAGE, async (entity) => {
+            // Entities also carry KCTag — scope the fetch to the scored row so
+            // the cursor value is the KCData score, not an unrelated component.
+            const rows = await ctx.db.unsafe<{ data: any }[]>(
+                `SELECT data FROM components WHERE entity_id = $1 AND deleted_at IS NULL AND data->>'score' IS NOT NULL LIMIT 1`,
+                [entity.id]
+            );
+            return rows[0]?.data?.score ?? null;
+        });
+
+        expect(paged.length).toBe(expectedIds.length);
+        expect(new Set(paged).size).toBe(expectedIds.length); // no dupes
+        expect(paged).toEqual(expectedIds);                    // same order as single-shot
+    });
+
+    test('sortedCursor() + OR query + sortBy DESC: keyset pages recover the same ordered set', async () => {
+        const { or } = await import('../../../query/Query');
+        const makeQuery = () =>
+            base()
+                .with(or([
+                    { component: KCData, filters: [Query.filter('score', FilterOp.LT, 8)] },
+                    { component: KCData, filters: [Query.filter('score', FilterOp.GTE, 100)] },
+                ]))
+                .sortBy(KCData, 'score', 'DESC');
+
+        const unbounded = await makeQuery().take(N * 2).exec();
+        const expectedIds = unbounded.map((e: any) => e.id);
+        expect(expectedIds.length).toBe(8 + 10);
+
+        const paged = await walkSortedPages(makeQuery, PAGE, async (entity) => {
+            const rows = await ctx.db.unsafe<{ data: any }[]>(
+                `SELECT data FROM components WHERE entity_id = $1 AND deleted_at IS NULL AND data->>'score' IS NOT NULL LIMIT 1`,
+                [entity.id]
+            );
+            return rows[0]?.data?.score ?? null;
+        });
+
+        expect(paged.length).toBe(expectedIds.length);
+        expect(new Set(paged).size).toBe(expectedIds.length);
+        expect(paged).toEqual(expectedIds);
+    });
+
+    test('sortedCursor() + OR query + NULLS FIRST throws a clear error', async () => {
+        const { or } = await import('../../../query/Query');
+        const token = Query.encodeSortedCursor(5, 'a1b2c3d4-e5f6-7890-abcd-ef1234567890');
         const q = base()
-            .with(or([{ component: KCData, filters: [Query.filter('score', FilterOp.LT, 5)] }]))
-            .sortBy(KCData, 'score', 'ASC')
+            .with(or([{ component: KCData, filters: [Query.filter('score', FilterOp.LT, 8)] }]))
+            .sortBy(KCData, 'score', 'ASC', /* nullsFirst */ true)
             .sortedCursor(token)
             .take(5);
-        await expect(q.exec()).rejects.toThrow('sortedCursor() cannot be combined with OR queries');
+        await expect(q.exec()).rejects.toThrow('does not support NULLS FIRST');
     });
 
     test("sortedCursor(token, 'before') throws a clear error for component sortBy", async () => {

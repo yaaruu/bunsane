@@ -13,7 +13,7 @@ import { getMembershipSource, getMembershipTable } from "./membershipSource";
  * Check if a component property is numeric based on metadata
  * Used to apply proper casting in ORDER BY clauses for index usage
  */
-function isNumericProperty(componentName: string, propertyName: string): boolean {
+export function isNumericProperty(componentName: string, propertyName: string): boolean {
     const storage = getMetadataStorage();
     const typeId = storage.getComponentId(componentName);
 

@@ -178,8 +178,10 @@ export class OrNode extends QueryNode {
             sql += ` WHERE ${conditions.join(' AND ')}`;
         }
 
-        // Add ordering
-        sql += " ORDER BY id";
+        // Add ordering (skipped when an outer sort wrapper re-orders the set)
+        if (!context.suppressNodeOrdering) {
+            sql += " ORDER BY id";
+        }
 
         // Add pagination
         if (context.limit !== null) {
@@ -302,8 +304,10 @@ export class OrNode extends QueryNode {
             sql += ` AND ${conditions.join(' AND ')}`;
         }
 
-        // Add ordering
-        sql += " ORDER BY entity_id";
+        // Add ordering (skipped when an outer sort wrapper re-orders the set)
+        if (!context.suppressNodeOrdering) {
+            sql += " ORDER BY entity_id";
+        }
 
         // Add pagination
         if (context.limit !== null) {
@@ -529,8 +533,10 @@ export class OrNode extends QueryNode {
             sql += ` WHERE ${conditions.join(' AND ')}`;
         }
 
-        // Add ordering
-        sql += " ORDER BY entity_id";
+        // Add ordering (skipped when an outer sort wrapper re-orders the set)
+        if (!context.suppressNodeOrdering) {
+            sql += " ORDER BY entity_id";
+        }
 
         // Add pagination
         if (context.limit !== null) {
@@ -673,7 +679,10 @@ export class OrNode extends QueryNode {
             context.params.push(...excludedTypes);
         }
 
-        sql += " ORDER BY base.id";
+        // Add ordering (skipped when an outer sort wrapper re-orders the set)
+        if (!context.suppressNodeOrdering) {
+            sql += " ORDER BY base.id";
+        }
 
         if (context.limit !== null) {
             sql += ` LIMIT $${paramIndex++}`;

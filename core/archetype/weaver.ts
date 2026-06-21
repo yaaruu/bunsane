@@ -5,6 +5,7 @@ import { printSchema } from "graphql";
 import { getMetadataStorage } from "../metadata";
 import { componentSchemaCache } from "./schemaBuilder";
 import { inputTypeRegistry, customTypeNameRegistry } from "./customTypes";
+import { logger } from "../Logger";
 
 export const archetypeSchemaCache = new Map<
     string,
@@ -37,9 +38,9 @@ export function weaveAllArchetypes() {
                 const instance = new ArchetypeClass();
                 instance.getZodObjectSchema();
             } catch (error) {
-                console.warn(
-                    `Could not generate schema for archetype ${archetypeName}:`,
-                    error
+                logger.warn(
+                    { scope: 'weaver', archetype: archetypeName, error },
+                    `Could not generate schema for archetype ${archetypeName}`
                 );
             }
         }
@@ -125,7 +126,7 @@ export function weaveAllArchetypes() {
                     }
                 }
             } catch (error) {
-                console.warn(`Could not process relations for archetype ${archetypeMetadata.name}:`, error);
+                logger.warn({ scope: 'weaver', archetype: archetypeMetadata.name, error }, `Could not process relations for archetype ${archetypeMetadata.name}`);
             }
 
             if (archetypeMetadata.functions) {
@@ -208,11 +209,24 @@ export function weaveAllArchetypes() {
 
         return schemaString;
     } catch (error) {
-        console.warn(
-            `Failed to weave all archetypes due to duplicate types.\n` +
-            `Archetypes being processed: ${archetypeNames.join(', ')}\n` +
-            `Error: ${error}`
-        );
+        const msg = error instanceof Error ? error.message : String(error);
+        // graphql-js rejects a schema carrying two same-named types
+        // ("...must contain uniquely named types but contains multiple types
+        // named 'X'..."). The DeduplicationVisitor drops the duplicate and the
+        // schema still weaves and serves downstream, so this is recovered noise
+        // — log at debug. Any OTHER weave failure stays at warn so real
+        // breakage remains visible.
+        if (/multiple types named|uniquely named types/i.test(msg)) {
+            logger.debug(
+                { scope: 'weaver', archetypes: archetypeNames },
+                `Duplicate GraphQL type during archetype weave — deduplicated, schema unaffected: ${msg}`
+            );
+        } else {
+            logger.warn(
+                { scope: 'weaver', archetypes: archetypeNames, error },
+                'Failed to weave all archetypes'
+            );
+        }
         return null;
     }
 }

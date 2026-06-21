@@ -306,14 +306,62 @@ describe('Query invariants (dynamic component combinations)', () => {
             expect(got).toEqual(expected);
         });
 
-        test('KNOWN LIMITATION: OR + sortBy returns correct membership (ordering not honored)', async () => {
-            // OrNode orders by entity_id only and ignores context.sortOrders. This
-            // documents/locks current behavior: sortBy on an OR query must NOT
-            // corrupt the result SET (it just doesn't reorder). If OR sort support
-            // is ever added, update this test rather than letting it silently change.
+        test('OR + sortBy honors order (membership preserved, monotonic both directions)', async () => {
+            // OR queries now resolve component sortBy() via the outer sort
+            // wrapper in Query.doExec — the id-set is JOIN-ed to the sort
+            // component and ORDER BY'd. Sort must change ORDER, never MEMBERSHIP.
+            const scoreOf = new Map(seeded.map(s => [s.id, s.score]));
             const unsorted = await fullSet(() => base().with(orLowOrHigh()));
-            const sortedRows = await base().with(orLowOrHigh()).sortBy(InvData, 'score', 'DESC').take(100000).exec();
-            expect(new Set(sortedRows.map(e => e.id))).toEqual(unsorted);
+
+            const desc = await base().with(orLowOrHigh()).sortBy(InvData, 'score', 'DESC').take(100000).exec();
+            const asc = await base().with(orLowOrHigh()).sortBy(InvData, 'score', 'ASC').take(100000).exec();
+
+            expect(new Set(desc.map(e => e.id))).toEqual(unsorted);
+            expect(new Set(asc.map(e => e.id))).toEqual(unsorted);
+
+            const descScores = desc.map(e => scoreOf.get(e.id)!);
+            const ascScores = asc.map(e => scoreOf.get(e.id)!);
+            expect(descScores).toEqual([...descScores].sort((a, b) => b - a));
+            expect(ascScores).toEqual([...ascScores].sort((a, b) => a - b));
+        });
+
+        test('OR + sortBy + OFFSET pagination yields a globally-sorted sequence', async () => {
+            const scoreOf = new Map(seeded.map(s => [s.id, s.score]));
+            const membership = await fullSet(() => base().with(orLowOrHigh()));
+
+            const paged: string[] = [];
+            for (let off = 0; off < N; off += 3) {
+                const page = await base().with(orLowOrHigh())
+                    .sortBy(InvData, 'score', 'ASC').offset(off).take(3).exec();
+                paged.push(...page.map(e => e.id));
+                if (page.length < 3) break;
+            }
+            expect(new Set(paged)).toEqual(membership);          // full recovery, no gaps/dupes
+            expect(paged.length).toBe(new Set(paged).size);
+            const pagedScores = paged.map(id => scoreOf.get(id)!);
+            expect(pagedScores).toEqual([...pagedScores].sort((a, b) => a - b));
+        });
+
+        test('OR + sortBy + keyset cursor (sortedCursor) recovers the full set in order', async () => {
+            const scoreOf = new Map(seeded.map(s => [s.id, s.score]));
+            const membership = await fullSet(() => base().with(orLowOrHigh()));
+
+            const got: string[] = [];
+            let token: string | undefined;
+            for (let guard = 0; guard < 100; guard++) {
+                let q = base().with(orLowOrHigh()).sortBy(InvData, 'score', 'ASC').take(3);
+                if (token) q = q.sortedCursor(token);
+                const page = await q.exec();
+                if (page.length === 0) break;
+                got.push(...page.map(e => e.id));
+                if (page.length < 3) break;
+                const last = page[page.length - 1]!;
+                token = Query.encodeSortedCursor(scoreOf.get(last.id)!, last.id);
+            }
+            expect(got.length).toBe(new Set(got).size);          // no dupes
+            expect(new Set(got)).toEqual(membership);            // same set as unbounded
+            const gotScores = got.map(id => scoreOf.get(id)!);
+            expect(gotScores).toEqual([...gotScores].sort((a, b) => a - b));
         });
     });
 });

@@ -68,6 +68,12 @@ export class QueryContext {
     // suppressed.
     public hasOrQuery: boolean = false;
 
+    // Set by Query.doExec while building an OR query whose final ordering is
+    // applied by an outer sort wrapper (entity-column or component sortBy).
+    // OrNode honours it by skipping its own `ORDER BY entity_id` so the inner
+    // id-set is not sorted twice (the outer wrapper re-orders the full set).
+    public suppressNodeOrdering: boolean = false;
+
     private trx: SQL | undefined;
     constructor(trx?: SQL) {
         this.trx = trx;
@@ -202,6 +208,7 @@ export class QueryContext {
         clone.eagerComponents = new Set(this.eagerComponents);
         clone.paginationAppliedInCTE = this.paginationAppliedInCTE;
         clone.hasOrQuery = this.hasOrQuery;
+        clone.suppressNodeOrdering = this.suppressNodeOrdering;
         return clone;
     }
 }
