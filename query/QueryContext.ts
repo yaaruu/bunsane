@@ -15,6 +15,20 @@ export interface SortOrder {
     nullsFirst?: boolean;
 }
 
+/**
+ * Sort by a native column on the `entities` table (created_at / updated_at).
+ * Unlike SortOrder, this needs no component and no `.with()` — the column
+ * always exists and is indexed-friendly. Applied as an outer ORDER BY in
+ * Query.doExec, invisible to the SQL planner nodes.
+ */
+export type EntitySortField = "created_at" | "updated_at";
+
+export interface EntitySortOrder {
+    field: EntitySortField;
+    direction: "ASC" | "DESC";
+    nullsFirst?: boolean;
+}
+
 export class QueryContext {
     public params: any[] = [];
     public paramIndex: number = 1;
@@ -24,6 +38,10 @@ export class QueryContext {
     public excludedComponentIds: Set<string> = new Set();
     public componentFilters: Map<string, QueryFilter[]> = new Map();
     public sortOrders: SortOrder[] = [];
+    // Native entities-table sorts (created_at/updated_at). Separate channel:
+    // the SQL nodes never read it — Query.doExec wraps the id-set with a
+    // JOIN entities ... ORDER BY. Keeps the component sort paths untouched.
+    public entitySortOrders: EntitySortOrder[] = [];
     public excludedEntityIds: Set<string> = new Set();
     public withId: string | null = null;
     public limit: number | null = null;
@@ -32,6 +50,14 @@ export class QueryContext {
     // Cursor-based pagination (more efficient than OFFSET for large datasets)
     public cursorId: string | null = null;
     public cursorDirection: 'after' | 'before' = 'after';
+
+    /**
+     * Composite keyset cursor for sorted queries.
+     * Encodes both the last row's sort value and its entity_id so the
+     * predicate can be `(sort_expr, entity_id) > ($v, $id)` (or `<` for DESC).
+     * Only set via Query.sortedCursor(); plain .cursor() never sets this.
+     */
+    public compositeCursor: { v: string | null; id: string } | null = null;
     public hasCTE: boolean = false;
     public cteName: string = "";
     public eagerComponents: Set<string> = new Set();
@@ -115,6 +141,9 @@ export class QueryContext {
             .map(s => `${s.component}.${s.property}:${s.direction}`)
             .sort()
             .join(',');
+        const entitySorts = this.entitySortOrders
+            .map(s => `@${s.field}:${s.direction}:${s.nullsFirst ? 'nf' : 'nl'}`)
+            .join(',');
 
         // Extract custom filter operators for cache key differentiation
         const customOperators = this.extractCustomOperators();
@@ -128,7 +157,7 @@ export class QueryContext {
         const excludedEntityCount = this.excludedEntityIds.size;
         const excludedEntitiesKey = excludedEntityCount > 0 ? `|excludedEntities:${excludedEntityCount}` : '';
 
-        const key = `${components}|${excludedComponents}|${filters}|${sorts}|${this.hasCTE}|${this.cteName}|${customOps}|${paginationKey}${excludedEntitiesKey}`;
+        const key = `${components}|${excludedComponents}|${filters}|${sorts}|${entitySorts}|${this.hasCTE}|${this.cteName}|${customOps}|${paginationKey}${excludedEntitiesKey}`;
         return key;
     }
 
@@ -160,12 +189,14 @@ export class QueryContext {
         clone.excludedComponentIds = new Set(this.excludedComponentIds);
         clone.componentFilters = new Map(this.componentFilters);
         clone.sortOrders = [...this.sortOrders];
+        clone.entitySortOrders = [...this.entitySortOrders];
         clone.excludedEntityIds = new Set(this.excludedEntityIds);
         clone.withId = this.withId;
         clone.limit = this.limit;
         clone.offsetValue = this.offsetValue;
         clone.cursorId = this.cursorId;
         clone.cursorDirection = this.cursorDirection;
+        clone.compositeCursor = this.compositeCursor ? { ...this.compositeCursor } : null;
         clone.hasCTE = this.hasCTE;
         clone.cteName = this.cteName;
         clone.eagerComponents = new Set(this.eagerComponents);

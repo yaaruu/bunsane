@@ -307,6 +307,64 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         return this;
     }
 
+    /**
+     * Use composite keyset pagination for a SORTED query.
+     *
+     * Pass the opaque token returned by `Query.encodeSortedCursor(sortValue, entityId)`
+     * where `sortValue` is the sort column's raw value from the last row of the
+     * previous page, and `entityId` is that row's entity id. The query must have
+     * exactly one active sort key (sortByCreatedAt / sortByUpdatedAt / sortBy).
+     * Multi-key sort cursors are not supported — the method will throw at exec time.
+     *
+     * @example
+     * // Page 1
+     * const page1 = await new Query().with(MyComp).sortBy(MyComp, 'score', 'ASC').take(10).exec();
+     * const last = page1[page1.length - 1]!;
+     * // Build cursor from the last row's sort value.
+     * const token = Query.encodeSortedCursor(last.componentData['MyComp'].score, last.id);
+     *
+     * // Page 2
+     * const page2 = await new Query().with(MyComp).sortBy(MyComp, 'score', 'ASC').take(10).sortedCursor(token).exec();
+     */
+    public sortedCursor(token: string, direction: 'after' | 'before' = 'after'): this {
+        this.context.compositeCursor = Query.decodeSortedCursor(token);
+        this.context.cursorDirection = direction;
+        // A composite cursor supersedes plain cursorId and OFFSET.
+        this.context.cursorId = null;
+        this.context.offsetValue = 0;
+        return this;
+    }
+
+    /**
+     * Encode a composite sort cursor from the last row's sort value and entity id.
+     * The sort value is stored as a string; pass the raw JS value (string, number,
+     * Date, or null). Dates are converted to ISO strings for timestamptz comparison.
+     */
+    public static encodeSortedCursor(sortValue: string | number | Date | null, entityId: string): string {
+        let v: string | null;
+        if (sortValue === null || sortValue === undefined) {
+            v = null;
+        } else if (sortValue instanceof Date) {
+            v = sortValue.toISOString();
+        } else {
+            v = String(sortValue);
+        }
+        return Buffer.from(JSON.stringify({ v, id: entityId })).toString('base64');
+    }
+
+    /** Decode a composite sort cursor token. Returns `{v, id}`. */
+    public static decodeSortedCursor(token: string): { v: string | null; id: string } {
+        try {
+            const parsed = JSON.parse(Buffer.from(token, 'base64').toString('utf8'));
+            if (typeof parsed !== 'object' || parsed === null || typeof parsed.id !== 'string') {
+                throw new Error('malformed cursor');
+            }
+            return { v: parsed.v ?? null, id: parsed.id };
+        } catch {
+            throw new Error(`Invalid sorted cursor token: "${token}"`);
+        }
+    }
+
     public sortBy<T extends BaseComponent>(
         componentCtor: new (...args: any[]) => T,
         property: keyof ComponentDataType<T>,
@@ -333,6 +391,36 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         });
 
         return this;
+    }
+
+    /**
+     * Sort by a native `entities`-table timestamp column (created_at /
+     * updated_at). Needs no component and no `.with()` — the column always
+     * exists on every entity and is a real indexed `timestamptz`, so this is
+     * cheaper than duplicating the timestamp into a JSONB component and
+     * sorting `data->>'...'`.
+     *
+     * Applied as an outer ORDER BY over the resolved id-set in doExec, so it
+     * composes with any `.with()` / filter combination. Cursor pagination is
+     * ignored when an entity sort is active (use .take()/.offset()).
+     */
+    public sortByEntityField(
+        field: "created_at" | "updated_at",
+        direction: SortDirection = "ASC",
+        nullsFirst: boolean = false
+    ): this {
+        this.context.entitySortOrders.push({ field, direction, nullsFirst });
+        return this;
+    }
+
+    /** Sort by entity creation time (`entities.created_at`). */
+    public sortByCreatedAt(direction: SortDirection = "ASC", nullsFirst: boolean = false): this {
+        return this.sortByEntityField("created_at", direction, nullsFirst);
+    }
+
+    /** Sort by entity last-update time (`entities.updated_at`). */
+    public sortByUpdatedAt(direction: SortDirection = "ASC", nullsFirst: boolean = false): this {
+        return this.sortByEntityField("updated_at", direction, nullsFirst);
     }
 
     public debugMode(enabled: boolean = true): this {
@@ -838,40 +926,198 @@ AND c.deleted_at IS NULL`;
         // Reset context for fresh execution
         this.context.reset();
 
-        // Build the DAG
-        const dag = new QueryDAG();
-
-        // Check if we have an OR query
-        if (this.orQuery) {
-            // For OR queries, we need to ensure entities have all required components first
-            if (this.context.componentIds.size > 0) {
-                // ComponentInclusionNode is the root, OrNode is the leaf
-                const componentNode = new ComponentInclusionNode();
-                dag.setRootNode(componentNode);
-
-                // OrNode filters on top of the base requirements
-                const orNode = new OrNode(this.orQuery);
-                orNode.addDependency(componentNode);
-                dag.addNode(orNode);
-            } else {
-                // No base requirements, OrNode is both root and leaf
-                const orNode = new OrNode(this.orQuery);
-                dag.setRootNode(orNode);
-            }
-        } else {
-            // Use buildBasicQuery for regular AND logic (includes CTE optimization)
-            const optimizedDag = QueryDAG.buildBasicQuery(this.context);
-            // Copy nodes from optimized DAG to our DAG
-            for (const node of optimizedDag.getNodes()) {
-                dag.addNode(node);
-            }
-            if (optimizedDag.getRootNode()) {
-                dag.setRootNode(optimizedDag.getRootNode()!);
-            }
+        // Composite keyset cursors are incompatible with OR queries (OrNode always
+        // emits ORDER BY entity_id only — documented gap #3 in QUERY_SORT_PAGINATION_PLAN).
+        if (this.context.compositeCursor && this.orQuery) {
+            throw new Error(
+                'sortedCursor() cannot be combined with OR queries (.with(or(...))). ' +
+                'OR + sortBy ordering is a known limitation (gap #3). Use OFFSET pagination instead.'
+            );
         }
 
-        // Execute the DAG
-        const result = dag.execute(this.context);
+        // Entity-column sort (sortByCreatedAt/sortByUpdatedAt) and component
+        // sortBy() cannot be combined: the outer wrapper re-orders solely by
+        // the entity column, silently overriding the component sort.
+        if (this.context.entitySortOrders.length > 0 && this.context.sortOrders.length > 0) {
+            throw new Error(
+                'sortByCreatedAt()/sortByUpdatedAt() cannot be combined with sortBy() in the same query. ' +
+                'Use one or the other.'
+            );
+        }
+
+        // Native entity-column sort (created_at/updated_at) is applied as an
+        // outer ORDER BY over the resolved id-set. The inner nodes must emit
+        // the FULL set with no ordering/pagination of their own, else their
+        // LIMIT would truncate the wrong rows before we re-order. Stash and
+        // neutralize pagination for the inner build; restore + re-apply in the
+        // wrapper below.
+        const entitySorts = this.context.entitySortOrders;
+        const useEntitySort = entitySorts.length > 0;
+        let savedLimit: number | null = null;
+        let savedOffset = 0;
+        let savedCursorId: string | null = null;
+        let savedCompositeCursor: { v: string | null; id: string } | null = null;
+        if (useEntitySort) {
+            savedLimit = this.context.limit;
+            savedOffset = this.context.offsetValue;
+            savedCursorId = this.context.cursorId;
+            savedCompositeCursor = this.context.compositeCursor;
+            this.context.limit = null;
+            this.context.offsetValue = 0;
+            this.context.cursorId = null;
+            this.context.compositeCursor = null;
+        }
+
+        // Inner DAG build + entity-sort wrapper run with pagination
+        // neutralized (above). Restore in `finally` so a throw mid-build —
+        // including the entity-sort guards below — can never leave a reused
+        // Query instance with limit/offset/cursor nulled.
+        let result: { sql: string; params: any[]; context: QueryContext };
+        try {
+            // Build the DAG
+            const dag = new QueryDAG();
+
+            // Check if we have an OR query
+            if (this.orQuery) {
+                // For OR queries, we need to ensure entities have all required components first
+                if (this.context.componentIds.size > 0) {
+                    // ComponentInclusionNode is the root, OrNode is the leaf
+                    const componentNode = new ComponentInclusionNode();
+                    dag.setRootNode(componentNode);
+
+                    // OrNode filters on top of the base requirements
+                    const orNode = new OrNode(this.orQuery);
+                    orNode.addDependency(componentNode);
+                    dag.addNode(orNode);
+                } else {
+                    // No base requirements, OrNode is both root and leaf
+                    const orNode = new OrNode(this.orQuery);
+                    dag.setRootNode(orNode);
+                }
+            } else {
+                // Use buildBasicQuery for regular AND logic (includes CTE optimization)
+                const optimizedDag = QueryDAG.buildBasicQuery(this.context);
+                // Copy nodes from optimized DAG to our DAG
+                for (const node of optimizedDag.getNodes()) {
+                    dag.addNode(node);
+                }
+                if (optimizedDag.getRootNode()) {
+                    dag.setRootNode(optimizedDag.getRootNode()!);
+                }
+            }
+
+            // Execute the DAG
+            result = dag.execute(this.context);
+
+            // Wrap the resolved id-set with an outer ORDER BY on the native
+            // entities column(s). result.params === this.context.params (same
+            // ref), so pushing pagination params keeps placeholders sequential.
+            if (useEntitySort) {
+                if (savedCompositeCursor && entitySorts.length > 1) {
+                    throw new Error(
+                        'sortedCursor() does not support multi-key entity sorts. ' +
+                        'Only a single sortByCreatedAt() or sortByUpdatedAt() is supported with composite keyset pagination.'
+                    );
+                }
+
+                const orderClauses = entitySorts.map(s => {
+                    // Hard-mapped allow-list — never interpolate raw input.
+                    const col = s.field === "updated_at" ? "updated_at" : "created_at";
+                    const nulls = s.nullsFirst ? "NULLS FIRST" : "NULLS LAST";
+                    const dir = s.direction === "DESC" ? "DESC" : "ASC";
+                    return `e.${col} ${dir} ${nulls}`;
+                }).join(", ");
+
+                let whereClause = '';
+                if (savedCompositeCursor) {
+                    const isBefore = this.context.cursorDirection === 'before';
+                    if (isBefore) {
+                        // 'before' for sorted entity-column cursors is not yet implemented:
+                        // it requires reversing ORDER BY and post-reversing rows in JS.
+                        // Throw a clear error rather than returning silently wrong pages.
+                        throw new Error(
+                            "sortedCursor(token, 'before') is not supported for sortByCreatedAt()/sortByUpdatedAt(). " +
+                            'Use OFFSET pagination or walk pages forward only.'
+                        );
+                    }
+
+                    // Composite keyset for native entity-column sort.
+                    // We truncate both sides to milliseconds so the JS Date (ms precision)
+                    // matches the stored TIMESTAMPTZ value. Without truncation, a stored
+                    // microsecond timestamp (e.g. 00:00:01.000123) always compares GREATER
+                    // than the ms-truncated cursor (00:00:01.000), causing already-seen
+                    // rows to re-qualify on every subsequent page.
+                    //
+                    // ORDER BY: date_trunc('milliseconds', col) <dir> NULLS x, base.id ASC
+                    // ASC+after:  (trunc_col, id) > ($v, $id)
+                    // DESC+after: trunc_col < $v OR (trunc_col = $v AND id > $id)
+                    const s = entitySorts[0]!;
+                    const rawCol = s.field === "updated_at" ? "e.updated_at" : "e.created_at";
+                    const col = `date_trunc('milliseconds', ${rawCol})`;
+                    const isDesc = s.direction === "DESC";
+                    const { v, id: cursorId } = savedCompositeCursor;
+
+                    if (v === null) {
+                        // After the last non-null row under NULLS LAST: for ASC the NULL
+                        // region follows all non-null rows — they've all been seen, so
+                        // nothing remains (entities.created_at is NOT NULL in practice,
+                        // but handle generically).
+                        whereClause = ' WHERE FALSE';
+                    } else if (!isDesc) {
+                        // ASC+after: row-comparison on truncated timestamp + id tiebreak.
+                        // Include NULL-timestamped rows too (NULLS LAST → they appear at
+                        // the very end, AFTER all non-null rows, so they have not yet been
+                        // visited when we are past a non-null cursor value).
+                        const vIdx = result.params.push(v);
+                        const idGtIdx = result.params.push(cursorId);
+                        whereClause = ` WHERE ((${col}, base.id) > ($${vIdx}::timestamptz, $${idGtIdx}::uuid) OR ${rawCol} IS NULL)`;
+                    } else {
+                        // DESC+after: values come in decreasing order; "after" the cursor
+                        // means smaller truncated timestamp, or same + larger id.
+                        const vLtIdx = result.params.push(v);
+                        const vEqIdx = result.params.push(v);
+                        const idGtIdx = result.params.push(cursorId);
+                        whereClause = ` WHERE (${col} < $${vLtIdx}::timestamptz OR (${col} = $${vEqIdx}::timestamptz AND base.id > $${idGtIdx}::uuid))`;
+                    }
+                }
+
+                // Mirror the ORDER BY truncation in the sort clause so the cursor
+                // comparison and the ORDER BY operate on the same precision.
+                const truncatedOrderClauses = entitySorts.map(s => {
+                    const rawCol = s.field === "updated_at" ? "e.updated_at" : "e.created_at";
+                    const col = `date_trunc('milliseconds', ${rawCol})`;
+                    const nulls = s.nullsFirst ? "NULLS FIRST" : "NULLS LAST";
+                    const dir = s.direction === "DESC" ? "DESC" : "ASC";
+                    return `${col} ${dir} ${nulls}`;
+                }).join(", ");
+                const effectiveOrderClauses = savedCompositeCursor ? truncatedOrderClauses : orderClauses;
+
+                let wrapped = `SELECT base.id FROM (${result.sql}) AS base
+                    JOIN entities e ON e.id = base.id${whereClause}
+                    ORDER BY ${effectiveOrderClauses}, base.id ASC`;
+
+                if (savedLimit !== null) {
+                    result.params.push(savedLimit);
+                    wrapped += ` LIMIT $${result.params.length}`;
+                }
+                // Only add OFFSET when not using cursor-based pagination
+                if (!savedCompositeCursor && (savedOffset > 0 || savedLimit !== null)) {
+                    result.params.push(savedOffset);
+                    wrapped += ` OFFSET $${result.params.length}`;
+                }
+
+                result.sql = wrapped;
+            }
+        } finally {
+            if (useEntitySort) {
+                // Restore so the Query instance stays reusable, even if the
+                // DAG build/execute or an entity-sort guard threw above.
+                this.context.limit = savedLimit;
+                this.context.offsetValue = savedOffset;
+                this.context.cursorId = savedCursorId;
+                this.context.compositeCursor = savedCompositeCursor;
+            }
+        }
 
         // Get the database connection (transaction or default)
         const dbConn = this.getDb();
