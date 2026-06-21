@@ -1,5 +1,5 @@
 import { getSerializedMetadataStorage } from "../core/metadata";
-import { findIndicatorComponentName } from "../studio/utils";
+import { findIndicatorComponentName } from "../utils/archetypeIndicator";
 import db from "../database";
 import type {
     StudioArcheTypeQueryParams,
