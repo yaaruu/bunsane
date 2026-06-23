@@ -23,5 +23,6 @@ export function syncLockConfig(manager: SchedulerManager): void {
         enableLogging: manager.config.enableLogging,
         lockTimeout: manager.config.lockTimeout ?? 0,
         retryInterval: manager.config.lockRetryInterval ?? 100,
+        backend: manager.config.lockBackend,
     });
 }

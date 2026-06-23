@@ -70,6 +70,7 @@ export class SchedulerManager {
             enableLogging: this.config.enableLogging,
             lockTimeout: this.config.lockTimeout ?? 0,
             retryInterval: this.config.lockRetryInterval ?? 100,
+            backend: this.config.lockBackend,
         });
 
         initializeLifecycleIntegration(this);

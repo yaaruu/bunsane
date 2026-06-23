@@ -1,29 +1,32 @@
 /**
- * Distributed Lock using PostgreSQL Advisory Locks
+ * DistributedLock — task-keyed mutual exclusion over a pluggable
+ * {@link LockBackend}.
  *
- * PostgreSQL advisory locks are session-level (bound to the connection that
- * acquired them). Bun's SQL pool hands out a different connection per query,
- * so naively calling `pg_try_advisory_lock` on the pooled client leaves the
- * lock stranded on whichever connection was used — `pg_advisory_unlock` on a
- * different connection silently returns `false` and the lock is held until
- * that connection eventually closes.
+ * This class is the stable, task-id-oriented facade the scheduler and
+ * {@link withLock} use. The actual locking mechanism is delegated to a backend:
  *
- * Fix: reserve a dedicated connection via `sql.reserve()` once per instance
- * and route every lock/unlock query through it. All locks owned by this
- * instance live in one PostgreSQL session, so unlock always hits the session
- * that acquired the lock. If the process crashes, PostgreSQL terminates the
- * session and every held lock is released automatically — no cleanup needed.
+ *  - `advisory`   — PostgreSQL session advisory locks (historical default;
+ *                   only safe with a session-pinned connection — see BUNSANE-1).
+ *  - `in-process` — in-memory, single instance / test double.
+ *  - `postgres`   — pooler-safe lease table (Phase 2).
+ *  - `redis`      — `SET NX PX` lease (Phase 4).
  *
- * The reservation is lazy (acquired on first use) and released when either
- * `releaseAll()` is called or no locks remain outstanding, so idle instances
- * do not permanently consume a pool slot.
+ * Select via `config.backend`, the `BUNSANE_LOCK_BACKEND` env var, or leave it
+ * `'auto'`. The facade keeps a per-instance map of held handles so the public
+ * API (`isHeld`, `getHeldLockCount`, …) is unchanged from the advisory-only
+ * era.
  *
- * @see https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS
+ * @see core/scheduler/locks/LockBackend.ts
  */
 
-import type { ReservedSQL } from "bun";
-import db from "../../database";
 import { logger } from "../Logger";
+import {
+    createLockBackend,
+    UnsafeAdvisoryPoolingError,
+    type LockBackend,
+    type LockBackendKind,
+    type LockHandle,
+} from "./locks";
 
 const loggerInstance = logger.child({ scope: "DistributedLock" });
 
@@ -41,81 +44,66 @@ export interface DistributedLockConfig {
     lockTimeout: number;
     /** Retry interval when lockTimeout > 0 */
     retryInterval: number;
+    /** Which {@link LockBackend} to use. Omitted → env / `'auto'`. */
+    backend?: LockBackendKind;
+    /** Lease lifetime in ms for lease backends (ignored by advisory). */
+    leaseTtlMs: number;
 }
 
 export const DEFAULT_LOCK_CONFIG: DistributedLockConfig = {
     enabled: true,
-    lockKeyPrefix: 0x42554E53, // "BUNS" in hex as a namespace prefix
+    lockKeyPrefix: 0x42554e53, // "BUNS" in hex as a namespace prefix
     enableLogging: false,
     lockTimeout: 0,
     retryInterval: 100,
+    leaseTtlMs: 30_000,
 };
+
+interface HeldLease {
+    handle: LockHandle;
+    /** TTL used at acquire time; reused for heartbeat renewals. */
+    ttlMs: number;
+}
 
 export class DistributedLock {
     private config: DistributedLockConfig;
-    private heldLocks: Set<string> = new Set();
-    private reservedConn: ReservedSQL | null = null;
-    private reservePromise: Promise<ReservedSQL> | null = null;
+    private backend: LockBackend;
+    /** Held leases keyed by taskId (one logical lock per task per instance). */
+    private heldLocks: Map<string, HeldLease> = new Map();
+    /** Count of releases/renews that found the lease already lost (stranded). */
+    private lostLeases = 0;
 
     constructor(config: Partial<DistributedLockConfig> = {}) {
         this.config = { ...DEFAULT_LOCK_CONFIG, ...config };
+        this.backend = this.makeBackend();
     }
 
+    private makeBackend(): LockBackend {
+        return createLockBackend({
+            kind: this.config.backend,
+            lockKeyPrefix: this.config.lockKeyPrefix,
+            enableLogging: this.config.enableLogging,
+        });
+    }
+
+    /**
+     * Stable bigint id for a task, used only for the {@link LockResult.lockKey}
+     * field (logs/events). Matches the advisory backend's own hash so a
+     * reported key lines up with the underlying advisory id when that backend
+     * is active. NOTE (BUNSANE-4): 32-bit space → possible collisions; this is
+     * an observability id, not the source of exclusion.
+     */
     private generateLockKey(taskId: string): bigint {
         let hash = 0;
         for (let i = 0; i < taskId.length; i++) {
             const char = taskId.charCodeAt(i);
-            hash = ((hash << 5) - hash) + char;
+            hash = (hash << 5) - hash + char;
             hash = hash & hash;
         }
         hash = Math.abs(hash);
-
         const prefix = BigInt(this.config.lockKeyPrefix);
         const hashBigInt = BigInt(hash >>> 0);
         return (prefix << 32n) | hashBigInt;
-    }
-
-    /**
-     * Lazily reserve one dedicated connection that owns every advisory lock
-     * this instance takes. Concurrent callers share the same reservation via
-     * `reservePromise`.
-     */
-    private async ensureReserved(): Promise<ReservedSQL> {
-        if (this.reservedConn) return this.reservedConn;
-        if (!this.reservePromise) {
-            // On reject (pool exhausted, shutdown mid-reserve), null the
-            // promise so subsequent callers retry a fresh reserve instead of
-            // receiving the same rejected promise forever (H-DB-2).
-            this.reservePromise = db.reserve().then(
-                (conn) => {
-                    this.reservedConn = conn;
-                    this.reservePromise = null;
-                    return conn;
-                },
-                (err) => {
-                    this.reservePromise = null;
-                    throw err;
-                }
-            );
-        }
-        return this.reservePromise;
-    }
-
-    /**
-     * Release the pinned connection back to the pool. Only safe when no
-     * advisory locks are currently held on this instance — otherwise the
-     * session would be closed and locks forfeited.
-     */
-    private releaseReservation(): void {
-        if (!this.reservedConn) return;
-        try {
-            this.reservedConn.release();
-        } catch (error) {
-            loggerInstance.warn(
-                `Failed to release reserved connection: ${error instanceof Error ? error.message : String(error)}`
-            );
-        }
-        this.reservedConn = null;
     }
 
     /**
@@ -123,20 +111,21 @@ export class DistributedLock {
      * `lockTimeout` is 0 (default); retries every `retryInterval` ms up to
      * `lockTimeout` otherwise.
      */
-    async tryAcquire(taskId: string): Promise<LockResult> {
+    async tryAcquire(
+        taskId: string,
+        ttlMs: number = this.config.leaseTtlMs
+    ): Promise<LockResult> {
+        const lockKey = this.generateLockKey(taskId);
+
         if (!this.config.enabled) {
             return { acquired: true, lockKey: 0n, taskId };
         }
 
-        const lockKey = this.generateLockKey(taskId);
-
         if (this.heldLocks.has(taskId)) {
-            // Defense in depth: if this instance already holds the lock for
-            // taskId, a second concurrent acquirer would mean overlapping
-            // execution (retry firing while previous run is still in the
-            // finally → release step, for example). Return acquired:false so
-            // the second caller skips, even if caller-side guards missed it.
-            // (H-SCHED-4).
+            // Defense in depth: this instance already holds the lock. A second
+            // concurrent acquirer means overlapping execution (e.g. a retry
+            // firing before the prior run hit its release). Report contention
+            // even if caller-side guards missed it (H-SCHED-4).
             if (this.config.enableLogging) {
                 loggerInstance.debug(
                     `Lock for ${taskId} already held locally — reporting overlap (acquired:false)`
@@ -148,63 +137,58 @@ export class DistributedLock {
         const startTime = Date.now();
 
         try {
-            const conn = await this.ensureReserved();
+            let handle = await this.backend.acquire(taskId, { ttlMs });
 
-            let acquired = await this.attemptLock(conn, lockKey);
-
-            if (!acquired && this.config.lockTimeout > 0) {
+            if (!handle && this.config.lockTimeout > 0) {
                 while (
-                    !acquired &&
+                    !handle &&
                     Date.now() - startTime < this.config.lockTimeout
                 ) {
                     await this.sleep(this.config.retryInterval);
-                    acquired = await this.attemptLock(conn, lockKey);
+                    handle = await this.backend.acquire(taskId, { ttlMs });
                 }
             }
 
-            if (acquired) {
-                this.heldLocks.add(taskId);
+            if (handle) {
+                this.heldLocks.set(taskId, { handle, ttlMs });
                 if (this.config.enableLogging) {
                     loggerInstance.debug(
-                        `Acquired lock for task ${taskId} (key: ${lockKey})`
+                        `Acquired lock for task ${taskId} (key: ${lockKey}, backend: ${this.backend.name})`
                     );
                 }
                 return { acquired: true, lockKey, taskId };
             }
 
-            // No locks taken on this attempt — if nothing else is held,
-            // return the reserved connection to the pool.
-            if (this.heldLocks.size === 0) {
-                this.releaseReservation();
-            }
-
             if (this.config.enableLogging) {
                 loggerInstance.debug(
-                    `Failed to acquire lock for task ${taskId} (key: ${lockKey}) — another instance is executing`
+                    `Failed to acquire lock for task ${taskId} (key: ${lockKey}) — another holder is executing`
                 );
             }
             return { acquired: false, lockKey, taskId };
         } catch (error) {
+            // An unsafe-pooling config is NOT a transient lock failure — never
+            // degrade it to a silent {acquired:false}. Fail loud (BUNSANE-7).
+            if (error instanceof UnsafeAdvisoryPoolingError) {
+                throw error;
+            }
             loggerInstance.error(
                 `Error acquiring lock for task ${taskId}: ${error instanceof Error ? error.message : String(error)}`
             );
-            if (this.heldLocks.size === 0) {
-                this.releaseReservation();
-            }
             return { acquired: false, lockKey, taskId };
         }
     }
 
     /**
-     * Release a single distributed lock. When the last lock is released the
-     * reserved connection is returned to the pool.
+     * Release a single distributed lock. Returns `true` only if a genuinely
+     * held lock was released.
      */
     async release(taskId: string): Promise<boolean> {
         if (!this.config.enabled) {
             return true;
         }
 
-        if (!this.heldLocks.has(taskId)) {
+        const held = this.heldLocks.get(taskId);
+        if (!held) {
             if (this.config.enableLogging) {
                 loggerInstance.warn(
                     `Lock for task ${taskId} was not held or already released`
@@ -213,62 +197,83 @@ export class DistributedLock {
             return false;
         }
 
-        const lockKey = this.generateLockKey(taskId);
-
-        if (!this.reservedConn) {
-            loggerInstance.warn(
-                `No reserved connection available for ${taskId}; dropping from heldLocks`
-            );
-            this.heldLocks.delete(taskId);
-            return false;
-        }
+        // Drop local ownership first so a failed backend release can't leave a
+        // phantom entry that blocks re-acquire forever.
+        this.heldLocks.delete(taskId);
 
         try {
-            const result = await this.reservedConn`
-                SELECT pg_advisory_unlock(${lockKey}::bigint) as pg_advisory_unlock
-            `;
-            const released = result[0]?.pg_advisory_unlock ?? false;
-
-            this.heldLocks.delete(taskId);
-
-            if (released && this.config.enableLogging) {
-                loggerInstance.debug(
-                    `Released lock for task ${taskId} (key: ${lockKey})`
+            const released = await this.backend.release(held.handle);
+            if (!released) {
+                // A false release is the canonical stranded/lost-lease signal
+                // (BUNSANE-1/2). Surface it LOUDLY (ERROR) and count it — this
+                // is the single highest-signal symptom of a broken lock.
+                this.lostLeases++;
+                loggerInstance.error(
+                    `Lock release for task ${taskId} returned false (backend: ${this.backend.name}) — lease was lost/stranded; the critical section may have run without exclusion`
                 );
-            } else if (!released) {
-                loggerInstance.warn(
-                    `pg_advisory_unlock returned false for task ${taskId} (key: ${lockKey})`
-                );
-            }
-
-            if (this.heldLocks.size === 0) {
-                this.releaseReservation();
+            } else if (this.config.enableLogging) {
+                loggerInstance.debug(`Released lock for task ${taskId}`);
             }
             return released;
         } catch (error) {
             loggerInstance.error(
                 `Error releasing lock for task ${taskId}: ${error instanceof Error ? error.message : String(error)}`
             );
-            this.heldLocks.delete(taskId);
-            if (this.heldLocks.size === 0) {
-                this.releaseReservation();
-            }
             return false;
         }
+    }
+
+    /**
+     * Renew the lease for a held task (heartbeat). Returns `true` if the lease
+     * is still ours and was extended. A `false` means the lease lapsed and was
+     * stolen mid-execution — surfaced as ERROR + counted. Backends without a
+     * lease (advisory: session-bound, never lapses while held) report `true`.
+     */
+    async renew(taskId: string): Promise<boolean> {
+        if (!this.config.enabled) return true;
+
+        const held = this.heldLocks.get(taskId);
+        if (!held) return false;
+
+        // Session-bound backends have no renew → the lock cannot lapse while
+        // held, so treat as a successful no-op.
+        if (!this.backend.renew) return true;
+
+        try {
+            const ok = await this.backend.renew(held.handle, held.ttlMs);
+            if (!ok) {
+                this.lostLeases++;
+                this.heldLocks.delete(taskId);
+                loggerInstance.error(
+                    `Lease renewal failed for task ${taskId} (backend: ${this.backend.name}) — lease expired and was stolen; the critical section is NO LONGER protected`
+                );
+            }
+            return ok;
+        } catch (error) {
+            loggerInstance.error(
+                `Error renewing lease for task ${taskId}: ${error instanceof Error ? error.message : String(error)}`
+            );
+            return false;
+        }
+    }
+
+    /** Total leases observed lost/stranded (failed renew or release). */
+    getLostLeaseCount(): number {
+        return this.lostLeases;
+    }
+
+    /** Configured lease lifetime in ms (drives heartbeat cadence in withLock). */
+    getLeaseTtlMs(): number {
+        return this.config.leaseTtlMs;
     }
 
     /**
      * Release all held locks. Safe to call during shutdown.
      */
     async releaseAll(): Promise<void> {
-        const tasks = Array.from(this.heldLocks);
+        const tasks = Array.from(this.heldLocks.keys());
         for (const taskId of tasks) {
             await this.release(taskId);
-        }
-        // release() returns the reservation once heldLocks empties, but if
-        // nothing was held we still need to clean up any pending reservation.
-        if (this.heldLocks.size === 0) {
-            this.releaseReservation();
         }
     }
 
@@ -281,21 +286,23 @@ export class DistributedLock {
     }
 
     updateConfig(config: Partial<DistributedLockConfig>): void {
+        const prevBackendKind = this.config.backend;
         this.config = { ...this.config, ...config };
+        // Recreate the backend only when its identity changes; otherwise keep
+        // the live one (it may own a reserved connection / held leases).
+        if (config.backend !== undefined && config.backend !== prevBackendKind) {
+            void this.backend.dispose?.();
+            this.backend = this.makeBackend();
+        }
     }
 
     getConfig(): DistributedLockConfig {
         return { ...this.config };
     }
 
-    private async attemptLock(
-        conn: ReservedSQL,
-        lockKey: bigint
-    ): Promise<boolean> {
-        const result = await conn`
-            SELECT pg_try_advisory_lock(${lockKey}::bigint) as pg_try_advisory_lock
-        `;
-        return result[0]?.pg_try_advisory_lock ?? false;
+    /** Backend name, for diagnostics / health output. */
+    getBackendName(): string {
+        return this.backend.name;
     }
 
     private sleep(ms: number): Promise<void> {

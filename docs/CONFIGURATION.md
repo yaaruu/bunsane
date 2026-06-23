@@ -61,6 +61,22 @@ See [Liveness & the write probe](#liveness--the-write-probe).
 | `GRAPHQL_MAX_DEPTH` | `15` floor | Max query depth. Hard floor of 15 — `0` no longer disables. Also `app.setGraphQLMaxDepth(n)`. |
 | `GRAPHQL_MAX_COMPLEXITY` | `1000` | Max query complexity (per-field cost × `first`/`limit`/`take`). Also `app.setGraphQLMaxComplexity(n)`. |
 
+## Distributed locking & scheduler
+
+Controls the lock primitive behind `withLock()` and the scheduler's
+single-execution gating. See [Locking & connection pooling](LOCKING.md) for the
+full guide.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BUNSANE_LOCK_BACKEND` | `auto` → `postgres` | Lock backend: `auto` \| `in-process` \| `postgres` \| `redis` \| `advisory`. `postgres` is a **pooler-safe lease table** (`bunsane_locks`) — the correct default behind PgBouncer transaction pooling. `in-process` = single instance only (no cross-process exclusion). `advisory` = legacy `pg_advisory_lock`; **only safe on a session-pinned connection** (see below). Also `scheduler.lockBackend`. |
+| `BUNSANE_ALLOW_UNSAFE_ADVISORY_LOCK` | `false` | `true` bypasses the first-use session-affinity probe that otherwise throws `UnsafeAdvisoryPoolingError` when the `advisory` backend is detected behind a transaction pooler. Override at your own risk — advisory locks strand silently there (BUNSANE-1). |
+
+> **Default changed:** the lock backend is now the pooler-safe `postgres` lease.
+> The old `pg_advisory_lock` primitive is opt-in (`advisory`) because it breaks
+> silently behind a transaction pooler. Single-instance deploys may opt down to
+> `in-process` to avoid the per-lock DB round trips.
+
 ## Query engine
 
 | Variable | Default | Description |
@@ -177,6 +193,30 @@ ALTER ROLE myapp SET idle_in_transaction_session_timeout = '30s';
 And on PgBouncer, lower `query_wait_timeout` (e.g. `30`) so a drained pool
 fails fast rather than hanging.
 
+### 3. Session-bound features break under transaction pooling
+
+Transaction pooling multiplexes each *transaction* onto a different backend, so
+anything that relies on **server-session state surviving across statements** is
+unsafe:
+
+| Feature | Why it breaks | Safe option |
+|---------|---------------|-------------|
+| `pg_advisory_lock` (the `advisory` lock backend) | lock and unlock land on different backends → lock strands, next acquire fails → `withLock` silently skips its critical section (BUNSANE-1) | Default `postgres` lease backend — see below. |
+| `sql.reserve()` for session pinning | pins client→PgBouncer, **not** PgBouncer→backend | Don't rely on it for session affinity behind a pooler. |
+| Session-level `SET` / GUCs, `LISTEN`/`NOTIFY` | session state/notifications don't persist across pooled transactions | Use a direct/`session`-mode lane for these. |
+
+**Locks are pooler-safe by default.** `BUNSANE_LOCK_BACKEND=postgres` (the
+default) uses a lease-row table where every acquire/renew/release is a single
+transaction — no session affinity required. If you explicitly opt into
+`advisory`, the backend runs a **session-affinity probe on first use** and
+throws `UnsafeAdvisoryPoolingError` (failing loud, never silently skipping) when
+it detects a transaction pooler — unless you set
+`BUNSANE_ALLOW_UNSAFE_ADVISORY_LOCK=true`. Advisory is only appropriate on a
+direct connection or a `session`-mode PgBouncer port.
+
+See [Locking & connection pooling](LOCKING.md) for backend selection and the
+full rationale.
+
 ### Recommended PgBouncer env block
 
 ```env
@@ -184,6 +224,7 @@ DB_CONNECTION_URL=postgres://myapp:***@pgbouncer:6432/mydb
 DB_DISABLE_PREPARE=true
 DB_CONNECTION_TIMEOUT=5
 # DB_STATEMENT_TIMEOUT intentionally unset — set statement_timeout on the PG role
+# Lock backend defaults to the pooler-safe 'postgres' lease — no extra config needed.
 ```
 
 ---
