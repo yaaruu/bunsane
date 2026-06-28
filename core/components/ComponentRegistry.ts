@@ -6,12 +6,11 @@ import ApplicationLifecycle, {
 import {
     CreateComponentPartitionTable,
     GenerateTableName,
-    UpdateComponentIndexes,
     AnalyzeAllComponentTables,
     CreateRelationIndexes,
     GetPartitionStrategy,
 } from "../../database/DatabaseHelper";
-import { ensureMultipleJSONBPathIndexes } from "../../database/IndexingStrategy";
+import { ensureMultipleJSONBPathIndexes, ensureLegacyIndexedFields } from "../../database/IndexingStrategy";
 import { GetSchema } from "../../database/DatabaseHelper";
 import { logger as MainLogger } from "../Logger";
 import { getMetadataStorage } from "../metadata";
@@ -307,30 +306,29 @@ class ComponentRegistry {
 
         // Update component indexes for components that have indexed properties
         // NOTE: Index operations are serialized to prevent deadlocks with ANALYZE
-        for (const { name, ctor } of components) {
-            const instance = new ctor();
+        const storage = getMetadataStorage();
+        for (const { name } of components) {
             const table_name = GenerateTableName(name);
+            // For HASH partitioning, redirect index operations to parent table
+            const indexTableName =
+                partitionStrategy === "hash" ? "components" : table_name;
 
-            // Handle legacy @CompData(indexed: true) properties
-            if (instance.indexedProperties().length > 0) {
-                // For HASH partitioning, redirect index operations to parent table
-                const indexTableName =
-                    partitionStrategy === "hash" ? "components" : table_name;
-                await UpdateComponentIndexes(
-                    indexTableName,
-                    instance.indexedProperties()
-                );
+            // Handle legacy @CompData(indexed: true) properties — Phase 1 type-aware:
+            // scalars -> btree/numeric (serve =, ORDER BY); arrays/objects -> GIN.
+            const componentId = storage.getComponentId(name);
+            const legacyIndexed = storage
+                .getComponentProperties(componentId)
+                .filter((p) => p.indexed);
+            if (legacyIndexed.length > 0) {
+                await ensureLegacyIndexedFields(indexTableName, legacyIndexed);
                 logger.trace(
-                    `Updated legacy indexes for component: ${name} on table: ${indexTableName}`
+                    `Updated legacy (type-aware) indexes for component: ${name} on table: ${indexTableName}`
                 );
             }
 
             // Handle new @IndexedField decorators
             const indexedFields = this.getIndexedFieldsForComponent(name);
             if (indexedFields.length > 0) {
-                // For HASH partitioning, create indexes on parent table
-                const indexTableName =
-                    partitionStrategy === "hash" ? "components" : table_name;
                 const indexDefinitions = indexedFields.map((field) => ({
                     tableName: indexTableName,
                     field: field.propertyKey,

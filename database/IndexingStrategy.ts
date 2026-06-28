@@ -389,6 +389,73 @@ export const ensureCompositeIndex = async (
     }
 };
 
+/**
+ * Picks the right index type for a legacy `@CompData({ indexed: true })` field.
+ *
+ * The historical default was GIN for every indexed field, but a per-field GIN
+ * (`(data->'field') jsonb_path_ops`) only serves containment (`@>`), NOT the
+ * `data->>'field'` text equality / `ORDER BY` the Query builder actually emits.
+ * So scalar fields silently fell back to sequential scans. We now route:
+ *   - array/object fields  -> GIN     (containment is the real use)
+ *   - numeric fields       -> numeric (functional index on `(...)::numeric`)
+ *   - everything else      -> btree   (`(data->>'field')` — serves =, <, ORDER BY)
+ */
+export const pickScalarIndexType = (p: { propertyType?: any; arrayOf?: any }): IndexType => {
+    if (p.arrayOf != null) return 'gin';
+    if (p.propertyType === Number) return 'numeric';
+    return 'btree';
+};
+
+/**
+ * Drops an index if it exists (best-effort, non-throwing). Identifier is
+ * framework-generated from already-validated table/field names; we only guard
+ * against malformed input, not length (Postgres truncates to 63 chars and the
+ * same truncation applies to DROP, so they still match).
+ */
+export const dropIndexIfExists = async (tableName: string, indexName: string): Promise<void> => {
+    tableName = validateIdentifier(tableName);
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(indexName)) {
+        throw new Error(`Invalid index name: ${indexName}`);
+    }
+    try {
+        await db.unsafe(`DROP INDEX IF EXISTS ${indexName}`);
+        logger.info(`Dropped legacy index ${indexName} on ${tableName} (superseded by btree/numeric)`);
+    } catch (error: any) {
+        if (error.message && (error.message.includes('does not exist') || error.message.includes('not found'))) {
+            return;
+        }
+        logger.warn(`Failed to drop legacy index ${indexName} on ${tableName}: ${error.message ?? error}`);
+    }
+};
+
+/**
+ * Phase 1 (RFC_MATERIALIZED_READ_MODELS §8): create type-aware indexes for
+ * legacy `@CompData({ indexed: true })` fields, and migrate away from the
+ * scalar-GIN footgun by dropping the obsolete per-field GIN where it has been
+ * replaced by a btree/numeric index (pure write amplification otherwise).
+ *
+ * Idempotent — safe to re-run on every startup against a live DB.
+ */
+export const ensureLegacyIndexedFields = async (
+    tableName: string,
+    properties: Array<{ propertyKey: string; propertyType?: any; arrayOf?: any }>
+): Promise<void> => {
+    const defs: IndexDefinition[] = properties.map((p) => ({
+        tableName,
+        field: p.propertyKey,
+        indexType: pickScalarIndexType(p),
+        isDateField: p.propertyType === Date,
+    }));
+    await ensureMultipleJSONBPathIndexes(tableName, defs);
+    // Migrate off the scalar-GIN footgun: a field now served by btree/numeric no
+    // longer needs (and cannot use) the old `idx_<table>_<field>_gin`.
+    for (const def of defs) {
+        if (def.indexType !== 'gin') {
+            await dropIndexIfExists(tableName, `idx_${tableName}_${def.field}_gin`);
+        }
+    }
+};
+
 export const analyzeAllComponentTables = async (): Promise<void> => {
     try {
         logger.trace(`Analyzing all component tables`);
