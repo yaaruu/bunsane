@@ -25,8 +25,13 @@ if (process.env.USE_PGLITE !== 'true') {
             if (trimmed && !trimmed.startsWith('#')) {
                 const [key, ...valueParts] = trimmed.split('=');
                 if (key) {
-                    const value = valueParts.join('=');
-                    process.env[key.trim()] = value.trim();
+                    const k = key.trim();
+                    // Respect env precedence: a value already set in the process
+                    // environment (e.g. injected by tests/pg-setup.ts to point at
+                    // an ephemeral scratch DB) must NOT be clobbered by .env.test.
+                    if (!(k in process.env)) {
+                        process.env[k] = valueParts.join('=').trim();
+                    }
                 }
             }
         }

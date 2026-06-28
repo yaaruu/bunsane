@@ -175,6 +175,43 @@ The wrapper script:
   race no longer exists — the full PGlite suite is green 3/3. The
   underlying lag was in the Bun SQL adapter's ACK handling, not bunsane.
 
+### Running Tests on Real PostgreSQL
+
+PGlite can't exercise real-PG-only behaviour (`?|`/`?&`, `CREATE INDEX
+CONCURRENTLY`, real LIST partitioning, Bun SQL param binding against a real
+backend). Bugs there sail past the PGlite run — e.g. the `?|`/`?&` "malformed
+array literal" regression that PGlite silently skipped. Use `tests/pg-setup.ts`
+to validate against a real server.
+
+```bash
+bun run test:pg                # unit + integration + graphql on real PG
+bun run test:pg:integration    # integration only
+bun tests/pg-setup.ts path/to/file.test.ts   # single file
+```
+
+The wrapper provisions an **ephemeral scratch database** on a real Postgres
+server, runs `bun test` against it with **prepared statements ENABLED on a
+DIRECT connection** (NOT PgBouncer), then drops the scratch DB on exit.
+
+Config (env vars, falling back to keys in the gitignored `.env.test`):
+- `PG_TEST_URL` — test-role connection on a direct port (DB name ignored; a
+  scratch DB is substituted). If unset, derived from `DB_CONNECTION_URL` with
+  the port swapped to `PG_DIRECT_PORT`.
+- `PG_DIRECT_PORT` — the direct Postgres listener port (bypasses PgBouncer).
+- `PG_ADMIN_URL` — superuser connection (CREATEDB) to the `postgres` DB. If
+  unset, derived from `BUNSANE_PG_DOCKER_CONTAINER` via `docker exec printenv`.
+
+**Why two connection modes matter:**
+- **PgBouncer (`:6432`) + `DB_DISABLE_PREPARE=true`** (the production combo)
+  BREAKS test seeding: Bun SQL with `prepare:false` serializes a JS object
+  param to `"[object Object]"`, so JSONB inserts fail with `invalid input
+  syntax for type json`. Never run the suite through PgBouncer.
+- **Shared app DB** breaks too: the default `list` partition strategy makes a
+  partition per component, and lazy creation for test components is guarded —
+  so the suite MUST own its schema (hence the ephemeral scratch DB).
+- The wrapper's direct + prepare:true + fresh-DB combo is the only one that
+  runs the full suite green on real PG17 (915/915).
+
 ## Directory Structure
 
 ```
