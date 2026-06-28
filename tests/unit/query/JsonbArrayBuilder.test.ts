@@ -94,13 +94,21 @@ describe('jsonbContainedByBuilder (<@)', () => {
 });
 
 describe('jsonbHasAnyBuilder (?|)', () => {
-    test('generates correct SQL with text[] cast', () => {
+    // REGRESSION GUARD: ?|/?& take a text[] RHS, but binding a JS array
+    // directly to `$N::text[]` makes Bun SQL serialize it to a brace-less CSV
+    // ("red,yellow") that Postgres rejects with "malformed array literal".
+    // PGlite doesn't support these operators, so the integration tests skip on
+    // the default zero-infra run and never caught it. The builder must bind a
+    // JSONB array param and convert it to text[] inside SQL. These assertions
+    // run everywhere (no DB) and fail loudly if the broken form returns.
+    test('binds JSONB param and converts to text[] in SQL (not a direct ::text[] bind)', () => {
         const ctx = new QueryContext();
         const result = jsonbHasAnyBuilder(
             { field: 'tags', operator: 'HAS_ANY', value: ['a', 'b'] },
             'c', ctx
         );
-        expect(result.sql).toBe("c.data->'tags' ?| $1::text[]");
+        expect(result.sql).toBe("c.data->'tags' ?| ARRAY(SELECT jsonb_array_elements_text($1::jsonb))");
+        expect(result.sql).not.toContain('::text[]');
         expect(ctx.params[0]).toEqual(['a', 'b']);
         expect(result.addedParams).toBe(1);
     });
@@ -125,13 +133,15 @@ describe('jsonbHasAnyBuilder (?|)', () => {
 });
 
 describe('jsonbHasAllBuilder (?&)', () => {
-    test('generates correct SQL with text[] cast', () => {
+    // See regression guard note on jsonbHasAnyBuilder above.
+    test('binds JSONB param and converts to text[] in SQL (not a direct ::text[] bind)', () => {
         const ctx = new QueryContext();
         const result = jsonbHasAllBuilder(
             { field: 'tags', operator: 'HAS_ALL', value: ['x', 'y'] },
             'c', ctx
         );
-        expect(result.sql).toBe("c.data->'tags' ?& $1::text[]");
+        expect(result.sql).toBe("c.data->'tags' ?& ARRAY(SELECT jsonb_array_elements_text($1::jsonb))");
+        expect(result.sql).not.toContain('::text[]');
         expect(ctx.params[0]).toEqual(['x', 'y']);
         expect(result.addedParams).toBe(1);
     });
