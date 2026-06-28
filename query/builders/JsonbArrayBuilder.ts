@@ -75,7 +75,10 @@ export const jsonbContainedByBuilder: FilterBuilder = (
  *
  * Query.filter("tags", FilterOp.HAS_ANY, ["urgent", "high"])
  *
- * Note: ?| operates on text[], so values are cast to strings.
+ * Note: ?| operates on text[]. We bind the values as a JSONB array param
+ * (Bun SQL serializes JS arrays to JSON reliably, but mangles a JS array
+ * bound directly to ::text[] into a brace-less CSV → "malformed array
+ * literal") and convert to text[] in SQL via jsonb_array_elements_text.
  */
 export const jsonbHasAnyBuilder: FilterBuilder = (
     filter: QueryFilter, alias: string, context: QueryContext
@@ -84,7 +87,7 @@ export const jsonbHasAnyBuilder: FilterBuilder = (
     const values = normalizeToArray(filter.value).map(String);
     const paramIndex = context.addParam(values);
     return {
-        sql: `${jsonbPath} ?| $${paramIndex}::text[]`,
+        sql: `${jsonbPath} ?| ARRAY(SELECT jsonb_array_elements_text($${paramIndex}::jsonb))`,
         addedParams: 1,
     };
 };
@@ -94,7 +97,9 @@ export const jsonbHasAnyBuilder: FilterBuilder = (
  *
  * Query.filter("tags", FilterOp.HAS_ALL, ["urgent", "high"])
  *
- * Note: ?& operates on text[], so values are cast to strings.
+ * Note: ?& operates on text[]. Same JSONB-param-then-convert approach as
+ * jsonbHasAnyBuilder (see note there) to avoid Bun's broken JS-array →
+ * ::text[] serialization.
  */
 export const jsonbHasAllBuilder: FilterBuilder = (
     filter: QueryFilter, alias: string, context: QueryContext
@@ -103,7 +108,7 @@ export const jsonbHasAllBuilder: FilterBuilder = (
     const values = normalizeToArray(filter.value).map(String);
     const paramIndex = context.addParam(values);
     return {
-        sql: `${jsonbPath} ?& $${paramIndex}::text[]`,
+        sql: `${jsonbPath} ?& ARRAY(SELECT jsonb_array_elements_text($${paramIndex}::jsonb))`,
         addedParams: 1,
     };
 };
