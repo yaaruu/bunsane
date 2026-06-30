@@ -36,6 +36,28 @@ A connection requires **either** `DB_CONNECTION_URL` **or**
 | `DB_DISABLE_PREPARE` | `false` | `true` disables Bun SQL's automatic server-side prepared statements (driver default is on). **Required behind PgBouncer in transaction pooling mode** — see [PgBouncer deployment](#pgbouncer-deployment) below. |
 | `DB_SAVE_PROFILE` | `false` | `true` logs per-phase `Entity.save` timings (`db`, `cache`, `hooks`, `total`). |
 
+### Automatic timestamptz migration
+
+On startup `DatabaseHelper` runs an idempotent migration that converts any
+`timestamp without time zone` columns on the base tables to `timestamptz`.
+The affected columns are `created_at`, `updated_at`, and `deleted_at` on both
+`entities` and `components`. Fresh databases created by this version already
+use `TIMESTAMPTZ` DDL, so the migration is a no-op for them. Existing stored
+values are interpreted as UTC — the framework only ever writes timestamps via
+`NOW()` / `CURRENT_TIMESTAMP`, which follow the session timezone; UTC is the
+correct assumption for any database run in UTC.
+
+On the partitioned `components` table PostgreSQL propagates the type change to
+every partition, which triggers a one-time table rewrite with a brief exclusive
+lock per column altered. This is a one-time cost on the first boot after
+upgrading from a build that used bare `timestamp`.
+
+There is no env var to control this migration; it runs automatically and is
+required for `Query.sortByCreatedAt()` / `Query.sortByUpdatedAt()` to produce
+correct results. Those methods read `entities.created_at` / `entities.updated_at`
+directly, and timezone-aware ordering is only possible when the columns are typed
+`timestamptz`.
+
 ## Health checks
 
 | Variable | Default | Description |
@@ -132,6 +154,49 @@ See [Liveness & the write probe](#liveness--the-write-probe).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `USE_PGLITE` | — | `true` runs against in-memory PGlite. Use the `tests/pglite-setup.ts` wrapper, not this var directly. |
+
+### Real-PostgreSQL test runner (tests/pg-setup.ts)
+
+PGlite is the zero-infrastructure default but it cannot exercise real-PG-only
+paths: the `?|` / `?&` JSONB operators, `CREATE INDEX CONCURRENTLY`, real LIST
+partitioning, and real Bun SQL parameter binding against a live backend. Bugs
+in those paths sail past the default PGlite run — the `?|`/`?&` "malformed
+array literal" regression is a concrete example that PGlite silently masked.
+`tests/pg-setup.ts` provisions an ephemeral scratch database on a real Postgres
+server, runs `bun test` against it with prepared statements **enabled** on a
+**direct connection** (not PgBouncer), then drops the scratch DB on exit.
+
+**Two connection modes must not be used for the test suite:**
+
+- **PgBouncer (`:6432`) with `DB_DISABLE_PREPARE=true`** — Bun SQL with
+  `prepare:false` serializes a JS object parameter to the literal string
+  `"[object Object]"`, causing JSONB inserts to fail with
+  `invalid input syntax for type json`. The suite must run on a direct port
+  with prepared statements on.
+- **The shared application DB** — the default `list` partition strategy lazily
+  creates one partition per component type. The suite must own its schema
+  (hence the ephemeral scratch DB); using the shared app DB causes component
+  partitions from unrelated data to collide and break test isolation.
+
+The wrapper automatically removes `DB_DISABLE_PREPARE` from the child
+environment and substitutes the scratch DB name, so both issues are bypassed
+without any manual configuration.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PG_TEST_URL` | (derived) | Test-role connection string on a direct Postgres port. The database name is ignored — the runner substitutes an ephemeral scratch DB. If unset, derived from `DB_CONNECTION_URL` with the port swapped to `PG_DIRECT_PORT`. |
+| `PG_DIRECT_PORT` | (none) | Direct Postgres listener port that bypasses PgBouncer. Used only when deriving `PG_TEST_URL` from `DB_CONNECTION_URL`. |
+| `PG_ADMIN_URL` | (derived) | Superuser (CREATEDB) connection URL targeting the `postgres` maintenance database. Used to CREATE/DROP the scratch DB. If unset, derived from `BUNSANE_PG_DOCKER_CONTAINER`. |
+| `BUNSANE_PG_DOCKER_CONTAINER` | (none) | Name of a Docker Postgres container (e.g. `infra-postgres`). When `PG_ADMIN_URL` is unset, admin credentials are read from the container via `docker exec printenv POSTGRES_USER` / `POSTGRES_PASSWORD`. |
+
+All four variables fall back to the matching key in the gitignored `.env.test`.
+
+| npm script | Directories covered |
+|------------|---------------------|
+| `test:pg` | `tests/unit` + `tests/integration` + `tests/graphql` |
+| `test:pg:unit` | `tests/unit` |
+| `test:pg:integration` | `tests/integration` |
+| `test:pg:graphql` | `tests/graphql` |
 
 ---
 

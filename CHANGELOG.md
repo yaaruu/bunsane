@@ -2,6 +2,146 @@
 
 All notable changes to bunsane are documented here.
 
+## 0.5.9 — 2026-06-30
+
+### Fixed
+
+- **Test-suite typecheck (`tsc --noEmit` green)** — 14 typecheck errors, all
+  in test files using drifted APIs (the framework source was already clean),
+  are fixed so a red typecheck can serve as a CI gate again. Notable: a
+  types-only module augmentation (`tests/types/bun-test-timeout.d.ts`) restores
+  the 2nd `timeout` arg on `bun:test` lifecycle hooks
+  (`beforeAll`/`afterAll`/etc.), which `bun-types` declares as single-arg but
+  Bun honors at runtime; `Entity.findById` → `Entity.FindById` casing fix in a
+  benchmark (the old call was undefined at runtime, swallowed by a cleanup
+  try/catch).
+
+## 0.5.8 — 2026-06-29
+
+### Fixed
+
+- **`?|` / `?&` (`HAS_ANY` / `HAS_ALL`) JSONB array operators** — these
+  builders bound a JS array directly to a `::text[]` parameter, but Bun SQL
+  serializes a JS array bound to `text[]` into a brace-less CSV (`red,yellow`),
+  so real PostgreSQL rejected it with `malformed array literal`. They now bind
+  the values as a JSONB array parameter (the same reliable path
+  `CONTAINS`/`CONTAINED_BY` already use — Bun serializes JS arrays to JSON
+  reliably) and convert to `text[]` in SQL via
+  `ARRAY(SELECT jsonb_array_elements_text($N::jsonb))`. The bug only ever
+  surfaced on real PostgreSQL: PGlite doesn't support `?|`/`?&`, so the default
+  zero-infrastructure (PGlite) test run never exercised the path. Verified on
+  real PG17 (`Query.jsonbArray` 13/13 pass, was 4 failing).
+
+### Added
+
+- **Real-PostgreSQL test runner (`tests/pg-setup.ts`)** — PGlite cannot
+  exercise real-PG-only paths (`?|`/`?&`, `CREATE INDEX CONCURRENTLY`, real
+  LIST partitioning, Bun SQL parameter binding against a real backend), so
+  regressions there pass the default zero-infra run — exactly how the
+  `?|`/`?&` bug above stayed hidden. The new wrapper mirrors `pglite-setup.ts`:
+  it provisions an ephemeral scratch database on a real Postgres server, runs
+  `bun test` against it with prepared statements ENABLED over a DIRECT
+  connection (never PgBouncer), then drops the scratch DB on exit. New scripts:
+  `test:pg`, `test:pg:unit`, `test:pg:integration`, `test:pg:graphql`. Config
+  comes from env vars `PG_TEST_URL`, `PG_DIRECT_PORT`, `PG_ADMIN_URL`,
+  `BUNSANE_PG_DOCKER_CONTAINER`, all falling back to the gitignored `.env.test`.
+  Full suite verified 915/915 green on real PG17.
+
+## 0.5.7 — 2026-06-28
+
+### Fixed
+
+- **Type-aware indexes for legacy `@CompData({ indexed: true })` fields** —
+  the historical default created a per-field GIN (`jsonb_path_ops`) for every
+  indexed `@CompData` field, but that index only serves containment (`@>`), NOT
+  the `data->>'field'` text equality / `ORDER BY` the Query builder actually
+  emits. Scalar indexed fields therefore silently fell back to sequential scans
+  — the "100× slow" symptom was a missing *usable* index, not framework
+  overhead. Index creation now routes by value type: arrays/objects → GIN,
+  numeric → a functional numeric index, everything else → btree on
+  `(data->>'field')`. Obsolete scalar GIN indexes are dropped on startup
+  (idempotent) to remove pure write amplification. No code change is required
+  — existing `indexed: true` fields get the correct index automatically on next
+  startup.
+
+### Added
+
+- **Materialized read models RFC** (`docs/RFC_MATERIALIZED_READ_MODELS.md`) —
+  a CQRS read-side design for ERP/CRM workloads in three tiers (M1 `@CompData`
+  projected → generated column, M2 `@ArcheType` materialize, M3 `@ReadModel`
+  cross-entity). Includes a fair 3-way staging benchmark (PG17, 1M rows) that
+  corrected the original headline: the 100–182× gap was the missing-index
+  footgun fixed above, not a generated-column win (true M1 gain is only
+  1.2–1.84×), so the index fix was re-prioritized as Phase 1.
+
+## 0.5.5 — 2026-06-21
+
+### Added
+
+- **Native entity-column sort** — new Query methods sort directly on the
+  `entities` table's native `created_at` / `updated_at` `timestamptz` columns,
+  needing no component, no `.with()`, and no throw:
+  `sortByCreatedAt(direction = "ASC", nullsFirst = false)`,
+  `sortByUpdatedAt(...)`, and the general
+  `sortByEntityField(field, direction, nullsFirst)`. They apply as an outer
+  `ORDER BY` over the resolved id-set, so they compose with any `.with()` /
+  filter combination, and are cheaper than duplicating the timestamp into a
+  JSONB component and sorting `data->>'...'`. Native entity-column sort cannot
+  be combined with a component `sortBy()` in the same query (throws a clear
+  error).
+
+- **Composite keyset cursor for sorted queries** —
+  `Query.encodeSortedCursor(sortValue, entityId)` produces an opaque token from
+  the last row of a page; `query.sortedCursor(token, direction = 'after')`
+  resumes pagination via a composite keyset over `(sortValue, entityId)`.
+  Covers entity-column sort and single-component `sortBy()`, ASC and DESC,
+  including tie rows. Unsupported combinations throw clearly rather than
+  returning silently wrong pages (OR queries, multi-key sort, `NULLS FIRST`,
+  and the `'before'` direction for entity-column / component sort).
+
+### Fixed
+
+- **Stable sorted pagination (deterministic tiebreak)** — every sorted
+  `ORDER BY` now ends in a unique `id ASC` key across all sort paths,
+  eliminating duplicate or skipped rows in `OFFSET` pagination over tied sort
+  keys.
+
+## 0.5.4 — 2026-06-20
+
+### Added
+
+- **Single-pass OR query optimization** — a base-dependent OR query
+  (`.with(X).with(or(...))`) now scans the base set ONCE and resolves the
+  branches as an OR-of-`EXISTS`, instead of the previous N× base scans plus
+  cartesian `UNION`. Default ON, with kill-switch env
+  `BUNSANE_ORNODE_SINGLE_PASS=0`. Parity-proven; roughly 37× faster on real
+  PG17 (~20× on PGlite) for the affected query shape.
+
+- **Entity list endpoint — pagination + search** — the Studio Entity Inspector
+  gained a paginated, searchable entity-listing endpoint at
+  `GET /studio/api/entities`. Query parameters: `limit` (integer, clamped to
+  1–1000, default 50), `offset` (integer, default 0), `search` (string,
+  case-insensitive UUID substring match via `ILIKE`), and `include_deleted`
+  (boolean string `"true"`, default false). Results are ordered by
+  `created_at DESC NULLS LAST`; the JSON response shape is
+  `{ entities, total, limit, offset }` where each entity carries
+  `{ id, created_at, updated_at, deleted_at, component_count }`.
+
+### Fixed
+
+- **JSONB `IN` / `NOT_IN` type casting** — a new `jsonbInListCast` makes
+  `FilterOp.IN` / `NOT_IN` work correctly against numeric and boolean JSONB
+  values, which previously produced `text = integer` type errors (or silently
+  wrong matches) in PostgreSQL; `OrNode` now uses the cast logic. Also fixes a
+  pagination regression where OR query results were incorrectly limited to the
+  first page.
+
+- **Auto-migration of `timestamp` columns to `timestamptz`** —
+  `DatabaseHelper` now migrates legacy `timestamp` columns to `timestamptz` on
+  startup (idempotent), so entity `created_at` / `updated_at` are
+  timezone-aware — required for correct native entity-column timestamp sorting
+  (above).
+
 ## 0.5.2 — 2026-06-19
 
 ### Added
