@@ -8,7 +8,6 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { Entity } from '../../core/Entity';
 import { Query, FilterOp } from '../../query/Query';
 import { Component, CompData, BaseComponent } from '../../core/components';
-import { ComponentRegistry } from '../../core/components/ComponentRegistry';
 import { ensureComponentsRegistered } from '../utils';
 
 // Benchmark components
@@ -131,7 +130,7 @@ describe('Query Performance Benchmark', () => {
         console.log(`\n🧹 Cleaning up ${createdEntityIds.length} entities...`);
         for (const id of createdEntityIds) {
             try {
-                const entity = await Entity.findById(id);
+                const entity = await Entity.FindById(id);
                 if (entity) {
                     await entity.delete();
                 }

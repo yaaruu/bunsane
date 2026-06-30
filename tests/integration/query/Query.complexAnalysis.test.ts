@@ -117,7 +117,7 @@ describe('Complex Query Performance Analysis', () => {
 
             if (i % 3 === 0) {
                 entity.add(TestOrder, {
-                    orderId: `ORD-${i}`,
+                    orderNumber: `ORD-${i}`,
                     total: 100 + (i % 500) * 10,
                     status: i % 2 === 0 ? 'completed' : 'pending'
                 });

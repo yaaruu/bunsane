@@ -116,7 +116,10 @@ describe('transaction-aware cache invalidation', () => {
         });
 
         expect(ran).toBe(true);
-        expect(cacheGoneWhenHookRan).toBe(true);
+        // cacheGoneWhenHookRan is assigned inside the onCommit closure, which
+        // TS control-flow can't observe — it stays narrowed to its `null` init.
+        // Compare explicitly so the assertion type-checks without weakening it.
+        expect(cacheGoneWhenHookRan === true).toBe(true);
     });
 
     test('transaction() returns the callback result', async () => {

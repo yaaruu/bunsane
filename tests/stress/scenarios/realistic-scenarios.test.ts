@@ -41,9 +41,9 @@ const BATCH_SIZE = Math.min(500, Math.floor(ENTITY_COUNT / 10) || 100);
 
 // Helper to generate realistic test data
 function generateProductData(index: number): Record<string, any> {
-    const category = CATEGORIES[index % CATEGORIES.length];
-    const subcategories = SUBCATEGORIES[category];
-    const subcategory = subcategories[index % subcategories.length];
+    const category = CATEGORIES[index % CATEGORIES.length]!;
+    const subcategories = SUBCATEGORIES[category]!;
+    const subcategory = subcategories[index % subcategories.length]!;
     const status = PRODUCT_STATUSES[index % PRODUCT_STATUSES.length];
     const now = new Date();
     const createdDaysAgo = Math.floor(Math.random() * 365);
