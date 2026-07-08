@@ -4,7 +4,7 @@ import { logger } from "../core/Logger";
 import db, { QUERY_TIMEOUT_MS } from "../database";
 import { timed } from "../core/Decorators";
 import { inList } from "../database/sqlHelpers";
-import { QueryContext, QueryDAG, SourceNode, ComponentInclusionNode } from "./index";
+import { QueryContext, QueryDAG, ComponentInclusionNode } from "./index";
 import { OrQuery } from "./OrQuery";
 import { OrNode } from "./OrNode";
 import { preparedStatementCache } from "../database/PreparedStatementCache";
@@ -16,6 +16,17 @@ import type { ComponentConstructor, TypedEntity, ComponentRecord } from "../type
 import { assertComponentTableName, assertFieldPath, assertIdentifier } from "./SqlIdentifier";
 import { getMembershipSource } from "./membershipSource";
 import { isNumericProperty } from "./ComponentInclusionNode";
+import { buildCoverageRequest } from "./planner/CoverageSet";
+import { shadowRunExec, shadowRunCount } from "./planner/ShadowRunner";
+import {
+    buildRmQuery,
+    buildRmCountQuery,
+    buildRmEstimateQuery,
+    SurfacePlanner,
+    recordRoute,
+    recordFallback,
+} from "./planner";
+import type { CoverageRequest } from "./planner/CoverageRequest";
 
 // Parsed once at module load instead of on every exec() (process.env read +
 // parseInt was on the query hot path). 0 disables the default limit.
@@ -24,6 +35,41 @@ let warnedDefaultLimit = false;
 
 // Gated once — dev keeps param diagnostics, production skips the loop entirely.
 const DEBUG_PARAMS = process.env.NODE_ENV !== 'production';
+
+// Read at call time (NOT module load) so BUNSANE_QSP_MODE can be flipped at runtime
+// (e.g. enable shadow on a canary without redeploy) and by tests that set the env
+// after this module is first imported — ES import hoisting evaluates Query.ts before
+// a test file's top-level env assignment. The check runs only AFTER the DB round trip
+// in doExec/doCountInner, so the single env read is negligible; the default
+// (unset/'off') short-circuits to zero extra work.
+function qspShadowEnabled(): boolean {
+    return process.env.BUNSANE_QSP_MODE === 'shadow';
+}
+
+function qspRouteEnabled(): boolean {
+    return process.env.BUNSANE_QSP_MODE === 'route';
+}
+
+function qspCountStrategy(): 'exact' | 'estimate' | 'n_plus_1' {
+    const v = process.env.BUNSANE_QSP_COUNT;
+    return v === 'estimate' || v === 'n_plus_1' ? v : 'exact';
+}
+
+/** Extract Plan Rows from EXPLAIN (FORMAT JSON) result (object or string). */
+function extractExplainPlanRows(plan: any[]): number {
+    try {
+        let qp: any = plan?.[0]?.['QUERY PLAN'];
+        if (typeof qp === 'string') {
+            qp = JSON.parse(qp);
+        }
+        const root = Array.isArray(qp) ? qp[0] : qp;
+        const planRows = root?.Plan?.['Plan Rows'] ?? root?.['Plan Rows'] ?? 0;
+        const n = Number(planRows);
+        return Number.isFinite(n) ? n : 0;
+    } catch {
+        return 0;
+    }
+}
 
 // Shared across all TypedEntity instances — avoids one closure allocation per row.
 // Must be called as a method (entity.getTyped(Ctor)) so `this` resolves correctly.
@@ -144,6 +190,13 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
     private skipComponentCache: boolean = false;
     private execSignal?: AbortSignal;
     private execPerRequest?: PerRequestCounters;
+    /** Last QSP route decision for this Query instance (additive; not GraphQL-exposed). */
+    private _lastRouteInfo: {
+        routed: boolean;
+        surface: 'rm' | 'legacy';
+        archetype?: string;
+        hasNextPage?: boolean;
+    } = { routed: false, surface: 'legacy' };
 
     /** Component constructors added to this query for type-safe access */
     private _componentCtors: ComponentConstructor[] = [];
@@ -151,6 +204,19 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
     constructor(trx?: SQL) {
         this.trx = trx;
         this.context = new QueryContext(trx);
+    }
+
+    /**
+     * Additive QSP diagnostic: whether the last exec/count served via rm_ (route mode)
+     * and optional hasNextPage from N+1 fetch. Not part of GraphQL schema.
+     */
+    public getLastRouteInfo(): {
+        routed: boolean;
+        surface: 'rm' | 'legacy';
+        archetype?: string;
+        hasNextPage?: boolean;
+    } {
+        return this._lastRouteInfo;
     }
 
     /**
@@ -578,6 +644,22 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
     }
 
     private async doCountInner(): Promise<number> {
+        // QSP route mode: serve exact/estimate count from rm_ when fully covered.
+        if (qspRouteEnabled() && !this.orQuery) {
+            const req = buildCoverageRequest(this.context);
+            const res = SurfacePlanner.instance.resolve(req);
+            if (res.surface === 'rm' && res.archetype && res.status === 'READY') {
+                try {
+                    return await this.doCountRouted(res.archetype, req);
+                } catch (err) {
+                    recordFallback('count_error');
+                    logger.warn({ scope: 'qsp.route.fallback', archetype: res.archetype, err }, 'QSP route count fallback to legacy');
+                    // fall through to legacy below
+                }
+            }
+        }
+        this._lastRouteInfo = { routed: false, surface: 'legacy' };
+
         // Build the DAG
         const dag = new QueryDAG();
 
@@ -652,7 +734,16 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         if (count === undefined || count === null) {
             return 0;
         }
-        return typeof count === 'string' ? parseInt(count, 10) : Number(count);
+        const finalCount = typeof count === 'string' ? parseInt(count, 10) : Number(count);
+        if (qspShadowEnabled()) {
+            try {
+                const req = buildCoverageRequest(this.context);
+                shadowRunCount(req, finalCount);
+            } catch {
+                /* shadow must never affect the served path */
+            }
+        }
+        return finalCount;
     }
 
     /**
@@ -923,6 +1014,94 @@ AND c.deleted_at IS NULL`;
         return typedEntity;
     }
 
+    /**
+     * QSP route mode: serve SELECT entity_id from rm_<archetype>.
+     * Fetches limit+1 when limit is set so hasNextPage can be reported without a second query.
+     * Hydration mirrors the legacy doExec tail (populate / eager load).
+     */
+    private async doExecRouted(archetype: string, req: CoverageRequest): Promise<Entity[]> {
+        const n = req.limit;
+        let fetchReq = req;
+        if (n !== null) {
+            fetchReq = { ...req, limit: n + 1 };
+        }
+
+        const { sql, params } = buildRmQuery(archetype, fetchReq);
+        const dbConn = this.getDb();
+        const rows = await timedUnsafe<any[]>(dbConn, sql, params, this.execSignal, this.execPerRequest);
+
+        let entityIds: string[] = rows.map((r: any) => r.entity_id);
+        let hasNextPage = false;
+        if (n !== null && entityIds.length > n) {
+            hasNextPage = true;
+            entityIds = entityIds.slice(0, n);
+        }
+
+        recordRoute(archetype);
+        this._lastRouteInfo = { routed: true, surface: 'rm', archetype, hasNextPage };
+
+        if (entityIds.length === 0) {
+            return [];
+        }
+
+        return this.hydrateEntityIds(entityIds);
+    }
+
+    /**
+     * QSP route mode count via rm_.
+     * - exact (default) / n_plus_1: count(*) — n_plus_1's "no second query" benefit is
+     *   realized at exec-time via hasNextPage; a bare .count() has no page so returns exact.
+     * - estimate: EXPLAIN (FORMAT JSON) Plan Rows on the filter SELECT.
+     */
+    private async doCountRouted(archetype: string, req: CoverageRequest): Promise<number> {
+        const dbConn = this.getDb();
+        const strat = qspCountStrategy();
+
+        if (strat === 'estimate') {
+            const { sql, params } = buildRmEstimateQuery(archetype, req);
+            const plan = await timedUnsafe<any[]>(
+                dbConn,
+                `EXPLAIN (FORMAT JSON) ${sql}`,
+                params,
+                this.execSignal,
+                this.execPerRequest
+            );
+            const rowsEst = extractExplainPlanRows(plan);
+            recordRoute(archetype);
+            this._lastRouteInfo = { routed: true, surface: 'rm', archetype };
+            return rowsEst;
+        }
+
+        // 'exact' (default) AND 'n_plus_1' for a bare count() both use exact count(*).
+        const { sql, params } = buildRmCountQuery(archetype, req);
+        const rows = await timedUnsafe<any[]>(dbConn, sql, params, this.execSignal, this.execPerRequest);
+        recordRoute(archetype);
+        this._lastRouteInfo = { routed: true, surface: 'rm', archetype };
+        return Number(rows[0]?.count ?? 0);
+    }
+
+    /** Hydrate Entity[] from ordered ids — same shape as the legacy doExec tail. */
+    private async hydrateEntityIds(entityIds: string[]): Promise<Entity[]> {
+        const entityMap = new Map<string, Entity>();
+        for (const id of entityIds) {
+            const entity = new Entity(id);
+            entity.setPersisted(true);
+            entity.setDirty(false);
+            entityMap.set(id, entity);
+        }
+
+        if (this.shouldPopulate && this.context.componentIds.size > 0) {
+            await this.populateComponents(entityMap);
+        }
+
+        if (this.context.eagerComponents.size > 0) {
+            const entitiesArray = Array.from(entityMap.values());
+            await Entity.LoadComponents(entitiesArray, Array.from(this.context.eagerComponents), this.skipComponentCache);
+        }
+
+        return entityIds.map(id => entityMap.get(id)!);
+    }
+
     private async doExec(): Promise<Entity[]> {
         // Reset context for fresh execution
         this.context.reset();
@@ -936,6 +1115,23 @@ AND c.deleted_at IS NULL`;
                 'Use one or the other.'
             );
         }
+
+        // QSP route mode: serve entity ids from rm_ when fully covered + READY.
+        // On any error fall through to the legacy body unchanged.
+        if (qspRouteEnabled() && !this.orQuery) {
+            const req = buildCoverageRequest(this.context);
+            const res = SurfacePlanner.instance.resolve(req);
+            if (res.surface === 'rm' && res.archetype && res.status === 'READY') {
+                try {
+                    return await this.doExecRouted(res.archetype, req);
+                } catch (err) {
+                    recordFallback('exec_error');
+                    logger.warn({ scope: 'qsp.route.fallback', archetype: res.archetype, err }, 'QSP route exec fallback to legacy');
+                    // fall through to legacy below — legacy body runs UNCHANGED
+                }
+            }
+        }
+        this._lastRouteInfo = { routed: false, surface: 'legacy' };
 
         // Native entity-column sort (created_at/updated_at) is applied as an
         // outer ORDER BY over the resolved id-set. The inner nodes must emit
@@ -1286,6 +1482,15 @@ AND c.deleted_at IS NULL`;
 
         // Convert to Entity objects
         const entityIds: string[] = entities.map((row: any) => row.id);
+
+        if (qspShadowEnabled()) {
+            try {
+                const req = buildCoverageRequest(this.context);
+                shadowRunExec(req, entityIds.slice());
+            } catch {
+                /* shadow must never affect the served path */
+            }
+        }
 
         if (entityIds.length === 0) {
             return [];
