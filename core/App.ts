@@ -1,4 +1,4 @@
-﻿import ApplicationLifecycle, {
+import ApplicationLifecycle, {
     ApplicationPhase,
     type PhaseChangeEvent,
 } from "./ApplicationLifecycle";
@@ -8,6 +8,7 @@ import {
     PrepareDatabase,
     UpdateComponentIndexes,
     EnsureDatabaseMigrations,
+    InitializeProjections,
 } from "../database/DatabaseHelper";
 import { ComponentRegistry } from "./components";
 import { logger as MainLogger } from "./Logger";
@@ -205,6 +206,7 @@ export default class App {
                 await EnsureDatabaseMigrations();
             }
             logger.trace(`Database prepared...`);
+            await InitializeProjections();
             ApplicationLifecycle.setPhase(ApplicationPhase.DATABASE_READY);
             await ComponentRegistry.registerAllComponents();
             ApplicationLifecycle.setPhase(ApplicationPhase.SYSTEM_REGISTERING);
