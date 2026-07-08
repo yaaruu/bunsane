@@ -98,6 +98,20 @@ See [Liveness & the write probe](#liveness--the-write-probe).
 | `BUNSANE_ORNODE_SINGLE_PASS` | `1` (on) | OR queries over a required base (`.with(X).with(or([...]))`) scan the base set **once** and combine branches as a disjunction of `EXISTS` predicates, instead of embedding the base in every branch and `UNION`-ing (which forced an N× base scan + a per-branch cartesian nested-loop). Parity-proven against the legacy shape; ~20× faster on a 3-branch OR. Kill-switch: set to `0`/`false` to revert to the legacy `UNION` shape instantly (no redeploy). |
 | `BUNSANE_RELATION_TYPED_COLUMN` | — | Typed relation column toggle (internal). |
 
+## Query Surface Planner (experimental)
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `BUNSANE_QSP_ENABLED` | `false` | master switch for QSP write-path maintenance (P2+) |
+| `BUNSANE_QSP_ARCHETYPES` | (empty) | CSV of archetype names to project (empty = none) |
+| `BUNSANE_QSP_MODE` | `off` | read routing: off \| shadow \| route |
+| `BUNSANE_QSP_COUNT` | `exact` | count strategy: exact \| n_plus_1 \| estimate |
+| `BUNSANE_QSP_BACKFILL_BATCH` | `5000` | backfill batch size |
+| `BUNSANE_QSP_BACKFILL_THROTTLE_MS` | `50` | inter-batch sleep (ms) |
+| `BUNSANE_QSP_ENTITIES_ACCEL` | `false` | enable the R1 generic entities accelerator (P5) |
+
+All QSP flags default off/safe; with them unset, framework behavior is unchanged. P1 only registers these vars and creates the projection_state table; no routing or write-path change is active yet.
+
 ## Cache
 
 | Variable | Default | Description |

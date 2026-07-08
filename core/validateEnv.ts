@@ -70,6 +70,19 @@ const envSchema = z
         DB_DISABLE_PREPARE: z
             .enum(["true", "false"])
             .optional(),
+        BUNSANE_QSP_ENABLED: z.enum(["true", "false"]).optional(),
+        BUNSANE_QSP_MODE: z.enum(["off", "shadow", "route"]).optional(),
+        BUNSANE_QSP_COUNT: z.enum(["exact", "n_plus_1", "estimate"]).optional(),
+        BUNSANE_QSP_ARCHETYPES: z.string().optional(),
+        BUNSANE_QSP_BACKFILL_BATCH: z
+            .string()
+            .regex(/^\d+$/, "BUNSANE_QSP_BACKFILL_BATCH must be numeric")
+            .optional(),
+        BUNSANE_QSP_BACKFILL_THROTTLE_MS: z
+            .string()
+            .regex(/^\d+$/, "BUNSANE_QSP_BACKFILL_THROTTLE_MS must be numeric")
+            .optional(),
+        BUNSANE_QSP_ENTITIES_ACCEL: z.enum(["true", "false"]).optional(),
     })
     .refine(
         (env) => {

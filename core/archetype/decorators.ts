@@ -112,6 +112,13 @@ export function ArcheType<T extends new () => BaseArcheType>(
             });
         }
 
+        const fieldDefs = prototype[archetypeFieldsSymbol];
+        if (fieldDefs) {
+            const componentNames = Array.from(
+                new Set(fieldDefs.map((f: any) => f.component?.name).filter(Boolean))
+            ) as string[];
+            storage.setArchetypeComponentNames(typeId, componentNames);
+        }
         return target;
     };
 }
