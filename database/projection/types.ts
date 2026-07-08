@@ -7,7 +7,7 @@ export interface ProjectedColumn {
     columnName: string;
 }
 
-export type ProjectionStatus = 'DISABLED' | 'BACKFILLING' | 'READY';
+export type ProjectionStatus = 'DISABLED' | 'BACKFILLING' | 'SHADOW' | 'READY';
 
 export type FieldReadiness = 'FILLING' | 'READY';
 export type FieldState = Record<string, FieldReadiness>;

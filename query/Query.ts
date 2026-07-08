@@ -25,8 +25,11 @@ import {
     SurfacePlanner,
     recordRoute,
     recordFallback,
+    type PlanResolution,
 } from "./planner";
 import type { CoverageRequest } from "./planner/CoverageRequest";
+import { qspMode, qspCountStrategy, qspActive } from "../database/projection/qspConfig";
+import { ProjectionManager } from "../database/projection/ProjectionManager";
 
 // Parsed once at module load instead of on every exec() (process.env read +
 // parseInt was on the query hot path). 0 disables the default limit.
@@ -36,25 +39,7 @@ let warnedDefaultLimit = false;
 // Gated once — dev keeps param diagnostics, production skips the loop entirely.
 const DEBUG_PARAMS = process.env.NODE_ENV !== 'production';
 
-// Read at call time (NOT module load) so BUNSANE_QSP_MODE can be flipped at runtime
-// (e.g. enable shadow on a canary without redeploy) and by tests that set the env
-// after this module is first imported — ES import hoisting evaluates Query.ts before
-// a test file's top-level env assignment. The check runs only AFTER the DB round trip
-// in doExec/doCountInner, so the single env read is negligible; the default
-// (unset/'off') short-circuits to zero extra work.
-function qspShadowEnabled(): boolean {
-    return process.env.BUNSANE_QSP_MODE === 'shadow';
-}
-
-function qspRouteEnabled(): boolean {
-    return process.env.BUNSANE_QSP_MODE === 'route';
-}
-
-function qspCountStrategy(): 'exact' | 'estimate' | 'n_plus_1' {
-    const v = process.env.BUNSANE_QSP_COUNT;
-    return v === 'estimate' || v === 'n_plus_1' ? v : 'exact';
-}
-
+// QSP gates read env at call time via qspConfig.
 /** Extract Plan Rows from EXPLAIN (FORMAT JSON) result (object or string). */
 function extractExplainPlanRows(plan: any[]): number {
     try {
@@ -644,18 +629,23 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
     }
 
     private async doCountInner(): Promise<number> {
-        // QSP route mode: serve exact/estimate count from rm_ when fully covered.
-        if (qspRouteEnabled() && !this.orQuery) {
-            const req = buildCoverageRequest(this.context);
-            const res = SurfacePlanner.instance.resolve(req);
-            if (res.surface === 'rm' && res.archetype && res.status === 'READY') {
+        // QSP: resolve coverage once. Route only when READY; shadow-compare in SHADOW.
+        let qspReq: CoverageRequest | undefined;
+        let qspRes: PlanResolution | undefined;
+        if (qspActive() && !this.orQuery) {
+            qspReq = buildCoverageRequest(this.context);
+            qspRes = SurfacePlanner.instance.resolve(qspReq);
+            if (qspMode() === 'route' && qspRes.surface === 'rm' && qspRes.archetype && qspRes.status === 'READY') {
                 try {
-                    return await this.doCountRouted(res.archetype, req);
+                    return await this.doCountRouted(qspRes.archetype, qspReq);
                 } catch (err) {
                     recordFallback('count_error');
-                    logger.warn({ scope: 'qsp.route.fallback', archetype: res.archetype, err }, 'QSP route count fallback to legacy');
+                    logger.warn({ scope: 'qsp.route.fallback', archetype: qspRes.archetype, err }, 'QSP route count fallback to legacy');
                     // fall through to legacy below
                 }
+            }
+            if (qspRes.triggerArchetype) {
+                void ProjectionManager.instance.ensureProjection(qspRes.triggerArchetype);
             }
         }
         this._lastRouteInfo = { routed: false, surface: 'legacy' };
@@ -735,12 +725,11 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
             return 0;
         }
         const finalCount = typeof count === 'string' ? parseInt(count, 10) : Number(count);
-        if (qspShadowEnabled()) {
-            try {
-                const req = buildCoverageRequest(this.context);
-                shadowRunCount(req, finalCount);
-            } catch {
-                /* shadow must never affect the served path */
+        if (qspReq && qspRes) {
+            const m = qspMode();
+            const shouldShadow = (m === 'shadow' && qspRes.surface === 'rm') || (m === 'route' && qspRes.status === 'SHADOW');
+            if (shouldShadow) {
+                try { shadowRunCount(qspReq, finalCount); } catch { /* shadow must never affect the served path */ }
             }
         }
         return finalCount;
@@ -1116,19 +1105,24 @@ AND c.deleted_at IS NULL`;
             );
         }
 
-        // QSP route mode: serve entity ids from rm_ when fully covered + READY.
-        // On any error fall through to the legacy body unchanged.
-        if (qspRouteEnabled() && !this.orQuery) {
-            const req = buildCoverageRequest(this.context);
-            const res = SurfacePlanner.instance.resolve(req);
-            if (res.surface === 'rm' && res.archetype && res.status === 'READY') {
+        // QSP: resolve coverage once (before pagination is neutralized below). Route only when
+        // READY; shadow-compare in SHADOW. On any route error fall through to the legacy body unchanged.
+        let qspReq: CoverageRequest | undefined;
+        let qspRes: PlanResolution | undefined;
+        if (qspActive() && !this.orQuery) {
+            qspReq = buildCoverageRequest(this.context);
+            qspRes = SurfacePlanner.instance.resolve(qspReq);
+            if (qspMode() === 'route' && qspRes.surface === 'rm' && qspRes.archetype && qspRes.status === 'READY') {
                 try {
-                    return await this.doExecRouted(res.archetype, req);
+                    return await this.doExecRouted(qspRes.archetype, qspReq);
                 } catch (err) {
                     recordFallback('exec_error');
-                    logger.warn({ scope: 'qsp.route.fallback', archetype: res.archetype, err }, 'QSP route exec fallback to legacy');
-                    // fall through to legacy below — legacy body runs UNCHANGED
+                    logger.warn({ scope: 'qsp.route.fallback', archetype: qspRes.archetype, err }, 'QSP route exec fallback to legacy');
+                    // fall through to legacy below; legacy body runs UNCHANGED
                 }
+            }
+            if (qspRes.triggerArchetype) {
+                void ProjectionManager.instance.ensureProjection(qspRes.triggerArchetype);
             }
         }
         this._lastRouteInfo = { routed: false, surface: 'legacy' };
@@ -1483,12 +1477,11 @@ AND c.deleted_at IS NULL`;
         // Convert to Entity objects
         const entityIds: string[] = entities.map((row: any) => row.id);
 
-        if (qspShadowEnabled()) {
-            try {
-                const req = buildCoverageRequest(this.context);
-                shadowRunExec(req, entityIds.slice());
-            } catch {
-                /* shadow must never affect the served path */
+        if (qspReq && qspRes) {
+            const m = qspMode();
+            const shouldShadow = (m === 'shadow' && qspRes.surface === 'rm') || (m === 'route' && qspRes.status === 'SHADOW');
+            if (shouldShadow) {
+                try { shadowRunExec(qspReq, entityIds.slice()); } catch { /* shadow must never affect the served path */ }
             }
         }
 

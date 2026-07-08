@@ -90,7 +90,7 @@ export async function run(archetypeName: string): Promise<void> {
             if (throttle > 0) await sleep(throttle);
         }
 
-        await mgr.setStatus(archetypeName, 'READY');
+        await mgr.setStatus(archetypeName, 'SHADOW');
         await db.unsafe(`UPDATE projection_state SET watermark = NULL WHERE archetype = $1`, [archetypeName]);
     } finally {
         await lock.release(taskId);

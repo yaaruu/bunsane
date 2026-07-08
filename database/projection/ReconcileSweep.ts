@@ -38,7 +38,7 @@ export async function reconcileArchetype(archetypeName: string, sampleSize = 200
         const mgr = ProjectionManager.instance;
         const descriptor = mgr.getDescriptor(archetypeName);
         const status = mgr.getStatus(archetypeName);
-        if (!descriptor || status !== 'READY') return 0;
+        if (!descriptor || (status !== 'READY' && status !== 'SHADOW')) return 0;
 
         const table = assertRmTableName(rmTableName(archetypeName));
         const sampleRows = await db.unsafe(

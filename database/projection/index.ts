@@ -7,3 +7,4 @@ export * from './DependencyMap';
 export * from './ProjectionManager';
 export { run as runBackfill } from './BackfillJob';
 export { reconcileArchetype, startReconcileSweep } from './ReconcileSweep';
+export * from './qspConfig';

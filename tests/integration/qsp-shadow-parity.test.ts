@@ -1,17 +1,16 @@
 // QSP Phase P3 — shadow-mode parity gate (real PostgreSQL).
 // Enables a projected archetype, backfills to READY, runs queries in shadow mode and
 // asserts the rm_ surface returns byte-identical ordered id-sets to the legacy compiler.
-// NOTE: env is set at top; Query.ts reads BUNSANE_QSP_MODE at call time so this works
+// NOTE: env is set at top; Query.ts reads BUNSANE_QSP at call time so this works
 // despite ES import hoisting.
-// Guard module-top env writes so BUNSANE_QSP_ENABLED does not leak into the shared
+// Guard module-top env writes so BUNSANE_QSP does not leak into the shared
 // bun-test process under PGlite (this describe is skipIf(isPGlite); on real PG the env
 // is set normally). Without the guard, a real App boot in another test file runs
 // InitializeProjections() under PGlite's single connection and wedges the whole run.
 if (process.env.USE_PGLITE !== 'true') {
-    process.env.BUNSANE_QSP_ENABLED = 'true';
     process.env.BUNSANE_QSP_ARCHETYPES = 'QspShadowArchetype';
     process.env.BUNSANE_QSP_BACKFILL_THROTTLE_MS = '0';
-    process.env.BUNSANE_QSP_MODE = 'shadow';
+    process.env.BUNSANE_QSP = 'shadow';
 }
 
 import 'reflect-metadata';
@@ -66,9 +65,8 @@ if (!isPGlite) {
 
         beforeAll(async () => {
             await ensureComponentsRegistered(QspShadowOrder, QspShadowCustomer);
-            process.env.BUNSANE_QSP_ENABLED = 'true';
             process.env.BUNSANE_QSP_ARCHETYPES = archetypeName;
-            process.env.BUNSANE_QSP_MODE = 'shadow';
+            process.env.BUNSANE_QSP = 'shadow';
 
             await db.unsafe(`DROP TABLE IF EXISTS ${tableName}`);
             await db`CREATE TABLE IF NOT EXISTS projection_state (
@@ -95,7 +93,7 @@ if (!isPGlite) {
 
             // Backfill reconstructs rm_ from components → READY.
             await runBackfill(archetypeName);
-            expect(ProjectionManager.instance.getStatus(archetypeName)).toBe('READY');
+            expect(ProjectionManager.instance.getStatus(archetypeName)).toBe('SHADOW');
 
             // Phase B: live dual-write path (status READY) — exercises upsert + timestamp parity.
             const N_B = 300;

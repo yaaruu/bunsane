@@ -2,72 +2,77 @@
 
 ## What QSP is
 
-QSP is a transparent read-path accelerator. For an opted-in **archetype** it maintains a
+QSP is a transparent read-path accelerator. For an eligible **archetype** it maintains a
 columnar read-model table `rm_<archetype>` (one row per entity, projected component fields
 as real typed columns) with a covering index, kept in sync by a synchronous dual-write on
 `entity.save()`. When a list query is **fully covered** by that archetype (same component
 set, supported filters/sort/keyset) and the projection is **READY**, the planner serves it
 from `rm_<archetype>` with a single index scan — bypassing the legacy INTERSECT / correlated
-`EXISTS` / scalar-subquery query DAG. Anything not covered, not READY, or not opted-in is
+`EXISTS` / scalar-subquery query DAG. Anything not covered, not READY, or not eligible is
 served by the **unchanged** legacy compiler. Every routed query has a transparent
 try/catch fallback to legacy, so QSP can never return wrong results or hard-fail a read.
 
-**Everything is behind flags that default OFF. With them unset, framework behavior is
-byte-for-byte identical to before.**
+**One knob, autopilot.** There is a single switch `BUNSANE_QSP`. Off = byte-for-byte identical
+to before (no `projection_state` table, no hooks). `shadow`/`route` turn on the autopilot: the
+**first covered list-query** for an eligible archetype lazily creates its read model and drives
+it through the lifecycle automatically — no archetype list, no manual backfill, no manual mode
+flips required.
 
 ## Environment flags
 
 | Variable | Default | Effect |
 |---|---|---|
-| `BUNSANE_QSP_ENABLED` | `false` | Master switch. Enables projection **write-path** maintenance + table creation on boot. |
-| `BUNSANE_QSP_ARCHETYPES` | (empty) | CSV of archetype names to project. Empty = nothing projected. |
-| `BUNSANE_QSP_MODE` | `off` | Read routing: `off` (100% legacy) \| `shadow` (serve legacy, run rm_ in parallel, compare) \| `route` (serve rm_). Read at query time — can be flipped without redeploy. |
+| `BUNSANE_QSP` | `off` | The single master knob. `off` = 100% legacy, zero footprint. `shadow` = auto-project lazily + verify parity, **never serve `rm_`** (permanent ops canary). `route` = auto-project + auto-shadow + **auto-promote to serving**. Read at query time — flip without redeploy. |
+| `BUNSANE_QSP_ARCHETYPES` | (empty) | Optional CSV scope limiter. Empty/unset = **ALL** archetypes eligible. Set it to bound the blast radius to specific archetypes. |
 | `BUNSANE_QSP_COUNT` | `exact` | `count()` strategy on rm_: `exact` (`count(*)`) \| `n_plus_1` (page-boundary only) \| `estimate` (planner row estimate). |
+| `BUNSANE_QSP_PROMOTE_MIN` | `50` | Clean shadow comparisons an archetype must accumulate (with zero divergences, in `route` mode) before SHADOW auto-promotes to READY. |
 | `BUNSANE_QSP_BACKFILL_BATCH` | `5000` | Backfill rows per batch. |
 | `BUNSANE_QSP_BACKFILL_THROTTLE_MS` | `50` | Sleep between backfill batches. Raise to reduce write-path pressure during a live backfill. |
 | `BUNSANE_QSP_ENTITIES_ACCEL` | `false` | R1 generic `entities` accelerator (P5, independent of the rm_ path). |
 
-Flags are validated on boot by `core/validateEnv.ts`. Rollout is **per-archetype** via the
-CSV plus the per-archetype `projection_state.status`.
+Flags are validated on boot by `core/validateEnv.ts`. (`BUNSANE_QSP` replaces the removed
+`BUNSANE_QSP_ENABLED` + `BUNSANE_QSP_MODE` pair.)
 
-## Safe enablement sequence (per archetype)
+## The automatic lifecycle (per archetype)
 
-Never skip a step. The order is designed so a live workload is never clobbered and a bad
-projection is caught in shadow before it can serve a byte to a user.
+`projection_state.status`:  `NONE (no row) → BACKFILLING → SHADOW → READY`.
 
-**(a) Turn on dual-write.** Set `BUNSANE_QSP_ENABLED=true` and add the archetype to
-`BUNSANE_QSP_ARCHETYPES`; deploy/restart. On boot `ProjectionManager.initialize()` creates
-`rm_<archetype>` + its covering index with `projection_state.status = DISABLED`. Reads stay
-100% legacy (`MODE` still `off`). No user-visible change.
+**(1) Trigger (lazy).** The first covered list-query for an eligible archetype with no
+`projection_state` row (and `BUNSANE_QSP` ≠ `off`) fires `ensureProjection(archetype)` fire-and-forget
+while serving that request from legacy. It is idempotent — `INSERT ... 'BACKFILLING' ON CONFLICT
+(archetype) DO NOTHING`, so across concurrent queries and instances only one winner proceeds. The
+winner creates `rm_<archetype>` + its covering index, registers the archetype in the in-memory
+dependency map with status BACKFILLING (**dual-write goes live *before* the backfill scan**), then
+kicks the advisory-leased backfill.
 
-**(b) Backfill to READY.** Run the backfill for the archetype (`runBackfill(archetype)` /
-the scheduled backfill task). It flips status **DISABLED → BACKFILLING** first — which
-**activates live dual-write** (live writes `INSERT ... DO UPDATE`, so they always win) — then
-scans historical entities in batches with `ON CONFLICT DO NOTHING` (so the backfill can never
-clobber a newer live write), and finally flips **BACKFILLING → READY**. It is advisory-leased
-(only one instance runs it), resumable via `projection_state.watermark`, and idempotent — safe
-to re-run. Watch backfill progress via the watermark / `qsp_backfill_progress`.
+**(2) Backfill → SHADOW.** The backfill scans historical entities in keyset batches with
+`ON CONFLICT DO NOTHING` (never clobbers a newer live dual-write), then sets status to **SHADOW**
+(not READY). It is advisory-leased (one instance), resumable via `projection_state.watermark`, and
+idempotent.
 
-**(c) Shadow SOAK — the production gate.** Set `BUNSANE_QSP_MODE=shadow`. Every
-covered+READY query now runs BOTH surfaces: it **serves legacy** and runs `rm_` in parallel,
-asserting identical ordered `entity_id[]`, `count()`, and `hasNextPage`. Soak over a **real,
-representative workload** until **`qsp_shadow_divergence_total` stays 0**.
-**Do NOT flip to `route` until shadow divergence has held at 0 across a meaningful soak.**
-Any non-zero divergence means a projection bug shipped — stay in shadow, investigate, fix,
-re-soak. This step is where projection bugs die instead of reaching users.
+**(3) SHADOW → READY (auto-promote).** In SHADOW, every covered query still **serves legacy** and
+shadow-compares `rm_` vs legacy (id-set + order + count). Once clean comparisons reach
+`BUNSANE_QSP_PROMOTE_MIN` (default 50) with **zero divergences** and `BUNSANE_QSP=route`, the
+projection auto-promotes to **READY**. In `BUNSANE_QSP=shadow` it **never** promotes — it stays a
+permanent parity canary. Any divergence blocks promotion, logs `qsp.shadow`, triggers a
+`ReconcileSweep` for that archetype, and resets the counters so it must re-prove from scratch.
 
-**(d) Route.** Set `BUNSANE_QSP_MODE=route`. Covered + READY + opted-in queries are now
-served from `rm_<archetype>`. Uncovered queries and any runtime error fall through to legacy
-transparently (tracked as `qsp_fallback_total`). Mode is read per query, so this takes
-effect without a redeploy; start on a canary if desired.
+**(4) READY (routing).** Covered + READY queries are served from `rm_<archetype>` with a single
+covering-index scan. Uncovered queries and any runtime error fall through to legacy transparently
+(`qsp_fallback_total`).
 
-**(e) Rollback — instant.** Either set `projection_state.status = DISABLED`
-(`ProjectionManager.setStatus(archetype, 'DISABLED')`) **or** remove the archetype from
-`BUNSANE_QSP_ARCHETYPES`. `setStatus` invalidates the planner cache immediately in-process;
-cluster-wide it takes effect within the 30s `PlannerCache` TTL backstop. Routing stops at
-once and reads return to legacy — correct, just slower. The `rm_` table is left in place, so
-re-enabling later needs no re-backfill (run a reconcile first if writes continued while
-disabled — see below).
+**(5) Rollback — instant.** Set `BUNSANE_QSP=off`: `qspActive()` goes false, the planner is not
+consulted, and all reads return to legacy — correct, just slower. The `rm_` tables remain (they are
+disposable / re-usable). Because mode is read per query, this takes effect without a redeploy.
+(Per-archetype force-disable via `projection_state.status` remains available for surgical rollback;
+run a reconcile first if writes continued while disabled — see below.)
+
+**Multi-instance.** `projection_state` is the shared source of truth. Each instance polls it every
+~30s to sync its status cache + dependency map, so an archetype triggered on instance A is picked up
+by instance B (which then dual-writes and eventually routes). Gap-window writes B misses before it
+syncs are covered by the one-time backfill or surface as SHADOW divergence → reconcile → then
+promote. Safe-by-construction: slow, never wrong (READY-gate + full-coverage-only + transparent
+fallback all hold).
 
 ## Metrics to watch
 
@@ -88,10 +93,11 @@ If your access log is enabled, each request also carries the served surface
   (`DO NOTHING`). Two instances will not double-run it. Tune throughput with
   `BUNSANE_QSP_BACKFILL_BATCH` / `BUNSANE_QSP_BACKFILL_THROTTLE_MS`.
 - **Reconcile sweep** (`startReconcileSweep(intervalMs = 300_000)`) is the safety net for
-  drift: it periodically samples READY `rm_` rows, recomputes them from `components`, repairs
+  drift: it periodically samples `rm_` rows, recomputes them from `components`, repairs
   any mismatch (`DO UPDATE`), and increments `qsp_drift_total`. Run it in production so
-  out-of-band component writes or missed fanouts self-heal. It only acts on READY archetypes
-  and is advisory-leased (single instance).
+  out-of-band component writes or missed fanouts self-heal. It acts on READY **and SHADOW**
+  archetypes (so a SHADOW divergence is repaired before it can block auto-promotion) and is
+  advisory-leased (single instance).
 - **Planner cache** has a 30s TTL. `ProjectionManager.setStatus()` invalidates it immediately
   in-process (BACKFILLING→READY and rollback→DISABLED apply at once locally); across processes
   the 30s TTL is the backstop (a Redis pub/sub invalidation seam is documented in

@@ -1,9 +1,9 @@
-// Guard module-top env writes so BUNSANE_QSP_ENABLED does not leak into the shared
+// Guard module-top env writes so BUNSANE_QSP does not leak into the shared
 // bun-test process under PGlite (this describe is skipIf(isPGlite); on real PG the env
 // is set normally). Without the guard, a real App boot in another test file runs
 // InitializeProjections() under PGlite's single connection and wedges the whole run.
 if (process.env.USE_PGLITE !== 'true') {
-    process.env.BUNSANE_QSP_ENABLED = 'true';
+    process.env.BUNSANE_QSP = 'route';
     process.env.BUNSANE_QSP_ARCHETYPES = 'QspTestArchetype';
     process.env.BUNSANE_QSP_BACKFILL_THROTTLE_MS = '0';
 }
@@ -40,7 +40,7 @@ if (!isPGlite) {
 
         beforeAll(async () => {
             await ensureComponentsRegistered(QspOrder);
-            process.env.BUNSANE_QSP_ENABLED = 'true';
+            process.env.BUNSANE_QSP = 'route';
             process.env.BUNSANE_QSP_ARCHETYPES = archetypeName;
             process.env.BUNSANE_QSP_BACKFILL_THROTTLE_MS = '0';
             await db.unsafe(`DROP TABLE IF EXISTS ${tableName}`);
@@ -124,7 +124,7 @@ if (!isPGlite) {
 
             // Backfill reconstructs the projection from the JSONB component rows.
             await runBackfill(archetypeName);
-            expect(ProjectionManager.instance.getStatus(archetypeName)).toBe('READY');
+            expect(ProjectionManager.instance.getStatus(archetypeName)).toBe('SHADOW');
 
             const after = await db.unsafe(
                 `SELECT entity_id, qsp_order_status, qsp_order_total, deleted_at

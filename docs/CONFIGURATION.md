@@ -102,15 +102,15 @@ See [Liveness & the write probe](#liveness--the-write-probe).
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `BUNSANE_QSP_ENABLED` | `false` | master switch for QSP write-path maintenance (P2+) |
-| `BUNSANE_QSP_ARCHETYPES` | (empty) | CSV of archetype names to project (empty = none) |
-| `BUNSANE_QSP_MODE` | `off` | read routing: off \| shadow \| route |
+| `BUNSANE_QSP` | `off` | single master knob: `off` (zero footprint, byte-identical to pre-QSP) \| `shadow` (auto-project lazily + verify parity, never serve rm_) \| `route` (auto-project + auto-shadow + auto-promote to serving). Read at query time — flip without redeploy. |
+| `BUNSANE_QSP_ARCHETYPES` | (empty) | optional CSV scope limiter of archetype names eligible for projection. **Empty/unset = ALL archetypes eligible.** |
 | `BUNSANE_QSP_COUNT` | `exact` | count strategy: exact \| n_plus_1 \| estimate |
+| `BUNSANE_QSP_PROMOTE_MIN` | `50` | clean shadow comparisons required before a SHADOW projection auto-promotes to READY (route mode only) |
 | `BUNSANE_QSP_BACKFILL_BATCH` | `5000` | backfill batch size |
 | `BUNSANE_QSP_BACKFILL_THROTTLE_MS` | `50` | inter-batch sleep (ms) |
 | `BUNSANE_QSP_ENTITIES_ACCEL` | `false` | enable the R1 generic entities accelerator (P5) |
 
-All QSP flags default off/safe; with them unset, framework behavior is unchanged. P1 only registers these vars and creates the projection_state table; no routing or write-path change is active yet.
+`BUNSANE_QSP` defaults to `off`; with it unset, framework behavior is byte-for-byte identical to pre-QSP (no `projection_state` table, no hooks). Setting it to `shadow`/`route` turns on the **autopilot**: the first covered list-query for an eligible archetype lazily creates its read model and drives it through the `NONE → BACKFILLING → SHADOW → READY` lifecycle automatically (see `docs/QSP_OPERATIONS.md`). Replaces the removed `BUNSANE_QSP_ENABLED` + `BUNSANE_QSP_MODE` pair.
 
 ## Cache
 

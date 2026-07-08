@@ -3,6 +3,7 @@ import { logger } from "../../core/Logger";
 import { SurfacePlanner } from "./SurfacePlanner";
 import { buildRmQuery, buildRmCountQuery } from "./RmPlanGenerator";
 import { recordShadowCompared, recordShadowDivergence } from "./metrics";
+import { ProjectionManager } from "../../database/projection/ProjectionManager";
 import type { CoverageRequest } from "./CoverageRequest";
 
 const inflight = new Set<Promise<void>>();
@@ -27,6 +28,7 @@ export function shadowRunExec(req: CoverageRequest, legacyIds: string[]): void {
                 const sample = { legacy: legacyIds.slice(0, 3), rm: rmIds.slice(0, 3) };
                 recordShadowDivergence({ archetype, kind: 'exec', detail: { legacyLen: legacyIds.length, rmLen: rmIds.length, firstDiffIndex, sample } });
                 logger.warn({ scope: 'qsp.shadow', archetype, divergence: { legacyLen: legacyIds.length, rmLen: rmIds.length, firstDiffIndex, sample } }, 'QSP shadow exec divergence');
+                await ProjectionManager.instance.recordShadowSample(archetype, true);
                 return;
             }
             let firstDiffIndex = -1;
@@ -40,6 +42,9 @@ export function shadowRunExec(req: CoverageRequest, legacyIds: string[]): void {
                 const sample = { legacy: legacyIds.slice(0, 3), rm: rmIds.slice(0, 3) };
                 recordShadowDivergence({ archetype, kind: 'exec', detail: { legacyLen: legacyIds.length, rmLen: rmIds.length, firstDiffIndex, sample } });
                 logger.warn({ scope: 'qsp.shadow', archetype, divergence: { legacyLen: legacyIds.length, rmLen: rmIds.length, firstDiffIndex, sample } }, 'QSP shadow exec divergence');
+                await ProjectionManager.instance.recordShadowSample(archetype, true);
+            } else {
+                await ProjectionManager.instance.recordShadowSample(archetype, false);
             }
         } catch (err) {
             logger.warn({ scope: 'qsp.shadow', archetype, err }, 'QSP shadow exec error (swallowed)');
@@ -60,10 +65,12 @@ export function shadowRunCount(req: CoverageRequest, legacyCount: number): void 
             const rows: any[] = await db.unsafe(sql, params);
             const rmCount = Number(rows[0]?.count ?? 0);
             recordShadowCompared();
-            if (legacyCount !== rmCount) {
+            const diverged = legacyCount !== rmCount;
+            if (diverged) {
                 recordShadowDivergence({ archetype, kind: 'count', detail: { legacyCount, rmCount } });
                 logger.warn({ scope: 'qsp.shadow', archetype, divergence: { legacyCount, rmCount } }, 'QSP shadow count divergence');
             }
+            await ProjectionManager.instance.recordShadowSample(archetype, diverged);
         } catch (err) {
             logger.warn({ scope: 'qsp.shadow', archetype, err }, 'QSP shadow count error (swallowed)');
         }

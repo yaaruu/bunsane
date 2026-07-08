@@ -1,16 +1,15 @@
 // QSP Phase P4 — route-mode parity gate (real PostgreSQL).
 // Serves rm_ for READY covered archetypes; compares SERVED-routed vs SERVED-legacy
-// by flipping BUNSANE_QSP_MODE at call time (Query.ts reads env inside the function).
+// by flipping BUNSANE_QSP at call time (Query.ts reads env inside the function).
 // NOTE: env is set at top; despite ES import hoisting, mode is re-read per call.
-// Guard module-top env writes so BUNSANE_QSP_ENABLED does not leak into the shared
+// Guard module-top env writes so BUNSANE_QSP does not leak into the shared
 // bun-test process under PGlite (this describe is skipIf(isPGlite); on real PG the env
 // is set normally). Without the guard, a real App boot in another test file runs
 // InitializeProjections() under PGlite's single connection and wedges the whole run.
 if (process.env.USE_PGLITE !== 'true') {
-    process.env.BUNSANE_QSP_ENABLED = 'true';
     process.env.BUNSANE_QSP_ARCHETYPES = 'QspRouteArchetype';
     process.env.BUNSANE_QSP_BACKFILL_THROTTLE_MS = '0';
-    process.env.BUNSANE_QSP_MODE = 'route';
+    process.env.BUNSANE_QSP = 'route';
     process.env.BUNSANE_QSP_COUNT = 'exact';
 }
 
@@ -74,9 +73,8 @@ if (!isPGlite) {
 
         beforeAll(async () => {
             await ensureComponentsRegistered(QspRouteOrder, QspRouteCustomer, QspRouteOther);
-            process.env.BUNSANE_QSP_ENABLED = 'true';
             process.env.BUNSANE_QSP_ARCHETYPES = archetypeName;
-            process.env.BUNSANE_QSP_MODE = 'route';
+            process.env.BUNSANE_QSP = 'route';
             process.env.BUNSANE_QSP_COUNT = 'exact';
 
             await db.unsafe(`DROP TABLE IF EXISTS ${tableName}`);
@@ -104,6 +102,8 @@ if (!isPGlite) {
 
             // Backfill reconstructs rm_ from components → READY.
             await runBackfill(archetypeName);
+            expect(ProjectionManager.instance.getStatus(archetypeName)).toBe('SHADOW');
+            await ProjectionManager.instance.setStatus(archetypeName, 'READY');
             expect(ProjectionManager.instance.getStatus(archetypeName)).toBe('READY');
 
             // Phase B: live dual-write path (status READY) — exercises upsert + timestamp parity.
@@ -152,9 +152,9 @@ if (!isPGlite) {
          * Asserts rm_ actually served (getLastRouteInfo().routed) and id-sets match.
          */
         async function routedParity(makeQuery: () => Query<any>) {
-            process.env.BUNSANE_QSP_MODE = 'off';
+            process.env.BUNSANE_QSP = 'off';
             const legacyIds = (await makeQuery().exec()).map(e => e.id);
-            process.env.BUNSANE_QSP_MODE = 'route';
+            process.env.BUNSANE_QSP = 'route';
             const q = makeQuery();
             const routedIds = (await q.exec()).map(e => e.id);
             expect(q.getLastRouteInfo().routed).toBe(true);
@@ -204,9 +204,9 @@ if (!isPGlite) {
 
                     // Subset: exact count parity (mode off → route).
                     if (countChecked < 50) {
-                        process.env.BUNSANE_QSP_MODE = 'off';
+                        process.env.BUNSANE_QSP = 'off';
                         const legacyCount = await makeQuery().count();
-                        process.env.BUNSANE_QSP_MODE = 'route';
+                        process.env.BUNSANE_QSP = 'route';
                         const routedCount = await makeQuery().count();
                         expect(routedCount).toBe(legacyCount);
                         countChecked++;
@@ -224,7 +224,7 @@ if (!isPGlite) {
         }, 300_000);
 
         test('rm_ actually used: getLastRouteInfo + EXPLAIN index scan', async () => {
-            process.env.BUNSANE_QSP_MODE = 'route';
+            process.env.BUNSANE_QSP = 'route';
             const makeQuery = () => new Query()
                 .with(QspRouteOrder, Query.filters(
                     Query.filter('status', '=', 'open'),
@@ -257,7 +257,7 @@ if (!isPGlite) {
         });
 
         test('read-after-write: dual-write visible on routed surface (I2)', async () => {
-            process.env.BUNSANE_QSP_MODE = 'route';
+            process.env.BUNSANE_QSP = 'route';
             const uniqueStatus = `raw_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
 
             const e = Entity.Create();
@@ -276,7 +276,7 @@ if (!isPGlite) {
         });
 
         test('keyset / hasNextPage boundary + keyset page continuity', async () => {
-            process.env.BUNSANE_QSP_MODE = 'route';
+            process.env.BUNSANE_QSP = 'route';
             const M = BOUNDARY_COUNT;
             expect(M).toBeGreaterThan(1);
 
@@ -304,7 +304,7 @@ if (!isPGlite) {
 
             // Keyset page: page1 under route, cursor, page2 under route — no overlap, matches legacy.
             const k = 5;
-            process.env.BUNSANE_QSP_MODE = 'route';
+            process.env.BUNSANE_QSP = 'route';
             const page1 = await new Query()
                 .with(QspRouteOrder, Query.filters(Query.filter('status', '=', BOUNDARY_STATUS)))
                 .with(QspRouteCustomer)
@@ -332,7 +332,7 @@ if (!isPGlite) {
             }
 
             // Legacy baseline for the same pages
-            process.env.BUNSANE_QSP_MODE = 'off';
+            process.env.BUNSANE_QSP = 'off';
             const leg1 = (await new Query()
                 .with(QspRouteOrder, Query.filters(Query.filter('status', '=', BOUNDARY_STATUS)))
                 .with(QspRouteCustomer)
@@ -354,7 +354,7 @@ if (!isPGlite) {
         });
 
         test('instant rollback: DISABLED stops routing immediately', async () => {
-            process.env.BUNSANE_QSP_MODE = 'route';
+            process.env.BUNSANE_QSP = 'route';
             const makeQuery = () => new Query()
                 .with(QspRouteOrder, Query.filters(Query.filter('status', '=', 'open')))
                 .with(QspRouteCustomer)
@@ -366,13 +366,13 @@ if (!isPGlite) {
             const routedIds = (await q1.exec()).map(e => e.id);
             expect(q1.getLastRouteInfo().routed).toBe(true);
 
-            process.env.BUNSANE_QSP_MODE = 'off';
+            process.env.BUNSANE_QSP = 'off';
             const legacyIds = (await makeQuery().exec()).map(e => e.id);
             expect(routedIds).toEqual(legacyIds);
 
             // Rollback projection → PlannerCache invalidated via setStatus seam
             await ProjectionManager.instance.setStatus(archetypeName, 'DISABLED');
-            process.env.BUNSANE_QSP_MODE = 'route';
+            process.env.BUNSANE_QSP = 'route';
             const q2 = makeQuery();
             const afterIds = (await q2.exec()).map(e => e.id);
             expect(q2.getLastRouteInfo().routed).toBe(false);
@@ -387,7 +387,7 @@ if (!isPGlite) {
         });
 
         test('transparent fallback (5a): uncovered query serves legacy, no throw', async () => {
-            process.env.BUNSANE_QSP_MODE = 'off';
+            process.env.BUNSANE_QSP = 'off';
             const makeQuery = () => new Query()
                 .with(QspRouteOrder, Query.filters(Query.filter('status', '=', 'closed')))
                 .with(QspRouteCustomer)
@@ -395,7 +395,7 @@ if (!isPGlite) {
                 .take(20);
             const legacyIds = (await makeQuery().exec()).map(e => e.id);
 
-            process.env.BUNSANE_QSP_MODE = 'route';
+            process.env.BUNSANE_QSP = 'route';
             const q = makeQuery();
             const ids = (await q.exec()).map(e => e.id);
             expect(q.getLastRouteInfo().routed).toBe(false);
@@ -406,7 +406,7 @@ if (!isPGlite) {
         });
 
         test('transparent fallback (5b): forced rm_ error serves legacy, no throw', async () => {
-            process.env.BUNSANE_QSP_MODE = 'off';
+            process.env.BUNSANE_QSP = 'off';
             const makeQuery = () => new Query()
                 .with(QspRouteOrder, Query.filters(Query.filter('status', '=', 'open')))
                 .with(QspRouteCustomer)
@@ -415,7 +415,7 @@ if (!isPGlite) {
             const legacyIds = (await makeQuery().exec()).map(e => e.id);
 
             // Prove it would route before destroying the table
-            process.env.BUNSANE_QSP_MODE = 'route';
+            process.env.BUNSANE_QSP = 'route';
             const qOk = makeQuery();
             await qOk.exec();
             expect(qOk.getLastRouteInfo().routed).toBe(true);

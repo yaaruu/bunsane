@@ -16,18 +16,17 @@
 //      knob) is NOT covered by the planner, so it stays on legacy and its plan
 //      still contains INTERSECT + SubPlan — routing never touched it.
 //
-// NOTE: env is set at top; Query.ts reads BUNSANE_QSP_MODE at call time so this
+// NOTE: env is set at top; Query.ts reads BUNSANE_QSP at call time so this
 // works despite ES import hoisting. explainAnalyze() ALWAYS compiles the legacy
 // DAG regardless of QSP mode, so it is the ground-truth for the legacy plan.
-// Guard module-top env writes so BUNSANE_QSP_ENABLED does not leak into the shared
+// Guard module-top env writes so BUNSANE_QSP does not leak into the shared
 // bun-test process under PGlite (this describe is skipIf(isPGlite); on real PG the env
 // is set normally). Without the guard, a real App boot in another test file runs
 // InitializeProjections() under PGlite's single connection and wedges the whole run.
 if (process.env.USE_PGLITE !== 'true') {
-    process.env.BUNSANE_QSP_ENABLED = 'true';
     process.env.BUNSANE_QSP_ARCHETYPES = 'QspDemotionArchetype';
     process.env.BUNSANE_QSP_BACKFILL_THROTTLE_MS = '0';
-    process.env.BUNSANE_QSP_MODE = 'route';
+    process.env.BUNSANE_QSP = 'route';
     process.env.BUNSANE_QSP_COUNT = 'exact';
 }
 
@@ -76,9 +75,8 @@ if (!isPGlite) {
 
         beforeAll(async () => {
             await ensureComponentsRegistered(QspDemoOrder, QspDemoCustomer);
-            process.env.BUNSANE_QSP_ENABLED = 'true';
             process.env.BUNSANE_QSP_ARCHETYPES = archetypeName;
-            process.env.BUNSANE_QSP_MODE = 'route';
+            process.env.BUNSANE_QSP = 'route';
             process.env.BUNSANE_QSP_COUNT = 'exact';
 
             await db.unsafe(`DROP TABLE IF EXISTS ${tableName}`);
@@ -106,6 +104,8 @@ if (!isPGlite) {
 
             // Backfill reconstructs rm_ from components → READY.
             await runBackfill(archetypeName);
+            expect(ProjectionManager.instance.getStatus(archetypeName)).toBe('SHADOW');
+            await ProjectionManager.instance.setStatus(archetypeName, 'READY');
             expect(ProjectionManager.instance.getStatus(archetypeName)).toBe('READY');
 
             // A few live dual-writes so rm_ exercises the upsert path too.
@@ -134,7 +134,7 @@ if (!isPGlite) {
         const reqOf = (q: Query<any>) => buildCoverageRequest((q as any).context);
 
         test('worst-case covered query: routed served plan has NO legacy cost centers; legacy DOES', async () => {
-            process.env.BUNSANE_QSP_MODE = 'route';
+            process.env.BUNSANE_QSP = 'route';
 
             const k = 10;
             const baseWorstCase = () => new Query()
@@ -205,7 +205,7 @@ if (!isPGlite) {
         }, 120_000);
 
         test('true INTERSECT worst-case (id-cursor + sort) stays on legacy — routing never touched it', async () => {
-            process.env.BUNSANE_QSP_MODE = 'route';
+            process.env.BUNSANE_QSP = 'route';
 
             // id-cursor + a component sort is intentionally NOT covered by the planner
             // (SurfacePlanner requires an id cursor to have zero sorts). This is the

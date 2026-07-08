@@ -3,7 +3,7 @@ import { logger as MainLogger } from "../core/Logger";
 import { getMetadataStorage } from "../core/metadata";
 import { ensureMultipleJSONBPathIndexes } from "./IndexingStrategy";
 import { getMembershipTable } from "../query/membershipSource";
-import { ProjectionManager } from "./projection";
+import { ProjectionManager, qspActive } from "./projection";
 const logger = MainLogger.child({ scope: "DatabaseHelper" });
 
 const BUNSANE_RELATION_TYPED_COLUMN = process.env.BUNSANE_RELATION_TYPED_COLUMN === 'true' || false;
@@ -84,11 +84,13 @@ export const PrepareDatabase = async () => {
         logger.error(`Failed to migrate timestamp columns to timestamptz: ${error}`);
         throw error;
     }
-    try {
-        await CreateProjectionStateTable();
-    } catch (error) {
-        logger.error(`Failed to create projection_state table: ${error}`);
-        throw error;
+    if (qspActive()) {
+        try {
+            await CreateProjectionStateTable();
+        } catch (error) {
+            logger.error(`Failed to create projection_state table: ${error}`);
+            throw error;
+        }
     }
 }
 
@@ -140,7 +142,7 @@ export const GetDatabaseDataSize = async () => {
 export const SetupDatabaseExtensions = async () => {
 }
 export const InitializeProjections = async () => {
-    if (process.env.BUNSANE_QSP_ENABLED !== 'true') return;
+    if (!qspActive()) return;
     try {
         await CreateProjectionStateTable();
         await ProjectionManager.instance.initialize();
