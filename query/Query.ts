@@ -4,7 +4,7 @@ import { logger } from "../core/Logger";
 import db, { QUERY_TIMEOUT_MS } from "../database";
 import { timed } from "../core/Decorators";
 import { inList } from "../database/sqlHelpers";
-import { QueryContext, QueryDAG, SourceNode, ComponentInclusionNode } from "./index";
+import { QueryContext, QueryDAG, ComponentInclusionNode } from "./index";
 import { OrQuery } from "./OrQuery";
 import { OrNode } from "./OrNode";
 import { preparedStatementCache } from "../database/PreparedStatementCache";
@@ -16,6 +16,23 @@ import type { ComponentConstructor, TypedEntity, ComponentRecord } from "../type
 import { assertComponentTableName, assertFieldPath, assertIdentifier } from "./SqlIdentifier";
 import { getMembershipSource } from "./membershipSource";
 import { isNumericProperty } from "./ComponentInclusionNode";
+import { buildCoverageRequest } from "./planner/CoverageSet";
+import { shadowRunExec, shadowRunCount } from "./planner/ShadowRunner";
+import {
+    buildRmQuery,
+    buildRmCountQuery,
+    buildRmEstimateQuery,
+    SurfacePlanner,
+    recordRoute,
+    recordFallback,
+    type PlanResolution,
+} from "./planner";
+import type { CoverageRequest } from "./planner/CoverageRequest";
+import { resolveHydrationPlan, EMPTY_HYDRATION_PLAN, type RmHydrationPlan } from "./planner/RmHydrationPlan";
+import { hydrateEntityFromRow } from "./planner/RmRowHydrator";
+import { PlannerCache } from "./planner/PlannerCache";
+import { qspMode, qspCountStrategy, qspActive, qspHydrate } from "../database/projection/qspConfig";
+import { ProjectionManager } from "../database/projection/ProjectionManager";
 
 // Parsed once at module load instead of on every exec() (process.env read +
 // parseInt was on the query hot path). 0 disables the default limit.
@@ -24,6 +41,23 @@ let warnedDefaultLimit = false;
 
 // Gated once — dev keeps param diagnostics, production skips the loop entirely.
 const DEBUG_PARAMS = process.env.NODE_ENV !== 'production';
+
+// QSP gates read env at call time via qspConfig.
+/** Extract Plan Rows from EXPLAIN (FORMAT JSON) result (object or string). */
+function extractExplainPlanRows(plan: any[]): number {
+    try {
+        let qp: any = plan?.[0]?.['QUERY PLAN'];
+        if (typeof qp === 'string') {
+            qp = JSON.parse(qp);
+        }
+        const root = Array.isArray(qp) ? qp[0] : qp;
+        const planRows = root?.Plan?.['Plan Rows'] ?? root?.['Plan Rows'] ?? 0;
+        const n = Number(planRows);
+        return Number.isFinite(n) ? n : 0;
+    } catch {
+        return 0;
+    }
+}
 
 // Shared across all TypedEntity instances — avoids one closure allocation per row.
 // Must be called as a method (entity.getTyped(Ctor)) so `this` resolves correctly.
@@ -144,6 +178,13 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
     private skipComponentCache: boolean = false;
     private execSignal?: AbortSignal;
     private execPerRequest?: PerRequestCounters;
+    /** Last QSP route decision for this Query instance (additive; not GraphQL-exposed). */
+    private _lastRouteInfo: {
+        routed: boolean;
+        surface: 'rm' | 'legacy';
+        archetype?: string;
+        hasNextPage?: boolean;
+    } = { routed: false, surface: 'legacy' };
 
     /** Component constructors added to this query for type-safe access */
     private _componentCtors: ComponentConstructor[] = [];
@@ -151,6 +192,19 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
     constructor(trx?: SQL) {
         this.trx = trx;
         this.context = new QueryContext(trx);
+    }
+
+    /**
+     * Additive QSP diagnostic: whether the last exec/count served via rm_ (route mode)
+     * and optional hasNextPage from N+1 fetch. Not part of GraphQL schema.
+     */
+    public getLastRouteInfo(): {
+        routed: boolean;
+        surface: 'rm' | 'legacy';
+        archetype?: string;
+        hasNextPage?: boolean;
+    } {
+        return this._lastRouteInfo;
     }
 
     /**
@@ -578,6 +632,27 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
     }
 
     private async doCountInner(): Promise<number> {
+        // QSP: resolve coverage once. Route only when READY; shadow-compare in SHADOW.
+        let qspReq: CoverageRequest | undefined;
+        let qspRes: PlanResolution | undefined;
+        if (qspActive() && !this.orQuery) {
+            qspReq = buildCoverageRequest(this.context);
+            qspRes = SurfacePlanner.instance.resolve(qspReq);
+            if (qspMode() === 'route' && qspRes.surface === 'rm' && qspRes.archetype && qspRes.status === 'READY') {
+                try {
+                    return await this.doCountRouted(qspRes.archetype, qspReq);
+                } catch (err) {
+                    recordFallback('count_error');
+                    logger.warn({ scope: 'qsp.route.fallback', archetype: qspRes.archetype, err }, 'QSP route count fallback to legacy');
+                    // fall through to legacy below
+                }
+            }
+            if (qspRes.triggerArchetype) {
+                void ProjectionManager.instance.ensureProjection(qspRes.triggerArchetype);
+            }
+        }
+        this._lastRouteInfo = { routed: false, surface: 'legacy' };
+
         // Build the DAG
         const dag = new QueryDAG();
 
@@ -652,7 +727,15 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         if (count === undefined || count === null) {
             return 0;
         }
-        return typeof count === 'string' ? parseInt(count, 10) : Number(count);
+        const finalCount = typeof count === 'string' ? parseInt(count, 10) : Number(count);
+        if (qspReq && qspRes) {
+            const m = qspMode();
+            const shouldShadow = (m === 'shadow' && qspRes.surface === 'rm') || (m === 'route' && qspRes.status === 'SHADOW');
+            if (shouldShadow) {
+                try { shadowRunCount(qspReq, finalCount); } catch { /* shadow must never affect the served path */ }
+            }
+        }
+        return finalCount;
     }
 
     /**
@@ -923,6 +1006,168 @@ AND c.deleted_at IS NULL`;
         return typedEntity;
     }
 
+    /**
+     * QSP route mode: serve SELECT entity_id from rm_<archetype>.
+     * Fetches limit+1 when limit is set so hasNextPage can be reported without a second query.
+     * Hydration mirrors the legacy doExec tail (populate / eager load).
+     */
+    private async doExecRouted(archetype: string, req: CoverageRequest): Promise<Entity[]> {
+        const n = req.limit;
+        let fetchReq = req;
+        if (n !== null) {
+            fetchReq = { ...req, limit: n + 1 };
+        }
+
+        // Columns needed to rebuild components from the row itself. Fetched only when hydration
+        // is actually enabled — otherwise the SELECT stays exactly as narrow as before.
+        const plan = qspHydrate() ? this.resolveRoutedHydrationPlan(archetype) : EMPTY_HYDRATION_PLAN;
+
+        const { sql, params } = buildRmQuery(archetype, fetchReq, plan.columns);
+        const dbConn = this.getDb();
+        const rows = await timedUnsafe<any[]>(dbConn, sql, params, this.execSignal, this.execPerRequest);
+
+        let resultRows: any[] = rows;
+        let entityIds: string[] = rows.map((r: any) => r.entity_id);
+        let hasNextPage = false;
+        if (n !== null && entityIds.length > n) {
+            hasNextPage = true;
+            entityIds = entityIds.slice(0, n);
+            resultRows = rows.slice(0, n); // rows stay index-aligned with entityIds
+        }
+
+        recordRoute(archetype);
+        this._lastRouteInfo = { routed: true, surface: 'rm', archetype, hasNextPage };
+
+        if (entityIds.length === 0) {
+            return [];
+        }
+
+        return this.hydrateEntityIds(entityIds, resultRows, plan);
+    }
+
+    /**
+     * QSP route mode count via rm_.
+     * - exact (default) / n_plus_1: count(*) — n_plus_1's "no second query" benefit is
+     *   realized at exec-time via hasNextPage; a bare .count() has no page so returns exact.
+     * - estimate: EXPLAIN (FORMAT JSON) Plan Rows on the filter SELECT.
+     */
+    private async doCountRouted(archetype: string, req: CoverageRequest): Promise<number> {
+        const dbConn = this.getDb();
+        const strat = qspCountStrategy();
+
+        if (strat === 'estimate') {
+            const { sql, params } = buildRmEstimateQuery(archetype, req);
+            const plan = await timedUnsafe<any[]>(
+                dbConn,
+                `EXPLAIN (FORMAT JSON) ${sql}`,
+                params,
+                this.execSignal,
+                this.execPerRequest
+            );
+            const rowsEst = extractExplainPlanRows(plan);
+            recordRoute(archetype);
+            this._lastRouteInfo = { routed: true, surface: 'rm', archetype };
+            return rowsEst;
+        }
+
+        // 'exact' (default) AND 'n_plus_1' for a bare count() both use exact count(*).
+        const { sql, params } = buildRmCountQuery(archetype, req);
+        const rows = await timedUnsafe<any[]>(dbConn, sql, params, this.execSignal, this.execPerRequest);
+        recordRoute(archetype);
+        this._lastRouteInfo = { routed: true, surface: 'rm', archetype };
+        return Number(rows[0]?.count ?? 0);
+    }
+
+    /**
+     * Hydration plan for a routed query. Returns the empty plan (row-hydrate nothing, behave
+     * exactly as before) whenever the descriptor is missing or the gates exclude everything.
+     */
+    private resolveRoutedHydrationPlan(archetype: string): RmHydrationPlan {
+        const descriptor = ProjectionManager.instance.getDescriptor(archetype);
+        if (!descriptor) return EMPTY_HYDRATION_PLAN;
+        const fieldState = PlannerCache.instance.getState(archetype)?.fieldState ?? {};
+        return resolveHydrationPlan(archetype, descriptor, fieldState);
+    }
+
+    /**
+     * Hydrate Entity[] from ordered ids — same shape as the legacy doExec tail.
+     *
+     * When `rows` and a non-empty `plan` are supplied, components covered by the plan are
+     * rebuilt from the rm_ row and the follow-up loads are reduced to the DELTA. Skipping that
+     * reduction would make row hydration pointless: populateComponents re-fetches and
+     * OVERWRITES the row-built objects, so the query would do strictly more work than before.
+     */
+    private async hydrateEntityIds(
+        entityIds: string[],
+        rows?: any[],
+        plan?: RmHydrationPlan
+    ): Promise<Entity[]> {
+        const canHydrate = !!(rows && plan && plan.components.size > 0 && rows.length === entityIds.length);
+
+        const entityMap = new Map<string, Entity>();
+        // A component counts as satisfied only if it hydrated for EVERY entity. A single row
+        // missing its id column would otherwise remove that component from the delta while one
+        // entity still lacks it — returning an entity silently missing a requested component.
+        const hydratedCounts = new Map<string, number>();
+
+        const buildBare = () => {
+            entityMap.clear();
+            hydratedCounts.clear();
+            for (const id of entityIds) {
+                const entity = new Entity(id);
+                entity.setPersisted(true);
+                entity.setDirty(false);
+                entityMap.set(id, entity);
+            }
+        };
+
+        if (canHydrate) {
+            try {
+                for (let i = 0; i < entityIds.length; i++) {
+                    const id = entityIds[i]!;
+                    const entity = new Entity(id);
+                    entity.setPersisted(true);
+                    entity.setDirty(false);
+                    for (const name of hydrateEntityFromRow(entity, rows![i]!, plan!)) {
+                        hydratedCounts.set(name, (hydratedCounts.get(name) ?? 0) + 1);
+                    }
+                    entityMap.set(id, entity);
+                }
+            } catch (err) {
+                // Mirror the route-level fallback: never fail a read because hydration broke.
+                recordFallback('hydrate_error');
+                logger.warn({ scope: 'qsp.hydrate.fallback', err }, 'QSP row hydration fallback to component load');
+                buildBare();
+            }
+        } else {
+            buildBare();
+        }
+
+        const storage = getMetadataStorage();
+        const satisfiedTypeIds = new Set<string>();
+        for (const [name, count] of hydratedCounts) {
+            if (count !== entityIds.length) continue;
+            const typeId = storage.getComponentId(name);
+            if (typeId) satisfiedTypeIds.add(typeId);
+        }
+
+        if (this.shouldPopulate && this.context.componentIds.size > 0) {
+            const delta = Array.from(this.context.componentIds).filter(t => !satisfiedTypeIds.has(t));
+            if (delta.length > 0) {
+                await this.populateComponents(entityMap, delta);
+            }
+        }
+
+        if (this.context.eagerComponents.size > 0) {
+            const delta = Array.from(this.context.eagerComponents).filter(t => !satisfiedTypeIds.has(t));
+            if (delta.length > 0) {
+                await Entity.LoadComponents(Array.from(entityMap.values()), delta, this.skipComponentCache);
+            }
+        }
+
+        return entityIds.map(id => entityMap.get(id)!);
+    }
+
     private async doExec(): Promise<Entity[]> {
         // Reset context for fresh execution
         this.context.reset();
@@ -936,6 +1181,28 @@ AND c.deleted_at IS NULL`;
                 'Use one or the other.'
             );
         }
+
+        // QSP: resolve coverage once (before pagination is neutralized below). Route only when
+        // READY; shadow-compare in SHADOW. On any route error fall through to the legacy body unchanged.
+        let qspReq: CoverageRequest | undefined;
+        let qspRes: PlanResolution | undefined;
+        if (qspActive() && !this.orQuery) {
+            qspReq = buildCoverageRequest(this.context);
+            qspRes = SurfacePlanner.instance.resolve(qspReq);
+            if (qspMode() === 'route' && qspRes.surface === 'rm' && qspRes.archetype && qspRes.status === 'READY') {
+                try {
+                    return await this.doExecRouted(qspRes.archetype, qspReq);
+                } catch (err) {
+                    recordFallback('exec_error');
+                    logger.warn({ scope: 'qsp.route.fallback', archetype: qspRes.archetype, err }, 'QSP route exec fallback to legacy');
+                    // fall through to legacy below; legacy body runs UNCHANGED
+                }
+            }
+            if (qspRes.triggerArchetype) {
+                void ProjectionManager.instance.ensureProjection(qspRes.triggerArchetype);
+            }
+        }
+        this._lastRouteInfo = { routed: false, surface: 'legacy' };
 
         // Native entity-column sort (created_at/updated_at) is applied as an
         // outer ORDER BY over the resolved id-set. The inner nodes must emit
@@ -1287,6 +1554,14 @@ AND c.deleted_at IS NULL`;
         // Convert to Entity objects
         const entityIds: string[] = entities.map((row: any) => row.id);
 
+        if (qspReq && qspRes) {
+            const m = qspMode();
+            const shouldShadow = (m === 'shadow' && qspRes.surface === 'rm') || (m === 'route' && qspRes.status === 'SHADOW');
+            if (shouldShadow) {
+                try { shadowRunExec(qspReq, entityIds.slice()); } catch { /* shadow must never affect the served path */ }
+            }
+        }
+
         if (entityIds.length === 0) {
             return [];
         }
@@ -1321,9 +1596,10 @@ AND c.deleted_at IS NULL`;
      * Bulk fetch and attach components to entities
      * @private
      */
-    private async populateComponents(entityMap: Map<string, Entity>): Promise<void> {
+    private async populateComponents(entityMap: Map<string, Entity>, onlyTypeIds?: string[]): Promise<void> {
         const entityIds = Array.from(entityMap.keys());
-        const componentTypeIds = Array.from(this.context.componentIds);
+        // onlyTypeIds narrows the fetch to components not already hydrated from an rm_ row.
+        const componentTypeIds = onlyTypeIds ?? Array.from(this.context.componentIds);
 
         if (entityIds.length === 0 || componentTypeIds.length === 0) {
             return;

@@ -13,6 +13,7 @@ import EntityHookManager from "../EntityHookManager";
 import { EntityCreatedEvent, EntityUpdatedEvent } from "../events/EntityLifecycleEvents";
 import { trackSideEffect } from "./pendingOps";
 import { handleCacheAfterSave, runPostDeleteSideEffects } from "./cacheStrategies";
+import { ProjectionManager } from "../../database/projection";
 import type { Entity } from "../Entity";
 
 export async function saveEntity(entity: Entity, trx?: SQL, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<boolean> {
@@ -192,6 +193,10 @@ export async function doSave(entity: Entity, trx: SQL, signal?: AbortSignal): Pr
         return true;
     }
 
+    const qspTouched = ProjectionManager.enabled
+        ? [...getDirtyComponents(entity), ...entity.removedComponents]
+        : undefined;
+
     // Cancellation goes through the shared `runWithSignal` helper so
     // every db.unsafe / trx`...` callsite in the framework uses the same
     // pattern: on abort the in-flight Bun SQL Query is cancelled, the
@@ -301,6 +306,10 @@ export async function doSave(entity: Entity, trx: SQL, signal?: AbortSignal): Pr
 
     await executeSave(trx);
 
+    if (ProjectionManager.enabled && qspTouched) {
+        await ProjectionManager.instance.upsertProjection(entity, qspTouched, trx);
+    }
+
     entity.setDirty(false);
 
     return true;
@@ -339,6 +348,9 @@ export async function doDelete(entity: Entity, force: boolean = false): Promise<
             } else {
                 await run(trx`UPDATE entities SET deleted_at = CURRENT_TIMESTAMP WHERE id = ${entity.id} AND deleted_at IS NULL`);
                 await run(trx`UPDATE components SET deleted_at = CURRENT_TIMESTAMP WHERE entity_id = ${entity.id} AND deleted_at IS NULL`);
+            }
+            if (ProjectionManager.enabled) {
+                await ProjectionManager.instance.deleteProjection(entity.id, force, trx);
             }
         });
         clearTimeout(timeoutHandle);

@@ -1,6 +1,8 @@
 import { getSerializedMetadataStorage } from "../core/metadata";
 import { findIndicatorComponentName } from "../utils/archetypeIndicator";
 import db from "../database";
+import { logger as MainLogger } from "../core/Logger";
+import { ProjectionManager, rmTableName, assertRmTableName } from "../database/projection";
 import type {
     StudioArcheTypeQueryParams,
     StudioArcheTypeResponse,
@@ -9,6 +11,8 @@ import type {
     ArcheTypeField,
     ArcheTypeEntityRecord,
 } from "./types";
+
+const logger = MainLogger.child({ scope: "archetypes-endpoint" });
 
 export async function handleStudioArcheTypeRecordsRequest(
     archeTypeName: string,
@@ -327,9 +331,23 @@ export async function handleStudioArcheTypeDeleteRequest(
 
         // 2. Delete from entities
         await db.unsafe(
-            `DELETE FROM entities WHERE id IN (${idPlaceholders})`,
+            `DELETE FROM entities WHERE id IN (${idPlaceholders})`, 
             entityIds
         );
+
+        if (ProjectionManager.enabled) {
+            try {
+                for (const archetype of ProjectionManager.instance.getArchetypeNames()) {
+                    const tableName = assertRmTableName(rmTableName(archetype));
+                    await db.unsafe(
+                        `DELETE FROM ${tableName} WHERE entity_id IN (${idPlaceholders})`, 
+                        entityIds
+                    );
+                }
+            } catch (error) {
+                logger.warn(`Failed to clean projection rows for bulk delete: ${error}`);
+            }
+        }
 
         const responseData: DeleteResponse = {
             success: true,

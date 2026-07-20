@@ -3,6 +3,7 @@ export interface ArcheTypeMetadata {
     target: Function;
     typeId: string;
     functions?: ArcheTypeFunctionMetadata[];
+    componentNames?: string[];   // component class names of this archetype's @ArcheTypeField set (P1 QSP)
 }
 
 export interface ArcheTypeFunctionMetadata {

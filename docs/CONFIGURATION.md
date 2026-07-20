@@ -98,6 +98,20 @@ See [Liveness & the write probe](#liveness--the-write-probe).
 | `BUNSANE_ORNODE_SINGLE_PASS` | `1` (on) | OR queries over a required base (`.with(X).with(or([...]))`) scan the base set **once** and combine branches as a disjunction of `EXISTS` predicates, instead of embedding the base in every branch and `UNION`-ing (which forced an N× base scan + a per-branch cartesian nested-loop). Parity-proven against the legacy shape; ~20× faster on a 3-branch OR. Kill-switch: set to `0`/`false` to revert to the legacy `UNION` shape instantly (no redeploy). |
 | `BUNSANE_RELATION_TYPED_COLUMN` | — | Typed relation column toggle (internal). |
 
+## Query Surface Planner (experimental)
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `BUNSANE_QSP` | `off` | single master knob: `off` (zero footprint, byte-identical to pre-QSP) \| `shadow` (auto-project lazily + verify parity, never serve rm_) \| `route` (auto-project + auto-shadow + auto-promote to serving). Read at query time — flip without redeploy. |
+| `BUNSANE_QSP_ARCHETYPES` | (empty) | optional CSV scope limiter of archetype names eligible for projection. **Empty/unset = ALL archetypes eligible.** |
+| `BUNSANE_QSP_COUNT` | `exact` | count strategy: exact \| n_plus_1 \| estimate |
+| `BUNSANE_QSP_PROMOTE_MIN` | `50` | clean shadow comparisons required before a SHADOW projection auto-promotes to READY (route mode only) |
+| `BUNSANE_QSP_BACKFILL_BATCH` | `5000` | backfill batch size |
+| `BUNSANE_QSP_BACKFILL_THROTTLE_MS` | `50` | inter-batch sleep (ms) |
+| `BUNSANE_QSP_ENTITIES_ACCEL` | `false` | enable the R1 generic entities accelerator (P5) |
+
+`BUNSANE_QSP` defaults to `off`; with it unset, framework behavior is byte-for-byte identical to pre-QSP (no `projection_state` table, no hooks). Setting it to `shadow`/`route` turns on the **autopilot**: the first covered list-query for an eligible archetype lazily creates its read model and drives it through the `NONE → BACKFILLING → SHADOW → READY` lifecycle automatically (see `docs/QSP_OPERATIONS.md`). Replaces the removed `BUNSANE_QSP_ENABLED` + `BUNSANE_QSP_MODE` pair.
+
 ## Cache
 
 | Variable | Default | Description |

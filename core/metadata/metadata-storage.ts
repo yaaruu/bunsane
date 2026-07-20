@@ -145,6 +145,10 @@ export class MetadataStorage {
         }
     }
 
+    setArchetypeComponentNames(typeId: string, componentNames: string[]) {
+        const meta = this.archetypes.find(a => a.typeId === typeId);
+        if (meta) meta.componentNames = componentNames;
+    }
     collectArcheTypeMetadata(metadata: ArcheTypeMetadata) {
         // Check if archetype already exists and update it
         const existingIndex = this.archetypes.findIndex(

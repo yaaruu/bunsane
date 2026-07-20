@@ -3,6 +3,7 @@ import { logger as MainLogger } from "../core/Logger";
 import { getMetadataStorage } from "../core/metadata";
 import { ensureMultipleJSONBPathIndexes } from "./IndexingStrategy";
 import { getMembershipTable } from "../query/membershipSource";
+import { ProjectionManager, qspActive } from "./projection";
 const logger = MainLogger.child({ scope: "DatabaseHelper" });
 
 const BUNSANE_RELATION_TYPED_COLUMN = process.env.BUNSANE_RELATION_TYPED_COLUMN === 'true' || false;
@@ -83,6 +84,14 @@ export const PrepareDatabase = async () => {
         logger.error(`Failed to migrate timestamp columns to timestamptz: ${error}`);
         throw error;
     }
+    if (qspActive()) {
+        try {
+            await CreateProjectionStateTable();
+        } catch (error) {
+            logger.error(`Failed to create projection_state table: ${error}`);
+            throw error;
+        }
+    }
 }
 
 /**
@@ -132,6 +141,15 @@ export const GetDatabaseDataSize = async () => {
 
 export const SetupDatabaseExtensions = async () => {
 }
+export const InitializeProjections = async () => {
+    if (!qspActive()) return;
+    try {
+        await CreateProjectionStateTable();
+        await ProjectionManager.instance.initialize();
+    } catch (error) {
+        logger.warn(`Failed to initialize projections: ${error}`);
+    }
+}
 
 export const CreateEntityTable = async () => {
     await db`CREATE TABLE IF NOT EXISTS entities (
@@ -150,6 +168,17 @@ export const CreateEntityTable = async () => {
     `);
 }
 
+export const CreateProjectionStateTable = async () => {
+    await db`CREATE TABLE IF NOT EXISTS projection_state (
+        archetype text PRIMARY KEY,
+        shape_hash text NOT NULL,
+        status text NOT NULL DEFAULT 'DISABLED',
+        shape_version int NOT NULL DEFAULT 1,
+        watermark uuid,
+        field_state jsonb NOT NULL DEFAULT '{}',
+        updated_at timestamptz NOT NULL DEFAULT now()
+    );`;
+}
 export const CreateComponentTable = async () => {
     const partitionStrategy = process.env.BUNSANE_PARTITION_STRATEGY === 'hash' ? 'hash' : 'list'; // Default to list (LIST+Direct is the recommended strategy)
 
