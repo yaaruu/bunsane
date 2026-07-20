@@ -11,6 +11,26 @@ interface CachedState {
 
 const TTL_MS = 30_000;
 
+/**
+ * `field_state` is jsonb, but depending on driver/column typing it can arrive as a JSON STRING
+ * rather than a parsed object. Every consumer does key lookups on it (`fieldState[columnName]`),
+ * and those return undefined on a string — silently reporting every column READY and defeating
+ * the FILLING gate for filtering, sorting AND hydration. Normalize once, here.
+ */
+function parseFieldState(raw: unknown): Record<string, 'FILLING' | 'READY'> {
+    if (!raw) return {};
+    if (typeof raw === 'string') {
+        try {
+            const parsed = JSON.parse(raw);
+            return parsed && typeof parsed === 'object' ? parsed : {};
+        } catch {
+            logger.warn({ scope: 'qsp.cache' }, 'Unparseable projection_state.field_state; treating as empty');
+            return {};
+        }
+    }
+    return typeof raw === 'object' ? (raw as Record<string, 'FILLING' | 'READY'>) : {};
+}
+
 export class PlannerCache {
     static #instance: PlannerCache | null = null;
 
@@ -34,7 +54,7 @@ export class PlannerCache {
                     status: (row.status as ProjectionStatus) ?? 'DISABLED',
                     shapeVersion: row.shape_version ?? 1,
                     shapeHash: row.shape_hash ?? '',
-                    fieldState: (row.field_state as Record<string, 'FILLING' | 'READY'>) ?? {},
+                    fieldState: parseFieldState(row.field_state),
                 });
             }
             this.lastRefresh = Date.now();
