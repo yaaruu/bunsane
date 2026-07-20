@@ -29,8 +29,9 @@ import {
 } from "./planner";
 import type { CoverageRequest } from "./planner/CoverageRequest";
 import { resolveHydrationPlan, EMPTY_HYDRATION_PLAN, type RmHydrationPlan } from "./planner/RmHydrationPlan";
+import { hydrateEntityFromRow } from "./planner/RmRowHydrator";
 import { PlannerCache } from "./planner/PlannerCache";
-import { qspMode, qspCountStrategy, qspActive } from "../database/projection/qspConfig";
+import { qspMode, qspCountStrategy, qspActive, qspHydrate } from "../database/projection/qspConfig";
 import { ProjectionManager } from "../database/projection/ProjectionManager";
 
 // Parsed once at module load instead of on every exec() (process.env read +
@@ -1017,20 +1018,21 @@ AND c.deleted_at IS NULL`;
             fetchReq = { ...req, limit: n + 1 };
         }
 
-        // Columns needed to rebuild components from the row itself. Selected but NOT yet
-        // consumed — hydration lands behind BUNSANE_QSP_HYDRATE in a later step, which keeps
-        // SQL-generation risk separate from hydration risk.
-        const plan = this.resolveRoutedHydrationPlan(archetype);
+        // Columns needed to rebuild components from the row itself. Fetched only when hydration
+        // is actually enabled — otherwise the SELECT stays exactly as narrow as before.
+        const plan = qspHydrate() ? this.resolveRoutedHydrationPlan(archetype) : EMPTY_HYDRATION_PLAN;
 
         const { sql, params } = buildRmQuery(archetype, fetchReq, plan.columns);
         const dbConn = this.getDb();
         const rows = await timedUnsafe<any[]>(dbConn, sql, params, this.execSignal, this.execPerRequest);
 
+        let resultRows: any[] = rows;
         let entityIds: string[] = rows.map((r: any) => r.entity_id);
         let hasNextPage = false;
         if (n !== null && entityIds.length > n) {
             hasNextPage = true;
             entityIds = entityIds.slice(0, n);
+            resultRows = rows.slice(0, n); // rows stay index-aligned with entityIds
         }
 
         recordRoute(archetype);
@@ -1040,7 +1042,7 @@ AND c.deleted_at IS NULL`;
             return [];
         }
 
-        return this.hydrateEntityIds(entityIds);
+        return this.hydrateEntityIds(entityIds, resultRows, plan);
     }
 
     /**
@@ -1087,23 +1089,80 @@ AND c.deleted_at IS NULL`;
         return resolveHydrationPlan(archetype, descriptor, fieldState);
     }
 
-    /** Hydrate Entity[] from ordered ids — same shape as the legacy doExec tail. */
-    private async hydrateEntityIds(entityIds: string[]): Promise<Entity[]> {
+    /**
+     * Hydrate Entity[] from ordered ids — same shape as the legacy doExec tail.
+     *
+     * When `rows` and a non-empty `plan` are supplied, components covered by the plan are
+     * rebuilt from the rm_ row and the follow-up loads are reduced to the DELTA. Skipping that
+     * reduction would make row hydration pointless: populateComponents re-fetches and
+     * OVERWRITES the row-built objects, so the query would do strictly more work than before.
+     */
+    private async hydrateEntityIds(
+        entityIds: string[],
+        rows?: any[],
+        plan?: RmHydrationPlan
+    ): Promise<Entity[]> {
+        const canHydrate = !!(rows && plan && plan.components.size > 0 && rows.length === entityIds.length);
+
         const entityMap = new Map<string, Entity>();
-        for (const id of entityIds) {
-            const entity = new Entity(id);
-            entity.setPersisted(true);
-            entity.setDirty(false);
-            entityMap.set(id, entity);
+        // A component counts as satisfied only if it hydrated for EVERY entity. A single row
+        // missing its id column would otherwise remove that component from the delta while one
+        // entity still lacks it — returning an entity silently missing a requested component.
+        const hydratedCounts = new Map<string, number>();
+
+        const buildBare = () => {
+            entityMap.clear();
+            hydratedCounts.clear();
+            for (const id of entityIds) {
+                const entity = new Entity(id);
+                entity.setPersisted(true);
+                entity.setDirty(false);
+                entityMap.set(id, entity);
+            }
+        };
+
+        if (canHydrate) {
+            try {
+                for (let i = 0; i < entityIds.length; i++) {
+                    const id = entityIds[i]!;
+                    const entity = new Entity(id);
+                    entity.setPersisted(true);
+                    entity.setDirty(false);
+                    for (const name of hydrateEntityFromRow(entity, rows![i]!, plan!)) {
+                        hydratedCounts.set(name, (hydratedCounts.get(name) ?? 0) + 1);
+                    }
+                    entityMap.set(id, entity);
+                }
+            } catch (err) {
+                // Mirror the route-level fallback: never fail a read because hydration broke.
+                recordFallback('hydrate_error');
+                logger.warn({ scope: 'qsp.hydrate.fallback', err }, 'QSP row hydration fallback to component load');
+                buildBare();
+            }
+        } else {
+            buildBare();
+        }
+
+        const storage = getMetadataStorage();
+        const satisfiedTypeIds = new Set<string>();
+        for (const [name, count] of hydratedCounts) {
+            if (count !== entityIds.length) continue;
+            const typeId = storage.getComponentId(name);
+            if (typeId) satisfiedTypeIds.add(typeId);
         }
 
         if (this.shouldPopulate && this.context.componentIds.size > 0) {
-            await this.populateComponents(entityMap);
+            const delta = Array.from(this.context.componentIds).filter(t => !satisfiedTypeIds.has(t));
+            if (delta.length > 0) {
+                await this.populateComponents(entityMap, delta);
+            }
         }
 
         if (this.context.eagerComponents.size > 0) {
-            const entitiesArray = Array.from(entityMap.values());
-            await Entity.LoadComponents(entitiesArray, Array.from(this.context.eagerComponents), this.skipComponentCache);
+            const delta = Array.from(this.context.eagerComponents).filter(t => !satisfiedTypeIds.has(t));
+            if (delta.length > 0) {
+                await Entity.LoadComponents(Array.from(entityMap.values()), delta, this.skipComponentCache);
+            }
         }
 
         return entityIds.map(id => entityMap.get(id)!);
@@ -1537,9 +1596,10 @@ AND c.deleted_at IS NULL`;
      * Bulk fetch and attach components to entities
      * @private
      */
-    private async populateComponents(entityMap: Map<string, Entity>): Promise<void> {
+    private async populateComponents(entityMap: Map<string, Entity>, onlyTypeIds?: string[]): Promise<void> {
         const entityIds = Array.from(entityMap.keys());
-        const componentTypeIds = Array.from(this.context.componentIds);
+        // onlyTypeIds narrows the fetch to components not already hydrated from an rm_ row.
+        const componentTypeIds = onlyTypeIds ?? Array.from(this.context.componentIds);
 
         if (entityIds.length === 0 || componentTypeIds.length === 0) {
             return;

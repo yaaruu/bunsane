@@ -162,6 +162,179 @@ if (!isPGlite) {
             return { legacyIds, routedIds };
         }
 
+        // --- Fix A: row hydration (BUNSANE_QSP_HYDRATE) ---------------------------------
+
+        /**
+         * Count statements that read `components` while running `fn`. This is the acceptance
+         * criterion for Fix A: hydration is pointless unless it removes these.
+         */
+        async function countComponentReads(fn: () => Promise<any>): Promise<{ components: number; total: number }> {
+            await PlannerCache.instance.refresh(); // settle cache traffic before counting
+            const realUnsafe = (db as any).unsafe.bind(db);
+            let components = 0;
+            let total = 0;
+            (db as any).unsafe = (sql: string, ...rest: any[]) => {
+                total++;
+                if (/\bFROM\s+components\b/i.test(sql)) components++;
+                return realUnsafe(sql, ...rest);
+            };
+            try {
+                await fn();
+            } finally {
+                (db as any).unsafe = realUnsafe;
+            }
+            return { components, total };
+        }
+
+        test('hydration removes the components re-read that populate() would issue', async () => {
+            const makeQuery = () => new Query()
+                .with(QspRouteOrder, Query.filters(Query.filter('status', '=', 'closed')))
+                .with(QspRouteCustomer)
+                .populate()
+                .take(50);
+
+            process.env.BUNSANE_QSP = 'route';
+
+            delete process.env.BUNSANE_QSP_HYDRATE;
+            const off = await countComponentReads(() => makeQuery().exec());
+
+            process.env.BUNSANE_QSP_HYDRATE = 'on';
+            try {
+                const on = await countComponentReads(() => makeQuery().exec());
+
+                // Off: rm_ gives ids, then populate() re-reads every component from `components`.
+                expect(off.components).toBeGreaterThan(0);
+                // On: the row already carries them — nothing left to fetch.
+                expect(on.components).toBe(0);
+            } finally {
+                delete process.env.BUNSANE_QSP_HYDRATE;
+            }
+        });
+
+        test('hydrated entities are indistinguishable from legacy-loaded ones', async () => {
+            const makeQuery = () => new Query()
+                .with(QspRouteOrder, Query.filters(Query.filter('status', '=', 'open')))
+                .with(QspRouteCustomer)
+                .populate()
+                .sortBy(QspRouteOrder, 'total', 'DESC')
+                .take(25);
+
+            process.env.BUNSANE_QSP = 'off';
+            const legacy = await makeQuery().exec();
+
+            process.env.BUNSANE_QSP = 'route';
+            process.env.BUNSANE_QSP_HYDRATE = 'on';
+            let routed: Entity[];
+            try {
+                const q = makeQuery();
+                routed = await q.exec();
+                expect(q.getLastRouteInfo().routed).toBe(true);
+            } finally {
+                delete process.env.BUNSANE_QSP_HYDRATE;
+            }
+
+            expect(routed.map(e => e.id)).toEqual(legacy.map(e => e.id));
+            expect(routed.length).toBeGreaterThan(0);
+
+            for (let i = 0; i < legacy.length; i++) {
+                for (const Ctor of [QspRouteOrder, QspRouteCustomer] as any[]) {
+                    const l: any = legacy[i]!.getInMemory(Ctor);
+                    const r: any = routed[i]!.getInMemory(Ctor);
+                    expect(r).toBeDefined();
+
+                    // Real component id — the F2 invariant that makes mutate+save safe.
+                    expect(r.id).toBe(l.id);
+                    expect(r.id).toMatch(/^[0-9a-f-]{36}$/i);
+                    // _persisted/_dirty are protected; read them the same way for both sides.
+                    expect(r._persisted).toBe(true);
+                    expect(r._dirty).toBe(false);
+                    expect(r._persisted).toBe(l._persisted);
+                    expect(r._dirty).toBe(l._dirty);
+                    expect(r.constructor.name).toBe(l.constructor.name);
+
+                    const ld = l.data();
+                    const rd = r.data();
+                    for (const key of Object.keys(ld)) {
+                        expect(`${key}=${rd[key]}`).toBe(`${key}=${ld[key]}`);
+                        // numeric must stay a number — PG returns it as a string over the wire.
+                        expect(typeof rd[key]).toBe(typeof ld[key]);
+                    }
+                }
+            }
+        });
+
+        test('mutate-and-save on a hydrated entity keeps exactly ONE components row per type', async () => {
+            // The F2 guard. A hydrated component carrying no real id would take the insert
+            // branch, mint a fresh uuid, miss the (id, type_id) conflict target, and duplicate
+            // its components row permanently — silent, unrecoverable read corruption.
+            process.env.BUNSANE_QSP = 'route';
+            process.env.BUNSANE_QSP_HYDRATE = 'on';
+
+            let target: Entity;
+            try {
+                const routed = await new Query()
+                    .with(QspRouteOrder, Query.filters(Query.filter('status', '=', 'pending')))
+                    .with(QspRouteCustomer)
+                    .populate()
+                    .take(1)
+                    .exec();
+                expect(routed.length).toBe(1);
+                target = routed[0]!;
+
+                await target.set(QspRouteOrder, { status: 'pending', total: 4242 });
+                await target.save();
+            } finally {
+                delete process.env.BUNSANE_QSP_HYDRATE;
+            }
+
+            const typeId = new QspRouteOrder().getTypeID();
+            const rows: any[] = await db.unsafe(
+                `SELECT count(*)::int AS n FROM components
+                 WHERE entity_id = $1 AND type_id = $2 AND deleted_at IS NULL`,
+                [target.id, typeId]
+            );
+            expect(rows[0].n).toBe(1);
+
+            // And the write landed on that row, rather than in a phantom duplicate.
+            const dataRows: any[] = await db.unsafe(
+                `SELECT data FROM components
+                 WHERE entity_id = $1 AND type_id = $2 AND deleted_at IS NULL`,
+                [target.id, typeId]
+            );
+            const saved = typeof dataRows[0].data === 'string' ? JSON.parse(dataRows[0].data) : dataRows[0].data;
+            expect(saved.total).toBe(4242);
+        });
+
+        test('a non-projected eager component is still loaded alongside hydrated ones', async () => {
+            process.env.BUNSANE_QSP = 'route';
+            process.env.BUNSANE_QSP_HYDRATE = 'on';
+            try {
+                const q = new Query()
+                    .with(QspRouteOrder, Query.filters(Query.filter('status', '=', 'gold')))
+                    .with(QspRouteCustomer)
+                    .populate()
+                    .take(5);
+                const routed = await q.exec();
+                expect(q.getLastRouteInfo().routed).toBe(true);
+                expect(routed.length).toBeGreaterThan(0);
+                // Both projected components present and fully populated from the row.
+                for (const e of routed) {
+                    expect((e as any).getInMemory(QspRouteOrder).status).toBe('gold');
+                    expect((e as any).getInMemory(QspRouteCustomer).tier).toBeDefined();
+                }
+            } finally {
+                delete process.env.BUNSANE_QSP_HYDRATE;
+            }
+        });
+
+        test('hydration is OFF by default — routed reads keep re-reading components', async () => {
+            delete process.env.BUNSANE_QSP_HYDRATE;
+            process.env.BUNSANE_QSP = 'route';
+            const stats = await countComponentReads(() => new Query()
+                .with(QspRouteOrder).with(QspRouteCustomer).populate().take(20).exec());
+            expect(stats.components).toBeGreaterThan(0);
+        });
+
         test('>=1000 randomized covered queries: zero routed-vs-legacy mismatches', async () => {
             resetQspPlannerMetrics();
             const seed = { s: 11 };

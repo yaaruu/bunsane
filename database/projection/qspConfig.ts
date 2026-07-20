@@ -17,6 +17,14 @@ export function qspInScope(archetype: string): boolean {
 }
 
 /**
+ * Serve component data from the rm_ row instead of re-reading `components`.
+ * Read at CALL time so it can be flipped at runtime. Default off.
+ */
+export function qspHydrate(): boolean {
+    return process.env.BUNSANE_QSP_HYDRATE === 'on';
+}
+
+/**
  * Row-hydration data-parity shadow. Independent of BUNSANE_QSP_HYDRATE: this only OBSERVES,
  * diffing rm_-hydrated components against the legacy read without serving either. Its results
  * deliberately do NOT feed recordShadowSample — that drives auto-promotion to READY, and
