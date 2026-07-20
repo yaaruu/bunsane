@@ -1,5 +1,5 @@
 import type { Entity } from '../../core/Entity';
-import type { ProjectionDescriptor } from './types';
+import type { ProjectionDescriptor, ProjectionSqlType } from './types';
 
 export function projectEntity(entity: Entity, descriptor: ProjectionDescriptor): Record<string, any> {
     const components = new Map<string, any>();
@@ -25,4 +25,26 @@ export function projectEntity(entity: Entity, descriptor: ProjectionDescriptor):
     }
 
     return result;
+}
+
+/**
+ * Exact inverse of the write rules above — turns an `rm_` column value back into the JS value
+ * a component field held before projection. Kept in this file so the two directions are read
+ * and edited together.
+ *
+ * The critical case is `numeric`: PostgreSQL returns numeric over the wire as a STRING. Without
+ * the explicit `Number()` every projected number field would silently change JS type on the
+ * hydration path while still comparing equal under `==`.
+ *
+ * NULL stays NULL. `projectEntity` maps absent/undefined fields to NULL, and that round-trip is
+ * asymmetric with the legacy JSONB path, which DROPS undefined so the field reads back absent.
+ * We preserve `null` — the one intentional divergence, observable in `comp.data()` and
+ * `Object.keys`, and normalized away in the shadow comparator.
+ */
+export function coerceProjectedValue(value: any, sqlType: ProjectionSqlType): any {
+    if (value === null || value === undefined) return null;
+    if (sqlType === 'numeric') return Number(value);
+    if (sqlType === 'timestamptz') return value instanceof Date ? value : new Date(value);
+    if (sqlType === 'boolean') return Boolean(value);
+    return typeof value === 'string' ? value : String(value);
 }

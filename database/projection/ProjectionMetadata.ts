@@ -46,29 +46,42 @@ const mapSqlType = (prop: { propertyType?: any }): ProjectionSqlType => {
 
 type MetadataStorageLike = ReturnType<typeof getMetadataStorage>;
 
+/**
+ * The single projectability predicate. `deriveProjectedColumns` (which columns exist) and
+ * `fullyColumnarComponents` (which components are safe to hydrate FROM those columns) MUST
+ * agree exactly — if they drift, a component whose field was silently skipped here would be
+ * served from rm_ with that field missing. Keep this the only place the rule is expressed.
+ */
+const isProjectableProp = (prop: { arrayOf?: any; isPrimitive?: boolean; isEnum?: boolean }): boolean => {
+    if (prop.arrayOf) return false;
+    return prop.isPrimitive === true || prop.isEnum === true;
+};
+
+const archetypeComponentNames = (
+    archetypeName: string,
+    storage: MetadataStorageLike
+): string[] => {
+    const metaComponentNames = storage.archetypes.find(a => a.name === archetypeName)?.componentNames;
+    if (metaComponentNames && metaComponentNames.length > 0) return metaComponentNames;
+
+    const fields = storage.archetypes_field_map.get(archetypeName) || [];
+    return Array.from(
+        new Set(fields.map(field => field.component?.name).filter(Boolean))
+    ) as string[];
+};
+
 export const deriveProjectedColumns = (
     archetypeName: string,
     storage: MetadataStorageLike = getMetadataStorage()
 ): ProjectedColumn[] => {
-    const metaComponentNames = storage.archetypes.find(a => a.name === archetypeName)?.componentNames;
-    let componentNames = metaComponentNames && metaComponentNames.length > 0
-        ? metaComponentNames
-        : undefined;
-
-    if (!componentNames) {
-        const fields = storage.archetypes_field_map.get(archetypeName) || [];
-        componentNames = Array.from(
-            new Set(fields.map(field => field.component?.name).filter(Boolean))
-        ) as string[];
-    }
+    const componentNames = archetypeComponentNames(archetypeName, storage);
 
     const columns: ProjectedColumn[] = [];
     for (const componentName of componentNames) {
         const typeId = storage.getComponentId(componentName);
         for (const prop of storage.getComponentProperties(typeId)) {
-            if (prop.arrayOf) continue;
+            if (!isProjectableProp(prop)) continue;
             const isScalarEnum = prop.isEnum === true;
-            if (!prop.isPrimitive && !isScalarEnum) continue;
             const sqlType = isScalarEnum ? 'text' : mapSqlType(prop);
 
             columns.push({
@@ -85,6 +98,33 @@ export const deriveProjectedColumns = (
         if (componentCmp !== 0) return componentCmp;
         return a.field.localeCompare(b.field);
     });
+};
+
+/**
+ * F1 gate — components whose ENTIRE `@CompData` surface is projected, i.e. safe to rebuild
+ * from an `rm_` row alone.
+ *
+ * Coverage matches at COMPONENT-SET level (`SurfacePlanner.isCovered`) while projection is
+ * lossy at FIELD level: a component with one scalar and one array field passes coverage but
+ * has no column for the array. Hydrating it from the row would silently yield a component
+ * missing that field. Only components listed here may be served from `rm_`; everything else
+ * falls back to the `components` read PER COMPONENT (not per query).
+ *
+ * A component with zero projectable fields is NOT fully columnar (it emits no columns and
+ * drops out of the descriptor set entirely).
+ */
+export const fullyColumnarComponents = (
+    archetypeName: string,
+    storage: MetadataStorageLike = getMetadataStorage()
+): Set<string> => {
+    const result = new Set<string>();
+    for (const componentName of archetypeComponentNames(archetypeName, storage)) {
+        const typeId = storage.getComponentId(componentName);
+        const props = storage.getComponentProperties(typeId);
+        if (props.length === 0) continue;
+        if (props.every(isProjectableProp)) result.add(componentName);
+    }
+    return result;
 };
 
 export const deriveProjectionDescriptor = (
