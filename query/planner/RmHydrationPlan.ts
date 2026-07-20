@@ -13,9 +13,20 @@ export interface RmHydrationPlan {
     components: Map<string, ProjectedColumn[]>;
     /** Flat column list for the SELECT. Empty = select entity_id only, exactly as before. */
     columns: ProjectedColumn[];
+    /**
+     * component name -> the column carrying that component's `components.id`.
+     * A component missing an entry here may be COMPARED but never SERVED: without its real id
+     * a mutate-and-save would insert a duplicate `components` row instead of updating.
+     * Populated once component ids are projected.
+     */
+    idColumns: Map<string, string>;
 }
 
-export const EMPTY_HYDRATION_PLAN: RmHydrationPlan = { components: new Map(), columns: [] };
+export const EMPTY_HYDRATION_PLAN: RmHydrationPlan = {
+    components: new Map(),
+    columns: [],
+    idColumns: new Map(),
+};
 
 /** F1 gate is metadata-derived and stable for a given shape; fieldState is not, so only this is cached. */
 const fullyColumnarCache = new Map<string, Set<string>>();
@@ -82,5 +93,5 @@ export function resolveHydrationPlan(
     }
 
     if (components.size === 0) return EMPTY_HYDRATION_PLAN;
-    return { components, columns };
+    return { components, columns, idColumns: new Map() };
 }

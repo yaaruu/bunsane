@@ -16,6 +16,16 @@ export function qspInScope(archetype: string): boolean {
     return raw.split(',').map(s => s.trim()).filter(Boolean).includes(archetype);
 }
 
+/**
+ * Row-hydration data-parity shadow. Independent of BUNSANE_QSP_HYDRATE: this only OBSERVES,
+ * diffing rm_-hydrated components against the legacy read without serving either. Its results
+ * deliberately do NOT feed recordShadowSample — that drives auto-promotion to READY, and
+ * entangling id-parity with data-parity would let one signal promote on the other's evidence.
+ */
+export function qspHydrateShadow(): boolean {
+    return process.env.BUNSANE_QSP_HYDRATE_SHADOW === 'on';
+}
+
 export function qspCountStrategy(): 'exact' | 'estimate' | 'n_plus_1' {
     const v = process.env.BUNSANE_QSP_COUNT;
     return v === 'estimate' || v === 'n_plus_1' ? v : 'exact';

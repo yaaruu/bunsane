@@ -26,6 +26,7 @@ import {
     PlannerCache, buildCoverageRequest, SurfacePlanner, buildRmQuery,
     drainShadows, qspPlannerMetrics, resetQspPlannerMetrics,
 } from '../../query/planner';
+import { resolveHydrationPlan } from '../../query/planner/RmHydrationPlan';
 import { createTestContext, ensureComponentsRegistered } from '../utils';
 
 const isPGlite = process.env.USE_PGLITE === 'true';
@@ -204,6 +205,51 @@ if (!isPGlite) {
                 await assertDirectParity(() => new Query().with(QspShadowOrder).with(QspShadowCustomer)
                     .sortBy(QspShadowOrder, 'total', dir).take(25).sortedCursor(token));
             }
+        });
+
+        test('row-hydration data parity: zero field divergences across every projected type', async () => {
+            resetQspPlannerMetrics();
+            process.env.BUNSANE_QSP_HYDRATE_SHADOW = 'on';
+            try {
+                // Both components are all-scalar, so the F1 gate admits both.
+                const descriptor = ProjectionManager.instance.getDescriptor(archetypeName)!;
+                const plan = resolveHydrationPlan(archetypeName, descriptor,
+                    PlannerCache.instance.getState(archetypeName)?.fieldState ?? {});
+                expect(plan.components.has('QspShadowOrder')).toBe(true);
+                expect(plan.components.has('QspShadowCustomer')).toBe(true);
+
+                const queries = [
+                    () => new Query().with(QspShadowOrder, Query.filters(Query.filter('status', '=', 'closed')))
+                        .with(QspShadowCustomer).sortBy(QspShadowOrder, 'total', 'DESC').take(50),
+                    () => new Query().with(QspShadowOrder, Query.filters(Query.filter('total', '>', 500)))
+                        .with(QspShadowCustomer, Query.filters(Query.filter('tier', '=', 'gold'))).take(40),
+                    () => new Query().with(QspShadowOrder).with(QspShadowCustomer)
+                        .sortByCreatedAt('DESC').take(60),
+                ];
+                for (const make of queries) await make().exec();
+
+                await drainShadows();
+
+                // `total` is numeric — PG returns it as a string over the wire. If coerce did not
+                // Number() it, every row would report a type-only divergence here.
+                if (qspPlannerMetrics.hydrationDivergenceTotal !== 0) {
+                    console.error('QSP hydration divergences:', qspPlannerMetrics.hydrationDivergenceByArchetype);
+                }
+                expect(qspPlannerMetrics.hydrationRowsCompared).toBeGreaterThan(0);
+                expect(qspPlannerMetrics.hydrationDivergenceTotal).toBe(0);
+            } finally {
+                delete process.env.BUNSANE_QSP_HYDRATE_SHADOW;
+            }
+        }, 120_000);
+
+        test('hydration shadow stays off by default and never feeds shadow promotion counters', async () => {
+            resetQspPlannerMetrics();
+            delete process.env.BUNSANE_QSP_HYDRATE_SHADOW;
+            await new Query().with(QspShadowOrder).with(QspShadowCustomer).take(20).exec();
+            await drainShadows();
+            expect(qspPlannerMetrics.hydrationRowsCompared).toBe(0);
+            // id-parity still ran — the two signals are independent.
+            expect(qspPlannerMetrics.shadowComparedTotal).toBeGreaterThan(0);
         });
 
         test('>=100 randomized covered combos: zero shadow divergences', async () => {

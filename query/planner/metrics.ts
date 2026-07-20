@@ -5,6 +5,14 @@ export const qspPlannerMetrics = {
     lastDivergences: [] as Array<{ archetype: string; kind: string; detail: any; at: string }>,
     routeTotal: {} as Record<string, number>,
     fallbackTotal: {} as Record<string, number>,
+    /**
+     * Row-hydration data-parity, tracked separately from the id-parity counters above.
+     * Kept distinct because shadowDivergenceTotal feeds auto-promotion to READY and these
+     * observations must not.
+     */
+    hydrationRowsCompared: 0,
+    hydrationDivergenceTotal: 0,
+    hydrationDivergenceByArchetype: {} as Record<string, number>,
 };
 
 export function recordShadowCompared() {
@@ -15,6 +23,15 @@ export function recordShadowDivergence(rec: { archetype: string; kind: string; d
     qspPlannerMetrics.shadowDivergenceTotal++;
     qspPlannerMetrics.lastDivergences.push({ ...rec, at: new Date().toISOString() });
     if (qspPlannerMetrics.lastDivergences.length > 100) qspPlannerMetrics.lastDivergences.shift();
+}
+
+export function recordHydrationParity(archetype: string, rowsCompared: number, divergences: number) {
+    qspPlannerMetrics.hydrationRowsCompared += rowsCompared;
+    qspPlannerMetrics.hydrationDivergenceTotal += divergences;
+    if (divergences > 0) {
+        qspPlannerMetrics.hydrationDivergenceByArchetype[archetype] =
+            (qspPlannerMetrics.hydrationDivergenceByArchetype[archetype] ?? 0) + divergences;
+    }
 }
 
 export function recordDrift(n = 1) {
@@ -38,4 +55,7 @@ export function resetQspPlannerMetrics() {
     qspPlannerMetrics.lastDivergences = [];
     qspPlannerMetrics.routeTotal = {};
     qspPlannerMetrics.fallbackTotal = {};
+    qspPlannerMetrics.hydrationRowsCompared = 0;
+    qspPlannerMetrics.hydrationDivergenceTotal = 0;
+    qspPlannerMetrics.hydrationDivergenceByArchetype = {};
 }
