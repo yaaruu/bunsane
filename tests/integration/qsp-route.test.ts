@@ -305,7 +305,10 @@ if (!isPGlite) {
             expect(saved.total).toBe(4242);
         });
 
-        test('a non-projected eager component is still loaded alongside hydrated ones', async () => {
+        // NOTE: eagerLoadComponents composition and the partial (non-empty) populate delta are
+        // covered in qsp-hydrate-mixed.test.ts — this archetype is all-scalar, so every
+        // component hydrates and the delta here is always empty.
+        test('both projected components are served from the row on a routed query', async () => {
             process.env.BUNSANE_QSP = 'route';
             process.env.BUNSANE_QSP_HYDRATE = 'on';
             try {

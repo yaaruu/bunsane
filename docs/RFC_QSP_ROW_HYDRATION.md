@@ -18,9 +18,20 @@ With both unset, behaviour is unchanged.
 
 Full regression: **968/0 real PG17**, **933/0 PGlite** (unit + integration + graphql).
 
-Open items for step 6: run the hydration shadow in production, confirm
-`hydrationDivergenceTotal == 0`, then flip the default in a separate revertible commit.
-Cache warming from `rm_` rows remains deliberately skipped (risk #4).
+Open items for step 6:
+
+1. Run the hydration shadow in production, confirm `hydrationDivergenceTotal == 0`, then flip
+   the default in a separate revertible commit.
+2. **`null` vs absent is still UNRESOLVED and currently UNOBSERVED.** Risk #2 below is not
+   settled by any existing test. `projectEntity` maps an unset scalar to NULL and `coerce`
+   returns `null`, whereas the legacy JSONB path drops undefined so the field reads back
+   ABSENT — observable in `comp.data()`, `Object.keys`, and GraphQL output. Nothing catches
+   this today: the deep-parity test iterates the LEGACY component's keys (so a key present only
+   on the rm_ side is invisible to it), the shadow comparator normalizes both sides to null by
+   design, and no fixture has an optional-unset field. Before flipping the default, add a
+   fixture with an unset optional scalar and decide explicitly whether to preserve `null` or
+   delete null-valued keys during hydration.
+3. Cache warming from `rm_` rows remains deliberately skipped (risk #4).
 
 ## Problem
 
