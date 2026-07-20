@@ -53,7 +53,11 @@ function buildRmFilterWhere(archetype: string, req: CoverageRequest): {
     return { table, whereClauses, params, p, columnLookup };
 }
 
-export function buildRmQuery(archetype: string, req: CoverageRequest): { sql: string; params: any[] } {
+export function buildRmQuery(
+    archetype: string,
+    req: CoverageRequest,
+    hydrateColumns: ProjectedColumn[] = []
+): { sql: string; params: any[] } {
     const { table, whereClauses, params, p, columnLookup } = buildRmFilterWhere(archetype, req);
 
     const hasKeyset = req.cursor?.kind === 'keyset';
@@ -152,8 +156,21 @@ export function buildRmQuery(archetype: string, req: CoverageRequest): { sql: st
         offsetClause = ` OFFSET ${p(req.offset)}`;
     }
 
+    // Widened SELECT for row hydration. Column names go through the same assertIdentifier
+    // guard as filter/sort columns — never interpolate a raw name. Deduped because a column
+    // may appear in the plan more than once only through caller error, and a duplicated
+    // output name would make the row object ambiguous.
+    const seen = new Set<string>();
+    const selectList = ['entity_id'];
+    for (const col of hydrateColumns) {
+        const colName = assertIdentifier(col.columnName, 'rmHydrateColumn');
+        if (seen.has(colName)) continue;
+        seen.add(colName);
+        selectList.push(`"${colName}"`);
+    }
+
     const whereSql = whereClauses.join(' AND ');
-    const sql = `SELECT entity_id FROM ${table} WHERE ${whereSql}${orderBy}${limitClause}${offsetClause}`;
+    const sql = `SELECT ${selectList.join(', ')} FROM ${table} WHERE ${whereSql}${orderBy}${limitClause}${offsetClause}`;
     return { sql, params };
 }
 

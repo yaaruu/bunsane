@@ -28,6 +28,8 @@ import {
     type PlanResolution,
 } from "./planner";
 import type { CoverageRequest } from "./planner/CoverageRequest";
+import { resolveHydrationPlan, EMPTY_HYDRATION_PLAN, type RmHydrationPlan } from "./planner/RmHydrationPlan";
+import { PlannerCache } from "./planner/PlannerCache";
 import { qspMode, qspCountStrategy, qspActive } from "../database/projection/qspConfig";
 import { ProjectionManager } from "../database/projection/ProjectionManager";
 
@@ -1015,7 +1017,12 @@ AND c.deleted_at IS NULL`;
             fetchReq = { ...req, limit: n + 1 };
         }
 
-        const { sql, params } = buildRmQuery(archetype, fetchReq);
+        // Columns needed to rebuild components from the row itself. Selected but NOT yet
+        // consumed — hydration lands behind BUNSANE_QSP_HYDRATE in a later step, which keeps
+        // SQL-generation risk separate from hydration risk.
+        const plan = this.resolveRoutedHydrationPlan(archetype);
+
+        const { sql, params } = buildRmQuery(archetype, fetchReq, plan.columns);
         const dbConn = this.getDb();
         const rows = await timedUnsafe<any[]>(dbConn, sql, params, this.execSignal, this.execPerRequest);
 
@@ -1067,6 +1074,17 @@ AND c.deleted_at IS NULL`;
         recordRoute(archetype);
         this._lastRouteInfo = { routed: true, surface: 'rm', archetype };
         return Number(rows[0]?.count ?? 0);
+    }
+
+    /**
+     * Hydration plan for a routed query. Returns the empty plan (row-hydrate nothing, behave
+     * exactly as before) whenever the descriptor is missing or the gates exclude everything.
+     */
+    private resolveRoutedHydrationPlan(archetype: string): RmHydrationPlan {
+        const descriptor = ProjectionManager.instance.getDescriptor(archetype);
+        if (!descriptor) return EMPTY_HYDRATION_PLAN;
+        const fieldState = PlannerCache.instance.getState(archetype)?.fieldState ?? {};
+        return resolveHydrationPlan(archetype, descriptor, fieldState);
     }
 
     /** Hydrate Entity[] from ordered ids — same shape as the legacy doExec tail. */
