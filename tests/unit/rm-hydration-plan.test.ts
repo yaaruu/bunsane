@@ -36,11 +36,17 @@ describe('resolveHydrationPlan', () => {
         expect(plan.components.has('HydPlanCustomer')).toBe(true);
         expect(plan.components.has('HydPlanOrder')).toBe(false);
 
-        // The SELECT list must contain exactly the hydratable component's columns.
+        // The SELECT list carries the hydratable component's fields AND its id column.
         expect(plan.columns.map(c => c.columnName).sort()).toEqual([
+            'hyd_plan_customer__cid',
             'hyd_plan_customer_lifetime_value',
             'hyd_plan_customer_tier',
         ]);
+
+        // The id column is tracked separately — it is not a @CompData field.
+        expect(plan.idColumns.get('HydPlanCustomer')).toBe('hyd_plan_customer__cid');
+        expect(plan.components.get('HydPlanCustomer')!.map(c => c.field).sort())
+            .toEqual(['lifetimeValue', 'tier']);
     });
 
     test('degrades per-component, not per-query — Order still routes, just not hydrated', () => {
@@ -78,7 +84,13 @@ describe('resolveHydrationPlan', () => {
         for (const col of plan.columns) {
             expect(plan.components.has(col.component)).toBe(true);
         }
+        const fieldColumns = plan.columns.filter(c => c.kind !== 'component_id');
         const flattened = [...plan.components.values()].flat().length;
-        expect(plan.columns.length).toBe(flattened);
+        expect(fieldColumns.length).toBe(flattened);
+
+        // Every hydratable component must carry an id column, else it can never be served.
+        for (const name of plan.components.keys()) {
+            expect(plan.idColumns.has(name)).toBe(true);
+        }
     });
 });

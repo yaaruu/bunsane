@@ -12,6 +12,14 @@ export function projectEntity(entity: Entity, descriptor: ProjectionDescriptor):
         const comp = components.get(col.component);
         if (!comp) continue;
 
+        // Component-id columns read components.id, not a @CompData field. upsertProjection runs
+        // AFTER save, so ids are already minted by the time we get here.
+        if (col.kind === 'component_id') {
+            const id = (comp as any).id;
+            result[col.columnName] = id ? String(id) : null;
+            continue;
+        }
+
         const raw = (comp as any)[col.field];
         if (col.sqlType === 'numeric') {
             result[col.columnName] = raw == null ? null : Number(raw);

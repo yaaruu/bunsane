@@ -6,25 +6,11 @@ import { assertIdentifier } from '../../query/SqlIdentifier';
 import { ProjectionManager } from './ProjectionManager';
 import { rmTableName, assertRmTableName } from './DDLGenerator';
 import { recordDrift } from '../../query/planner/metrics';
-import type { ProjectedColumn } from './types';
+import { projectionSourceExpr } from './ProjectionSource';
 
 const logger = MainLogger.child({ scope: 'qsp.reconcile' });
 
 const ZERO_UUID = '00000000-0000-0000-0000-000000000000';
-
-const assertTypeId = (typeId: string): string => {
-    if (!/^[a-f0-9]{1,64}$/.test(typeId)) {
-        throw new Error(`Invalid projection component type id: ${typeId}`);
-    }
-    return typeId;
-};
-
-const castFor = (column: ProjectedColumn): string => {
-    if (column.sqlType === 'numeric') return '::numeric';
-    if (column.sqlType === 'timestamptz') return '::timestamptz';
-    if (column.sqlType === 'boolean') return '::boolean';
-    return '';
-};
 
 export async function reconcileArchetype(archetypeName: string, sampleSize = 200): Promise<number> {
     if (!ProjectionManager.enabled) return 0;
@@ -55,10 +41,8 @@ export async function reconcileArchetype(archetypeName: string, sampleSize = 200
 
             for (const col of descriptor.columns) {
                 const colName = assertIdentifier(col.columnName, 'projectedColumn');
-                const field = assertIdentifier(col.field, 'projectedField');
-                const typeId = assertTypeId(storage.getComponentId(col.component) ?? '');
-                const cast = castFor(col);
-                const recomputeSql = `SELECT (c.data->>'${field}')${cast} AS v FROM components c WHERE c.entity_id = $1 AND c.type_id = '${typeId}' AND c.deleted_at IS NULL LIMIT 1`;
+                const typeId = storage.getComponentId(col.component) ?? '';
+                const recomputeSql = `SELECT ${projectionSourceExpr(col, typeId, '$1')} AS v`;
                 const recomputedRows = await db.unsafe(recomputeSql, [entityId]);
                 const recomputed = recomputedRows[0] ? recomputedRows[0].v : null;
                 const actual = row[colName] ?? null;
@@ -78,9 +62,8 @@ export async function reconcileArchetype(archetypeName: string, sampleSize = 200
                 const quotedInsertColumns = insertColumns.map(col => projectedColumns.includes(col) ? `"${col}"` : col).join(', ');
                 const selectColumns = descriptor.columns.map(col => {
                     const columnName = assertIdentifier(col.columnName, 'projectedColumn');
-                    const field = assertIdentifier(col.field, 'projectedField');
-                    const typeId = assertTypeId(storage.getComponentId(col.component) ?? '');
-                    return `(SELECT (c.data->>'${field}')${castFor(col)} FROM components c WHERE c.entity_id = e.id AND c.type_id = '${typeId}' AND c.deleted_at IS NULL LIMIT 1) AS "${columnName}"`;
+                    const typeId = storage.getComponentId(col.component) ?? '';
+                    return `${projectionSourceExpr(col, typeId, 'e.id')} AS "${columnName}"`;
                 });
                 const selectList = ['e.id', ...selectColumns, 'e.created_at', 'e.updated_at', 'e.deleted_at', '$2'].join(', ');
                 const projectedUpdates = projectedColumns.map(col => `"${col}" = EXCLUDED."${col}"`);

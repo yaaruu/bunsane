@@ -24,6 +24,7 @@
  */
 import { getMetadataStorage } from '../../core/metadata';
 import { computeShapeHash } from './ShapeHasher';
+import { COMPONENT_ID_FIELD } from './types';
 import type { ProjectedColumn, ProjectionDescriptor, ProjectionSqlType } from './types';
 
 const snakeCase = (input: string): string => {
@@ -79,7 +80,25 @@ export const deriveProjectedColumns = (
     const columns: ProjectedColumn[] = [];
     for (const componentName of componentNames) {
         const typeId = storage.getComponentId(componentName);
-        for (const prop of storage.getComponentProperties(typeId)) {
+        const props = storage.getComponentProperties(typeId);
+
+        // A component that contributes no field columns is not in the projection at all, so it
+        // gets no id column either.
+        if (props.some(isProjectableProp)) {
+            columns.push({
+                component: componentName,
+                field: COMPONENT_ID_FIELD,
+                sqlType: 'uuid',
+                // COMPONENT_ID_FIELD already leads with '__', giving the documented
+                // `<component>__cid`. A real field `cid` yields single-underscore
+                // `<component>_cid`, so the two only collide for a field literally named
+                // `_cid` — which the assertion below rejects.
+                columnName: `${snakeCase(componentName)}${COMPONENT_ID_FIELD}`,
+                kind: 'component_id',
+            });
+        }
+
+        for (const prop of props) {
             if (!isProjectableProp(prop)) continue;
             const isScalarEnum = prop.isEnum === true;
             const sqlType = isScalarEnum ? 'text' : mapSqlType(prop);
@@ -91,6 +110,21 @@ export const deriveProjectedColumns = (
                 columnName: `${snakeCase(componentName)}_${snakeCase(prop.propertyKey)}`,
             });
         }
+    }
+
+    // Two columns sharing a name would make the SELECTed row object ambiguous and silently
+    // serve one component's value as another's. Fail loudly at derivation instead.
+    const seen = new Map<string, ProjectedColumn>();
+    for (const col of columns) {
+        const prior = seen.get(col.columnName);
+        if (prior) {
+            throw new Error(
+                `Projected column name collision on "${col.columnName}" for archetype ${archetypeName}: ` +
+                `${prior.component}.${prior.field} and ${col.component}.${col.field}. ` +
+                `Rename the offending @CompData field.`
+            );
+        }
+        seen.set(col.columnName, col);
     }
 
     return columns.sort((a, b) => {

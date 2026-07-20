@@ -207,6 +207,41 @@ if (!isPGlite) {
             }
         });
 
+        test('projected component ids match components.id for backfilled AND dual-written rows', async () => {
+            // Without this the hydrator silently skips every component (no id => never serve),
+            // so Fix A would degrade to a no-op instead of failing.
+            const mismatches: any[] = await db.unsafe(`
+                SELECT r.entity_id,
+                       r.qsp_shadow_order__cid AS rm_order_cid,
+                       o.id AS real_order_cid,
+                       r.qsp_shadow_customer__cid AS rm_customer_cid,
+                       c.id AS real_customer_cid
+                FROM ${tableName} r
+                LEFT JOIN components o ON o.entity_id = r.entity_id
+                     AND o.type_id = $1 AND o.deleted_at IS NULL
+                LEFT JOIN components c ON c.entity_id = r.entity_id
+                     AND c.type_id = $2 AND c.deleted_at IS NULL
+                WHERE r.deleted_at IS NULL
+                  AND (r.qsp_shadow_order__cid IS DISTINCT FROM o.id
+                    OR r.qsp_shadow_customer__cid IS DISTINCT FROM c.id)
+                LIMIT 5
+            `, [
+                new QspShadowOrder().getTypeID(),
+                new QspShadowCustomer().getTypeID(),
+            ]);
+
+            if (mismatches.length > 0) console.error('cid mismatches:', mismatches);
+            expect(mismatches.length).toBe(0);
+
+            const [{ total, withIds }] = await db.unsafe(`
+                SELECT count(*)::int AS total,
+                       count(qsp_shadow_order__cid)::int AS "withIds"
+                FROM ${tableName} WHERE deleted_at IS NULL
+            `);
+            expect(total).toBeGreaterThan(0);
+            expect(withIds).toBe(total);
+        });
+
         test('row-hydration data parity: zero field divergences across every projected type', async () => {
             resetQspPlannerMetrics();
             process.env.BUNSANE_QSP_HYDRATE_SHADOW = 'on';

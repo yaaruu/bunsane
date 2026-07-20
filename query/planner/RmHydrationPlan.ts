@@ -1,4 +1,5 @@
 import { fullyColumnarComponents } from "../../database/projection/ProjectionMetadata";
+import { COMPONENT_ID_FIELD } from "../../database/projection/types";
 import type { ProjectedColumn, ProjectionDescriptor, FieldReadiness } from "../../database/projection/types";
 
 /**
@@ -66,8 +67,13 @@ export function resolveHydrationPlan(
     if (fullyColumnar.size === 0) return EMPTY_HYDRATION_PLAN;
 
     const byComponent = new Map<string, ProjectedColumn[]>();
+    const idColumnByComponent = new Map<string, string>();
     for (const col of descriptor.columns) {
         if (!fullyColumnar.has(col.component)) continue;
+        if (col.kind === 'component_id') {
+            idColumnByComponent.set(col.component, col.columnName);
+            continue; // carried separately — it is not a @CompData field
+        }
         let cols = byComponent.get(col.component);
         if (!cols) {
             cols = [];
@@ -85,13 +91,28 @@ export function resolveHydrationPlan(
     };
 
     const components = new Map<string, ProjectedColumn[]>();
+    const idColumns = new Map<string, string>();
     const columns: ProjectedColumn[] = [];
     for (const [component, cols] of byComponent) {
         if (cols.some(isFilling)) continue;
         components.set(component, cols);
         columns.push(...cols);
+
+        // Carry the id column so the hydrated component can be mutated and saved. Without it
+        // hydrateEntityFromRow skips the component rather than risk a duplicate insert.
+        const idColumn = idColumnByComponent.get(component);
+        if (idColumn) {
+            idColumns.set(component, idColumn);
+            columns.push({
+                component,
+                field: COMPONENT_ID_FIELD,
+                sqlType: 'uuid',
+                columnName: idColumn,
+                kind: 'component_id',
+            });
+        }
     }
 
     if (components.size === 0) return EMPTY_HYDRATION_PLAN;
-    return { components, columns, idColumns: new Map() };
+    return { components, columns, idColumns };
 }

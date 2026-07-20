@@ -39,8 +39,36 @@ describe('deriveProjectedColumns', () => {
         expect(byColumnName.has('qsp_test_order_tags')).toBe(false);
     });
 
-    test('sorts columns by component then field', () => {
+    test('projects a component-id column for every component that contributes fields', () => {
         const columns = deriveProjectedColumns('QspOrderListView');
+        const idColumns = columns.filter(col => col.kind === 'component_id');
+
+        expect(idColumns.map(col => col.columnName).sort()).toEqual([
+            'qsp_test_customer__cid',
+            'qsp_test_order__cid',
+        ]);
+        for (const col of idColumns) expect(col.sqlType).toBe('uuid');
+
+        // Double underscore keeps it distinct from a real field named `cid`.
+        expect(columns.some(col => col.columnName === 'qsp_test_order_cid')).toBe(false);
+    });
+
+    test('rejects a column-name collision at derivation instead of serving ambiguous rows', () => {
+        @Component
+        class QspCollideComp extends BaseComponent {
+            @CompData() _cid!: string; // snake-cases to `__cid`, colliding with the id column
+        }
+        @ArcheType({ name: 'QspCollideView' })
+        class QspCollideView extends BaseArcheType {
+            @ArcheTypeField(QspCollideComp) c!: QspCollideComp;
+        }
+        void QspCollideView;
+
+        expect(() => deriveProjectedColumns('QspCollideView')).toThrow(/collision/i);
+    });
+
+    test('sorts field columns by component then field', () => {
+        const columns = deriveProjectedColumns('QspOrderListView').filter(col => col.kind !== 'component_id');
         expect(columns.map(col => `${col.component}.${col.field}`)).toEqual([
             'QspTestCustomer.tier',
             'QspTestOrder.paid',

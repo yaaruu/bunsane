@@ -4,25 +4,12 @@ import { getDistributedLock } from '../../core/scheduler/DistributedLock';
 import { assertIdentifier } from '../../query/SqlIdentifier';
 import { ProjectionManager } from './ProjectionManager';
 import { rmTableName, assertRmTableName } from './DDLGenerator';
-import type { ProjectedColumn } from './types';
+import { assertTypeId, projectionSourceExpr } from './ProjectionSource';
 
 const ZERO_UUID = '00000000-0000-0000-0000-000000000000';
 
 export const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-const assertTypeId = (typeId: string): string => {
-    if (!/^[a-f0-9]{1,64}$/.test(typeId)) {
-        throw new Error(`Invalid projection component type id: ${typeId}`);
-    }
-    return typeId;
-};
-
-const castFor = (column: ProjectedColumn): string => {
-    if (column.sqlType === 'numeric') return '::numeric';
-    if (column.sqlType === 'timestamptz') return '::timestamptz';
-    if (column.sqlType === 'boolean') return '::boolean';
-    return '';
-};
 
 export async function run(archetypeName: string): Promise<void> {
     if (!ProjectionManager.enabled) return;
@@ -68,9 +55,8 @@ export async function run(archetypeName: string): Promise<void> {
             const insertColumns = ['entity_id', ...projectedColumns, 'created_at', 'updated_at', 'deleted_at', 'shape_version'];
             const selectColumns = descriptor.columns.map(col => {
                 const columnName = assertIdentifier(col.columnName, 'projectedColumn');
-                const field = assertIdentifier(col.field, 'projectedField');
-                const typeId = assertTypeId(storage.getComponentId(col.component));
-                return `(SELECT (c.data->>'${field}')${castFor(col)} FROM components c WHERE c.entity_id = e.id AND c.type_id = '${typeId}' AND c.deleted_at IS NULL LIMIT 1) AS "${columnName}"`;
+                const typeId = storage.getComponentId(col.component);
+                return `${projectionSourceExpr(col, typeId, 'e.id')} AS "${columnName}"`;
             });
             const selectList = ['e.id', ...selectColumns, 'e.created_at', 'e.updated_at', 'e.deleted_at', '$3'].join(', ');
             const quotedInsertColumns = insertColumns.map(col => projectedColumns.includes(col) ? `"${col}"` : col).join(', ');

@@ -9,6 +9,7 @@ const SQL_TYPES: Record<ProjectionSqlType, string> = {
     numeric: 'numeric',
     timestamptz: 'timestamptz',
     boolean: 'boolean',
+    uuid: 'uuid',
 };
 
 export const rmTableName = (archetypeName: string): string => `rm_${archetypeName.toLowerCase()}`;
