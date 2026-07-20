@@ -1,7 +1,26 @@
 # RFC: QSP row hydration (Fix A) — serve component data from the `rm_` row
 
-Status: PLAN (not implemented). Branch: experimental/query-surface-planner (tip fa4df14).
+Status: **Steps 1–5 IMPLEMENTED** (5 commits on experimental/query-surface-planner, not pushed).
+Step 6 (flip default on) deliberately NOT done — it is gated on clean production shadow data.
 Date: 2026-07-20.
+
+Shipped: `BUNSANE_QSP_HYDRATE=off|on` (default **off**) serves components from the `rm_` row;
+`BUNSANE_QSP_HYDRATE_SHADOW=on` diffs row-hydration against legacy without serving.
+With both unset, behaviour is unchanged.
+
+| Step | Commit | Verification |
+|---|---|---|
+| 1 derivation | `651c91d` | 9/9 unit |
+| 2 widened SELECT | `147ed8b` | 23/23 QSP integration (real PG), 6/6 unit |
+| 3 data-parity shadow | `4f72e1b` | 8/8 shadow-parity, >0 rows compared, 0 divergences |
+| 4 project component ids | `b1e3297` | 25/25 QSP integration + `__cid` == `components.id` assertion |
+| 5 serve behind flag | `626f57a` | 31/31 QSP integration; `components` reads 0 with flag on |
+
+Full regression: **968/0 real PG17**, **933/0 PGlite** (unit + integration + graphql).
+
+Open items for step 6: run the hydration shadow in production, confirm
+`hydrationDivergenceTotal == 0`, then flip the default in a separate revertible commit.
+Cache warming from `rm_` rows remains deliberately skipped (risk #4).
 
 ## Problem
 
@@ -99,6 +118,23 @@ entity-level timestamps, and a wrong cache entry outlives the request.
 
 Steps 1/2/4 are behaviour-preserving by construction; 3 is observation-only; only 5 changes
 served reads and it is flag-gated with fallback.
+
+### Implementation notes (deltas from the plan)
+
+- **Step 2 fetches the hydration columns only when hydration is enabled.** The plan had the
+  widened SELECT always on; gating it keeps the flag-off SQL byte-identical to before.
+- **`fullyColumnarComponents` shares one `isProjectableProp` predicate with
+  `deriveProjectedColumns`.** If the gate and the column derivation drifted, a silently-skipped
+  field would be served as missing — the exact F1 failure.
+- **A component counts as hydrated only if it hydrated for EVERY entity in the result.** Not in
+  the plan, and load-bearing: a per-component global flag would let one row missing its id drop
+  that component from the populate delta while another entity still lacked it.
+- **`ProjectionSource` extracted** so backfill and reconcile build column expressions once —
+  `component_id` columns read `c.id`, not `c.data->>field`, and duplicating that rule would mean
+  a column backfilled correctly and reconciled to NULL.
+- **Column-name collisions throw at derivation** rather than serving an ambiguous row object.
+- **Id columns are projected for every component contributing fields**, not just fully-columnar
+  ones — a simpler rule than coupling column derivation to the F1 gate.
 
 ## Tests
 Existing: `tests/integration/qsp-route.test.ts` (real PG only, `isPGlite` guard :31),
