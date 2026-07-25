@@ -29,6 +29,27 @@ const logger = MainLogger.child({ scope: 'qsp.schema' });
 
 const ZERO_UUID = '00000000-0000-0000-0000-000000000000';
 
+/**
+ * A pre-existing `field_state` that is not a jsonb OBJECT (legacy rows have
+ * been seen holding a jsonb *string*) cannot be `||`-merged — the result would
+ * be an array. Fall back to `{}` in that case.
+ */
+const fieldStateBase = `(CASE WHEN jsonb_typeof(field_state) = 'object' THEN field_state ELSE '{}'::jsonb END)`;
+
+/**
+ * Inline jsonb literal rather than a bound parameter: Bun SQL encodes a JS
+ * object param differently depending on `prepare` (a JSON-encoded STRING with
+ * prepare:true — which `||` turns into an array — and "[object Object]" with
+ * prepare:false behind PgBouncer). Column names are already validated
+ * identifiers, so inlining is safe and mode-independent.
+ */
+const fieldStateLiteral = (columns: ProjectedColumn[], state: 'FILLING' | 'READY'): string => {
+    const entries = columns
+        .map(col => `"${assertIdentifier(col.columnName, 'projectedColumn')}":"${state}"`)
+        .join(',');
+    return `'{${entries}}'::jsonb`;
+};
+
 const invalidatePlannerCache = async (archetype: string): Promise<void> => {
     try {
         const { PlannerCache } = await import('../../query/planner/PlannerCache');
@@ -70,17 +91,14 @@ export async function syncRmSchema(
         await addColumn(archetype, col);
     }
 
-    const filling: Record<string, 'FILLING'> = {};
-    for (const col of missing) filling[col.columnName] = 'FILLING';
-
     await db.unsafe(
         `UPDATE projection_state
-         SET field_state = (CASE WHEN jsonb_typeof(field_state) = 'object' THEN field_state ELSE '{}'::jsonb END) || $2::jsonb,
-             shape_hash = $3,
-             shape_version = $4,
+         SET field_state = ${fieldStateBase} || ${fieldStateLiteral(missing, 'FILLING')},
+             shape_hash = $2,
+             shape_version = $3,
              updated_at = now()
          WHERE archetype = $1`,
-        [archetype, JSON.stringify(filling), descriptor.shapeHash, descriptor.shapeVersion]
+        [archetype, descriptor.shapeHash, descriptor.shapeVersion]
     );
     await invalidatePlannerCache(archetype);
 
@@ -133,13 +151,11 @@ export async function fillColumns(archetype: string, columns: ProjectedColumn[])
         if (throttle > 0) await new Promise(resolve => setTimeout(resolve, throttle));
     }
 
-    const ready: Record<string, 'READY'> = {};
-    for (const col of columns) ready[col.columnName] = 'READY';
     await db.unsafe(
         `UPDATE projection_state
-         SET field_state = (CASE WHEN jsonb_typeof(field_state) = 'object' THEN field_state ELSE '{}'::jsonb END) || $2::jsonb, updated_at = now()
+         SET field_state = ${fieldStateBase} || ${fieldStateLiteral(columns, 'READY')}, updated_at = now()
          WHERE archetype = $1`,
-        [archetype, JSON.stringify(ready)]
+        [archetype]
     );
     await invalidatePlannerCache(archetype);
     logger.info(

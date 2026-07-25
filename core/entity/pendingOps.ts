@@ -66,6 +66,11 @@ export function trackCacheOp(p: Promise<void>): void {
     p.finally(() => pendingCacheOps.delete(p));
 }
 
+/** In-flight post-commit side effects. Observability + test assertions. */
+export function pendingSideEffectCount(): number {
+    return pendingSideEffects.size;
+}
+
 export function trackSideEffect(p: Promise<void>): void {
     pendingSideEffects.add(p);
     p.finally(() => pendingSideEffects.delete(p));
