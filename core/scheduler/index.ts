@@ -16,6 +16,19 @@ export {
 
 export {
     withLock,
+    LockUnavailableError,
     type WithLockOptions,
     type LockOutcome,
 } from './withLock';
+
+export {
+    createLockBackend,
+    InProcessLockBackend,
+    AdvisoryLockBackend,
+    PostgresLeaseLockBackend,
+    UnsafeAdvisoryPoolingError,
+    type LockBackend,
+    type LockBackendKind,
+    type LockHandle,
+    type AcquireOptions,
+} from './locks';

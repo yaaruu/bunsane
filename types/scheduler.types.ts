@@ -210,6 +210,19 @@ export interface SchedulerConfig {
      * @default 100
      */
     lockRetryInterval?: number;
+    /**
+     * Which lock backend to use for distributed locking.
+     *  - `'auto'`       — safest correct default for the deployment.
+     *  - `'in-process'` — single instance only (no cross-process exclusion).
+     *  - `'postgres'`   — pooler-safe lease table (recommended for pgbouncer).
+     *  - `'redis'`      — Redis `SET NX PX` lease (opt-in).
+     *  - `'advisory'`   — PostgreSQL session advisory locks; ONLY safe on a
+     *                     session-pinned connection (breaks behind a
+     *                     transaction pooler — see BUNSANE-1).
+     * Overridable via `BUNSANE_LOCK_BACKEND`.
+     * @default 'auto'
+     */
+    lockBackend?: "auto" | "in-process" | "postgres" | "redis" | "advisory";
 }
 
 export interface DistributedLockMetrics {
