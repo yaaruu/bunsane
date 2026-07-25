@@ -12,6 +12,24 @@
  * finishes on its own. The query's eventual settle is swallowed so it can't
  * surface as an unhandled rejection after the race is lost.
  */
+/**
+ * Forward an upstream abort (e.g. the request-scoped `req.signal`) onto a
+ * locally-owned controller, so a caller-supplied signal and an internal
+ * wall-clock timeout can share one signal without either being dropped.
+ * Hand-rolled rather than `AbortSignal.any` for runtime portability.
+ * Returns an unlink function; call it when the operation settles.
+ */
+export function linkAbortSignals(upstream: AbortSignal | undefined, controller: AbortController): () => void {
+    if (!upstream) return () => { /* nothing to unlink */ };
+    if (upstream.aborted) {
+        controller.abort(upstream.reason);
+        return () => { /* already settled */ };
+    }
+    const onAbort = () => controller.abort(upstream.reason);
+    upstream.addEventListener('abort', onAbort, { once: true });
+    return () => upstream.removeEventListener('abort', onAbort);
+}
+
 export async function runWithSignal<T>(q: any, signal?: AbortSignal): Promise<T> {
     if (!signal) return await q;
     if (signal.aborted) {

@@ -9,6 +9,7 @@ import { OrQuery } from "./OrQuery";
 import { OrNode } from "./OrNode";
 import { preparedStatementCache } from "../database/PreparedStatementCache";
 import { timedUnsafe, type PerRequestCounters } from "../database/instrumentedDb";
+import { linkAbortSignals } from "../database/cancellable";
 import { getMetadataStorage } from "../core/metadata";
 import { shouldUseDirectPartition } from "../core/Config";
 import type { SQL } from "bun";
@@ -507,24 +508,57 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         return this;
     }
 
-    public count(opts?: QueryExecOptions): Promise<number> {
-        this.applyExecOptions(opts);
-        return new Promise<number>((resolve, reject) => {
+    /**
+     * Run a terminal operation under the wall-clock query timeout.
+     *
+     * The timer CANCELS the in-flight statement (via `execSignal` →
+     * `runWithSignal` → Bun SQL `query.cancel()`) before rejecting. Rejecting
+     * alone leaves the query running server-side, holding a pooled backend
+     * and its locks after the caller has given up — the failure mode that
+     * turns a DB slowdown into pool exhaustion behind pgbouncer.
+     *
+     * A caller-supplied `signal` is linked in, and `execSignal` is restored
+     * on settle so a reusable Query instance is not left holding a fired
+     * signal.
+     */
+    private runWithTimeout<T>(label: string, run: () => Promise<T>): Promise<T> {
+        const controller = new AbortController();
+        const restoreSignal = this.execSignal;
+        const unlinkCaller = linkAbortSignals(restoreSignal, controller);
+        this.execSignal = controller.signal;
+
+        return new Promise<T>((resolve, reject) => {
             const timeout = setTimeout(() => {
-                logger.error(`Query count execution timeout`);
-                reject(new Error(`Query count execution timeout after ${QUERY_TIMEOUT_MS / 1000} seconds`));
+                logger.error(`${label} timeout`);
+                const err = new Error(`${label} timeout after ${QUERY_TIMEOUT_MS / 1000} seconds`);
+                controller.abort(err);
+                reject(err);
             }, QUERY_TIMEOUT_MS);
+            // unref: at high QPS thousands of these are live concurrently;
+            // they must not hold the event loop open nor add ref'd-timer churn.
             (timeout as unknown as { unref?: () => void }).unref?.();
-            this.doCount()
+
+            const cleanup = () => {
+                clearTimeout(timeout);
+                unlinkCaller();
+                this.execSignal = restoreSignal;
+            };
+
+            run()
                 .then(result => {
-                    clearTimeout(timeout);
+                    cleanup();
                     resolve(result);
                 })
                 .catch(error => {
-                    clearTimeout(timeout);
+                    cleanup();
                     reject(error);
                 });
         });
+    }
+
+    public count(opts?: QueryExecOptions): Promise<number> {
+        this.applyExecOptions(opts);
+        return this.runWithTimeout('Query count execution', () => this.doCount());
     }
 
     /**
@@ -749,22 +783,7 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         componentCtor: new (...args: any[]) => T,
         field: keyof ComponentDataType<T>
     ): Promise<number> {
-        return new Promise<number>((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                logger.error(`Query sum execution timeout`);
-                reject(new Error(`Query sum execution timeout after ${QUERY_TIMEOUT_MS / 1000} seconds`));
-            }, QUERY_TIMEOUT_MS);
-            (timeout as unknown as { unref?: () => void }).unref?.();
-            this.doAggregate('SUM', componentCtor, field as string)
-                .then(result => {
-                    clearTimeout(timeout);
-                    resolve(result);
-                })
-                .catch(error => {
-                    clearTimeout(timeout);
-                    reject(error);
-                });
-        });
+        return this.runWithTimeout('Query sum execution', () => this.doAggregate('SUM', componentCtor, field as string));
     }
 
     /**
@@ -778,22 +797,7 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         componentCtor: new (...args: any[]) => T,
         field: keyof ComponentDataType<T>
     ): Promise<number> {
-        return new Promise<number>((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                logger.error(`Query average execution timeout`);
-                reject(new Error(`Query average execution timeout after ${QUERY_TIMEOUT_MS / 1000} seconds`));
-            }, QUERY_TIMEOUT_MS);
-            (timeout as unknown as { unref?: () => void }).unref?.();
-            this.doAggregate('AVG', componentCtor, field as string)
-                .then(result => {
-                    clearTimeout(timeout);
-                    resolve(result);
-                })
-                .catch(error => {
-                    clearTimeout(timeout);
-                    reject(error);
-                });
-        });
+        return this.runWithTimeout('Query average execution', () => this.doAggregate('AVG', componentCtor, field as string));
     }
 
     /**
@@ -949,27 +953,10 @@ AND c.deleted_at IS NULL`;
             }
         }
 
-        return new Promise<TypedEntity<TComponents>[]>((resolve, reject) => {
-            // Add timeout to prevent hanging queries
-            const timeout = setTimeout(() => {
-                logger.error(`Query execution timeout`);
-                reject(new Error(`Query execution timeout after ${QUERY_TIMEOUT_MS / 1000} seconds`));
-            }, QUERY_TIMEOUT_MS); // 30 second timeout
-            // unref: at high QPS thousands of these are live concurrently;
-            // they must not hold the event loop open nor add ref'd-timer churn.
-            (timeout as unknown as { unref?: () => void }).unref?.();
-
-            this.doExec()
-                .then(result => {
-                    clearTimeout(timeout);
-                    // Wrap entities with typed accessors
-                    const typedEntities = result.map(e => this.wrapTypedEntity(e));
-                    resolve(typedEntities);
-                })
-                .catch(error => {
-                    clearTimeout(timeout);
-                    reject(error);
-                });
+        return this.runWithTimeout('Query execution', async () => {
+            const result = await this.doExec();
+            // Wrap entities with typed accessors
+            return result.map(e => this.wrapTypedEntity(e));
         });
     }
 
