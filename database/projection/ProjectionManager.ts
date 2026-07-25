@@ -8,6 +8,7 @@ import { deriveProjectionDescriptor } from './ProjectionMetadata';
 import { buildDependencyMap } from './DependencyMap';
 import { projectEntity } from './projectEntity';
 import { createCoveringIndex, createRmTable, rmTableName, assertRmTableName } from './DDLGenerator';
+import { syncRmSchema } from './SchemaSync';
 import { assertIdentifier } from '../../query/SqlIdentifier';
 import { qspActive, qspMode, qspInScope } from './qspConfig';
 
@@ -69,6 +70,10 @@ export class ProjectionManager {
                      ON CONFLICT (archetype) DO UPDATE SET shape_hash = EXCLUDED.shape_hash`,
                     [descriptor.archetype, descriptor.shapeHash, descriptor.shapeVersion]
                 );
+                // Shape growth: an existing rm_ table never gains columns from
+                // CREATE TABLE IF NOT EXISTS. Diff and ALTER, marking new
+                // columns FILLING until filled (B7).
+                await syncRmSchema(archetypeName, descriptor);
                 const rows = await db.unsafe(`SELECT status FROM projection_state WHERE archetype = $1`, [descriptor.archetype]);
                 this.statusCache.set(archetypeName, (rows[0]?.status ?? 'DISABLED') as ProjectionStatus);
             } catch (error) {
@@ -132,6 +137,7 @@ export class ProjectionManager {
             );
             const won = rows.length > 0;
             await createRmTable(archetype, descriptor.columns);
+            await syncRmSchema(archetype, descriptor);
             if (won) {
                 await createCoveringIndex(archetype, this.coveringIndexOpts(descriptor));
             }
@@ -153,16 +159,25 @@ export class ProjectionManager {
     async syncActiveProjections(): Promise<void> {
         if (!qspActive()) return;
         try {
+            // Empty params array forces the extended protocol; the no-params
+            // form goes through the simple query path, where rows can arrive
+            // without named columns and every `row.archetype` reads undefined.
             const rows = await db.unsafe(
-                `SELECT archetype, status FROM projection_state WHERE status IN ('BACKFILLING','SHADOW','READY')`
+                `SELECT archetype, status FROM projection_state WHERE status IN ('BACKFILLING','SHADOW','READY')`,
+                []
             );
             for (const row of rows) {
-                const archetype = row.archetype as string;
+                const archetype = row?.archetype as string | undefined;
+                if (!archetype) {
+                    logger.warn({ row }, 'syncActiveProjections: projection_state row without an archetype — skipped');
+                    continue;
+                }
                 if (!qspInScope(archetype)) continue;
                 if (!this.descriptors.has(archetype)) {
                     try {
                         const descriptor = deriveProjectionDescriptor(archetype);
                         await createRmTable(archetype, descriptor.columns);
+                        await syncRmSchema(archetype, descriptor);
                         this.registerArchetype(archetype, descriptor);
                     } catch (e) {
                         logger.warn(`syncActiveProjections: cannot register ${archetype}: ${e}`);
