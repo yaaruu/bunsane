@@ -33,6 +33,7 @@ import { OpenAPISpecGenerator, type SwaggerEndpointMetadata } from "../swagger";
 import type BasePlugin from "../plugins";
 import { preparedStatementCache } from "../database/PreparedStatementCache";
 import db from "../database";
+import { probeConnection } from "../database/connectionProbe";
 import { type Middleware, composeMiddleware } from "./Middleware";
 import { validateEnv } from "./validateEnv";
 import type { RemoteManager, RemoteManagerConfig } from "./remote";
@@ -199,6 +200,10 @@ export default class App {
             ApplicationLifecycle.getCurrentPhase() ===
             ApplicationPhase.DATABASE_INITIALIZING
         ) {
+            // Verify connection assumptions (transaction pooling,
+            // statement_timeout) before anything depends on them. Never
+            // throws; logs at error when a documented mitigation is inert.
+            await probeConnection();
             if (!(await HasValidBaseTable())) {
                 await PrepareDatabase();
             } else {
