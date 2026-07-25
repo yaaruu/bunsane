@@ -2,7 +2,7 @@
 
 All notable changes to bunsane are documented here.
 
-## Unreleased
+## 0.5.10 — 2026-07-26
 
 Downstream ticket "locking, timeouts, and silent-no-op write paths"
 (2026-07-25). Every item below failed **silently and in the safe-looking
