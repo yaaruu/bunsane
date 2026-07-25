@@ -357,7 +357,15 @@ export async function doDelete(entity: Entity, force: boolean = false): Promise<
 
         // Fire-and-forget post-commit side effects: lifecycle hooks + cache
         // invalidation. Errors are logged, never propagate to caller.
-        queueMicrotask(() => runPostDeleteSideEffects(entity, !force));
+        // Tracked in pendingSideEffects (same as the save path) so
+        // Entity.drainPendingSideEffects() / shutdown can await cache
+        // invalidation — otherwise a script that deletes then exits leaves
+        // the write-through cache serving deleted rows.
+        trackSideEffect(new Promise<void>((resolve) => {
+            queueMicrotask(() => {
+                runPostDeleteSideEffects(entity, !force).finally(() => resolve());
+            });
+        }));
 
         return true;
     } catch (error) {
