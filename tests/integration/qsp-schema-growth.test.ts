@@ -133,5 +133,31 @@ if (!isPGlite) {
             const added = await syncRmSchema(archetypeName, descriptor);
             expect(added).toEqual([]);
         });
+
+        test('resumes a fill interrupted by a restart (column present, still FILLING)', async () => {
+            const descriptor = deriveProjectionDescriptor(archetypeName);
+            // The crashed-mid-fill state: column exists, field_state still FILLING.
+            await db.unsafe(
+                `UPDATE projection_state
+                 SET field_state = field_state || '{"${newColumn}":"FILLING"}'::jsonb
+                 WHERE archetype = $1`,
+                [archetypeName]
+            );
+
+            const resumed = await syncRmSchema(archetypeName, descriptor, { fill: false });
+            expect(resumed.map(col => col.columnName)).toEqual([newColumn]);
+
+            const { fillColumns } = await import('../../database/projection/SchemaSync');
+            await fillColumns(archetypeName, resumed);
+
+            const rows = await db.unsafe(
+                `SELECT field_state FROM projection_state WHERE archetype = $1`,
+                [archetypeName]
+            );
+            const state = typeof rows[0].field_state === 'string'
+                ? JSON.parse(rows[0].field_state)
+                : rows[0].field_state;
+            expect(state[newColumn]).toBe('READY');
+        });
     });
 }

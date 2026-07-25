@@ -20,6 +20,7 @@
 import db from '../index';
 import { logger as MainLogger } from '../../core/Logger';
 import { getMetadataStorage } from '../../core/metadata';
+import { getDistributedLock } from '../../core/scheduler/DistributedLock';
 import { assertIdentifier } from '../../query/SqlIdentifier';
 import { addColumn, rmTableName, assertRmTableName } from './DDLGenerator';
 import { projectionSourceExpr } from './ProjectionSource';
@@ -85,34 +86,66 @@ export async function syncRmSchema(
 ): Promise<ProjectedColumn[]> {
     const present = await existingRmColumns(archetype);
     const missing = descriptor.columns.filter(col => !present.has(col.columnName));
-    if (missing.length === 0) return [];
+
+    // A fill interrupted by a restart leaves the column present but still
+    // FILLING — permanently excluded from the planner if nothing re-kicks it.
+    // Resume those alongside any newly added columns.
+    const filling = await currentFillingColumns(archetype);
+    const stalled = descriptor.columns.filter(col => present.has(col.columnName) && filling.has(col.columnName));
+
+    if (missing.length === 0 && stalled.length === 0) return [];
 
     for (const col of missing) {
         await addColumn(archetype, col);
     }
 
-    await db.unsafe(
-        `UPDATE projection_state
-         SET field_state = ${fieldStateBase} || ${fieldStateLiteral(missing, 'FILLING')},
-             shape_hash = $2,
-             shape_version = $3,
-             updated_at = now()
-         WHERE archetype = $1`,
-        [archetype, descriptor.shapeHash, descriptor.shapeVersion]
-    );
-    await invalidatePlannerCache(archetype);
+    if (missing.length > 0) {
+        await db.unsafe(
+            `UPDATE projection_state
+             SET field_state = ${fieldStateBase} || ${fieldStateLiteral(missing, 'FILLING')},
+                 shape_hash = $2,
+                 shape_version = $3,
+                 updated_at = now()
+             WHERE archetype = $1`,
+            [archetype, descriptor.shapeHash, descriptor.shapeVersion]
+        );
+        await invalidatePlannerCache(archetype);
 
-    logger.warn(
-        { archetype, columns: missing.map(col => col.columnName) },
-        'Projection shape grew — added rm_ columns, marked FILLING until backfilled'
-    );
+        logger.warn(
+            { archetype, columns: missing.map(col => col.columnName) },
+            'Projection shape grew — added rm_ columns, marked FILLING until backfilled'
+        );
+    }
+    if (stalled.length > 0) {
+        logger.warn(
+            { archetype, columns: stalled.map(col => col.columnName) },
+            'Resuming an interrupted projection column fill (columns still FILLING)'
+        );
+    }
 
+    const toFill = [...missing, ...stalled];
     if (opts.fill !== false) {
-        void fillColumns(archetype, missing).catch(err =>
+        void fillColumns(archetype, toFill).catch(err =>
             logger.error({ archetype, err }, 'Projection column fill failed — columns stay FILLING')
         );
     }
-    return missing;
+    return toFill;
+}
+
+/** Columns currently marked FILLING for this archetype. */
+async function currentFillingColumns(archetype: string): Promise<Set<string>> {
+    const rows = await db.unsafe(
+        `SELECT field_state FROM projection_state WHERE archetype = $1`,
+        [archetype]
+    );
+    const raw = rows[0]?.field_state;
+    if (!raw) return new Set();
+    let parsed: any = raw;
+    if (typeof raw === 'string') {
+        try { parsed = JSON.parse(raw); } catch { return new Set(); }
+    }
+    if (typeof parsed !== 'object' || Array.isArray(parsed)) return new Set();
+    return new Set(Object.keys(parsed).filter(key => parsed[key] === 'FILLING'));
 }
 
 /**
@@ -123,43 +156,63 @@ export async function syncRmSchema(
  */
 export async function fillColumns(archetype: string, columns: ProjectedColumn[]): Promise<void> {
     if (columns.length === 0) return;
-    const table = assertRmTableName(rmTableName(archetype));
-    const storage = getMetadataStorage();
-    const batchSize = parseInt(process.env.BUNSANE_QSP_BACKFILL_BATCH ?? '5000', 10);
-    const throttle = parseInt(process.env.BUNSANE_QSP_BACKFILL_THROTTLE_MS ?? '50', 10);
 
-    const assignments = columns.map(col => {
-        const columnName = assertIdentifier(col.columnName, 'projectedColumn');
-        const typeId = storage.getComponentId(col.component) ?? '';
-        return `"${columnName}" = ${projectionSourceExpr(col, typeId, 'r.entity_id')}`;
-    }).join(', ');
+    // Same coordination as backfill / reconcile: without it every instance
+    // scans the whole table at boot. Not acquiring means another instance is
+    // already filling — its completion flips the columns to READY.
+    const lock = getDistributedLock();
+    const taskId = `qsp-fill-${archetype}`;
+    const res = await lock.tryAcquire(taskId);
+    if (!res.acquired) return;
 
-    let watermark = ZERO_UUID;
-    while (true) {
-        const rows = await db.unsafe(
-            `WITH batch AS (
-                 SELECT entity_id FROM ${table} WHERE entity_id > $1 ORDER BY entity_id LIMIT $2
-             )
-             UPDATE ${table} r SET ${assignments}
-             FROM batch b WHERE r.entity_id = b.entity_id
-             RETURNING r.entity_id`,
-            [watermark, batchSize]
+    try {
+        const table = assertRmTableName(rmTableName(archetype));
+        const storage = getMetadataStorage();
+        const batchSize = parseInt(process.env.BUNSANE_QSP_BACKFILL_BATCH ?? '5000', 10);
+        const throttle = parseInt(process.env.BUNSANE_QSP_BACKFILL_THROTTLE_MS ?? '50', 10);
+
+        const assignments = columns.map(col => {
+            const columnName = assertIdentifier(col.columnName, 'projectedColumn');
+            const typeId = storage.getComponentId(col.component) ?? '';
+            return `"${columnName}" = ${projectionSourceExpr(col, typeId, 'r.entity_id')}`;
+        }).join(', ');
+
+        let watermark = ZERO_UUID;
+        while (true) {
+            // Termination and the watermark are driven by the SELECT, not by
+            // the UPDATE's RETURNING: a concurrent delete of every row in the
+            // batch would make RETURNING empty while later rows still hold
+            // NULLs, and stopping there would flip the columns to READY with
+            // the fill unfinished.
+            const batch = await db.unsafe(
+                `SELECT entity_id FROM ${table} WHERE entity_id > $1 ORDER BY entity_id LIMIT $2`,
+                [watermark, batchSize]
+            );
+            if (batch.length === 0) break;
+            const lastId = batch[batch.length - 1].entity_id as string;
+
+            await db.unsafe(
+                `UPDATE ${table} r SET ${assignments}
+                 WHERE r.entity_id > $1 AND r.entity_id <= $2`,
+                [watermark, lastId]
+            );
+
+            watermark = lastId;
+            if (throttle > 0) await new Promise(resolve => setTimeout(resolve, throttle));
+        }
+
+        await db.unsafe(
+            `UPDATE projection_state
+             SET field_state = ${fieldStateBase} || ${fieldStateLiteral(columns, 'READY')}, updated_at = now()
+             WHERE archetype = $1`,
+            [archetype]
         );
-        if (rows.length === 0) break;
-        // RETURNING order is unspecified; advance on the batch maximum.
-        watermark = rows.reduce((max: string, row: any) => (row.entity_id > max ? row.entity_id : max), watermark);
-        if (throttle > 0) await new Promise(resolve => setTimeout(resolve, throttle));
+        await invalidatePlannerCache(archetype);
+        logger.info(
+            { archetype, columns: columns.map(col => col.columnName) },
+            'Projection column fill complete — columns READY'
+        );
+    } finally {
+        await lock.release(taskId);
     }
-
-    await db.unsafe(
-        `UPDATE projection_state
-         SET field_state = ${fieldStateBase} || ${fieldStateLiteral(columns, 'READY')}, updated_at = now()
-         WHERE archetype = $1`,
-        [archetype]
-    );
-    await invalidatePlannerCache(archetype);
-    logger.info(
-        { archetype, columns: columns.map(col => col.columnName) },
-        'Projection column fill complete — columns READY'
-    );
 }

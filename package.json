@@ -33,6 +33,7 @@
         "upload",
         "utils",
         "tsconfig.json",
+        "docs",
         "CHANGELOG.md"
     ],
     "scripts": {

@@ -519,7 +519,10 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
      *
      * A caller-supplied `signal` is linked in, and `execSignal` is restored
      * on settle so a reusable Query instance is not left holding a fired
-     * signal.
+     * signal. `execSignal` is instance state (as it already was via
+     * applyExecOptions), so two terminal calls running CONCURRENTLY on the
+     * same Query instance share one signal — a timeout in either cancels
+     * both. Run concurrent terminals on separate Query instances.
      */
     private runWithTimeout<T>(label: string, run: () => Promise<T>): Promise<T> {
         const controller = new AbortController();

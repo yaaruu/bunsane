@@ -45,16 +45,23 @@ export function resetConnectionProbe(): void {
     cached = null;
 }
 
+// PostgreSQL normalizes `SHOW statement_timeout` to the largest exact unit
+// (3600000 → "1h"), so every unit it can emit must parse or a correctly
+// applied timeout would be reported as ignored.
+const UNIT_MS: Record<string, number> = {
+    us: 1 / 1000,
+    ms: 1,
+    s: 1000,
+    min: 60_000,
+    h: 3_600_000,
+    d: 86_400_000,
+};
+
 const parseTimeoutMs = (shown: string | undefined): number | null => {
     if (!shown) return null;
-    const match = /^(\d+)\s*(ms|s|min)?$/.exec(shown.trim());
+    const match = /^(\d+)\s*(us|ms|s|min|h|d)?$/.exec(shown.trim());
     if (!match) return null;
-    const value = parseInt(match[1]!, 10);
-    switch (match[2]) {
-        case 's': return value * 1000;
-        case 'min': return value * 60_000;
-        default: return value;
-    }
+    return parseInt(match[1]!, 10) * (UNIT_MS[match[2] ?? 'ms'] ?? 1);
 };
 
 /**
@@ -102,7 +109,10 @@ export async function probeConnection(sql: SQL = db): Promise<ConnectionProbeRes
     if (requested) {
         const requestedMs = parseTimeoutMs(requested);
         const effectiveMs = parseTimeoutMs(result.statementTimeout);
-        result.statementTimeoutIgnored = effectiveMs === 0 || (requestedMs !== null && effectiveMs !== requestedMs);
+        // Unparseable effective value → inconclusive, stay quiet. `0` means no
+        // timeout at all, which is the actual PgBouncer outcome.
+        result.statementTimeoutIgnored = effectiveMs === 0
+            || (effectiveMs !== null && requestedMs !== null && effectiveMs !== requestedMs);
     }
 
     if (result.transactionPooling) {
