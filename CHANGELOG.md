@@ -2,6 +2,71 @@
 
 All notable changes to bunsane are documented here.
 
+## Unreleased
+
+Downstream ticket "locking, timeouts, and silent-no-op write paths"
+(2026-07-25). Every item below failed **silently and in the safe-looking
+direction**: a lock that reported acquired while stranded, a delete that
+reported removed while writing nothing, a timeout that reported applied while
+ignored, a projection that reported created while missing a column. The bias
+across these fixes is to fail loudly.
+
+### Added
+
+- **Pluggable lock backends (B1)** — `LockBackend` with `postgres` (lease
+  table `bunsane_locks`), `in-process`, and legacy `advisory` implementations,
+  selected via `BUNSANE_LOCK_BACKEND` / `scheduler.lockBackend` (`auto` →
+  `postgres`). The lease backend is **pooler-safe**: one autocommit statement
+  per acquire/renew/release, owner-token fencing, `expires_at` crash recovery,
+  heartbeat renew from `withLock`. This code was written on 2026-06-22 and
+  never merged — 0.5.7–0.5.9 shipped only the advisory implementation, and the
+  `docs/LOCKING.md` referenced by the changelog did not exist in the package.
+  It does now.
+- **Advisory-backend session-affinity guard (B1)** — `set_config` then read
+  back on a separate statement; a lost value proves the connection has no
+  session affinity and throws `UnsafeAdvisoryPoolingError` instead of stranding
+  locks. Override with `BUNSANE_ALLOW_UNSAFE_ADVISORY_LOCK=true`.
+- **Boot-time connection probe (B6)** — `probeConnection()` measures what the
+  framework used to assume: `pg_backend_pid()` across separate statements
+  (differing PIDs prove transaction pooling → logs what is unsafe there), and
+  `SHOW statement_timeout` read back against `DB_STATEMENT_TIMEOUT` (mismatch
+  logs at **error** with the `ALTER ROLE` remedy). Never throws.
+- **Projection schema growth (B7)** — `SchemaSync` diffs the archetype
+  descriptor against `information_schema.columns` on registration/sync, adds
+  missing `rm_` columns, marks them `FILLING` in `projection_state.field_state`
+  (the planner already excludes FILLING columns from coverage, filter, sort and
+  hydration) and fills them for existing rows before flipping to `READY`.
+  `addColumn` had existed with zero callers, so adding a projected field broke
+  every dual-write on that archetype until someone ran `ALTER TABLE` by hand.
+- `docs/POOLING.md` (what is and isn't safe behind `pool_mode = transaction`)
+  and `docs/STANDALONE_SCRIPTS.md` (scripts are a supported execution mode —
+  bootstrap and drain-before-exit).
+- `Entity`-level `pendingSideEffectCount()` for drain assertions.
+
+### Fixed
+
+- **`Entity.delete()` silently no-oped outside the app lifecycle (B4)** —
+  `EntityManager.deleteEntity` gated on a `dbReady` flag set only by the
+  `DATABASE_READY` phase, which standalone scripts never emit. Deletes resolved
+  `false`, wrote nothing, logged nothing — while `save()` in the same script
+  worked, because it bypasses `EntityManager`. The gate is gone; `false` now
+  means only "entity not persisted" and DB failures throw.
+- **Post-delete side effects were unawaitable (B5)** — the delete path's
+  fire-and-forget hooks + cache invalidation are now tracked in
+  `pendingSideEffects`, so `Entity.drainPendingSideEffects()` and shutdown cover
+  deletes. A script that deleted and exited could leave the write-through cache
+  serving deleted rows.
+- **Query timeouts abandoned the query instead of cancelling it (B2)** —
+  `Query.exec/count/sum/average` rejected the caller's promise while the
+  statement kept running server-side, holding a pooled backend and its locks;
+  behind pgbouncer that compounds a slowdown into pool exhaustion. All four now
+  run through `runWithTimeout`, which aborts `execSignal` (→ Bun SQL
+  `query.cancel()`) before rejecting, the same mechanism the write path has
+  used since `saveEntity`. Rejection messages unchanged.
+- **`syncActiveProjections` logged `cannot register undefined` every 30 s
+  (B3)** — rows without an archetype are skipped, and the query now passes an
+  empty params array so it uses the extended protocol.
+
 ## 0.5.9 — 2026-06-30
 
 ### Fixed

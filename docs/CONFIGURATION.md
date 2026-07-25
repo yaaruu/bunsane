@@ -30,9 +30,9 @@ A connection requires **either** `DB_CONNECTION_URL` **or**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DB_QUERY_TIMEOUT` | `30000` (ms) | Client-side wall-clock timeout for `Query.exec/count/sum/average` and `Entity.save`. **JS-side only** — raises a client error and rolls back; it does *not* kill the server-side query (see `DB_STATEMENT_TIMEOUT`). |
+| `DB_QUERY_TIMEOUT` | `30000` (ms) | Client-side wall-clock timeout for `Query.exec/count/sum/average`, `Entity.save` and `Entity.doDelete`. JS-side, but it **cancels** the in-flight statement (`query.cancel()`) before rejecting, so the backend is released rather than left running. A server-side backstop is still worthwhile — see `DB_STATEMENT_TIMEOUT`. |
 | `DB_CONNECTION_TIMEOUT` | `30` (s) | How long the pool waits for a free connection before rejecting. Consider `5` for user-facing services so clients fail fast instead of queueing. |
-| `DB_STATEMENT_TIMEOUT` | unset (opt-in, ms) | Server-side `statement_timeout` appended to the connection URL so PostgreSQL itself kills runaway queries. **Skipped under PgBouncer** (rejects startup parameters) and under PGlite. Set it server-side on the role instead when behind PgBouncer. |
+| `DB_STATEMENT_TIMEOUT` | unset (opt-in, ms) | Server-side `statement_timeout` appended to the connection URL as the `options` startup parameter. Skipped under PGlite. **Inert behind PgBouncer**, which drops `options` — the boot probe logs at error when it did not stick. Behind a pooler use `ALTER ROLE … SET statement_timeout` instead. |
 | `DB_DISABLE_PREPARE` | `false` | `true` disables Bun SQL's automatic server-side prepared statements (driver default is on). **Required behind PgBouncer in transaction pooling mode** — see [PgBouncer deployment](#pgbouncer-deployment) below. |
 | `DB_SAVE_PROFILE` | `false` | `true` logs per-phase `Entity.save` timings (`db`, `cache`, `hooks`, `total`). |
 
@@ -260,8 +260,12 @@ are unusable under transaction pooling anyway.
 
 ### 2. Server-side statement timeout (set on the role, not the app)
 
-`DB_STATEMENT_TIMEOUT` is skipped under PgBouncer because PgBouncer rejects the
-startup parameter. Instead, set the timeout server-side so PostgreSQL kills
+`DB_STATEMENT_TIMEOUT` is always sent as the `options` startup parameter — the
+framework cannot detect a pooler from the URL, and PgBouncer **drops** `options`
+(it must be in `IGNORE_STARTUP_PARAMETERS` or connections fail outright), so
+behind a pooler the setting is accepted and has no effect. This is now verified
+at boot: `probeConnection()` reads `SHOW statement_timeout` back and logs at
+**error** when it did not stick. Set the timeout server-side so PostgreSQL kills
 runaway queries even when the app cannot:
 
 ```sql
@@ -271,6 +275,11 @@ ALTER ROLE myapp SET idle_in_transaction_session_timeout = '30s';
 
 And on PgBouncer, lower `query_wait_timeout` (e.g. `30`) so a drained pool
 fails fast rather than hanging.
+
+> Full support matrix (what is safe, what is inert, what throws) behind
+> `pool_mode = transaction`: [POOLING.md](POOLING.md). Running migrations /
+> backfills / cleanups as standalone scripts:
+> [STANDALONE_SCRIPTS.md](STANDALONE_SCRIPTS.md).
 
 ### 3. Session-bound features break under transaction pooling
 
