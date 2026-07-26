@@ -35,6 +35,7 @@ entity; a database failure throws.
 | GraphQL/HTTP server, middleware, request context | No per-request DataLoader batching — `entity.get()` is one query per call. Prefer `Query…populate()`. |
 | Scheduler, reconcile sweep, projection poll | `ProjectionManager` is not polling; if `BUNSANE_QSP` is on, the dual-write still runs on save/delete because it lives in the write path. |
 | Cache manager (unless you `await CacheManager.initialize(...)`) | Writes bypass the cache instead of invalidating it — see below. |
+| DB admission (`database/gateway.ts`) | Inert. `App.init()` arms it after migrations; a script never runs that path, so framework queries are unbounded in concurrency. That matches the pre-gateway behaviour, and it is usually what a one-off wants. For a bulk backfill sharing a database with a live service, arm it deliberately: `import { armGateway } from 'bunsane/database/gateway'; armGateway();` — then the script's own concurrency is bounded and `lane: 'background'` work cannot occupy the whole pool. Check `getGatewayStats().armed` if unsure which mode you are in. |
 | Signal handlers / graceful shutdown | You own process exit. |
 
 ## Before you exit

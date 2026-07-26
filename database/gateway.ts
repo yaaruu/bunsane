@@ -441,15 +441,21 @@ export async function dbTransaction<T>(
     const deadline = resolveDeadline(opts);
     const admission = await admit(lane, deadline, opts.signal, opts.label);
     try {
+        // `opts.conn` is honoured so a caller already holding a transaction handle
+        // can open a SAVEPOINT on it instead of acquiring a second pooled
+        // connection — which is what `(db as any).transaction(...)` would do,
+        // deadlocking against itself once every statement is routed here.
+        const target = opts.conn ?? db;
+
         // The ALS scope MUST be entered inside the transaction callback, not
-        // around `db.transaction(...)`. Bun invokes the callback from its own
+        // around `.transaction(...)`. Bun invokes the callback from its own
         // async context (`onTransactionConnected` in bun:sql), so a scope
         // established outside does not propagate into it: measured, every
         // statement inside the transaction re-entered admission and deadlocked
         // against the permit the transaction itself was holding — the precise
         // failure this design exists to avoid. Entering the scope here means it
         // propagates through everything `fn` awaits.
-        return await (db as any).transaction((trx: any) => admittedScope.run({ lane }, () => fn(trx)));
+        return await (target as any).transaction((trx: any) => admittedScope.run({ lane }, () => fn(trx)));
     } finally {
         admission.release();
     }

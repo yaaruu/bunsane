@@ -281,6 +281,26 @@ describe('transactions hold one permit for their duration', () => {
         expect(inAdmittedScope()).toBe(false);
     });
 
+    test('opts.conn is used, so an open handle gets a savepoint not a second connection', async () => {
+        // Acquiring a second pooled connection from inside a transaction is how a
+        // migrated write path would deadlock against itself.
+        let sawHandle: unknown = null;
+        const handle = {
+            transaction: (cb: (trx: any) => any) => {
+                sawHandle = 'used';
+                return cb({ marker: 'savepoint' });
+            },
+        };
+
+        const trxSeen = await dbTransaction(async (trx: any) => trx.marker, {
+            conn: handle,
+            timeoutMs: 1_000,
+        });
+
+        expect(sawHandle).toBe('used');
+        expect(trxSeen).toBe('savepoint');
+    });
+
     test('exemption does not leak outside the transaction scope', async () => {
         await dbTransaction(async () => {
             expect(inAdmittedScope()).toBe(true);
