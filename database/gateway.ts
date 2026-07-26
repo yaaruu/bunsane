@@ -209,9 +209,33 @@ const admittedScope = new AsyncLocalStorage<{ lane: Lane }>();
 
 let queues: { total: AdmissionQueue; background: AdmissionQueue } | null = null;
 let configuredFor = -1;
+let armed = false;
+let warnedAboutLiveRebuild = false;
 
 function admissionEnabled(): boolean {
     return process.env.BUNSANE_DB_ADMISSION !== 'off';
+}
+
+/**
+ * Engage admission. Until this is called, `dbExec`/`dbTransaction` are a
+ * passthrough.
+ *
+ * Boot DDL is the reason. `PrepareDatabase()` / `EnsureDatabaseMigrations()` run
+ * dozens of statements before the pool size is meaningfully known, and admitting
+ * them would serialize the migration phase behind a limit derived from a
+ * possibly-zero `poolMax` — slowing the one phase that has no concurrency to gain
+ * from being bounded. Arming after migrations keeps boot unbounded and steady
+ * state bounded, without needing a special lane whose name would lie about what
+ * it is for.
+ */
+export function armGateway(): void {
+    if (armed) return;
+    armed = true;
+    logger.info({ enabled: admissionEnabled() }, 'DB admission armed');
+}
+
+export function isGatewayArmed(): boolean {
+    return armed;
 }
 
 /**
@@ -225,6 +249,28 @@ function admissionEnabled(): boolean {
 function getQueues() {
     const poolMax = getDbStats().poolMax || parseInt(process.env.POSTGRES_MAX_CONNECTIONS ?? '20', 10);
     if (queues && configuredFor === poolMax) return queues;
+
+    // Never swap the queues out from under live permits. `setPoolMax` runs on
+    // every `resetDatabase()` (benchmarks do that), and rebuilding mid-flight
+    // would leave holders releasing into orphaned queues while new callers
+    // acquire against fresh full-capacity ones — briefly exceeding the limit and
+    // stranding the old waiters' timers.
+    //
+    // A resized pool DOES take effect, just not mid-flight: the rebuild happens
+    // on the first call after the queues go idle (or immediately via
+    // `resetGateway()`). "Deferred until idle", not "ignored".
+    if (queues && (queues.total.available < queues.total.capacity
+        || queues.background.available < queues.background.capacity)) {
+        if (!warnedAboutLiveRebuild) {
+            warnedAboutLiveRebuild = true;
+            logger.warn(
+                { configuredFor, poolMax },
+                'Pool size changed while DB admission permits were outstanding — keeping the ' +
+                'existing limits. Call resetGateway() when the pool is idle to reconfigure.',
+            );
+        }
+        return queues;
+    }
 
     const headroom = Math.max(1, parseInt(process.env.DB_ADMISSION_HEADROOM ?? '1', 10) || 1);
     const total = Math.max(1, poolMax - headroom);
@@ -245,6 +291,8 @@ function getQueues() {
 export function resetGateway(): void {
     queues = null;
     configuredFor = -1;
+    armed = false;
+    warnedAboutLiveRebuild = false;
     for (const lane of Object.keys(laneStats) as Lane[]) laneStats[lane] = newLaneStats();
 }
 
@@ -275,7 +323,7 @@ interface Admission {
  */
 async function admit(lane: Lane, deadline: number, signal?: AbortSignal, label?: string): Promise<Admission> {
     const noop: Admission = { release: () => {} };
-    if (!admissionEnabled() || lane === 'health' || admittedScope.getStore()) return noop;
+    if (!armed || !admissionEnabled() || lane === 'health' || admittedScope.getStore()) return noop;
 
     const { total, background } = getQueues();
     const t0 = performance.now();
@@ -416,6 +464,8 @@ export function getGatewayStats() {
     const { total, background } = getQueues();
     return {
         enabled: admissionEnabled(),
+        /** False until `armGateway()` runs (boot DDL is deliberately unbounded). */
+        armed,
         admissionLimit: total.capacity,
         admissionAvailable: total.available,
         backgroundLimit: background.capacity,

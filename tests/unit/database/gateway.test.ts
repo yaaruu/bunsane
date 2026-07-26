@@ -22,6 +22,7 @@ import {
     resetGateway,
     inAdmittedScope,
     isAdmissionTimeout,
+    armGateway,
     DbAdmissionTimeoutError,
     DbStatementTimeoutError,
 } from '../../../database/gateway';
@@ -76,6 +77,9 @@ beforeEach(() => {
     process.env.DB_ADMISSION_HEADROOM = '1';
     delete process.env.BUNSANE_DB_ADMISSION;
     resetGateway();
+    // Admission is inert until armed (boot DDL runs unbounded), so every test
+    // that exercises it has to arm first — same as App does after migrations.
+    armGateway();
 });
 
 afterEach(() => {
@@ -157,6 +161,38 @@ describe('admission capacity', () => {
             dbExec('SELECT 1', [], { conn: instantConn, timeoutMs: 500 }),
         ]);
         expect(getGatewayStats().admissionAvailable).toBe(2);
+    });
+
+    test('is inert until armed, so boot DDL is never serialized behind it', async () => {
+        resetGateway(); // disarms — the state a process is in during migrations
+        expect(getGatewayStats().armed).toBe(false);
+
+        const gate = gatedConn();
+        const all = [1, 2, 3, 4, 5].map(() => dbExec('SELECT 1', [], { conn: gate.conn, timeoutMs: 5_000 }));
+        await Bun.sleep(20);
+        expect(gate.started()).toBe(5); // no bound applied
+        gate.releaseAll();
+        await Promise.all(all);
+    });
+
+    test('a pool-size change is deferred until the queues are idle, never applied mid-flight', async () => {
+        const gate = gatedConn();
+        const held = dbExec('SELECT 1', [], { conn: gate.conn, timeoutMs: 5_000 });
+        await Bun.sleep(10);
+        expect(getGatewayStats().admissionAvailable).toBe(1);
+
+        // Rebuilding here would strand this permit's release on an orphaned queue
+        // and let new callers acquire against fresh full capacity.
+        setPoolMax(10);
+        expect(getGatewayStats().admissionLimit).toBe(2);
+        expect(getGatewayStats().admissionAvailable).toBe(1);
+
+        gate.releaseAll();
+        await held;
+
+        // Idle now, so the new size takes effect — deferred, not ignored.
+        expect(getGatewayStats().admissionLimit).toBe(9); // poolMax 10 − headroom 1
+        expect(getGatewayStats().admissionAvailable).toBe(9);
     });
 
     test('BUNSANE_DB_ADMISSION=off is a pure passthrough', async () => {
