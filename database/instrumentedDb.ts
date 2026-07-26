@@ -1,6 +1,7 @@
 import type { SQL } from "bun";
 import { logger as MainLogger } from "../core/Logger";
 import { runWithSignal } from "./cancellable";
+import { isPoolAcquisitionError } from "./poolErrors";
 
 const logger = MainLogger.child({ scope: "db" });
 
@@ -14,8 +15,11 @@ interface DbStatsInternal {
     maxMs: number;
     slowCount: number;
     abortedCount: number;
+    poolAcquireFailures: number;
     inFlight: number;
     inFlightMax: number;
+    poolMax: number;
+    saturatedSince: number;
     dataLoaderCalls: { entity: number; component: number; relation: number };
 }
 
@@ -25,10 +29,46 @@ const stats: DbStatsInternal = {
     maxMs: 0,
     slowCount: 0,
     abortedCount: 0,
+    poolAcquireFailures: 0,
     inFlight: 0,
     inFlightMax: 0,
+    poolMax: 0,
+    saturatedSince: 0,
     dataLoaderCalls: { entity: 0, component: 0, relation: 0 },
 };
+
+/**
+ * Record the pool's configured size so saturation is expressed against a
+ * denominator instead of an unlabelled number. Called from `createDatabase()`.
+ */
+export function setPoolMax(max: number): void {
+    stats.poolMax = Number.isFinite(max) && max > 0 ? max : 0;
+    stats.saturatedSince = 0;
+}
+
+/**
+ * How long the pool has been continuously saturated, in ms (0 = not saturated).
+ *
+ * `inFlight` counts calls that go through this module, which today is a SUBSET
+ * of the framework's DB traffic (the tagged-template paths in
+ * `core/entity/*`, `core/BatchLoader.ts` and most of `database/`,
+ * `database/projection/*` and `endpoints/*` bypass it). So this is a LOWER
+ * BOUND on real occupancy: it under-reports saturation, never over-reports it.
+ * The single execution seam that makes it exact is the next milestone; until
+ * then, treat a positive value as certain and a zero as unproven.
+ */
+export function poolSaturatedForMs(now: number = Date.now()): number {
+    return stats.saturatedSince === 0 ? 0 : Math.max(0, now - stats.saturatedSince);
+}
+
+function trackSaturation(): void {
+    if (stats.poolMax <= 0) return;
+    if (stats.inFlight >= stats.poolMax) {
+        if (stats.saturatedSince === 0) stats.saturatedSince = Date.now();
+    } else {
+        stats.saturatedSince = 0;
+    }
+}
 
 /**
  * Per-request counter incremented when current request context is reachable
@@ -55,6 +95,7 @@ export async function timedUnsafe<T = any>(
     const t0 = performance.now();
     stats.inFlight++;
     if (stats.inFlight > stats.inFlightMax) stats.inFlightMax = stats.inFlight;
+    trackSaturation();
     if (perRequest) perRequest.dbQueryCount++;
     let aborted = false;
     try {
@@ -65,10 +106,15 @@ export async function timedUnsafe<T = any>(
             aborted = true;
             stats.abortedCount++;
         }
+        // Pool exhaustion, not a query failure: the statement never reached the
+        // server. Counted separately so "we ran out of slots" is legible in
+        // /metrics instead of hiding among generic errors.
+        if (isPoolAcquisitionError(err)) stats.poolAcquireFailures++;
         throw err;
     } finally {
         const dt = performance.now() - t0;
         stats.inFlight--;
+        trackSaturation();
         stats.totalCount++;
         stats.totalMs += dt;
         if (dt > stats.maxMs) stats.maxMs = dt;
@@ -117,8 +163,11 @@ export function getDbStats() {
         avgMs: Number(avgMs.toFixed(2)),
         slowCount: stats.slowCount,
         abortedCount: stats.abortedCount,
+        poolAcquireFailures: stats.poolAcquireFailures,
         inFlight: stats.inFlight,
         inFlightMax: stats.inFlightMax,
+        poolMax: stats.poolMax,
+        poolSaturatedForMs: poolSaturatedForMs(),
         slowThresholdMs: SLOW_MS,
         dataLoaderCalls: { ...stats.dataLoaderCalls },
     };
@@ -133,8 +182,10 @@ export function resetDbStats(): void {
     stats.maxMs = 0;
     stats.slowCount = 0;
     stats.abortedCount = 0;
+    stats.poolAcquireFailures = 0;
     stats.inFlight = 0;
     stats.inFlightMax = 0;
+    stats.saturatedSince = 0;
     stats.dataLoaderCalls.entity = 0;
     stats.dataLoaderCalls.component = 0;
     stats.dataLoaderCalls.relation = 0;

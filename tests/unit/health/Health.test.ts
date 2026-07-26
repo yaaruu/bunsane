@@ -1,9 +1,14 @@
-import { describe, test, expect, beforeEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import {
     deepHealthCheck,
     readinessCheck,
     type HealthDeps,
 } from "../../../core/health";
+import {
+    resetDbStats,
+    setPoolMax,
+    timedUnsafe,
+} from "../../../database/instrumentedDb";
 
 let dbUp: boolean;
 let cacheUp: boolean;
@@ -154,5 +159,96 @@ describe("readinessCheck", () => {
 
         expect(httpStatus).toBe(503);
         expect(result.status).toBe("unavailable");
+    });
+});
+
+/**
+ * Sustained pool saturation sheds traffic via READINESS. It must never fail
+ * liveness: a full pool is also what a legitimate burst looks like, and
+ * restarting mid-burst trades a slow minute for a cold start plus a reconnect
+ * thundering herd. "Wedged" (write probe hangs) is the condition that restarts.
+ */
+describe("readiness under pool saturation", () => {
+    const originalThreshold = process.env.DB_POOL_SATURATION_READY_MS;
+
+    beforeEach(() => {
+        dbUp = true;
+        cacheUp = true;
+        writeUp = true;
+        resetDbStats();
+        setPoolMax(0);
+    });
+
+    afterEach(() => {
+        if (originalThreshold === undefined) delete process.env.DB_POOL_SATURATION_READY_MS;
+        else process.env.DB_POOL_SATURATION_READY_MS = originalThreshold;
+        resetDbStats();
+        setPoolMax(0);
+    });
+
+    /** Hold the (size-1) pool busy so saturation accrues, then release. */
+    async function whileSaturated<T>(sustainMs: number, fn: () => Promise<T>): Promise<T> {
+        setPoolMax(1);
+        const db = {
+            unsafe: () => new Promise((resolve) => {
+                const h = setTimeout(() => resolve([]), sustainMs + 500);
+                (h as any).unref?.();
+            }),
+        };
+        const busy = timedUnsafe(db as any, "SELECT pg_sleep(1)", []);
+        await Bun.sleep(sustainMs);
+        try {
+            return await fn();
+        } finally {
+            void busy.catch(() => { /* abandoned on purpose */ });
+        }
+    }
+
+    test("fails readiness once saturation outlasts the threshold", async () => {
+        process.env.DB_POOL_SATURATION_READY_MS = "10";
+
+        const { result, httpStatus } = await whileSaturated(40, () =>
+            readinessCheck(true, false, makeDeps()),
+        );
+
+        expect(httpStatus).toBe(503);
+        expect(result.status).toBe("unavailable");
+        expect(result.checks.db_pool?.status).toBe("saturated");
+        expect(result.checks.db_pool?.pool_max).toBe(1);
+        expect(result.checks.db_pool?.in_flight).toBeGreaterThanOrEqual(1);
+        expect(result.checks.db_pool?.saturated_for_ms).toBeGreaterThan(10);
+    });
+
+    test("a momentarily full pool does not flap readiness", async () => {
+        process.env.DB_POOL_SATURATION_READY_MS = "5000";
+
+        const { httpStatus, result } = await whileSaturated(20, () =>
+            readinessCheck(true, false, makeDeps()),
+        );
+
+        expect(httpStatus).toBe(200);
+        expect(result.checks.db_pool).toBeUndefined();
+    });
+
+    test("saturation never fails liveness — that stays the write probe's job", async () => {
+        process.env.DB_POOL_SATURATION_READY_MS = "10";
+
+        const { httpStatus, result } = await whileSaturated(40, () =>
+            deepHealthCheck(makeDeps()),
+        );
+
+        expect(httpStatus).toBe(200);
+        expect(result.status).toBe("ok");
+        expect(result.checks.db_pool).toBeUndefined();
+    });
+
+    test("threshold 0 disables the check", async () => {
+        process.env.DB_POOL_SATURATION_READY_MS = "0";
+
+        const { httpStatus } = await whileSaturated(40, () =>
+            readinessCheck(true, false, makeDeps()),
+        );
+
+        expect(httpStatus).toBe(200);
     });
 });

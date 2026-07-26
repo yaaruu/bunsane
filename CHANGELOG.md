@@ -2,6 +2,105 @@
 
 All notable changes to bunsane are documented here.
 
+## 0.5.11 — 2026-07-26
+
+Hotfix for the downstream B8 report: a ~7 h production outage where the API
+wedged with an **idle** database — Postgres at 0 % CPU, no locks, pgbouncer
+reporting 0 queries/s — because the client-side pool lost one slot at a time
+across a business day and never got any back.
+
+0.5.10's theme was "fail loudly". This release corrects a case where the *fix
+itself* was documented as delivering a property it does not have:
+`docs/POOLING.md` claimed wall-clock timeouts were safe behind a pooler because
+they cancel the statement, so the backend is released. Measurement says
+otherwise, and nothing tested the claim. Docs rows now cite a measurement or a
+boot probe.
+
+### Fixed
+
+- **Bun SQL pool timeouts are SECONDS; the framework passed milliseconds.**
+  `idleTimeout: 30000` and `maxLifetime: 600000` meant ~8 h 20 m and ~6.9 days,
+  not 30 s and 10 min — so **no pooled connection was ever recycled on age or
+  idleness** within a container's life. An idle pool never shrank (holding `max`
+  server-side connections after any burst), and a connection in a degraded state
+  had no age-based escape. Now 30 s / 600 s, overridable via
+  `DB_POOL_IDLE_TIMEOUT` / `DB_POOL_MAX_LIFETIME`.
+  Units verified empirically on Bun 1.4.0 (`idleTimeout: 2` → `onclose
+  ERR_POSTGRES_IDLE_TIMEOUT` at t=2016 ms), not inferred from a comment.
+  ⚠️ This is proven for *idle* connections. Whether the corrected `maxLifetime`
+  can also evict a connection stuck on an abandoned query is **unmeasured**, so
+  it is not claimed as the whole explanation for the lost slots.
+- **A ms/s mix-up is now rejected at boot** rather than silently disabling the
+  policy, with a **per-setting** ceiling (`DB_CONNECTION_TIMEOUT` 300 s,
+  `DB_POOL_IDLE_TIMEOUT` 3600 s, `DB_POOL_MAX_LIFETIME` 86400 s). A single
+  global cap would have missed the bug that shipped: 30 000 s sits under any cap
+  loose enough to allow a one-day lifetime. Use `0` for "no limit".
+- **Pool exhaustion answers 503, not 500.** `ERR_POSTGRES_CONNECTION_TIMEOUT`
+  (the pool-wait expiring — the statement never reached the server) is now
+  classified in `database/poolErrors.ts` and answered as
+  `503 POOL_EXHAUSTED` + `Retry-After`, counted as `poolAcquireFailures` in
+  `/metrics`. A 500 told clients their request was wrong when the server was
+  merely full.
+- **`PlannerCache.refresh` is bounded, single-flight and loud.** It ran
+  `db.unsafe(...)` with no signal, no timeout and no metrics, fire-and-forget
+  from `getState()` on the read hot path, and every query arriving during a slow
+  refresh started another one. It now runs through the instrumented seam with a
+  5 s timeout, shares one in-flight refresh across concurrent callers, and
+  escalates to **error** after 3 consecutive failures with the staleness of the
+  map it is still serving. In production this failed 523/523 times from boot at
+  `warn` level and read as noise.
+
+### Added
+
+- **Pool-saturation readiness signal.** `/health/ready` fails with a `db_pool`
+  check once the pool has been continuously saturated for
+  `DB_POOL_SATURATION_READY_MS` (default 3000; `0` disables), so traffic is shed
+  and the pool can drain in place. Deliberately **not** a liveness signal: a full
+  pool is also what a legitimate burst looks like, and restarting mid-burst
+  trades a slow minute for a cold start plus a reconnect thundering herd. A
+  genuinely wedged pool still fails liveness via the `/health` write probe.
+  Saturation is measured against a new `poolMax`, published by the pool
+  constructor; `/metrics` gains `poolMax`, `poolSaturatedForMs` and
+  `poolAcquireFailures` alongside the existing `inFlight` / `inFlightMax`.
+  Caveat stated in the docs: `inFlight` counts only calls through
+  `database/instrumentedDb.ts`, a subset of framework DB traffic, so it is a
+  **lower bound** — a positive saturation reading is certain, a zero is
+  unproven.
+- **`BUNSANE_ABORT_MODE=cancel|off`** (default `cancel`, unchanged behaviour) —
+  a temporary diagnostic switch so a deployment can test whether issuing
+  `query.cancel()` is itself implicated in pooled connections that never
+  return. There is deliberately no `destroy` mode: Bun SQL exposes no way to
+  destroy one pooled connection, and a mode that cannot do what its name says is
+  the exact failure pattern being removed. This switch will be deleted once the
+  mechanism is identified.
+
+### Changed — documentation now matches measurement
+
+- `docs/POOLING.md` no longer opens with "yes, and it's what the framework is
+  tuned for". **`pool_mode = session` scoped to the app's user/database (or a
+  direct connection) is now the recommended topology**; transaction pooling is
+  supported-but-degraded, with the caveats listed.
+- The "Query/save wall-clock timeouts ✅ safe" row is now ❌ **ineffective as a
+  slot-recovery mechanism**, with the measurement: aborting `pg_sleep(20)`
+  through pgbouncer released the slot at **20.0 s** — the query's natural end —
+  whether the client abandoned it or called `cancel()` and waited. A cancel
+  request needs a server connection to be forwarded, which is precisely what is
+  unavailable when the pool is exhausted. `DB_QUERY_TIMEOUT` bounds the
+  **caller**, not the statement; the only real statement bound behind a pooler is
+  `ALTER ROLE … SET statement_timeout`.
+- `DB_CONNECTION_TIMEOUT` default stays **30 s** on purpose. Request-facing
+  deployments should set `5`, and the docs now say so — but one pool is shared
+  with background work (scheduler, outbox, projection backfill/reconcile) that
+  legitimately waits longer, and there is no per-lane timeout yet. Lowering the
+  global default would start failing that work. Per-lane defaults land with the
+  execution seam.
+- `DB_DISABLE_PREPARE=true` is still the advice behind transaction pooling, now
+  with the field counter-evidence recorded: one deployment saw `prepare: false`
+  produce `unnamed prepared statement does not exist` where `prepare: true` had
+  produced `bind message has N result formats but query has M columns`. Both
+  modes can desync through that Bun/PgBouncer pairing; the advice is the better
+  of two bad options, not a guarantee.
+
 ## 0.5.10 — 2026-07-26
 
 Downstream ticket "locking, timeouts, and silent-no-op write paths"

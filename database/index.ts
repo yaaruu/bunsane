@@ -1,5 +1,6 @@
 import {SQL} from "bun";
 import { logger } from "../core/Logger";
+import { setPoolMax } from "./instrumentedDb";
 
 // Query timeout in milliseconds (default 30s, configurable via env)
 // This is used by Query.exec(), Entity.save(), etc.
@@ -7,6 +8,59 @@ export const QUERY_TIMEOUT_MS = parseInt(process.env.DB_QUERY_TIMEOUT ?? '30000'
 
 // Module-level state for the database connection
 let _db: SQL | null = null;
+
+/**
+ * Bun SQL pool timeouts are expressed in SECONDS, not milliseconds
+ * (`bun-types/sql.d.ts` — "Maximum time in seconds", `connectionTimeout` default
+ * `30`; verified empirically on Bun 1.4.0: `new SQL({ idleTimeout: 2 })` emitted
+ * `onclose ERR_POSTGRES_IDLE_TIMEOUT` at t=2016 ms).
+ *
+ * The framework previously passed `idleTimeout: 30000` and
+ * `maxLifetime: 600000`, intending 30 s / 10 min but actually configuring
+ * ~8 h 20 m / ~6.9 days. No container reaches either, so **no connection was
+ * ever recycled on age or idleness**: an idle pool never shrank (pinning `max`
+ * server-side connections behind a pooler after any burst) and a connection in
+ * a degraded state — protocol desync, for instance — had no age-based escape.
+ *
+ * A value beyond what that setting could plausibly mean in seconds is a ms/s
+ * mix-up, not an intent, so reject it instead of silently running with the
+ * policy disabled. The ceiling is PER SETTING: a single global cap would not
+ * catch the bug that shipped, since `idleTimeout: 30000` (8 h 20 m) is under any
+ * cap loose enough to allow a one-day `maxLifetime`. A deployment that genuinely
+ * wants "effectively never" sets 0, which Bun documents as unlimited.
+ */
+export const POOL_SECONDS_MAX = {
+    /** Waiting minutes for a pool slot is already pathological. */
+    DB_CONNECTION_TIMEOUT: 300,
+    /** Idle connections exist to be reaped; an hour is already very patient. */
+    DB_POOL_IDLE_TIMEOUT: 3_600,
+    /** A day is the longest defensible lifetime for a pooled connection. */
+    DB_POOL_MAX_LIFETIME: 86_400,
+} as const;
+
+export function parsePoolSeconds(
+    envName: string,
+    raw: string | undefined,
+    defaultSeconds: number,
+    maxSeconds: number = POOL_SECONDS_MAX[envName as keyof typeof POOL_SECONDS_MAX] ?? 86_400,
+): number {
+    if (raw === undefined || raw === '') return defaultSeconds;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+        throw new Error(
+            `${envName} must be a non-negative integer number of SECONDS (got ${JSON.stringify(raw)}).`,
+        );
+    }
+    if (value > maxSeconds) {
+        throw new Error(
+            `${envName}=${value} exceeds ${maxSeconds} seconds. Bun SQL pool timeouts are in ` +
+            `SECONDS, not milliseconds — a value this large is a ms/s mix-up (it was exactly this ` +
+            `bug that left connections un-recycled for the life of the process). ` +
+            `Set seconds, or 0 for "no limit" if that is genuinely intended.`,
+        );
+    }
+    return value;
+}
 
 function createDatabase(): SQL {
     let url = `postgres://${process.env.POSTGRES_USER}:${process.env.POSTGRES_PASSWORD}@${process.env.POSTGRES_HOST}:${process.env.POSTGRES_PORT ?? "5432"}/${process.env.POSTGRES_DB}`;
@@ -23,9 +77,12 @@ function createDatabase(): SQL {
     //     statement_timeout` back and logs at error level if it did not stick.
     //     The supported path behind a pooler is
     //     `ALTER ROLE <user> SET statement_timeout = '<ms>'`.
-    //   - DB_QUERY_TIMEOUT (default 30 s) is JS-side, but it DOES cancel the
-    //     in-flight query (runWithSignal → Bun SQL `query.cancel()`) on both the
-    //     read and write paths, so the backend is released rather than abandoned.
+    //   - DB_QUERY_TIMEOUT (default 30 s) is JS-side. It bounds how long the
+    //     CALLER waits; it does NOT bound the statement. Behind a pooler the
+    //     `query.cancel()` it issues does not free the slot — the statement runs
+    //     to natural completion and holds its pooled connection for that whole
+    //     time (measured, ticket B8a; see database/cancellable.ts). Do not treat
+    //     it as a recovery mechanism for pool exhaustion.
     if (process.env.USE_PGLITE !== 'true' && process.env.DB_STATEMENT_TIMEOUT) {
         try {
             const urlObj = new URL(url);
@@ -42,14 +99,31 @@ function createDatabase(): SQL {
     const max = parseInt(process.env.POSTGRES_MAX_CONNECTIONS ?? '20', 10);
     logger.info(`Connection pool size: ${max} connections`);
     logger.info(`Query timeout: ${QUERY_TIMEOUT_MS}ms`);
+    // Publish the denominator so pool occupancy is reportable as a ratio
+    // (/metrics, readiness) instead of an unlabelled in-flight count.
+    setPoolMax(max);
 
     // DB_CONNECTION_TIMEOUT (default 30 s): the pool waits this long for a free
-    // slot before rejecting the caller. At 30 s, pool exhaustion queues HTTP
-    // requests for up to 30 s each, holding sockets and consuming memory.
-    // User-facing services should consider 5 s for fast-fail so clients get
-    // an error quickly rather than a slow timeout. Long-running background
-    // workers (schedulers, outbox, migrations) can keep higher values.
-    const connTimeout = parseInt(process.env.DB_CONNECTION_TIMEOUT ?? '30', 10);
+    // slot before rejecting the caller with ERR_POSTGRES_CONNECTION_TIMEOUT
+    // (classified by ./poolErrors and answered as a 503, not a 500).
+    //
+    // At 30 s — the same value as DB_QUERY_TIMEOUT — pool exhaustion stacks two
+    // 30 s waits per request, which is how a slowdown becomes an outage:
+    // requests queue for a slot, get one, then die on the query clock.
+    // **Request-facing deployments should set 5.** The default stays 30 because
+    // there is one pool shared with background work (scheduler, outbox,
+    // projection backfill and reconcile) that legitimately waits longer, and no
+    // per-lane timeout exists yet to tell them apart — lowering it globally
+    // would start failing that work instead. Per-lane defaults land with the
+    // execution seam.
+    const connTimeout = parsePoolSeconds('DB_CONNECTION_TIMEOUT', process.env.DB_CONNECTION_TIMEOUT, 30);
+
+    // Both in SECONDS (see parsePoolSeconds above). Recycling matters most behind a
+    // pooler: it is the only mechanism that ever retires a connection the driver
+    // still believes is usable.
+    const idleTimeout = parsePoolSeconds('DB_POOL_IDLE_TIMEOUT', process.env.DB_POOL_IDLE_TIMEOUT, 30);
+    const maxLifetime = parsePoolSeconds('DB_POOL_MAX_LIFETIME', process.env.DB_POOL_MAX_LIFETIME, 600);
+    logger.info(`Pool timeouts: idle=${idleTimeout}s lifetime=${maxLifetime}s connect=${connTimeout}s`);
 
     // DB_DISABLE_PREPARE (opt-in): turn off Bun SQL's automatic server-side
     // prepared statements (driver default `prepare: true`). REQUIRED behind
@@ -58,6 +132,13 @@ function createDatabase(): SQL {
     // absent on the next, yielding `prepared statement "..." does not exist`
     // errors that can poison the pooled client and wedge the write path. Costs
     // a little per-query planning; negligible next to the failure it prevents.
+    //
+    // NOT a guarantee: one production deployment reported `prepare: false` making
+    // things worse behind PgBouncer 1.25.1 (`unnamed prepared statement does not
+    // exist`, `bind message supplies 3 parameters, but prepared statement ""
+    // requires 0`), where `prepare: true` produced `bind message has N result
+    // formats but query has M columns` instead. Both modes can desync through
+    // that pairing. See docs/CONFIGURATION.md § PgBouncer deployment.
     const disablePrepare = process.env.DB_DISABLE_PREPARE === 'true';
     if (disablePrepare) {
         logger.info('Prepared statements disabled (DB_DISABLE_PREPARE=true) — required for PgBouncer transaction pooling');
@@ -66,8 +147,8 @@ function createDatabase(): SQL {
     return new SQL({
         url,
         max,
-        idleTimeout: 30000,
-        maxLifetime: 600000,
+        idleTimeout,
+        maxLifetime,
         connectionTimeout: connTimeout,
         // Only override when disabling; otherwise leave Bun's default (true).
         ...(disablePrepare ? { prepare: false } : {}),
