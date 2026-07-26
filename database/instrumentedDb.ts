@@ -40,6 +40,10 @@ const stats: DbStatsInternal = {
 /**
  * Record the pool's configured size so saturation is expressed against a
  * denominator instead of an unlabelled number. Called from `createDatabase()`.
+ *
+ * Clears the saturation clock, because a new pool has no history. Note that
+ * `resetDatabase()` also goes through `createDatabase()` (benchmarks use it), so
+ * saturation is NOT monotonic across a pool rebuild — it restarts from zero.
  */
 export function setPoolMax(max: number): void {
     stats.poolMax = Number.isFinite(max) && max > 0 ? max : 0;

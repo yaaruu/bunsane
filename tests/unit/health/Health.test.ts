@@ -5,6 +5,8 @@ import {
     type HealthDeps,
 } from "../../../core/health";
 import {
+    getDbStats,
+    poolSaturatedForMs,
     resetDbStats,
     setPoolMax,
     timedUnsafe,
@@ -186,21 +188,24 @@ describe("readiness under pool saturation", () => {
         setPoolMax(0);
     });
 
-    /** Hold the (size-1) pool busy so saturation accrues, then release. */
+    /**
+     * Hold the (size-1) pool busy so saturation accrues, then release it and
+     * WAIT for the call to unwind. Abandoning it instead would leave
+     * `timedUnsafe`'s `finally` to decrement `inFlight` after `afterEach` had
+     * already reset the counters, pushing the shared module-level `inFlight` to
+     * -1 for every later test in the process.
+     */
     async function whileSaturated<T>(sustainMs: number, fn: () => Promise<T>): Promise<T> {
         setPoolMax(1);
-        const db = {
-            unsafe: () => new Promise((resolve) => {
-                const h = setTimeout(() => resolve([]), sustainMs + 500);
-                (h as any).unref?.();
-            }),
-        };
-        const busy = timedUnsafe(db as any, "SELECT pg_sleep(1)", []);
+        let release: () => void = () => {};
+        const gate = new Promise<any[]>((resolve) => { release = () => resolve([]); });
+        const busy = timedUnsafe({ unsafe: () => gate } as any, "SELECT pg_sleep(1)", []);
         await Bun.sleep(sustainMs);
         try {
             return await fn();
         } finally {
-            void busy.catch(() => { /* abandoned on purpose */ });
+            release();
+            await busy;
         }
     }
 
@@ -250,5 +255,16 @@ describe("readiness under pool saturation", () => {
         );
 
         expect(httpStatus).toBe(200);
+    });
+
+    test("occupancy accounting balances — no leaked in-flight count", async () => {
+        process.env.DB_POOL_SATURATION_READY_MS = "10";
+
+        await whileSaturated(20, () => readinessCheck(true, false, makeDeps()));
+
+        // `inFlight` is module-level state shared by every test in the process,
+        // so an unbalanced increment/decrement here corrupts later suites.
+        expect(getDbStats().inFlight).toBe(0);
+        expect(poolSaturatedForMs()).toBe(0);
     });
 });
