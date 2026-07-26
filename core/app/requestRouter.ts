@@ -10,6 +10,7 @@ import {
 import { routeStudio } from "./studioRouter";
 import { getDbStats } from "../../database/instrumentedDb";
 import { isPoolAcquisitionError } from "../../database/poolErrors";
+import { isAdmissionTimeout } from "../../database/gateway";
 import type { RequestStats } from "../RequestContext";
 
 const logger = MainLogger.child({ scope: "App" });
@@ -302,7 +303,7 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
                     error as any,
                 );
                 clearTimeout(timeoutId);
-                if (isPoolAcquisitionError(error)) {
+                if (isPoolAcquisitionError(error) || isAdmissionTimeout(error)) {
                     return wrap(poolExhaustedResponse());
                 }
                 return wrap(new Response(
