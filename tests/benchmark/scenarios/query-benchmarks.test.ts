@@ -15,6 +15,16 @@ import { Query, FilterOp } from '../../../query/Query';
 import { BenchmarkRunner, type BenchmarkResult } from '../../stress/BenchmarkRunner';
 import { ComponentRegistry } from '../../../core/components';
 import { getMetadataStorage } from '../../../core/metadata';
+import db from '../../../database';
+import {
+    CALIBRATION_SCENARIO,
+    buildBaseline,
+    compareToBaseline,
+    currentEnvironment,
+    formatComparison,
+    readBaseline,
+    writeBaseline,
+} from '../runners/BaselineGate';
 
 // Generate type_id same way as framework
 function generateTypeId(name: string): string {
@@ -58,6 +68,13 @@ beforeAll(async () => {
         storage.getComponentId(name);
     }
 
+    // Warm the pool before measuring. `idleTimeout` is a real 30 s since 0.5.11
+    // (it used to be ~8 h by accident), so a cold or partly-idle pool now pays
+    // connection establishment inside the first measured iterations. Open every
+    // slot concurrently first so the numbers describe query cost, not TCP+auth.
+    const poolMax = parseInt(process.env.POSTGRES_MAX_CONNECTIONS ?? '10', 10);
+    await Promise.all(Array.from({ length: poolMax }, () => db`SELECT 1`));
+
     console.log(`\n=== Query Benchmarks [${tier.toUpperCase()}] ===\n`);
 });
 
@@ -74,9 +91,88 @@ afterAll(async () => {
             console.log(`  ${status} ${r.name.padEnd(40)} p95=${r.timings.p95.toFixed(1).padStart(8)}ms  rows=${String(r.rowsReturned).padStart(6)}`);
         }
     }
+
+    runBaselineGate();
 });
 
+/**
+ * Record or judge this run against the stored baseline.
+ *
+ * The per-scenario `targetP95` values above stay as a coarse sanity floor; this
+ * gate is the part that answers "did my change cost throughput", by comparing
+ * calibration-normalized p95 against a recorded baseline for the same engine and
+ * tier. See tests/benchmark/runners/BaselineGate.ts.
+ */
+function runBaselineGate(): void {
+    const env = currentEnvironment(tier);
+    const current = buildBaseline(results, env);
+
+    if (!current) {
+        console.error(
+            `\n[bench-gate] no '${CALIBRATION_SCENARIO}' result — cannot normalize, gate skipped.` +
+            `\n[bench-gate] the calibration scenario must run for the gate to mean anything.\n`,
+        );
+        return;
+    }
+
+    if (process.env.BENCH_BASELINE === 'write') {
+        const path = writeBaseline(tier, current);
+        console.log(`\n[bench-gate] baseline written: ${path}`);
+        console.log(`[bench-gate] calibration p95 ${current.calibrationP95}ms on ${env.engine}/${env.platform}\n`);
+        return;
+    }
+
+    const baseline = readBaseline(tier, env.engine);
+    if (!baseline) {
+        console.log(
+            `\n[bench-gate] no baseline for tier '${tier}' on ${env.engine} — nothing to compare.` +
+            `\n[bench-gate] record one with: BENCH_BASELINE=write bun run bench:run:${tier}\n`,
+        );
+        return;
+    }
+
+    const comparison = compareToBaseline(current, baseline);
+    console.log(formatComparison(comparison, baseline));
+
+    if (!comparison.ok) {
+        // Fail the process, not an individual test: the regression is a property
+        // of the run as a whole and must break CI.
+        process.exitCode = 1;
+    }
+}
+
 describe(`Query Benchmarks [${tier.toUpperCase()}]`, () => {
+    /**
+     * The denominator for every other scenario (see BaselineGate). It tracks how
+     * fast THIS machine is today, so comparing ratios against it lets a baseline
+     * recorded on one host judge a run on another.
+     *
+     * It is a 200-row scan rather than `take(1)` on purpose: a `take(1)` version
+     * measured a ~0.4 ms median, and dividing 20 ms scenarios by 0.4 ms produced
+     * ratios in the hundreds that swung ±10 % between identical runs. The
+     * denominator must be big enough that its own jitter does not dominate every
+     * numerator.
+     *
+     * Do not "optimize" or change this scenario: its stability is the whole
+     * point. A change here silently rescales every recorded baseline.
+     */
+    test('calibration: bounded scan of an indexed field', async () => {
+        const result = await runner.run(
+            CALIBRATION_SCENARIO,
+            async () => {
+                return await new Query()
+                    .with(BenchUser, {
+                        filters: [Query.filter('status', FilterOp.EQ, 'active')]
+                    })
+                    .take(200)
+                    .exec();
+            },
+            { iterations: 30, warmupIterations: 5 }
+        );
+        results.push(result);
+        expect(result.timings.median).toBeGreaterThan(0);
+    });
+
     describe('Single Component Queries', () => {
         test('indexed field filter (user by status)', async () => {
             const result = await runner.run(

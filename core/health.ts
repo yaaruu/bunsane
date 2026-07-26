@@ -1,10 +1,21 @@
 import db from "../database";
 import { runWithSignal } from "../database/cancellable";
+import { getDbStats, poolSaturatedForMs } from "../database/instrumentedDb";
+import { logger as MainLogger } from "./Logger";
 import { CacheManager } from "./cache/CacheManager";
+
+const logger = MainLogger.child({ scope: "health" });
 
 export interface CheckResult {
     status: string;
     latency_ms: number;
+}
+
+export interface PoolCheckResult {
+    status: "up" | "saturated";
+    saturated_for_ms: number;
+    in_flight: number;
+    pool_max: number;
 }
 
 export interface HealthResponse {
@@ -22,6 +33,12 @@ export interface HealthResponse {
          * restarts the container instead of it serving 504s indefinitely.
          */
         database_write?: CheckResult;
+        /**
+         * Present only on the readiness path, and only when pool saturation is
+         * what failed the check. Deliberately absent from `/health` — see
+         * `poolSaturationFailure()`.
+         */
+        db_pool?: PoolCheckResult;
     };
 }
 
@@ -173,6 +190,62 @@ export async function deepHealthCheck(deps: HealthDeps = defaultDeps): Promise<H
     };
 }
 
+/**
+ * Sustained pool saturation fails READINESS, never liveness.
+ *
+ * A full pool is also what a legitimate burst looks like. Liveness failure
+ * restarts the process, which turns a slow minute into a cold start plus a
+ * reconnect thundering herd — the cure being worse than the disease. Readiness
+ * failure sheds traffic and lets the pool drain in place, which is the correct
+ * response to "temporarily at capacity".
+ *
+ * A genuinely wedged pool is a different condition and already has a different
+ * signal: the write probe on `/health` (independent 5 s timeout) hangs and
+ * liveness fails, so the container is restarted. Saturation says "full";
+ * the write probe says "stuck". Only the second warrants a restart.
+ *
+ * Checked BEFORE the DB probes and short-circuiting them: when the pool is
+ * already saturated, a probe would queue for a slot and add load to prove
+ * something we can read from a counter for free.
+ *
+ * `DB_POOL_SATURATION_READY_MS` (default 3000; 0 disables) is the sustained
+ * duration that must elapse first, so an instantaneous full pool — normal at
+ * peak — does not flap readiness.
+ */
+function poolSaturationReadyMs(): number {
+    // Read at call time, matching the framework's other runtime toggles, so a
+    // harness can exercise the threshold without reimporting the module.
+    const parsed = parseInt(process.env.DB_POOL_SATURATION_READY_MS ?? "3000", 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function poolSaturationFailure(): HealthResult | null {
+    const thresholdMs = poolSaturationReadyMs();
+    if (thresholdMs === 0) return null;
+    const saturatedForMs = poolSaturatedForMs();
+    if (saturatedForMs <= thresholdMs) return null;
+
+    const stats = getDbStats();
+    return {
+        result: {
+            status: "unavailable",
+            timestamp: new Date().toISOString(),
+            uptime: process.uptime(),
+            checks: {
+                database: { status: "unknown", latency_ms: 0 },
+                cache: { status: "unknown", latency_ms: 0 },
+                db_pool: {
+                    status: "saturated",
+                    saturated_for_ms: saturatedForMs,
+                    in_flight: stats.inFlight,
+                    pool_max: stats.poolMax,
+                },
+            },
+        },
+        httpStatus: 503,
+    };
+}
+
 export async function readinessCheck(
     isReady: boolean,
     isShuttingDown: boolean,
@@ -195,6 +268,15 @@ export async function readinessCheck(
             },
             httpStatus: 503,
         };
+    }
+
+    const saturated = poolSaturationFailure();
+    if (saturated) {
+        logger.warn(
+            { check: "db_pool", ...saturated.result.checks.db_pool },
+            "Readiness failing: DB connection pool saturated — shedding traffic until it drains",
+        );
+        return saturated;
     }
 
     return deepHealthCheck(deps);

@@ -1,4 +1,5 @@
 import db from "../../database";
+import { timedUnsafe } from "../../database/instrumentedDb";
 import { logger } from "../../core/Logger";
 import type { ProjectionStatus } from "../../database/projection/types";
 
@@ -10,6 +11,16 @@ interface CachedState {
 }
 
 const TTL_MS = 30_000;
+
+/**
+ * Wall clock for the refresh query itself. This is a single unindexed read of a
+ * table with one row per archetype — generous at 5 s, and no new env knob:
+ * anything slower than this is a symptom to surface, not a value to tune.
+ */
+const REFRESH_TIMEOUT_MS = 5_000;
+
+/** Consecutive failures before the log level escalates from warn to error. */
+const FAILURES_BEFORE_ERROR = 3;
 
 /**
  * `field_state` is jsonb, but depending on driver/column typing it can arrive as a JSON STRING
@@ -40,13 +51,45 @@ export class PlannerCache {
 
     private states = new Map<string, CachedState>();
     private lastRefresh = 0;
+    private inFlight: Promise<void> | null = null;
+    private consecutiveFailures = 0;
 
     private constructor() {}
 
+    /**
+     * Refresh is called fire-and-forget from `getState()` on the read hot path,
+     * so it must be bounded and single-flight:
+     *
+     *   - BOUNDED: it used to run `db.unsafe(...)` with no signal and no
+     *     timeout. A hung refresh held a pool slot indefinitely, from a code
+     *     path nobody awaits.
+     *   - SINGLE-FLIGHT: without this, every query arriving while a slow
+     *     refresh is outstanding starts another one, so a slow projection_state
+     *     read amplifies into one query per request.
+     *   - LOUD: failure used to log at `warn` and return, leaving the planner
+     *     serving a silently stale map. In production this failed 523/523 times
+     *     from boot and read as noise. Repeated failure is now an `error` with
+     *     the consecutive count and how stale the map is.
+     */
     async refresh(): Promise<void> {
+        if (this.inFlight) return this.inFlight;
+        this.inFlight = this.doRefresh().finally(() => { this.inFlight = null; });
+        return this.inFlight;
+    }
+
+    private async doRefresh(): Promise<void> {
+        const controller = new AbortController();
+        const timer = setTimeout(
+            () => controller.abort(new Error(`PlannerCache refresh timeout after ${REFRESH_TIMEOUT_MS}ms`)),
+            REFRESH_TIMEOUT_MS,
+        );
+        (timer as unknown as { unref?: () => void }).unref?.();
         try {
-            const rows = await db.unsafe(
-                `SELECT archetype, status, shape_version, shape_hash, field_state FROM projection_state`
+            const rows = await timedUnsafe<any[]>(
+                db,
+                `SELECT archetype, status, shape_version, shape_hash, field_state FROM projection_state`,
+                [],
+                controller.signal,
             );
             this.states.clear();
             for (const row of rows) {
@@ -57,9 +100,35 @@ export class PlannerCache {
                     fieldState: parseFieldState(row.field_state),
                 });
             }
+            if (this.consecutiveFailures > 0) {
+                logger.info(
+                    { scope: 'qsp.cache', afterFailures: this.consecutiveFailures },
+                    'PlannerCache refresh recovered',
+                );
+            }
+            this.consecutiveFailures = 0;
             this.lastRefresh = Date.now();
         } catch (err) {
-            logger.warn({ scope: 'qsp.cache', err }, 'PlannerCache refresh failed');
+            this.consecutiveFailures++;
+            const staleForMs = this.lastRefresh === 0 ? null : Date.now() - this.lastRefresh;
+            const details = {
+                scope: 'qsp.cache',
+                err,
+                consecutiveFailures: this.consecutiveFailures,
+                staleForMs,
+                neverLoaded: this.lastRefresh === 0,
+            };
+            if (this.consecutiveFailures >= FAILURES_BEFORE_ERROR) {
+                logger.error(
+                    details,
+                    'PlannerCache refresh failing repeatedly — projection routing decisions are ' +
+                    'being made from a stale (or empty) projection_state map',
+                );
+            } else {
+                logger.warn(details, 'PlannerCache refresh failed');
+            }
+        } finally {
+            clearTimeout(timer);
         }
     }
 

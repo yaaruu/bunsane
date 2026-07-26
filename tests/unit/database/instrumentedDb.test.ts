@@ -10,8 +10,11 @@ import {
     incrementDataLoaderCall,
     getDbStats,
     resetDbStats,
+    setPoolMax,
+    poolSaturatedForMs,
     type PerRequestCounters,
 } from '../../../database/instrumentedDb';
+import { POOL_ACQUIRE_TIMEOUT_CODE } from '../../../database/poolErrors';
 
 interface FakeQuery<T> extends Promise<T> {
     cancel(): void;
@@ -102,6 +105,71 @@ describe('timedUnsafe', () => {
         await timedUnsafe(db as any, 'SELECT 1', []);
         const stats = getDbStats();
         expect(stats.slowCount).toBe(0);
+    });
+});
+
+describe('pool saturation tracking', () => {
+    beforeEach(() => {
+        resetDbStats();
+        setPoolMax(0);
+    });
+
+    test('reports no saturation when the pool size is unknown', async () => {
+        const db = makeFakeDb({ delayMs: 1 });
+        await timedUnsafe(db as any, 'SELECT 1', []);
+        expect(poolSaturatedForMs()).toBe(0);
+        expect(getDbStats().poolMax).toBe(0);
+    });
+
+    test('marks saturation while in-flight calls reach the pool size, and clears on drain', async () => {
+        setPoolMax(1);
+        const db = makeFakeDb({ delayMs: 25 });
+        const inFlight = timedUnsafe(db as any, 'SELECT 1', []);
+
+        // One call, pool of one → saturated for as long as it runs.
+        await Bun.sleep(10);
+        expect(poolSaturatedForMs()).toBeGreaterThan(0);
+        expect(getDbStats().inFlight).toBe(1);
+
+        await inFlight;
+        expect(poolSaturatedForMs()).toBe(0);
+    });
+
+    test('saturation is continuous, not cumulative — a gap resets the clock', async () => {
+        setPoolMax(1);
+
+        // A long first call, so a cumulative (buggy) clock would be obvious.
+        await timedUnsafe(makeFakeDb({ delayMs: 80 }) as any, 'SELECT 1', []);
+        expect(poolSaturatedForMs()).toBe(0);
+
+        const second = timedUnsafe(makeFakeDb({ delayMs: 80 }) as any, 'SELECT 1', []);
+        await Bun.sleep(5);
+        const during = poolSaturatedForMs();
+        await second;
+
+        // Only the second call's window counts. Cumulative would be >= 85;
+        // the bound is loose because Windows timer granularity is ~15 ms.
+        expect(during).toBeGreaterThan(0);
+        expect(during).toBeLessThan(60);
+    });
+
+    test('counts pool-acquisition failures separately from query errors', async () => {
+        const acquireTimeout = Object.assign(new Error('connection timeout'), {
+            code: POOL_ACQUIRE_TIMEOUT_CODE,
+        });
+        const db = makeFakeDb({ delayMs: 1, rejectWith: acquireTimeout });
+
+        await expect(timedUnsafe(db as any, 'SELECT 1', [])).rejects.toBeDefined();
+
+        const stats = getDbStats();
+        expect(stats.poolAcquireFailures).toBe(1);
+        expect(stats.abortedCount).toBe(0);
+    });
+
+    test('a plain query error is not counted as pool exhaustion', async () => {
+        const db = makeFakeDb({ delayMs: 1, rejectWith: new Error('syntax error') });
+        await expect(timedUnsafe(db as any, 'SELECT bad', [])).rejects.toBeDefined();
+        expect(getDbStats().poolAcquireFailures).toBe(0);
     });
 });
 

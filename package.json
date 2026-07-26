@@ -1,6 +1,6 @@
 {
     "name": "bunsane",
-    "version": "0.5.10",
+    "version": "0.5.11",
     "author": {
         "name": "yaaruu"
     },
@@ -66,7 +66,11 @@
         "bench:run:sm": "bun tests/benchmark/scripts/run-benchmarks.ts sm",
         "bench:run:md": "bun tests/benchmark/scripts/run-benchmarks.ts md",
         "bench:run:lg": "bun tests/benchmark/scripts/run-benchmarks.ts lg",
-        "bench:run:xl": "bun tests/benchmark/scripts/run-benchmarks.ts xl"
+        "bench:run:xl": "bun tests/benchmark/scripts/run-benchmarks.ts xl",
+        "bench:baseline:xs": "BENCH_BASELINE=write bun tests/benchmark/scripts/run-benchmarks.ts xs",
+        "bench:baseline:md": "BENCH_BASELINE=write bun tests/benchmark/scripts/run-benchmarks.ts md",
+        "bench:gate": "bun tests/benchmark/scripts/run-benchmarks.ts md",
+        "test:pool-saturation": "bun tests/load/pool-saturation.ts"
     },
     "devDependencies": {
         "@electric-sql/pglite": "^0.3.15",

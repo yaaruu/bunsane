@@ -9,9 +9,35 @@ import {
 } from "./healthEndpoints";
 import { routeStudio } from "./studioRouter";
 import { getDbStats } from "../../database/instrumentedDb";
+import { isPoolAcquisitionError } from "../../database/poolErrors";
 import type { RequestStats } from "../RequestContext";
 
 const logger = MainLogger.child({ scope: "App" });
+
+/**
+ * Pool exhaustion is a capacity failure, not a request failure: the statement
+ * never reached the database. Answer 503 + Retry-After so clients and load
+ * balancers treat it as retryable back-pressure, instead of the 500 that says
+ * "your request was wrong" and invites no retry.
+ *
+ * Note this covers the REST and framework paths. GraphQL responses are formatted
+ * by Yoga, which reports resolver errors in a 200 body — a pooled-out GraphQL
+ * request is still visible via `poolAcquireFailures` in /metrics and the error
+ * log, but its HTTP status is Yoga's to decide.
+ */
+function poolExhaustedResponse(): Response {
+    return new Response(
+        JSON.stringify({
+            error: "Database connection pool exhausted",
+            code: "POOL_EXHAUSTED",
+            retryable: true,
+        }),
+        {
+            status: 503,
+            headers: { "Content-Type": "application/json", "Retry-After": "1" },
+        },
+    );
+}
 
 function combineSignals(signals: AbortSignal[]): AbortSignal {
     const anyFn = (AbortSignal as any).any;
@@ -276,6 +302,9 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
                     error as any,
                 );
                 clearTimeout(timeoutId);
+                if (isPoolAcquisitionError(error)) {
+                    return wrap(poolExhaustedResponse());
+                }
                 return wrap(new Response(
                     JSON.stringify({
                         error: "Internal server error",
@@ -323,6 +352,10 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
                 JSON.stringify({ error: "Request timeout", code: "TIMEOUT_ERROR" }),
                 { status: 408, headers: { "Content-Type": "application/json" } },
             ));
+        }
+
+        if (isPoolAcquisitionError(error)) {
+            return wrap(poolExhaustedResponse());
         }
 
         return wrap(new Response(

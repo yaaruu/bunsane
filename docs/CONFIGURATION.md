@@ -30,8 +30,12 @@ A connection requires **either** `DB_CONNECTION_URL` **or**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DB_QUERY_TIMEOUT` | `30000` (ms) | Client-side wall-clock timeout for `Query.exec/count/sum/average`, `Entity.save` and `Entity.doDelete`. JS-side, but it **cancels** the in-flight statement (`query.cancel()`) before rejecting, so the backend is released rather than left running. A server-side backstop is still worthwhile — see `DB_STATEMENT_TIMEOUT`. |
-| `DB_CONNECTION_TIMEOUT` | `30` (s) | How long the pool waits for a free connection before rejecting. Consider `5` for user-facing services so clients fail fast instead of queueing. |
+| `DB_QUERY_TIMEOUT` | `30000` (ms) | Client-side wall-clock timeout for `Query.exec/count/sum/average`, `Entity.save` and `Entity.doDelete`. It bounds **how long the caller waits**. It requests cancellation first, but behind a connection pooler that does *not* free the pooled slot — the statement runs to natural completion (measured; see [POOLING.md](./POOLING.md) B8a). The only effective bound on a statement is server-side `statement_timeout`. |
+| `DB_CONNECTION_TIMEOUT` | `30` (s) | Bun SQL's timeout when **establishing** a connection. When it fires, `ERR_POSTGRES_CONNECTION_TIMEOUT` is classified as capacity and answered with **503 + `Retry-After`** (`code: POOL_EXHAUSTED`), counted as `poolAcquireFailures` in `/metrics`. ⚠️ **Whether it also bounds waiting for a busy pool to free a slot is unverified.** Measured against the PGlite bridge with `max: 1` and a 1 s timeout, a second caller **queued for 2.9 s and then succeeded** — i.e. the wait for a slot was not bounded. Bun's own docs say "when establishing a connection", which is not the same thing. Re-measure on your topology with `bun run test:pool-saturation` before relying on this as a fast-fail mechanism. **Request-facing deployments should still set `5`.** The default stays 30 s because background work (scheduler, outbox, projection backfill/reconcile) shares this pool and legitimately waits longer — there is no per-lane timeout yet. |
+| `DB_POOL_IDLE_TIMEOUT` | `30` (**s**) | Close idle pooled connections after this long. Bun SQL pool timeouts are in **seconds**; a value above `86400` is rejected at boot as a ms/s mix-up. Use `0` for no limit. |
+| `DB_POOL_MAX_LIFETIME` | `600` (**s**) | Retire a pooled connection after this long regardless of activity. Recycling is the only mechanism that ever retires a connection the driver still believes is usable — before 0.5.11 these two were passed as milliseconds, so nothing was ever recycled. Same `86400` guard; `0` for no limit. |
+| `DB_POOL_SATURATION_READY_MS` | `3000` (ms, `0` disables) | How long the pool must stay continuously saturated (`inFlight >= poolMax`) before `/health/ready` fails with a `db_pool` check. Sheds traffic so the pool can drain; deliberately does **not** fail liveness, because a full pool is also what a legitimate burst looks like. |
+| `BUNSANE_ABORT_MODE` | `cancel` | `cancel` (request cancellation on abort, then reject) or `off` (reject without touching the query). **Temporary** diagnostic switch for isolating whether `cancel()` is implicated in pooled connections that never return; will be removed. |
 | `DB_STATEMENT_TIMEOUT` | unset (opt-in, ms) | Server-side `statement_timeout` appended to the connection URL as the `options` startup parameter. Skipped under PGlite. **Inert behind PgBouncer**, which drops `options` — the boot probe logs at error when it did not stick. Behind a pooler use `ALTER ROLE … SET statement_timeout` instead. |
 | `DB_DISABLE_PREPARE` | `false` | `true` disables Bun SQL's automatic server-side prepared statements (driver default is on). **Required behind PgBouncer in transaction pooling mode** — see [PgBouncer deployment](#pgbouncer-deployment) below. |
 | `DB_SAVE_PROFILE` | `false` | `true` logs per-phase `Entity.save` timings (`db`, `cache`, `hooks`, `total`). |
@@ -232,8 +236,16 @@ All four variables fall back to the matching key in the gitignored `.env.test`.
 
 ## PgBouncer deployment
 
-Running BunSane behind PgBouncer in **transaction pooling mode**
-(`pool_mode=transaction`) requires two settings, or the write path can wedge.
+**Prefer `pool_mode = session` scoped to the application's user/database** (or a
+direct connection). PgBouncer supports per-user and per-database `pool_mode`, so
+this is usually possible even on shared pooler infrastructure — check
+`pool_size` / `max_db_connections` for that pool so the app's session-pinned
+connections do not starve other consumers. Session affinity makes every caveat
+below disappear.
+
+Running behind **transaction pooling** (`pool_mode=transaction`) is supported but
+several things then fail *silently*; the settings below are the minimum, and
+[POOLING.md](POOLING.md) is the full matrix.
 
 ### 1. Disable prepared statements — `DB_DISABLE_PREPARE=true`
 
@@ -257,6 +269,19 @@ are unusable under transaction pooling anyway.
 >
 > This does **not** relate to the framework's `PreparedStatementCache` class,
 > which is deprecated and a no-op on the hot path — toggling it has no effect.
+
+> ⚠️ **Counter-evidence from the field, unresolved.** One production deployment
+> (Bun + PgBouncer 1.25.1, transaction mode) reported `DB_DISABLE_PREPARE=true`
+> making things *worse*: `unnamed prepared statement does not exist` and
+> `bind message supplies 3 parameters, but prepared statement "" requires 0`,
+> where `prepare: true` had produced `bind message has N result formats but query
+> has M columns` instead. Lowering PgBouncer `max_prepared_statements` to 0 did
+> not help either. So both modes can desync through this Bun/PgBouncer pair, and
+> the advice above is not a guarantee — it is the better of two bad options on
+> the evidence available. This is the strongest argument for the session-mode
+> lane at the top of this section. If you hit either signature, record which mode
+> and which versions; the framework cannot currently detect this state, and that
+> gap is tracked.
 
 ### 2. Server-side statement timeout (set on the role, not the app)
 
@@ -313,7 +338,14 @@ DB_DISABLE_PREPARE=true
 DB_CONNECTION_TIMEOUT=5
 # DB_STATEMENT_TIMEOUT intentionally unset — set statement_timeout on the PG role
 # Lock backend defaults to the pooler-safe 'postgres' lease — no extra config needed.
+# Pool recycling defaults (seconds) are correct as-is; override only with cause:
+#   DB_POOL_IDLE_TIMEOUT=30
+#   DB_POOL_MAX_LIFETIME=600
 ```
+
+Remember that **no client-side timeout frees a pooled slot** behind a pooler
+(POOLING.md B8a): `DB_CONNECTION_TIMEOUT=5` makes callers fail fast, the role's
+`statement_timeout` is what actually stops the work.
 
 ---
 
