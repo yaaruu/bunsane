@@ -90,13 +90,17 @@ server-side.** Everything else bounds the caller, not the work.
   **how long the caller waits**. It requests cancellation first, but see B8a
   below: through a pooler that does not release the slot. Treat it as a caller
   deadline, never as capacity recovery.
-- `DB_CONNECTION_TIMEOUT` (default 30 s) — how long the pool waits for a free
-  slot before throwing `ERR_POSTGRES_CONNECTION_TIMEOUT`, which the framework
-  answers with **503 + `Retry-After`** (`code: POOL_EXHAUSTED`) and counts as
-  `poolAcquireFailures` in `/metrics`. **Request-facing deployments should set
-  `5`.** The default stays 30 s because background work (scheduler, outbox,
-  projection backfill/reconcile) shares the same pool and legitimately waits
-  longer; there is no per-lane timeout yet.
+- `DB_CONNECTION_TIMEOUT` (default 30 s) — Bun SQL's connection-**establishment**
+  timeout. When it fires, `ERR_POSTGRES_CONNECTION_TIMEOUT` is answered as
+  **503 + `Retry-After`** (`code: POOL_EXHAUSTED`) and counted as
+  `poolAcquireFailures` in `/metrics`. ⚠️ Whether it also bounds *waiting for a
+  busy pool* is **unverified**: against the PGlite bridge with `max: 1`, a second
+  caller queued 2.9 s and then succeeded rather than timing out at 1 s. Measure
+  your own topology with `bun run test:pool-saturation` before treating this as
+  fast-fail. **Request-facing deployments should still set `5`.** The default
+  stays 30 s because background work (scheduler, outbox, projection
+  backfill/reconcile) shares the same pool and legitimately waits longer; there
+  is no per-lane timeout yet.
 - `DB_POOL_IDLE_TIMEOUT` (default 30) and `DB_POOL_MAX_LIFETIME` (default 600) —
   **seconds**, not milliseconds. Connection recycling; see below.
 - `DB_POOL_SATURATION_READY_MS` (default 3000, `0` disables) — how long the pool

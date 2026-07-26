@@ -260,6 +260,69 @@ Each row: the query to run, what to capture, and the pass criterion after the co
 5. For engine-shape changes (steps 1, 2) PGlite bench is acceptable; for index/partition changes (steps 3, 4, 5) **real PG only**.
 6. Keep the `EXPLAIN` output — a latency delta without a plan delta is noise; a plan-node change is the real signal.
 
+### 7.9 The regression gate (0.5.11+)
+
+Hand-written `targetP95: 100` thresholds answer "is this fast enough on whichever
+machine the number was picked on". The gate answers the question a refactor
+actually needs: **did this change cost throughput?**
+
+```bash
+bun run bench:baseline:md    # record a baseline for this engine + tier
+bun run bench:gate           # compare; non-zero exit on regression
+BENCH_MARGIN_PCT=15 bun run bench:gate      # tighter margin
+BENCH_ITERATIONS=80 bun run bench:gate      # more samples per scenario
+```
+
+Baselines live in `tests/benchmark/baseline/<tier>-<engine>.json` and are
+committed, so a regression shows up as a diff rather than as folklore. Mechanism
+in `tests/benchmark/runners/BaselineGate.ts`:
+
+- **Gated on the median, not p95.** p95 over 20 iterations is effectively the max
+  and is dominated by GC and Windows' ~15 ms timer granularity — two runs of
+  identical code differed **+40 %** at p95. p95 is still recorded, for reading.
+- **Calibration-normalized.** Every run includes `calibration-single-row` (a
+  bounded 200-row scan); each scenario is compared as `median / calibrationMedian`
+  so a uniformly slower host produces the same ratios. The calibration query is
+  deliberately not trivial: a `take(1)` version measured ~0.4 ms and its own
+  jitter dominated every ratio.
+- **Absolute floor.** A regression must also move the raw median by ≥ 0.5 ms, and
+  agree in sign with the ratio — otherwise a shrinking denominator reports
+  scenarios that got *faster* as regressions (observed: +4.2 % ratio, −1.28 ms raw).
+- **Environment-fingerprinted.** Engine, tier, pool size, framework and Bun
+  version are recorded, and a cross-engine comparison is refused rather than
+  silently producing nonsense.
+
+**Known limits — do not oversell this gate.** Measured on PGlite/Windows against
+a single-run baseline, worst-case drift on identical code is **18.2 %**, and some
+scenarios drift *reproducibly* (`count-products` +14.1 % then +14.2 %), which
+more iterations does not fix — 20 → 80 barely moved it. Hence the 25 % default
+margin: the gate catches structural regressions (an added round trip per query, a
+lost batch, a new serialization point — 2× events), not 10 % tuning questions.
+Two tracked follow-ups would tighten it: make the baseline the median of K suite
+runs, and record the authoritative baseline on **real Postgres**. PGlite is
+single-connection, so nothing it reports describes pool behaviour at all.
+
+### 7.10 Saturation and recovery (`tests/load/pool-saturation.ts`)
+
+The load harness that the B8 outage needed. Drives the pool past capacity and
+asserts the framework fails fast and **returns to full capacity**:
+
+```bash
+POOL_TEST_URL=postgres://user:pw@host:5432/db bun run test:pool-saturation
+# knobs: POOL_SIZE [3] SLOW_SECONDS [5] CONN_TIMEOUT_SECONDS [1]
+```
+
+- **phase 1** — exhaustion must fail inside the connection-timeout budget and be
+  classified as capacity (`ERR_POSTGRES_CONNECTION_TIMEOUT` → 503), not as a
+  query error.
+- **phase 2** — every slot must be usable again afterwards, not just one. A pool
+  that never returns to `max` is exactly the B8 failure.
+- **phase 3** — *measures* whether a client-side abort returns the slot early or
+  whether it stays pinned until the statement ends by itself. Run this against
+  the real topology: on a session-affine connection cancel frees the slot, behind
+  `pool_mode = transaction` it does not (B8a), and the script reports which
+  world you are in instead of assuming.
+
 ---
 
 ## 8. References

@@ -49,11 +49,19 @@ export class BenchmarkRunner {
         options: BenchmarkOptions = {}
     ): Promise<BenchmarkResult> {
         const {
-            iterations = 20,
             warmupIterations = 3,
             targetP95,
             collectMemory = true
         } = options;
+
+        // BENCH_ITERATIONS overrides the per-scenario count. The regression gate
+        // uses it to buy statistical stability: median drift between identical
+        // runs measured ~12% at 20 iterations on PGlite/Windows, which is the
+        // same order as the regressions the gate needs to detect.
+        const envIterations = parseInt(process.env.BENCH_ITERATIONS ?? '', 10);
+        const iterations = Number.isFinite(envIterations) && envIterations > 0
+            ? envIterations
+            : (options.iterations ?? 20);
 
         // Warmup phase
         for (let i = 0; i < warmupIterations; i++) {
