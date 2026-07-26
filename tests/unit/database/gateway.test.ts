@@ -23,6 +23,7 @@ import {
     inAdmittedScope,
     isAdmissionTimeout,
     DbAdmissionTimeoutError,
+    DbStatementTimeoutError,
 } from '../../../database/gateway';
 import { resetDbStats, setPoolMax } from '../../../database/instrumentedDb';
 
@@ -31,7 +32,15 @@ const originalEnv = {
     headroom: process.env.DB_ADMISSION_HEADROOM,
 };
 
-/** A fake connection whose queries resolve only when released. */
+/**
+ * A fake connection whose queries resolve only when released.
+ *
+ * Mirrors `makeFakeDb` in instrumentedDb.test.ts: the query object needs a
+ * `cancel()` and a pre-attached `.catch()`, because `runWithSignal` calls
+ * `q.cancel?.()` on abort and then attaches its own handler. Without them an
+ * aborted query left a rejection nobody owned, which under `bun test` silently
+ * took down the whole runner — no failure, no summary, exit 0.
+ */
 function gatedConn() {
     const releases: Array<() => void> = [];
     let started = 0;
@@ -41,7 +50,18 @@ function gatedConn() {
         conn: {
             unsafe: () => {
                 started++;
-                return new Promise<any[]>((resolve) => releases.push(() => resolve([])));
+                let rejectFn: (err: Error) => void = () => {};
+                const promise: any = new Promise<any[]>((resolve, reject) => {
+                    rejectFn = reject;
+                    releases.push(() => resolve([]));
+                });
+                promise.catch(() => { /* swallow post-abort settle */ });
+                promise.cancelled = false;
+                promise.cancel = () => {
+                    promise.cancelled = true;
+                    rejectFn(Object.assign(new Error('Query cancelled'), { name: 'AbortError' }));
+                };
+                return promise;
             },
         },
     };
@@ -234,12 +254,31 @@ describe('transactions hold one permit for their duration', () => {
 });
 
 describe('deadlines cover the query too', () => {
+    /**
+     * `dbExec`'s statement timer is `unref()`'d on purpose — at high QPS
+     * thousands are live at once and they must not hold the event loop open. A
+     * real query keeps the loop alive by itself, through its socket, so the
+     * timer always gets a chance to fire.
+     *
+     * A FAKE query has no socket. With nothing else pending, Bun never fires an
+     * unref'd timer and the test hangs instead of timing out (this is the same
+     * trap that made the admission timer hang before it was left ref'd). So hold
+     * something ref'd for the duration, standing in for the socket a real query
+     * would have.
+     */
+    let keepLoopAlive: ReturnType<typeof setInterval> | undefined;
+    beforeEach(() => { keepLoopAlive = setInterval(() => {}, 50); });
+    afterEach(() => { if (keepLoopAlive) clearInterval(keepLoopAlive); });
+
     test('a statement that outlives the remaining budget is aborted', async () => {
         const gate = gatedConn();
         const err = await dbExec('SELECT pg_sleep(30)', [], { conn: gate.conn, timeoutMs: 80 })
             .then(() => null, (e) => e);
-        expect(err).toBeDefined();
+        // The deadline reason must survive, not be replaced by the driver's
+        // "Query cancelled" — the caller is usually logging this.
+        expect(err).toBeInstanceOf(DbStatementTimeoutError);
         expect(String((err as Error).message)).toContain('timeout');
+        expect((err as { cause?: unknown }).cause).toBeDefined();
         gate.releaseAll();
         // The permit must come back even though the query was abandoned.
         expect(getGatewayStats().admissionAvailable).toBe(2);

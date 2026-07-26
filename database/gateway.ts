@@ -56,6 +56,26 @@ const logger = MainLogger.child({ scope: 'db.gateway' });
 
 export type Lane = 'request' | 'background' | 'health';
 
+/**
+ * Thrown when the statement outlived its remaining budget.
+ *
+ * Needed because the driver wins the race: aborting makes Bun reject the query
+ * with its own cancellation error, so without this translation the caller sees
+ * "Query cancelled" and the *reason* — which deadline, how long, which lane — is
+ * lost exactly when it is being logged. The driver error is preserved as `cause`.
+ */
+export class DbStatementTimeoutError extends Error {
+    readonly code = 'ERR_BUNSANE_DB_STATEMENT_TIMEOUT';
+    constructor(readonly lane: Lane, readonly budgetMs: number, readonly label?: string, cause?: unknown) {
+        super(
+            `DB statement timeout after ${Math.round(budgetMs)}ms ` +
+            `(lane=${lane}${label ? `, label=${label}` : ''})`,
+        );
+        this.name = 'DbStatementTimeoutError';
+        if (cause !== undefined) (this as { cause?: unknown }).cause = cause;
+    }
+}
+
 /** Thrown when capacity did not become available before the deadline. */
 export class DbAdmissionTimeoutError extends Error {
     readonly code = 'ERR_BUNSANE_DB_ADMISSION_TIMEOUT';
@@ -322,16 +342,33 @@ export async function dbExec<T = any>(sql: string, params: any[] = [], opts: DbE
 
         const controller = new AbortController();
         const unlink = linkAbortSignals(opts.signal, controller);
+        let deadlineExpired = false;
+        // Unref'd, unlike the admission timer above: at high QPS thousands of
+        // these are live at once and they must not hold the event loop open. That
+        // is safe here because an in-flight query keeps the loop alive through
+        // its own socket, so the timer always gets a chance to fire. The
+        // admission timer has no such companion work, which is why it stays
+        // ref'd — the two choices are deliberate and opposite.
         const timer = setTimeout(
-            () => controller.abort(new Error(
-                `DB statement timeout after ${Math.round(remaining)}ms (lane=${lane}${opts.label ? `, label=${opts.label}` : ''})`,
-            )),
+            () => {
+                deadlineExpired = true;
+                controller.abort(new DbStatementTimeoutError(lane, remaining, opts.label));
+            },
             remaining,
         );
         (timer as unknown as { unref?: () => void }).unref?.();
 
         try {
             return await timedUnsafe<T>(opts.conn ?? db, sql, params, controller.signal, opts.perRequest);
+        } catch (err) {
+            // The driver wins the race: cancelling makes it reject with its own
+            // error ("Query cancelled"), which would replace the reason the
+            // caller needs. Re-throw our deadline error, keeping the driver's as
+            // `cause`. A caller-initiated abort keeps the caller's reason.
+            if (deadlineExpired) {
+                throw new DbStatementTimeoutError(lane, remaining, opts.label, err);
+            }
+            throw err;
         } finally {
             clearTimeout(timer);
             unlink();
