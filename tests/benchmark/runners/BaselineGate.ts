@@ -15,12 +15,16 @@
  *     Windows' ~15 ms timer granularity on queries that take 2 ms. Measured:
  *     two runs of *identical code* differed by +40 % at p95. The median is
  *     stable enough to judge; p95 is still recorded, for reading, not gating.
- *  2. **Calibration-normalized, with an absolute floor.** Absolute milliseconds
- *     are not portable across machines, CI runners, or a laptop on battery, so
- *     each scenario is compared as `median / calibrationMedian`. A uniformly 2×
- *     slower host yields the same ratios. And because a ratio on
- *     sub-millisecond timings can swing wildly for free, a regression must ALSO
- *     exceed `MIN_ABSOLUTE_DELTA_MS` in raw median terms to count.
+ *  2. **Calibration-normalized, with an absolute floor.** Each scenario is
+ *     compared as `median / calibrationMedian`, which removes *some* host and
+ *     load sensitivity. And because a ratio on sub-millisecond timings can swing
+ *     wildly for free, a regression must ALSO exceed `MIN_ABSOLUTE_DELTA_MS` in
+ *     raw median terms to count.
+ *     NOT a cross-machine portability claim: measured same-machine drift is
+ *     already 18.2 % worst case, so a different host cannot be assumed better.
+ *     Comparison is therefore refused across platforms (see `compareToBaseline`)
+ *     — every machine records its own baseline, and the gate answers
+ *     "before vs after on this host", which is the question a refactor asks.
  *  3. **Environment-fingerprinted.** The engine (PGlite vs real Postgres), tier,
  *     pool size and framework version are recorded. A comparison across a
  *     different engine is refused outright rather than silently producing
@@ -219,6 +223,21 @@ export function compareToBaseline(current: Baseline, baseline: Baseline): Compar
     }
     if (current.environment.tier !== baseline.environment.tier) {
         return { ...empty, ok: false, incomparable: `tier changed: baseline=${baseline.environment.tier} current=${current.environment.tier}` };
+    }
+    // Platform mismatch is NOT gated — it is declared incomparable. Calibration
+    // normalization reduces host sensitivity but does not eliminate it, and
+    // same-machine drift is already 18.2 %, so judging a Linux CI run against a
+    // Windows laptop baseline would manufacture verdicts nobody measured. Each
+    // machine records its own baseline; `ok` stays true so a fresh host does not
+    // fail CI merely for being a fresh host.
+    if (current.environment.platform !== baseline.environment.platform) {
+        return {
+            ...empty,
+            ok: true,
+            incomparable: `platform differs: baseline=${baseline.environment.platform} ` +
+                `current=${current.environment.platform} — record a baseline on this host ` +
+                `(BENCH_BASELINE=write) rather than comparing across hardware`,
+        };
     }
 
     const regressions: Regression[] = [];

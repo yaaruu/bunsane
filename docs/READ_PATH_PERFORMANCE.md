@@ -281,10 +281,16 @@ in `tests/benchmark/runners/BaselineGate.ts`:
   and is dominated by GC and Windows' ~15 ms timer granularity — two runs of
   identical code differed **+40 %** at p95. p95 is still recorded, for reading.
 - **Calibration-normalized.** Every run includes `calibration-single-row` (a
-  bounded 200-row scan); each scenario is compared as `median / calibrationMedian`
-  so a uniformly slower host produces the same ratios. The calibration query is
+  bounded 200-row scan); each scenario is compared as `median / calibrationMedian`,
+  which removes *some* host and load sensitivity. The calibration query is
   deliberately not trivial: a `take(1)` version measured ~0.4 ms and its own
   jitter dominated every ratio.
+  This is **not** a cross-machine portability claim — same-machine drift is
+  already 18.2 %, so a different host cannot be assumed better. A platform
+  mismatch is reported as *incomparable* and does not produce a verdict: every
+  machine (including CI) records its own baseline, and the gate answers
+  "before vs after **on this host**", which is what a refactor actually asks.
+  The committed `*-pglite.json` baselines were recorded on Windows/x64.
 - **Absolute floor.** A regression must also move the raw median by ≥ 0.5 ms, and
   agree in sign with the ratio — otherwise a shrinking denominator reports
   scenarios that got *faster* as regressions (observed: +4.2 % ratio, −1.28 ms raw).
