@@ -378,7 +378,7 @@ function resolveDeadline(opts: DbExecOptions): number {
  * minute before failing. The remaining budget after admission is what the query
  * gets.
  */
-export async function dbExec<T = any>(sql: string, params: any[] = [], opts: DbExecOptions = {}): Promise<T> {
+export async function dbExec<T = any>(sql: string, params?: any[], opts: DbExecOptions = {}): Promise<T> {
     const lane = opts.lane ?? 'request';
     const deadline = resolveDeadline(opts);
     const admission = await admit(lane, deadline, opts.signal, opts.label);

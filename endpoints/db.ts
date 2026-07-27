@@ -51,7 +51,7 @@ export function studioExec<T = any>(
     label: string,
     deadline: number,
     sql: string,
-    params: any[] = [],
+    params?: any[],
 ): Promise<T> {
     return dbExec<T>(sql, params, { lane: "background", label, deadline });
 }

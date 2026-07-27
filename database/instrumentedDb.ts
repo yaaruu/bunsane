@@ -89,10 +89,31 @@ export interface PerRequestCounters {
  * `Query.cancel()`. Total ms is recorded into module-level stats; calls
  * over `BUNSANE_DB_SLOW_MS` increment slowCount and emit a warn log.
  */
+/**
+ * `params` is deliberately optional AND distinct from `[]`.
+ *
+ * Bun routes `unsafe(sql)` through the simple query protocol and
+ * `unsafe(sql, [...])` — including an EMPTY array — through the extended one,
+ * where the statement gets PREPARED. The two are not interchangeable:
+ *
+ *  - Bun derives a prepared statement's name from a truncated prefix of the
+ *    SQL, so forcing extra statements onto the prepared path can collide two
+ *    different queries that share their first ~40 characters:
+ *    `prepared statement "PSELECT DISTINCT ec.entity_id as id FROM $8" already
+ *    exists` (42P05). Observed by passing `[]` for statements that previously
+ *    passed nothing.
+ *  - The reverse also bites: on the simple path rows can arrive without named
+ *    columns, which is why `ProjectionManager.syncActiveProjections` passes an
+ *    explicit `[]` on purpose.
+ *
+ * So the caller's choice is forwarded verbatim rather than normalised. Note
+ * that comparing RESULTS of the two forms shows no difference — the divergence
+ * is in the protocol, not the rows.
+ */
 export async function timedUnsafe<T = any>(
     db: SQL,
     sql: string,
-    params: any[],
+    params?: any[],
     signal?: AbortSignal,
     perRequest?: PerRequestCounters,
 ): Promise<T> {
@@ -103,7 +124,7 @@ export async function timedUnsafe<T = any>(
     if (perRequest) perRequest.dbQueryCount++;
     let aborted = false;
     try {
-        const q = (db as any).unsafe(sql, params);
+        const q = params === undefined ? (db as any).unsafe(sql) : (db as any).unsafe(sql, params);
         return await runWithSignal<T>(q, signal);
     } catch (err) {
         if ((err as Error)?.name === 'AbortError' || signal?.aborted) {

@@ -1,16 +1,18 @@
-import { DDL_TIMEOUT_MS } from "./index";
+import { DDL_TIMEOUT_MS, QUERY_TIMEOUT_MS } from "./index";
 import { dbExec } from "./gateway";
 import { logger } from "../core/Logger";
 
 /**
  * Catalog lookup — "does this index exist", "is this table partitioned".
  *
- * Fast by nature and always a prelude to DDL, so it gets the short budget: a
- * catalog probe that cannot answer in 10 s means the database is in no state to
- * start building an index anyway.
+ * Gets the ordinary query budget rather than a bespoke number. These run at
+ * boot too, where the database may be cold and `information_schema` scans are
+ * slower than the millisecond they cost in steady state; inventing a tighter
+ * limit here would turn a slow start into a failed one. Two budgets total —
+ * query and DDL — is the whole rule.
  */
 const catalogQuery = <T = any>(label: string, sql: string): Promise<T> =>
-    dbExec<T>(sql, [], { lane: "background", label, timeoutMs: 10_000 });
+    dbExec<T>(sql, undefined, { lane: "background", label, timeoutMs: QUERY_TIMEOUT_MS });
 
 /**
  * Schema DDL — index builds, ANALYZE, DROP INDEX.
@@ -25,7 +27,7 @@ const catalogQuery = <T = any>(label: string, sql: string): Promise<T> =>
  * not a cost.
  */
 const ddlStatement = <T = any>(label: string, sql: string): Promise<T> =>
-    dbExec<T>(sql, [], { lane: "background", label, timeoutMs: DDL_TIMEOUT_MS });
+    dbExec<T>(sql, undefined, { lane: "background", label, timeoutMs: DDL_TIMEOUT_MS });
 
 const validateIdentifier = (str: string, maxLength: number = 64): string => {
     if (!str || typeof str !== 'string' || str.length === 0 || str.length > maxLength) {

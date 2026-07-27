@@ -24,7 +24,7 @@ import { DDL_TIMEOUT_MS } from '../index';
 export function projExec<T = any>(
     label: string,
     sql: string,
-    params: any[] = [],
+    params?: any[],
     timeoutMs?: number,
 ): Promise<T> {
     return dbExec<T>(sql, params, { lane: 'background', label, timeoutMs });
@@ -36,6 +36,6 @@ export function projExec<T = any>(
  * Long budget for the same reason as `IndexingStrategy`: DDL outlives a query
  * timeout by design, and aborting it does not stop the server-side work.
  */
-export function projDdl<T = any>(label: string, sql: string, params: any[] = []): Promise<T> {
+export function projDdl<T = any>(label: string, sql: string, params?: any[]): Promise<T> {
     return dbExec<T>(sql, params, { lane: 'background', label, timeoutMs: DDL_TIMEOUT_MS });
 }
