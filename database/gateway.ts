@@ -3,16 +3,18 @@
  *
  * WHY THIS EXISTS
  *
- * Framework DB traffic reaches Postgres through ~111 raw `.unsafe(` call sites
- * plus ~47 tagged templates, of which only a handful carry a timeout, a
- * cancellation signal, or a metric. There is consequently nowhere to put a
+ * Framework DB traffic used to reach Postgres through ~111 raw `.unsafe(` call
+ * sites plus ~47 tagged templates, of which only a handful carried a timeout, a
+ * cancellation signal, or a metric. There was consequently nowhere to put a
  * policy: bounding concurrency, propagating a deadline, keeping background work
- * from starving user traffic, or even counting queries accurately all require
+ * from starving user traffic, or even counting queries accurately all required
  * touching every call site. That is the structural reason a slow database turned
  * into a wedged application — the framework had no place to say "no".
  *
- * This module is that place. Every framework query is meant to route through
- * `dbExec` / `dbTransaction`, and the policies below live here only.
+ * This module is that place. Framework queries route through `dbExec`,
+ * `dbRun` (for tagged templates) or `dbTransaction`, and the policies below live
+ * here only. `tests/unit/db-seam.test.ts` enforces that and carries the
+ * documented list of what is deliberately exempt.
  *
  * ADMISSION IS PER TRANSACTION, NOT PER STATEMENT
  *

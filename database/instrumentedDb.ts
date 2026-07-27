@@ -53,13 +53,14 @@ export function setPoolMax(max: number): void {
 /**
  * How long the pool has been continuously saturated, in ms (0 = not saturated).
  *
- * `inFlight` counts calls that go through this module, which today is a SUBSET
- * of the framework's DB traffic (the tagged-template paths in
- * `core/entity/*`, `core/BatchLoader.ts` and most of `database/`,
- * `database/projection/*` and `endpoints/*` bypass it). So this is a LOWER
- * BOUND on real occupancy: it under-reports saturation, never over-reports it.
- * The single execution seam that makes it exact is the next milestone; until
- * then, treat a positive value as certain and a zero as unproven.
+ * `inFlight` counts calls that go through this module. Since the execution seam
+ * landed (W2 step 2) that is every framework query except the documented
+ * exemptions in `tests/unit/db-seam.test.ts` — boot DDL tagged templates, lock
+ * renewal, health probes, and statements on a caller-supplied transaction. So
+ * it is now close to exact rather than the loose lower bound it used to be, but
+ * still a LOWER bound: the exempt paths hold real connections this does not
+ * count, and consumer code calling `getDb()` directly is invisible to it.
+ * Treat a positive value as certain and a zero as very likely but unproven.
  */
 export function poolSaturatedForMs(now: number = Date.now()): number {
     return stats.saturatedSince === 0 ? 0 : Math.max(0, now - stats.saturatedSince);
