@@ -6,6 +6,22 @@ import { setPoolMax } from "./instrumentedDb";
 // This is used by Query.exec(), Entity.save(), etc.
 export const QUERY_TIMEOUT_MS = parseInt(process.env.DB_QUERY_TIMEOUT ?? '30000', 10);
 
+/**
+ * Budget for schema DDL — `CREATE INDEX [CONCURRENTLY]`, `ALTER TABLE`,
+ * partition attach, projection table creation.
+ *
+ * Separate from `QUERY_TIMEOUT_MS` because DDL is long-running BY DESIGN: a
+ * concurrent index build on a large table routinely outlives 30 s. Giving it the
+ * query budget would abort the build — and per docs/POOLING.md B8a the abort
+ * does not reach Postgres, so the index would keep building while the framework
+ * logged a failure and possibly retried, producing duplicate work against a
+ * table already under an index build.
+ *
+ * 10 minutes is a bound, not a target: it exists so a wedged DDL statement
+ * eventually releases its admission permit rather than pinning one forever.
+ */
+export const DDL_TIMEOUT_MS = parseInt(process.env.DB_DDL_TIMEOUT ?? '600000', 10);
+
 // Module-level state for the database connection
 let _db: SQL | null = null;
 

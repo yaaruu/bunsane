@@ -1,5 +1,6 @@
 import type { SQL } from 'bun';
 import db from '../index';
+import { projExec } from './exec';
 import { logger as MainLogger } from '../../core/Logger';
 import { getMetadataStorage } from '../../core/metadata';
 import type { Entity } from '../../core/Entity';
@@ -64,7 +65,7 @@ export class ProjectionManager {
                 await createRmTable(archetypeName, descriptor.columns);
                 await createCoveringIndex(archetypeName, this.coveringIndexOpts(descriptor));
 
-                await db.unsafe(
+                await projExec('projection.state.register',
                     `INSERT INTO projection_state (archetype, shape_hash, status, shape_version)
                      VALUES ($1, $2, 'DISABLED', $3)
                      ON CONFLICT (archetype) DO UPDATE SET shape_hash = EXCLUDED.shape_hash`,
@@ -74,7 +75,8 @@ export class ProjectionManager {
                 // CREATE TABLE IF NOT EXISTS. Diff and ALTER, marking new
                 // columns FILLING until filled (B7).
                 await syncRmSchema(archetypeName, descriptor);
-                const rows = await db.unsafe(`SELECT status FROM projection_state WHERE archetype = $1`, [descriptor.archetype]);
+                const rows = await projExec<any[]>('projection.state.status',
+                    `SELECT status FROM projection_state WHERE archetype = $1`, [descriptor.archetype]);
                 this.statusCache.set(archetypeName, (rows[0]?.status ?? 'DISABLED') as ProjectionStatus);
             } catch (error) {
                 logger.warn(`Failed to initialize projection for ${archetypeName}: ${error}`);
@@ -90,6 +92,11 @@ export class ProjectionManager {
     }
 
     async setStatus(archetype: string, status: ProjectionStatus, trx?: SQL): Promise<void> {
+        // Deliberately NOT routed through the gateway (see ./exec.ts). Callers
+        // may pass a `trx` opened by a not-yet-migrated transaction, and taking
+        // an admission permit while that transaction already holds a pooled
+        // connection is the nested-acquire deadlock the seam exists to prevent.
+        // Migrate together with `saveEntity` (W2 slice 4).
         await (trx ?? db).unsafe(
             `UPDATE projection_state SET status = $1, updated_at = now() WHERE archetype = $2`,
             [status, archetype]
@@ -128,7 +135,7 @@ export class ProjectionManager {
         this.ensuring.add(archetype);
         try {
             const descriptor = deriveProjectionDescriptor(archetype);
-            const rows = await db.unsafe(
+            const rows = await projExec<any[]>('projection.state.claim',
                 `INSERT INTO projection_state (archetype, shape_hash, status, shape_version)
                  VALUES ($1, $2, 'BACKFILLING', $3)
                  ON CONFLICT (archetype) DO NOTHING
@@ -142,7 +149,8 @@ export class ProjectionManager {
                 await createCoveringIndex(archetype, this.coveringIndexOpts(descriptor));
             }
             this.registerArchetype(archetype, descriptor);
-            const s = await db.unsafe(`SELECT status FROM projection_state WHERE archetype = $1`, [archetype]);
+            const s = await projExec<any[]>('projection.state.status',
+                `SELECT status FROM projection_state WHERE archetype = $1`, [archetype]);
             this.statusCache.set(archetype, (s[0]?.status ?? 'BACKFILLING') as ProjectionStatus);
             this.startPoll();
             if (won) {
@@ -162,7 +170,7 @@ export class ProjectionManager {
             // Empty params array forces the extended protocol; the no-params
             // form goes through the simple query path, where rows can arrive
             // without named columns and every `row.archetype` reads undefined.
-            const rows = await db.unsafe(
+            const rows = await projExec<any[]>('projection.state.active',
                 `SELECT archetype, status FROM projection_state WHERE status IN ('BACKFILLING','SHADOW','READY')`,
                 []
             );

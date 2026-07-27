@@ -1,5 +1,31 @@
-import db from "./index";
+import { DDL_TIMEOUT_MS } from "./index";
+import { dbExec } from "./gateway";
 import { logger } from "../core/Logger";
+
+/**
+ * Catalog lookup — "does this index exist", "is this table partitioned".
+ *
+ * Fast by nature and always a prelude to DDL, so it gets the short budget: a
+ * catalog probe that cannot answer in 10 s means the database is in no state to
+ * start building an index anyway.
+ */
+const catalogQuery = <T = any>(label: string, sql: string): Promise<T> =>
+    dbExec<T>(sql, [], { lane: "background", label, timeoutMs: 10_000 });
+
+/**
+ * Schema DDL — index builds, ANALYZE, DROP INDEX.
+ *
+ * Long budget (`DDL_TIMEOUT_MS`, 10 min) because `CREATE INDEX CONCURRENTLY` on
+ * a large table routinely outlives any query timeout. Aborting it would not stop
+ * the build server-side (docs/POOLING.md B8a) — it would only make the framework
+ * log a failure and potentially retry against a table already being indexed.
+ *
+ * Background lane, so a burst of index creation cannot take pool capacity from
+ * request traffic. Bounding how many index builds run at once is a feature here,
+ * not a cost.
+ */
+const ddlStatement = <T = any>(label: string, sql: string): Promise<T> =>
+    dbExec<T>(sql, [], { lane: "background", label, timeoutMs: DDL_TIMEOUT_MS });
 
 const validateIdentifier = (str: string, maxLength: number = 64): string => {
     if (!str || typeof str !== 'string' || str.length === 0 || str.length > maxLength) {
@@ -43,7 +69,7 @@ export const ensureJSONBPathIndex = async (
         logger.trace(`Ensuring ${indexType.toUpperCase()} index ${indexName} on ${tableName} for field ${field}${isDateField ? ' (date field - indexed as text)' : ''}`);
 
         // Check if index already exists
-        const existingIndexes = await db.unsafe(`
+        const existingIndexes = await catalogQuery<any[]>("index.exists", `
             SELECT indexname
             FROM pg_indexes
             WHERE tablename = '${tableName}' AND indexname = '${indexName}'
@@ -55,7 +81,7 @@ export const ensureJSONBPathIndex = async (
         }
 
         // Check if table is partitioned
-        const partitionCheck = await db.unsafe(`
+        const partitionCheck = await catalogQuery<any[]>("index.partitionCheck", `
             SELECT relkind
             FROM pg_class
             WHERE relname = '${tableName}' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
@@ -94,7 +120,7 @@ export const ensureJSONBPathIndex = async (
         }
 
         logger.trace(`Creating index with SQL: ${indexSQL}`);
-        await db.unsafe(indexSQL);
+        await ddlStatement("index.create", indexSQL);
         logger.info(`Created ${indexType.toUpperCase()} index ${indexName} on ${tableName}${useConcurrently ? ' (concurrently)' : ' (blocking)'}`);
 
     } catch (error: any) {
@@ -112,7 +138,7 @@ export const ensureJSONBPathIndex = async (
             logger.warn(`Deadlock detected while creating index ${indexName}, checking if it exists now...`);
             // Wait a bit and check if index exists now (created by another process)
             await new Promise(resolve => setTimeout(resolve, 500));
-            const checkAgain = await db.unsafe(`
+            const checkAgain = await catalogQuery<any[]>("index.exists.recheck", `
                 SELECT indexname FROM pg_indexes
                 WHERE tablename = '${tableName}' AND indexname = '${indexName}'
             `);
@@ -162,7 +188,7 @@ export const analyzeTable = async (tableName: string): Promise<void> => {
     try {
         tableName = validateIdentifier(tableName);
         logger.trace(`Running ANALYZE on table ${tableName}`);
-        await db.unsafe(`ANALYZE ${tableName}`);
+        await ddlStatement("index.analyze", `ANALYZE ${tableName}`);
         logger.info(`Completed ANALYZE on table ${tableName}`);
     } catch (error) {
         logger.error(`Failed to ANALYZE table ${tableName}: ${error}`);
@@ -193,7 +219,7 @@ export const ensureNumericIndex = async (
         logger.trace(`Ensuring numeric index ${indexName} on ${tableName} for field ${field}`);
 
         // Check if index already exists
-        const existingIndexes = await db.unsafe(`
+        const existingIndexes = await catalogQuery<any[]>("index.exists", `
             SELECT indexname
             FROM pg_indexes
             WHERE tablename = '${tableName}' AND indexname = '${indexName}'
@@ -205,7 +231,7 @@ export const ensureNumericIndex = async (
         }
 
         // Check if table is partitioned
-        const partitionCheck = await db.unsafe(`
+        const partitionCheck = await catalogQuery<any[]>("index.partitionCheck", `
             SELECT relkind
             FROM pg_class
             WHERE relname = '${tableName}' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
@@ -222,7 +248,7 @@ export const ensureNumericIndex = async (
             AND data->>'${field}' ~ '^-?[0-9]+\\.?[0-9]*$'`;
 
         logger.trace(`Creating numeric index with SQL: ${indexSQL}`);
-        await db.unsafe(indexSQL);
+        await ddlStatement("index.create", indexSQL);
         logger.info(`Created numeric index ${indexName} on ${tableName}${useConcurrently ? ' (concurrently)' : ' (blocking)'}`);
 
     } catch (error: any) {
@@ -266,7 +292,7 @@ export const ensureFullTextIndex = async (
     try {
         logger.trace(`Ensuring full-text GIN index ${indexName} on ${tableName} for field ${field} (language: ${language})`);
 
-        const existingIndexes = await db.unsafe(`
+        const existingIndexes = await catalogQuery<any[]>("index.exists", `
             SELECT indexname
             FROM pg_indexes
             WHERE tablename = '${tableName}' AND indexname = '${indexName}'
@@ -277,7 +303,7 @@ export const ensureFullTextIndex = async (
             return;
         }
 
-        const partitionCheck = await db.unsafe(`
+        const partitionCheck = await catalogQuery<any[]>("index.partitionCheck", `
             SELECT relkind
             FROM pg_class
             WHERE relname = '${tableName}' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
@@ -291,7 +317,7 @@ export const ensureFullTextIndex = async (
         const indexSQL = `CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} IF NOT EXISTS ${indexName} ON ${tableName} USING GIN (to_tsvector('${language}', data->'${field}'))`;
 
         logger.trace(`Creating full-text index with SQL: ${indexSQL}`);
-        await db.unsafe(indexSQL);
+        await ddlStatement("index.create", indexSQL);
         logger.info(`Created full-text GIN index ${indexName} on ${tableName}${useConcurrently ? ' (concurrently)' : ' (blocking)'}`);
 
     } catch (error: any) {
@@ -332,7 +358,7 @@ export const ensureCompositeIndex = async (
         logger.trace(`Ensuring composite index ${indexName} on ${tableName}`);
 
         // Check if index already exists
-        const existingIndexes = await db.unsafe(`
+        const existingIndexes = await catalogQuery<any[]>("index.exists", `
             SELECT indexname
             FROM pg_indexes
             WHERE tablename = '${tableName}' AND indexname = '${indexName}'
@@ -344,7 +370,7 @@ export const ensureCompositeIndex = async (
         }
 
         // Check if table is partitioned
-        const partitionCheck = await db.unsafe(`
+        const partitionCheck = await catalogQuery<any[]>("index.partitionCheck", `
             SELECT relkind
             FROM pg_class
             WHERE relname = '${tableName}' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
@@ -369,7 +395,7 @@ export const ensureCompositeIndex = async (
             ON ${tableName} (${indexExpressions})`;
 
         logger.trace(`Creating composite index with SQL: ${indexSQL}`);
-        await db.unsafe(indexSQL);
+        await ddlStatement("index.create", indexSQL);
         logger.info(`Created composite index ${indexName} on ${tableName}${useConcurrently ? ' (concurrently)' : ' (blocking)'}`);
 
     } catch (error: any) {
@@ -418,7 +444,7 @@ export const dropIndexIfExists = async (tableName: string, indexName: string): P
         throw new Error(`Invalid index name: ${indexName}`);
     }
     try {
-        await db.unsafe(`DROP INDEX IF EXISTS ${indexName}`);
+        await ddlStatement("index.drop", `DROP INDEX IF EXISTS ${indexName}`);
         logger.info(`Dropped legacy index ${indexName} on ${tableName} (superseded by btree/numeric)`);
     } catch (error: any) {
         if (error.message && (error.message.includes('does not exist') || error.message.includes('not found'))) {
@@ -461,7 +487,7 @@ export const analyzeAllComponentTables = async (): Promise<void> => {
         logger.trace(`Analyzing all component tables`);
 
         // Get all component partition tables
-        const tables = await db.unsafe(`
+        const tables = await catalogQuery<any[]>("index.listTables", `
             SELECT tablename
             FROM pg_tables
             WHERE tablename LIKE 'components_%' AND schemaname = 'public'
