@@ -2,6 +2,55 @@
 
 All notable changes to bunsane are documented here.
 
+## Unreleased
+
+### Corrected
+
+- **B8a is a driver property, not a pooling one — `pool_mode = session` does NOT
+  fix it.** 0.5.11 (below) explained the pinned pool slot as a cancel request
+  that the pooler could not forward. Re-measured on PostgreSQL 17.10 with Bun
+  1.4.0-canary.1, running the same harness against both topologies: a direct
+  connection reacquired the slot at **5010 ms** and pgbouncer
+  `pool_mode = transaction` at **5009 ms**, for a 5000 ms statement. Identical,
+  so the pooler is not in the loop.
+
+  Watching the backend from a second connection shows the actual mechanism:
+  after `cancel()` at 415 ms it stays `active` at every sample through 7717 ms
+  and the query **resolves — does not reject —** at 8018 ms, its natural end.
+  `query.cancel()` issues no Postgres CancelRequest at all. Re-run with three
+  pool slots free (capacity confirmed live) to rule out the cancel channel
+  queueing behind the query it targets; same result.
+
+  **If you are moving to `pool_mode = session`, keep doing it** — it is still
+  required for advisory locks, the `options` startup parameter, and server-side
+  prepared statements (B1/B6). But it buys nothing for B8a, so
+  **`ALTER ROLE <user> SET statement_timeout` is now load-bearing rather than
+  supplementary**: it is the only thing that bounds a statement that is not
+  wrapped in a transaction. Shipping session mode *without* it reproduces the
+  outage signature.
+
+- **`DB_CONNECTION_TIMEOUT` does not fast-fail a busy pool.** 0.5.11 advised
+  request-facing deployments to set `5` so callers fail instead of queueing.
+  Measured: with `connectionTimeout: 1`, a caller arriving at a full pool queued
+  **4860 ms (direct) / 4862 ms (pooled)** and then succeeded — it waited out the
+  statements ahead of it. Bun documents the option as the connection
+  *establishment* timeout, and that is all it is. `5` remains reasonable as an
+  establishment bound; it is not admission control. Bounding the wait is the
+  execution seam's job (`database/gateway.ts`).
+
+- The bound that does work, on both topologies: `SET LOCAL statement_timeout`
+  killed a 6 s statement at ~1214 ms with the slot reusable 1–2 ms later. Use
+  `SET LOCAL`, never plain `SET` — under transaction pooling a session-level
+  `SET` leaks to the next client of that pooled server connection.
+
+### Fixed
+
+- `tests/pg-setup.ts` discovers the direct Postgres port from
+  `docker port <container> 5432` per run instead of trusting a pinned
+  `PG_DIRECT_PORT`. Docker reassigns that host port on every container recreate,
+  and a stale pin fails as `ERR_POSTGRES_CONNECTION_REFUSED` — which reads as
+  "no real Postgres available" and silently skips the real-PG test tier.
+
 ## 0.5.11 — 2026-07-26
 
 Hotfix for the downstream B8 report: a ~7 h production outage where the API
@@ -88,12 +137,22 @@ boot probe.
   unavailable when the pool is exhausted. `DB_QUERY_TIMEOUT` bounds the
   **caller**, not the statement; the only real statement bound behind a pooler is
   `ALTER ROLE … SET statement_timeout`.
+
+  > ⚠️ **The conclusion holds; the explanation above is wrong.** The slot is
+  > pinned, but not because a cancel could not be forwarded — `cancel()` sends
+  > nothing, and the same pinning happens on a direct connection. Corrected under
+  > *Unreleased* at the top of this file; it changes what `pool_mode = session`
+  > is worth.
+
 - `DB_CONNECTION_TIMEOUT` default stays **30 s** on purpose. Request-facing
   deployments should set `5`, and the docs now say so — but one pool is shared
   with background work (scheduler, outbox, projection backfill/reconcile) that
   legitimately waits longer, and there is no per-lane timeout yet. Lowering the
   global default would start failing that work. Per-lane defaults land with the
   execution seam.
+
+  > ⚠️ Setting `5` does **not** make callers fail fast at a busy pool — measured
+  > since; see *Unreleased*. It bounds connection establishment only.
 - `DB_DISABLE_PREPARE=true` is still the advice behind transaction pooling, now
   with the field counter-evidence recorded: one deployment saw `prepare: false`
   produce `unnamed prepared statement does not exist` where `prepare: true` had

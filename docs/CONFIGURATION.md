@@ -30,7 +30,7 @@ A connection requires **either** `DB_CONNECTION_URL` **or**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DB_QUERY_TIMEOUT` | `30000` (ms) | Client-side wall-clock timeout for `Query.exec/count/sum/average`, `Entity.save` and `Entity.doDelete`. It bounds **how long the caller waits**. It requests cancellation first, but behind a connection pooler that does *not* free the pooled slot — the statement runs to natural completion (measured; see [POOLING.md](./POOLING.md) B8a). The only effective bound on a statement is server-side `statement_timeout`. |
+| `DB_QUERY_TIMEOUT` | `30000` (ms) | Client-side wall-clock timeout for `Query.exec/count/sum/average`, `Entity.save` and `Entity.doDelete`. It bounds **how long the caller waits**. It requests cancellation first, but that request never reaches Postgres — `query.cancel()` issues no CancelRequest, so the statement runs to natural completion and holds its slot for the full duration. Measured identically on a direct connection and through a pooler, so this is a driver property and session pooling does not change it (see [POOLING.md](./POOLING.md) B8a). The only effective bound on a statement is server-side `statement_timeout`. |
 | `DB_CONNECTION_TIMEOUT` | `30` (s) | Bun SQL's timeout when **establishing** a connection. When it fires, `ERR_POSTGRES_CONNECTION_TIMEOUT` is classified as capacity and answered with **503 + `Retry-After`** (`code: POOL_EXHAUSTED`), counted as `poolAcquireFailures` in `/metrics`. ⚠️ **Whether it also bounds waiting for a busy pool to free a slot is unverified.** Measured against the PGlite bridge with `max: 1` and a 1 s timeout, a second caller **queued for 2.9 s and then succeeded** — i.e. the wait for a slot was not bounded. Bun's own docs say "when establishing a connection", which is not the same thing. Re-measure on your topology with `bun run test:pool-saturation` before relying on this as a fast-fail mechanism. **Request-facing deployments should still set `5`.** The default stays 30 s because background work (scheduler, outbox, projection backfill/reconcile) shares this pool and legitimately waits longer — there is no per-lane timeout yet. |
 | `DB_POOL_IDLE_TIMEOUT` | `30` (**s**) | Close idle pooled connections after this long. Bun SQL pool timeouts are in **seconds**; a value above `86400` is rejected at boot as a ms/s mix-up. Use `0` for no limit. |
 | `DB_POOL_MAX_LIFETIME` | `600` (**s**) | Retire a pooled connection after this long regardless of activity. Recycling is the only mechanism that ever retires a connection the driver still believes is usable — before 0.5.11 these two were passed as milliseconds, so nothing was ever recycled. Same `86400` guard; `0` for no limit. |
@@ -345,9 +345,12 @@ DB_CONNECTION_TIMEOUT=5
 #   DB_POOL_MAX_LIFETIME=600
 ```
 
-Remember that **no client-side timeout frees a pooled slot** behind a pooler
-(POOLING.md B8a): `DB_CONNECTION_TIMEOUT=5` makes callers fail fast, the role's
-`statement_timeout` is what actually stops the work.
+Remember that **no client-side timeout frees a pooled slot** — on any topology,
+not just behind a pooler (POOLING.md B8a). The role's `statement_timeout` is what
+actually stops the work. `DB_CONNECTION_TIMEOUT=5` does *not* make callers fail
+fast at a busy pool either: measured, a caller queued ~4.9 s waiting out the
+statements ahead of it before succeeding. It bounds connection **establishment**;
+bounding the wait for capacity is the execution seam's job.
 
 ---
 
