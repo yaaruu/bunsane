@@ -175,6 +175,40 @@ against a 0.35 ms baseline. Inside a transaction that already exists, `SET LOCAL
 costs **+0.12 ms**. So the framework guards transactions by default and leaves
 bare statements to the role-level default.
 
+### What the framework does about it
+
+`dbTransaction` (`database/gateway.ts`) emits `SET LOCAL statement_timeout` from
+its own deadline, on every transaction it opens. Every write path — `entity.save`,
+`entity.delete`, studio bulk deletes — therefore carries a real server-side bound.
+
+Cost, measured end to end rather than projected: **+0.40 ms on a 3.0 ms entity
+save (13%)**, 200 interleaved samples on real PG 17. That is one extra round
+trip, and it is the floor — issuing the `SET LOCAL` unawaited so the driver might
+pipeline it with the transaction body was tried and changed nothing (0.397 ms vs
+0.400 ms), because Bun serializes a connection's queue. The +0.12 ms quoted above
+is the micro-benchmark figure for a bare `BEGIN`/`SELECT 1`/`COMMIT`; a real save
+pays a full round trip.
+
+Three deliberate exceptions:
+
+- **Bare statements are not wrapped.** `dbExec` takes `serverTimeout: true` per
+  call, and the studio endpoints and projection backfill/reconcile set it,
+  because ~1 ms is invisible against a table scan. The read path does not, because
+  it issues thousands of statements per request and +3.7× each is a regression,
+  not a safeguard. **This is the gap the role-level default covers, and the reason
+  it is load-bearing.**
+- **Not on DDL.** `CREATE INDEX CONCURRENTLY` cannot run inside a transaction
+  block, so `projDdl` and `IndexingStrategy` stay unwrapped.
+- **Not on a caller-supplied handle.** `SET LOCAL` is transaction-scoped, not
+  savepoint-scoped: releasing a savepoint does not restore the previous value, so
+  emitting inside a transaction *you* opened would silently reset your
+  `statement_timeout` for the rest of it.
+
+When the server kills a statement the framework re-throws it as
+`DbStatementTimeoutError` carrying the lane, label and budget, instead of the bare
+`canceling statement due to statement timeout`. `BUNSANE_DB_SERVER_TIMEOUT=off`
+disables emission entirely; it is also skipped under PGlite.
+
 `BUNSANE_ABORT_MODE=cancel|off` (default `cancel`) exists **temporarily** so a
 deployment can test whether issuing `cancel()` is itself implicated in
 connections that never return to the pool. Note that the two modes are now known

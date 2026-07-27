@@ -4,6 +4,41 @@ All notable changes to bunsane are documented here.
 
 ## Unreleased
 
+### Added
+
+- **Server-side deadline enforcement.** `dbTransaction` now emits
+  `SET LOCAL statement_timeout` derived from its own deadline, so every write
+  path (`entity.save`, `entity.delete`, studio bulk deletes) carries a bound the
+  *server* honours. Until now every timeout in the framework was client-side,
+  and a client-side abort does not stop Postgres — the statement runs to
+  completion and holds its pool slot for its real duration. That is the outage
+  mechanism, and this is the fix for the transaction half of it.
+
+  Measured cost on real PG 17, 200 interleaved samples: **+0.40 ms on a 3.0 ms
+  entity save (13%)** — one extra round trip, paid once per transaction. (An
+  earlier micro-benchmark on a bare `BEGIN`/`SELECT 1`/`COMMIT` suggested
+  +0.12 ms; a real save pays the full round trip, and the end-to-end number is
+  the one that counts. Issuing the `SET LOCAL` unawaited so the driver might
+  pipeline it was tried and made no difference — Bun serializes a connection's
+  queue.) Wrapping a *bare* statement in a transaction to carry the setting
+  costs **+0.95 ms (3.7×)** against a 0.35 ms baseline, so bare statements are
+  **opt-in** (`dbExec(..., { serverTimeout: true })`) — taken by the studio
+  endpoints and projection backfill/reconcile, not by the read path. Bare
+  statements that do not opt in remain covered only by
+  `ALTER ROLE <user> SET statement_timeout`, which is why that stays
+  load-bearing.
+
+  Not applied to DDL (`CREATE INDEX CONCURRENTLY` cannot run inside a
+  transaction block) or to a caller-supplied transaction handle (`SET LOCAL` is
+  transaction-scoped, not savepoint-scoped, so it would silently outlive our
+  savepoint and change the caller's setting). Skipped under PGlite, as
+  `DB_STATEMENT_TIMEOUT` already is. Kill switch: `BUNSANE_DB_SERVER_TIMEOUT=off`.
+
+  A server-side kill is re-thrown as `DbStatementTimeoutError` with the lane,
+  label and budget attached, rather than the bare `canceling statement due to
+  statement timeout` — otherwise the new bound would be less legible than the
+  client-side one it replaces.
+
 ### Corrected
 
 - **B8a is a driver property, not a pooling one — `pool_mode = session` does NOT

@@ -27,7 +27,11 @@ export function projExec<T = any>(
     params?: any[],
     timeoutMs?: number,
 ): Promise<T> {
-    return dbExec<T>(sql, params, { lane: 'background', label, timeoutMs });
+    // Server-side bound opted in: these are sweeps over user data, so ~1 ms of
+    // transaction wrapper is nothing against them, and a runaway one holding a
+    // pool slot indefinitely is the failure this exists to prevent. Deliberately
+    // NOT on `projDdl` below.
+    return dbExec<T>(sql, params, { lane: 'background', label, timeoutMs, serverTimeout: true });
 }
 
 /**
@@ -35,6 +39,11 @@ export function projExec<T = any>(
  *
  * Long budget for the same reason as `IndexingStrategy`: DDL outlives a query
  * timeout by design, and aborting it does not stop the server-side work.
+ *
+ * No `serverTimeout` here, and it is not an oversight: it would open a
+ * transaction, and `CREATE INDEX CONCURRENTLY` cannot run inside one. PGlite
+ * strips CONCURRENTLY (`USE_PGLITE` guard in `DDLGenerator`), so that mistake
+ * would pass the PGlite suite and fail only on real Postgres.
  */
 export function projDdl<T = any>(label: string, sql: string, params?: any[]): Promise<T> {
     return dbExec<T>(sql, params, { lane: 'background', label, timeoutMs: DDL_TIMEOUT_MS });

@@ -125,6 +125,28 @@ export interface DbExecOptions {
      * rather than hardcoding it, so it cannot drift from reality.
      */
     callerOwnsConn?: boolean;
+    /**
+     * Enforce the deadline SERVER-side with `SET LOCAL statement_timeout`.
+     *
+     * `dbTransaction` does this by default; `dbExec`/`dbRun` do not, and the
+     * asymmetry is measured, not stylistic (real PG 17):
+     *
+     *   inside a transaction that already exists   +0.40 ms  (one round trip;
+     *                                              13% of a 3.0 ms entity save,
+     *                                              200 interleaved samples)
+     *   wrapping a bare statement in one to        +0.95 ms  (3.7× a 0.35 ms
+     *   carry it                                   `SELECT 1`, median of 300)
+     *
+     * One extra round trip is the real unit, and it is worth paying once per
+     * write. It is NOT worth paying per statement on a read path that issues
+     * thousands of them per request — there it is a regression wearing a
+     * safeguard's clothes, which is why this is opt-in.
+     *
+     * Worth opting in for known-heavy work where ~1 ms is invisible next to a
+     * multi-second query: studio endpoints, backfill, reconcile. NOT for DDL —
+     * `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block.
+     */
+    serverTimeout?: boolean;
 }
 
 interface LaneStats {
@@ -409,6 +431,62 @@ function resolveDeadline(opts: DbExecOptions): number {
 }
 
 /**
+ * SERVER-SIDE DEADLINE ENFORCEMENT
+ *
+ * A client-side abort does not stop the server. Measured on Bun 1.4.0-canary.1:
+ * `query.cancel()` sends no Postgres CancelRequest, so an abandoned statement
+ * runs to completion and keeps its pool slot for its real duration — identical
+ * on a direct connection and through PgBouncer, because it is a driver
+ * property, not a pooling one. That is the outage signature: the app gives up,
+ * the database does not, and the slot never comes back.
+ *
+ * `SET LOCAL statement_timeout` is the bound that works. A 6 s statement was
+ * killed at 1215 ms (direct) / 1213 ms (pooled) against a 1200 ms setting, and
+ * the slot was reusable 1–2 ms later on both.
+ *
+ * `SET LOCAL`, never plain `SET`: under transaction pooling the server
+ * connection is handed to another client at COMMIT, and a session-level setting
+ * would follow it there — one caller's 500 ms budget silently becoming
+ * everyone's.
+ */
+function serverTimeoutEnabled(): boolean {
+    // PGlite is skipped for the same reason `DB_STATEMENT_TIMEOUT` is: it is a
+    // single-connection in-process engine where the failure this guards against
+    // cannot occur, and the whole test suite now crosses this path.
+    return process.env.BUNSANE_DB_SERVER_TIMEOUT !== 'off' && process.env.USE_PGLITE !== 'true';
+}
+
+/**
+ * Apply the remaining budget as a server-side statement timeout on `conn`.
+ * Must be called INSIDE a transaction — `SET LOCAL` outside one is a no-op with
+ * a warning.
+ *
+ * `SET` cannot take a bind parameter, so the value is interpolated — safe here
+ * because `ms` is a validated integer, never caller text. Passing NO params
+ * array keeps this on the simple query protocol, which matters twice over: the
+ * statement is never prepared, so varying SQL text cannot collide with Bun's
+ * ~40-character prepared-statement naming (the 42P05 shape this codebase has
+ * already paid for once), and it measured cheaper than the constant-text
+ * `SELECT set_config('statement_timeout', $1, true)` alternative — +0.40 ms vs
+ * +0.55 ms on a real entity save.
+ */
+async function applyStatementTimeout(conn: any, budgetMs: number): Promise<void> {
+    // Guard the floor deliberately: `statement_timeout = 0` means NO timeout in
+    // Postgres, so rounding an exhausted budget down would silently remove the
+    // bound at exactly the moment it matters most.
+    const ms = Math.max(1, Math.ceil(budgetMs));
+    await conn.unsafe(`SET LOCAL statement_timeout = '${ms}ms'`);
+}
+
+/** SQLSTATE 57014 raised by `statement_timeout`, as opposed to a client cancel. */
+export function isServerStatementTimeout(err: unknown): boolean {
+    const e = err as { code?: unknown; errno?: unknown; message?: unknown } | null | undefined;
+    if (e?.code === '57014' || e?.errno === '57014') return true;
+    return typeof e?.message === 'string'
+        && e.message.includes('canceling statement due to statement timeout');
+}
+
+/**
  * Execute one statement under lane admission and a deadline that covers BOTH the
  * wait for capacity and the query itself.
  *
@@ -445,6 +523,18 @@ export async function dbRun<T = any>(
 ): Promise<T> {
     const lane = opts.lane ?? 'request';
     const deadline = resolveDeadline(opts);
+
+    // Opt-in server-side enforcement. A lone statement has no transaction to
+    // hang `SET LOCAL` on, so one is opened for it — hence the +0.95 ms and
+    // hence opt-in. Admission is taken by `dbTransaction`; the inner call runs
+    // inside its ALS scope and is exempt, so no permit is taken twice.
+    if (opts.serverTimeout === true && opts.conn === undefined && !opts.callerOwnsConn && serverTimeoutEnabled()) {
+        return await dbTransaction<T>(
+            (trx) => dbRun<T>(makeQuery, describe, { ...opts, conn: trx, deadline, serverTimeout: false }),
+            { ...opts, deadline },
+        );
+    }
+
     const admission = await admit(lane, deadline, opts.signal, opts.label, opts.callerOwnsConn === true);
     try {
         const remaining = deadline - Date.now();
@@ -482,7 +572,14 @@ export async function dbRun<T = any>(
             // error ("Query cancelled"), which would replace the reason the
             // caller needs. Re-throw our deadline error, keeping the driver's as
             // `cause`. A caller-initiated abort keeps the caller's reason.
-            if (deadlineExpired) {
+            //
+            // A SERVER-side kill arrives the same way and needs the same
+            // translation: `canceling statement due to statement timeout` says
+            // nothing about which lane, label or budget was exceeded, which is
+            // precisely the information `DbStatementTimeoutError` exists to
+            // carry. Without this the server bound would be strictly less
+            // legible than the client one it replaces.
+            if (deadlineExpired || isServerStatementTimeout(err)) {
                 throw new DbStatementTimeoutError(lane, remaining, opts.label, err);
             }
             throw err;
@@ -507,12 +604,28 @@ export async function dbTransaction<T>(
     opts: DbExecOptions = {},
 ): Promise<T> {
     const lane = opts.lane ?? 'request';
+    const startedAt = Date.now();
     const deadline = resolveDeadline(opts);
     // Same exemption as `dbExec`: opening a SAVEPOINT on a handle the caller
     // already holds consumes no new pooled connection, so it must not queue for
     // a permit behind work that does.
     const admission = await admit(lane, deadline, opts.signal, opts.label, opts.callerOwnsConn === true);
     try {
+        // Emit `SET LOCAL statement_timeout` unless the caller opts out. Costs
+        // one round trip (+0.40 ms, 13% of a 3.0 ms entity save) — paid once
+        // per transaction, in exchange for the write path having a bound the
+        // server actually honours.
+        //
+        // NOT when `conn` is supplied. `SET LOCAL` is transaction-scoped, not
+        // savepoint-scoped: releasing the savepoint this opens does NOT restore
+        // the previous value, so a framework transaction nested inside consumer
+        // code's own transaction would silently reset THEIR statement_timeout
+        // for the rest of it. Same reasoning for `callerOwnsConn`.
+        const emitServerTimeout = opts.serverTimeout !== false
+            && opts.conn === undefined
+            && !opts.callerOwnsConn
+            && serverTimeoutEnabled();
+
         // `opts.conn` is honoured so a caller already holding a transaction handle
         // can open a SAVEPOINT on it instead of acquiring a second pooled
         // connection — which is what `(db as any).transaction(...)` would do,
@@ -527,7 +640,31 @@ export async function dbTransaction<T>(
         // against the permit the transaction itself was holding — the precise
         // failure this design exists to avoid. Entering the scope here means it
         // propagates through everything `fn` awaits.
-        return await (target as any).transaction((trx: any) => admittedScope.run({ lane }, () => fn(trx)));
+        return await (target as any).transaction((trx: any) => admittedScope.run({ lane }, async () => {
+            if (emitServerTimeout) {
+                const budget = deadline - Date.now();
+                // Refuse rather than run unbounded: `statement_timeout = 0`
+                // disables the timeout, so an already-spent budget must fail
+                // here, not silently open the transaction with no bound.
+                if (budget <= 0) throw new DbStatementTimeoutError(lane, 0, opts.label);
+                // Plainly awaited. Issuing it unawaited and resolving it
+                // alongside `fn` — hoping the driver would pipeline the two —
+                // was measured and made no difference (0.397 ms vs 0.400 ms):
+                // Bun serializes a connection's queue rather than batching it,
+                // so the round trip is real and there is no version of this
+                // that costs less. Not worth the ordering risk for 3 µs.
+                await applyStatementTimeout(trx, budget);
+            }
+            return await fn(trx);
+        }));
+    } catch (err) {
+        // Statements issued on the raw `trx` handle never pass through
+        // `dbRun`, so this is the only place their server-side kill can be
+        // translated — `saveEntity`'s inner writes are exactly that shape.
+        if (isServerStatementTimeout(err)) {
+            throw new DbStatementTimeoutError(lane, deadline - startedAt, opts.label, err);
+        }
+        throw err;
     } finally {
         admission.release();
     }

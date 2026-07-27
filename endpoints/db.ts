@@ -53,7 +53,13 @@ export function studioExec<T = any>(
     sql: string,
     params?: any[],
 ): Promise<T> {
-    return dbExec<T>(sql, params, { lane: "background", label, deadline });
+    // `serverTimeout` opted in: studio statements are table scans and COUNT(*)s
+    // where the ~1 ms cost of wrapping them in a transaction to carry
+    // `SET LOCAL statement_timeout` is invisible, and where an unbounded one is
+    // exactly what must not pin a pool slot shared with user traffic. This is
+    // what turns the note above ("the deadline is not a statement bound") into
+    // one for studio specifically.
+    return dbExec<T>(sql, params, { lane: "background", label, deadline, serverTimeout: true });
 }
 
 /**
