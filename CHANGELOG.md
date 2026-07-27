@@ -2,9 +2,51 @@
 
 All notable changes to bunsane are documented here.
 
-## Unreleased
+## 0.6.0 — 2026-07-27
+
+The release 0.5.11 was a hotfix for: it gives the framework somewhere to put a
+policy about its own database traffic, and then puts two there.
 
 ### Added
+
+- **The DB execution seam (`database/gateway.ts`).** Framework DB traffic used to
+  reach Postgres through ~111 raw `.unsafe(` call sites plus ~47 tagged
+  templates, of which a handful carried a timeout, a signal or a metric. There
+  was consequently nowhere to bound concurrency, propagate a deadline, keep
+  background work off user traffic, or even count queries accurately — each
+  would have meant editing every call site. That is the structural reason a slow
+  database became a wedged application: the framework had no place to say "no".
+
+  Everything now routes through `dbExec` / `dbRun` / `dbTransaction`, which own:
+
+  - **Lanes.** `request` may use the whole admission limit; `background`
+    (scheduler, outbox, projection backfill/reconcile, studio endpoints) is
+    capped at half so it cannot starve user traffic; `health` is never admitted,
+    because a probe that queues behind saturation reports "wedged" when the truth
+    is "busy" and the orchestrator restarts a healthy container.
+  - **Admission per TRANSACTION, never per statement.** A transaction already
+    holds its pooled connection; making it queue for a permit to issue its *next*
+    statement is a nested-acquire deadlock that presents exactly like the outage
+    this work came from. Exemption follows the async call tree via
+    AsyncLocalStorage, plus an explicit `callerOwnsConn` for handles arriving from
+    outside the framework (`Query.withTrx`, `saveEntity(entity, trx)`).
+  - **One deadline covering the wait AND the query.** Two independent 30 s clocks
+    is how a request stalls for a minute before failing.
+  - **Our own queue, deliberately.** `DB_CONNECTION_TIMEOUT` was assumed to bound
+    waiting for a busy pool; measured, a caller queued 4860 ms against a 1 s
+    setting and then succeeded. It is the connection *establishment* timeout.
+  - Per-label metrics, slow log, and `/metrics.dbAdmission`.
+
+  `tests/unit/db-seam.test.ts` keeps the seam closed by grepping the tree, with
+  an allow-list where every entry states why it cannot be routed — boot DDL whose
+  tagged templates change wire protocol if converted, lock renewal that must
+  never queue, health probes, and statements on a caller-supplied transaction.
+  Two further tests fail if an entry goes stale or loses its reason.
+
+  Admission engages via `armGateway()` *after* boot migrations, so DDL is never
+  serialized behind a limit derived before the pool is warm. `BUNSANE_DB_ADMISSION=off`
+  makes the whole thing a passthrough; `DB_ADMISSION_HEADROOM` (default 1) keeps
+  connections outside the limit for the health lane.
 
 - **Server-side deadline enforcement.** `dbTransaction` now emits
   `SET LOCAL statement_timeout` derived from its own deadline, so every write
