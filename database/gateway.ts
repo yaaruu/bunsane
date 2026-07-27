@@ -428,7 +428,7 @@ async function admit(
             logger.warn(
                 { unarmedCalls, lane, label },
                 'DB admission is NOT armed and this process is past boot — every query is running ' +
-                'unbounded. armGateway() is called by App.start(); a standalone script or job that ' +
+                'unbounded. armGateway() is called by App.init(); a standalone script or job that ' +
                 'uses the framework database directly must call it itself.',
             );
         }

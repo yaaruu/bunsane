@@ -215,7 +215,7 @@ A request-facing deployment wants all three. See
 
 ### Admission is inert until something arms it
 
-`armGateway()` is called by `App.start()` after migrations, so boot DDL runs
+`armGateway()` is called by `App.init()` after migrations, so boot DDL runs
 unbounded by design. Anything that uses the framework's database *without*
 booting an App — a standalone script, a one-off job — therefore gets no admission
 at all. `getGatewayStats().unarmedCalls` counts queries that took that path, and

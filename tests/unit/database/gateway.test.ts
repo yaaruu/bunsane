@@ -477,7 +477,7 @@ describe('per-lane deadlines', () => {
 /**
  * The unarmed path — admission's silent failure mode.
  *
- * `armGateway()` is called only by App.start(), so anything using the framework
+ * `armGateway()` is called only by App.init(), so anything using the framework
  * database without booting an App gets no admission and no indication of it.
  */
 describe('unarmed traffic is counted', () => {
