@@ -2,7 +2,8 @@ import DataLoader from 'dataloader';
 import { Entity } from './Entity';
 import db from '../database';
 import { inList } from '../database/sqlHelpers';
-import { timedUnsafe, incrementDataLoaderCall, type PerRequestCounters } from '../database/instrumentedDb';
+import { incrementDataLoaderCall, type PerRequestCounters } from '../database/instrumentedDb';
+import { dbExec } from '../database/gateway';
 import {logger as MainLogger} from './Logger';
 const logger = MainLogger.child({ module: 'RequestLoaders' });
 import { getMetadataStorage } from './metadata';
@@ -53,12 +54,12 @@ export function createRequestLoaders(
       
       if (missingIds.length > 0) {
         const idList = inList(missingIds, 1);
-        const rows = await timedUnsafe<any[]>(db, `
+        const rows = await dbExec<any[]>(`
           SELECT id
           FROM entities
           WHERE id IN ${idList.sql}
             AND deleted_at IS NULL
-        `, idList.params, signal, perRequest);
+        `, idList.params, { lane: 'request', label: 'loader.entity.byIds', signal, perRequest });
         
         const entities = rows.map((row: any) => {
           const entity = new Entity(row.id);
@@ -157,13 +158,13 @@ export function createRequestLoaders(
           const typeIds = [...new Set(missingKeys.map(k => k.typeId))];
           const entityIdList = inList(entityIds, 1);
           const typeIdList = inList(typeIds, entityIdList.newParamIndex);
-          const rows = await timedUnsafe<any[]>(db, `
+          const rows = await dbExec<any[]>(`
             SELECT id, entity_id, type_id, data, created_at, updated_at, deleted_at
             FROM components
             WHERE entity_id IN ${entityIdList.sql}
               AND type_id IN ${typeIdList.sql}
               AND deleted_at IS NULL
-          `, [...entityIdList.params, ...typeIdList.params], signal, perRequest);
+          `, [...entityIdList.params, ...typeIdList.params], { lane: 'request', label: 'loader.component.byEntityTypes', signal, perRequest });
           
           const components: ComponentData[] = rows.map((row: any) => ({
             id: row.id,
@@ -287,7 +288,7 @@ export function createRequestLoaders(
           logger.trace(`[RelationLoader] Batched query for ${groupedKeys.length} keys with foreign key ${foreignKey}`);
 
           // SINGLE BATCHED QUERY for all entities in this group
-          const rows = await timedUnsafe<any[]>(db, `
+          const rows = await dbExec<any[]>(`
             SELECT DISTINCT
               c.entity_id,
               c.data,
@@ -299,7 +300,7 @@ export function createRequestLoaders(
             WHERE e.deleted_at IS NULL
               AND c.deleted_at IS NULL
               AND ${whereClause}
-          `, [entityIds], signal, perRequest);
+          `, [entityIds], { lane: 'request', label: 'loader.relation.distinct', signal, perRequest });
 
           logger.trace(`[RelationLoader] Found ${rows.length} total components for ${entityIds.length} entities`);
 
@@ -416,7 +417,7 @@ export function createRequestLoaders(
           // comma-string by the Bun SQL driver and fails). foreignKeyField
           // comes from trusted relation decorator metadata.
           const entityList = inList(entityIds, 2);
-          const rows = await timedUnsafe<any[]>(db, `
+          const rows = await dbExec<any[]>(`
             SELECT c.entity_id, c.data->>'${foreignKeyField}' AS fk_value
             FROM components c
             INNER JOIN entities e ON c.entity_id = e.id
@@ -424,7 +425,7 @@ export function createRequestLoaders(
               AND c.deleted_at IS NULL
               AND e.deleted_at IS NULL
               AND c.data->>'${foreignKeyField}' IN ${entityList.sql}
-          `, [componentTypeId, ...entityList.params], signal, perRequest);
+          `, [componentTypeId, ...entityList.params], { lane: 'request', label: 'loader.relation.fk', signal, perRequest });
 
           for (const key of groupedKeys) {
             const relatedIds = [...new Set(

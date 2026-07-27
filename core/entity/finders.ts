@@ -3,6 +3,7 @@
 // Entity instance; the Entity class is imported lazily where construction
 // is needed to avoid a module-eval cycle.
 import { logger } from "../Logger";
+import { dbRun } from "../../database/gateway";
 import db from "../../database";
 import ComponentRegistry from "../components/ComponentRegistry";
 import { uuidv7 } from "../../utils/uuid";
@@ -24,11 +25,11 @@ export async function loadMultiple(ids: string[]): Promise<Entity[]> {
         logger.warn(`LoadMultiple: Filtered out ${ids.length - validIds.length} invalid entity IDs`);
     }
 
-    const components = await db`
+    const components = await dbRun<any[]>((conn) => conn`
         SELECT c.id, c.entity_id, c.type_id, c.data
         FROM components c
         WHERE c.entity_id IN ${sql(validIds)} AND c.deleted_at IS NULL
-    `;
+    `, "finders.loadMultiple", { lane: "request", label: "finders.loadMultiple" });
 
     const entitiesMap = new Map<string, Entity>();
 
@@ -67,11 +68,11 @@ export async function loadComponents(entities: Entity[], componentIds: string[],
 
     const entityIds = validEntities.map(e => e.id);
 
-    const components = await db`
+    const components = await dbRun<any[]>((conn) => conn`
         SELECT c.id, c.entity_id, c.type_id, c.data
         FROM components c
         WHERE c.entity_id IN ${sql(entityIds)} AND c.type_id IN ${sql(componentIds)} AND c.deleted_at IS NULL
-    `;
+    `, "finders.eagerLoad", { lane: "request", label: "finders.eagerLoad" });
 
     // Use Map for O(1) lookups instead of O(n) find() - fixes O(n²) performance issue
     const entityMap = new Map<string, Entity>(validEntities.map(e => [e.id, e]));

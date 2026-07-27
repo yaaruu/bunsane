@@ -1,5 +1,5 @@
 import db from "../../database";
-import { timedUnsafe } from "../../database/instrumentedDb";
+import { dbExec } from "../../database/gateway";
 import { logger } from "../../core/Logger";
 import type { ProjectionStatus } from "../../database/projection/types";
 
@@ -85,11 +85,12 @@ export class PlannerCache {
         );
         (timer as unknown as { unref?: () => void }).unref?.();
         try {
-            const rows = await timedUnsafe<any[]>(
-                db,
+            // Background lane: the planner refresh runs off the read hot path
+            // and must never take capacity from the request that triggered it.
+            const rows = await dbExec<any[]>(
                 `SELECT archetype, status, shape_version, shape_hash, field_state FROM projection_state`,
                 [],
-                controller.signal,
+                { lane: 'background', label: 'planner.refresh', signal: controller.signal, timeoutMs: REFRESH_TIMEOUT_MS },
             );
             this.states.clear();
             for (const row of rows) {

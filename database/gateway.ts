@@ -48,7 +48,7 @@
 import type { SQL } from 'bun';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import db, { QUERY_TIMEOUT_MS } from './index';
-import { timedUnsafe, getDbStats, type PerRequestCounters } from './instrumentedDb';
+import { timedQuery, getDbStats, type PerRequestCounters } from './instrumentedDb';
 import { linkAbortSignals } from './cancellable';
 import { logger as MainLogger } from '../core/Logger';
 
@@ -104,6 +104,25 @@ export interface DbExecOptions {
     perRequest?: PerRequestCounters;
     /** Execute on this connection/transaction handle instead of the pool. */
     conn?: SQL | any;
+    /**
+     * The caller already holds the connection in `conn` (a transaction, a
+     * reserved connection), so this statement consumes no new pooled slot and
+     * must NOT wait for an admission permit.
+     *
+     * Explicit rather than inferred from `conn`. Ownership is not a property of
+     * the object: `conn` is also how a caller substitutes a different pool (the
+     * gateway's own tests inject a stub that way), and treating every foreign
+     * handle as owned would silently disable admission wherever `conn` is used
+     * for injection.
+     *
+     * Set it wherever a transaction handle arrives from OUTSIDE the framework —
+     * `Query.withTrx(trx)`, `saveEntity(entity, trx)` — because there is no
+     * admitted ALS scope to inherit in those cases, and admitting while holding
+     * a connection is the nested-acquire deadlock this seam exists to prevent.
+     * Derive it from the handle at that boundary (`callerOwnsConn: !!this.trx`)
+     * rather than hardcoding it, so it cannot drift from reality.
+     */
+    callerOwnsConn?: boolean;
 }
 
 interface LaneStats {
@@ -321,9 +340,27 @@ interface Admission {
  * Acquire capacity for `lane` before the deadline. `health` and already-admitted
  * scopes return immediately.
  */
-async function admit(lane: Lane, deadline: number, signal?: AbortSignal, label?: string): Promise<Admission> {
+async function admit(
+    lane: Lane,
+    deadline: number,
+    signal?: AbortSignal,
+    label?: string,
+    callerOwnsConnection = false,
+): Promise<Admission> {
     const noop: Admission = { release: () => {} };
-    if (!armed || !admissionEnabled() || lane === 'health' || admittedScope.getStore()) return noop;
+    // `callerOwnsConnection` is the second exemption alongside the ALS scope, and
+    // it covers what ALS cannot: a connection handed in from OUTSIDE the
+    // framework. `Query.withTrx(trx)` lets consumer code pass a transaction it
+    // opened with a raw `db.transaction()`, so there is no admitted scope to
+    // inherit — yet the connection is unquestionably already held. Admitting
+    // there would block waiting for a permit while holding the very resource
+    // permits are rationing: the nested-acquire deadlock, arriving through the
+    // public API rather than through our own call tree.
+    //
+    // The rule is simply: whoever owns the connection already paid for it.
+    if (!armed || !admissionEnabled() || lane === 'health' || callerOwnsConnection || admittedScope.getStore()) {
+        return noop;
+    }
 
     const { total, background } = getQueues();
     const t0 = performance.now();
@@ -379,9 +416,34 @@ function resolveDeadline(opts: DbExecOptions): number {
  * gets.
  */
 export async function dbExec<T = any>(sql: string, params?: any[], opts: DbExecOptions = {}): Promise<T> {
+    return await dbRun<T>(
+        (conn) => (params === undefined ? (conn as any).unsafe(sql) : (conn as any).unsafe(sql, params)),
+        sql,
+        opts,
+    );
+}
+
+/**
+ * Run a caller-built query under the same lane, admission and deadline policy.
+ *
+ * The escape hatch for TAGGED TEMPLATES. `db\`… ${sql(ids)} …\`` cannot be
+ * expressed as a flat string plus params without rewriting the SQL by hand, and
+ * converting templates to `unsafe()` changes the wire protocol — which broke the
+ * suite once already via Bun's prepared-statement naming (see
+ * `database/DatabaseHelper.ts`). Passing the factory keeps construction and
+ * protocol byte-identical while still getting admission, a deadline, cancellation
+ * and metrics.
+ *
+ * `describe` is a label for the slow log, since there is no SQL string to snip.
+ */
+export async function dbRun<T = any>(
+    makeQuery: (conn: any) => any,
+    describe: string,
+    opts: DbExecOptions = {},
+): Promise<T> {
     const lane = opts.lane ?? 'request';
     const deadline = resolveDeadline(opts);
-    const admission = await admit(lane, deadline, opts.signal, opts.label);
+    const admission = await admit(lane, deadline, opts.signal, opts.label, opts.callerOwnsConn === true);
     try {
         const remaining = deadline - Date.now();
         if (remaining <= 0) {
@@ -407,7 +469,12 @@ export async function dbExec<T = any>(sql: string, params?: any[], opts: DbExecO
         (timer as unknown as { unref?: () => void }).unref?.();
 
         try {
-            return await timedUnsafe<T>(opts.conn ?? db, sql, params, controller.signal, opts.perRequest);
+            return await timedQuery<T>(
+                () => makeQuery(opts.conn ?? db),
+                describe,
+                controller.signal,
+                opts.perRequest,
+            );
         } catch (err) {
             // The driver wins the race: cancelling makes it reject with its own
             // error ("Query cancelled"), which would replace the reason the
@@ -439,7 +506,10 @@ export async function dbTransaction<T>(
 ): Promise<T> {
     const lane = opts.lane ?? 'request';
     const deadline = resolveDeadline(opts);
-    const admission = await admit(lane, deadline, opts.signal, opts.label);
+    // Same exemption as `dbExec`: opening a SAVEPOINT on a handle the caller
+    // already holds consumes no new pooled connection, so it must not queue for
+    // a permit behind work that does.
+    const admission = await admit(lane, deadline, opts.signal, opts.label, opts.callerOwnsConn === true);
     try {
         // `opts.conn` is honoured so a caller already holding a transaction handle
         // can open a SAVEPOINT on it instead of acquiring a second pooled

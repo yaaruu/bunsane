@@ -8,7 +8,8 @@ import { QueryContext, QueryDAG, ComponentInclusionNode } from "./index";
 import { OrQuery } from "./OrQuery";
 import { OrNode } from "./OrNode";
 import { preparedStatementCache } from "../database/PreparedStatementCache";
-import { timedUnsafe, type PerRequestCounters } from "../database/instrumentedDb";
+import { type PerRequestCounters } from "../database/instrumentedDb";
+import { dbExec } from "../database/gateway";
 import { linkAbortSignals } from "../database/cancellable";
 import { getMetadataStorage } from "../core/metadata";
 import { shouldUseDirectPartition } from "../core/Config";
@@ -206,6 +207,38 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         hasNextPage?: boolean;
     } {
         return this._lastRouteInfo;
+    }
+
+    /**
+     * Run a read statement through the DB execution seam.
+     *
+     * Same argument order as the `timedUnsafe` it replaces, so the change at
+     * each call site is the function name and a label, nothing else.
+     *
+     * `callerOwnsConn` is derived from `this.trx`, never hardcoded: a Query
+     * given a transaction via `withTrx()` runs on a connection the caller
+     * already holds — often one opened by consumer code with a raw
+     * `db.transaction()`, where there is no admitted scope to inherit. Waiting
+     * for an admission permit there would block while holding the very resource
+     * permits ration, which is the nested-acquire deadlock this seam exists to
+     * prevent.
+     */
+    private execSql<T = any>(
+        label: string,
+        conn: any,
+        sql: string,
+        params: any[],
+        signal?: AbortSignal,
+        perRequest?: PerRequestCounters,
+    ): Promise<T> {
+        return dbExec<T>(sql, params, {
+            conn,
+            callerOwnsConn: !!this.trx,
+            lane: 'request',
+            label,
+            signal,
+            perRequest,
+        });
     }
 
     /**
@@ -632,7 +665,7 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
             params = [];
         }
 
-        const result = await timedUnsafe<any[]>(dbConn, sql, params, this.execSignal, this.execPerRequest);
+        const result = await this.execSql<any[]>('query.exec', dbConn, sql, params, this.execSignal, this.execPerRequest);
 
         if (!result || result.length === 0 || result[0].estimate === null) {
             // Fallback to exact count if statistics not available
@@ -735,7 +768,7 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         // per connection (prepare:true default) — the former framework-level
         // "prepared statement cache" never called a prepare API and only
         // added cache-key string building on the hot path.
-        const countResult: any[] = await timedUnsafe<any[]>(dbConn, countSql, result.params, this.execSignal, this.execPerRequest);
+        const countResult: any[] = await this.execSql<any[]>('query.count', dbConn, countSql, result.params, this.execSignal, this.execPerRequest);
 
         // Debug logging
         if (this.debug) {
@@ -900,7 +933,7 @@ AND c.deleted_at IS NULL`;
 
         // Direct execution — see doCountInner for why the framework-level
         // prepared statement cache was removed from the hot path.
-        const aggregateResult: any[] = await timedUnsafe<any[]>(dbConn, aggregateSql, result.params, this.execSignal, this.execPerRequest);
+        const aggregateResult: any[] = await this.execSql<any[]>('query.aggregate', dbConn, aggregateSql, result.params, this.execSignal, this.execPerRequest);
 
         // Debug logging
         if (this.debug) {
@@ -1014,7 +1047,7 @@ AND c.deleted_at IS NULL`;
 
         const { sql, params } = buildRmQuery(archetype, fetchReq, plan.columns);
         const dbConn = this.getDb();
-        const rows = await timedUnsafe<any[]>(dbConn, sql, params, this.execSignal, this.execPerRequest);
+        const rows = await this.execSql<any[]>('query.rm.route', dbConn, sql, params, this.execSignal, this.execPerRequest);
 
         let resultRows: any[] = rows;
         let entityIds: string[] = rows.map((r: any) => r.entity_id);
@@ -1047,7 +1080,7 @@ AND c.deleted_at IS NULL`;
 
         if (strat === 'estimate') {
             const { sql, params } = buildRmEstimateQuery(archetype, req);
-            const plan = await timedUnsafe<any[]>(
+            const plan = await this.execSql<any[]>('query.rm.estimate', 
                 dbConn,
                 `EXPLAIN (FORMAT JSON) ${sql}`,
                 params,
@@ -1062,7 +1095,7 @@ AND c.deleted_at IS NULL`;
 
         // 'exact' (default) AND 'n_plus_1' for a bare count() both use exact count(*).
         const { sql, params } = buildRmCountQuery(archetype, req);
-        const rows = await timedUnsafe<any[]>(dbConn, sql, params, this.execSignal, this.execPerRequest);
+        const rows = await this.execSql<any[]>('query.rm.rows', dbConn, sql, params, this.execSignal, this.execPerRequest);
         recordRoute(archetype);
         this._lastRouteInfo = { routed: true, surface: 'rm', archetype };
         return Number(rows[0]?.count ?? 0);
@@ -1539,7 +1572,7 @@ AND c.deleted_at IS NULL`;
         // "prepared statement cache" stored a placeholder object and
         // re-executed db.unsafe anyway — pure cache-key/bookkeeping overhead
         // on every exec.
-        const entities: any[] = await timedUnsafe<any[]>(dbConn, result.sql, result.params, this.execSignal, this.execPerRequest);
+        const entities: any[] = await this.execSql<any[]>('query.entities', dbConn, result.sql, result.params, this.execSignal, this.execPerRequest);
 
         // Convert to Entity objects
         const entityIds: string[] = entities.map((row: any) => row.id);
@@ -1609,7 +1642,7 @@ AND c.deleted_at IS NULL`;
             // Single component type - use direct partition if available
             const partitionTableName = ComponentRegistry.getPartitionTableName(componentTypeIds[0]!);
             if (partitionTableName) {
-                components = await timedUnsafe<any[]>(dbConn, `
+                components = await this.execSql<any[]>('query.components.partition', dbConn, `
                     SELECT id, entity_id, type_id, data, created_at, updated_at
                     FROM ${partitionTableName}
                     WHERE entity_id IN ${entityIdList.sql}
@@ -1618,7 +1651,7 @@ AND c.deleted_at IS NULL`;
                 `, [...entityIdList.params, ...typeIdList.params], this.execSignal, this.execPerRequest);
             } else {
                 // Fallback to parent table
-                components = await timedUnsafe<any[]>(dbConn, `
+                components = await this.execSql<any[]>('query.components.fallback', dbConn, `
                     SELECT id, entity_id, type_id, data, created_at, updated_at
                     FROM components
                     WHERE entity_id IN ${entityIdList.sql}
@@ -1628,7 +1661,7 @@ AND c.deleted_at IS NULL`;
             }
         } else {
             // Multiple types or direct partition disabled - use parent table
-            components = await timedUnsafe<any[]>(dbConn, `
+            components = await this.execSql<any[]>('query.components.multi', dbConn, `
                 SELECT id, entity_id, type_id, data, created_at, updated_at
                 FROM components
                 WHERE entity_id IN ${entityIdList.sql}
@@ -1788,7 +1821,7 @@ AND c.deleted_at IS NULL`;
         }
 
         // Execute the EXPLAIN ANALYZE query
-        const explainResult = await timedUnsafe<any[]>(dbConn, explainSql, result.params, this.execSignal, this.execPerRequest);
+        const explainResult = await this.execSql<any[]>('query.explain', dbConn, explainSql, result.params, this.execSignal, this.execPerRequest);
 
         // Format the result
         return explainResult.map((row: any) => row['QUERY PLAN']).join('\n');

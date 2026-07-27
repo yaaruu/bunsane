@@ -110,10 +110,45 @@ export interface PerRequestCounters {
  * that comparing RESULTS of the two forms shows no difference — the divergence
  * is in the protocol, not the rows.
  */
+/**
+ * Time and count a query built by the caller.
+ *
+ * Exists so TAGGED TEMPLATES can be instrumented without being rewritten into
+ * `unsafe(sql, params)`. Those are different wire protocols — converting them
+ * changes how Bun names prepared statements and has already broken the suite
+ * once (see the note above) — and templates using the `sql()` fragment helper
+ * (`WHERE id IN ${sql(ids)}`) cannot be expressed as a flat string plus params
+ * without hand-rewriting the SQL. Handing the factory in keeps construction
+ * exactly as it was while still getting the timing, counters and cancellation.
+ */
+export async function timedQuery<T = any>(
+    makeQuery: () => any,
+    describe: string,
+    signal?: AbortSignal,
+    perRequest?: PerRequestCounters,
+): Promise<T> {
+    return await runTimed<T>(makeQuery, describe, signal, perRequest);
+}
+
 export async function timedUnsafe<T = any>(
     db: SQL,
     sql: string,
     params?: any[],
+    signal?: AbortSignal,
+    perRequest?: PerRequestCounters,
+): Promise<T> {
+    return await runTimed<T>(
+        () => (params === undefined ? (db as any).unsafe(sql) : (db as any).unsafe(sql, params)),
+        sql,
+        signal,
+        perRequest,
+    );
+}
+
+async function runTimed<T = any>(
+    makeQuery: () => any,
+    /** SQL text, or a label when the caller built the query itself. Slow-log only. */
+    describe: string,
     signal?: AbortSignal,
     perRequest?: PerRequestCounters,
 ): Promise<T> {
@@ -124,7 +159,7 @@ export async function timedUnsafe<T = any>(
     if (perRequest) perRequest.dbQueryCount++;
     let aborted = false;
     try {
-        const q = params === undefined ? (db as any).unsafe(sql) : (db as any).unsafe(sql, params);
+        const q = makeQuery();
         return await runWithSignal<T>(q, signal);
     } catch (err) {
         if ((err as Error)?.name === 'AbortError' || signal?.aborted) {
@@ -149,7 +184,7 @@ export async function timedUnsafe<T = any>(
                 {
                     durationMs: Math.round(dt),
                     thresholdMs: SLOW_MS,
-                    sqlSnippet: sql.length > 200 ? sql.slice(0, 200) + '…' : sql,
+                    sqlSnippet: describe.length > 200 ? describe.slice(0, 200) + '…' : describe,
                     msg: 'Slow DB call',
                 },
                 'Slow DB call',
