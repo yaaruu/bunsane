@@ -2,6 +2,59 @@
 
 All notable changes to bunsane are documented here.
 
+## Unreleased
+
+Everything here came out of a downstream verification of 0.6.1 that reached three
+wrong conclusions — and every one of them traced back to something this repo
+either stated inaccurately or left unasserted. No behaviour change.
+
+### Fixed
+
+- **`armGateway()` is called by `App.init()`, not `App.start()`.** Four comments
+  and docs said `start()`; the call is at `core/App.ts:219` inside `init()`,
+  which begins at :159 while `start()` begins at :401. "Will the serving process
+  be armed?" is exactly the question a deploy has to answer, and the comment sent
+  the reader to the wrong method.
+
+- **`probeConnection()` no longer reports "not transaction-pooled" when it simply
+  could not tell.** PgBouncer returns connections LIFO, so on an idle pool every
+  probe statement lands on the same backend and a transaction-pooled deployment
+  is indistinguishable from a session-pooled one. That read as
+  `transactionPooling: false` twice — once at 0.5.10 boot on production, once as
+  a first-run flake after a vendor swap. New `poolingOutcome:
+  'proven' | 'unproven-idle-pool' | 'skipped'` alongside the boolean (same shape
+  as `cancelEffective: boolean | null`), and the unproven case now logs that it
+  must not be read as "no pooler". Detecting harder was considered and rejected:
+  issuing the statements concurrently across pool connections yields distinct
+  backends under session pooling too, trading a false negative for a false
+  positive that would wrongly demand `DB_DISABLE_PREPARE=true`.
+
+### Added
+
+- **`tests/integration/db-admission-shedding.test.ts`** — the real-PG saturation
+  numbers quoted in `gateway.test.ts` and `docs/CONFIGURATION.md` were a
+  measurement readers had to trust. They are assertions now: 20 concurrent
+  `pg_sleep(2)` against `admissionLimit = 3`, at an 800 ms budget (majority shed
+  before reaching the server, nothing completes) and at 30 s (nothing shed, all
+  20 complete, drain several times a single statement). Shed-at-the-door
+  (`DbAdmissionTimeoutError`) and killed-after-admission
+  (`DbStatementTimeoutError`) are counted separately, because collapsing them
+  hides which bound fired.
+
+- **`tests/unit/database/poolingProbe.test.ts`** — covers the tri-state above,
+  including that observing no PIDs at all stays `skipped` rather than
+  collapsing into `unproven`.
+
+### Documentation
+
+- **`DB_REQUEST_TIMEOUT` is a total deadline, and the docs now say what that
+  costs.** `gateway.ts` and `CONFIGURATION.md` already stated it covers "the
+  wait for a permit AND the query", but not the consequence: a 500 ms request
+  budget also kills any *admitted* query slower than 500 ms. It is not a
+  queue-only knob, and it should be sized against the slowest legitimate request.
+  It bounds the CALLER; reclaiming the pool SLOT remains the server-side
+  `statement_timeout`'s job (B8a) — different guarantees, both wanted.
+
 ## 0.6.1 — 2026-07-27
 
 Two gaps found by measuring 0.6.0's own admission against a saturated pool.
@@ -38,7 +91,7 @@ by default.
   outright, so it would bound only the query and never the queue.
 
 - **`getGatewayStats().unarmedCalls`** — queries that bypassed admission because
-  nothing had armed the gateway. `armGateway()`'s only caller is `App.start()`,
+  nothing had armed the gateway. `armGateway()`'s only caller is `App.init()`,
   after migrations, so anything using the framework database without booting an
   App got no admission and nothing said so. A mitigation that is absent and
   silent is worse than one that is absent and loud: the metrics look calm
