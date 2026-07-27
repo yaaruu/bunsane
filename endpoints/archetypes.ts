@@ -1,6 +1,7 @@
 import { getSerializedMetadataStorage } from "../core/metadata";
 import { findIndicatorComponentName } from "../utils/archetypeIndicator";
-import db from "../database";
+import { studioDeadline, studioExec, studioErrorResponse, STUDIO_DB_TIMEOUT_MS } from "./db";
+import { dbExec, dbTransaction } from "../database/gateway";
 import { logger as MainLogger } from "../core/Logger";
 import { ProjectionManager, rmTableName, assertRmTableName } from "../database/projection";
 import type {
@@ -14,6 +15,21 @@ import type {
 
 const logger = MainLogger.child({ scope: "archetypes-endpoint" });
 
+/**
+ * Budget held back from the record-gathering loop for the trailing COUNT.
+ *
+ * Both share one request deadline, so without a reserve the loop would consume
+ * it entirely and the COUNT — the last statement, after all the real work — is
+ * what would throw.
+ *
+ * Proportional, not a flat 2 s: a flat reserve larger than the whole budget
+ * would make the loop's first guard fire immediately, so a deployment that set
+ * `BUNSANE_STUDIO_DB_TIMEOUT` below the reserve would get an endpoint that
+ * gathers nothing and then fails on the COUNT anyway. Capping at a quarter of
+ * the budget keeps the reserve meaningful at any configured value.
+ */
+const COUNT_RESERVE_MS = Math.min(2_000, Math.floor(STUDIO_DB_TIMEOUT_MS / 4));
+
 export async function handleStudioArcheTypeRecordsRequest(
     archeTypeName: string,
     params: StudioArcheTypeQueryParams = {}
@@ -26,6 +42,13 @@ export async function handleStudioArcheTypeRecordsRequest(
     // Conditional filter: include or exclude soft-deleted rows
     const deletedFilter = includeDeleted ? "" : "AND c.deleted_at IS NULL";
     const deletedFilterBare = includeDeleted ? "" : "AND deleted_at IS NULL";
+
+    // One budget for the whole handler. The loop below keeps fetching batches
+    // until it has filled a page, so the number of statements is data-dependent
+    // and unbounded in principle — a per-query timeout would bound none of it.
+    // A shared deadline also terminates the loop when the budget runs out,
+    // rather than letting it grind against a slow database indefinitely.
+    const deadline = studioDeadline();
 
     try {
         const metadataStorage = getSerializedMetadataStorage();
@@ -78,15 +101,33 @@ export async function handleStudioArcheTypeRecordsRequest(
         let currentOffset = offset;
         const validEntities: ArcheTypeEntityRecord[] = [];
         let hasMoreData = true;
+        let budgetExhausted = false;
 
+        // Stop looping while there is still budget for the trailing COUNT.
+        //
+        // Running the loop to the deadline would make the shared budget DESTROY
+        // completed work: `dbExec` throws once nothing remains, so a handler
+        // holding 40 of 50 assembled records would answer 503 with none of them.
+        // A short page is the better failure for a list view — the operator sees
+        // real data and can page again — so exhausting the budget ends the loop
+        // and returns what was gathered. The reserve exists because the COUNT
+        // below shares this deadline and would otherwise be the statement that
+        // throws instead.
         while (validEntities.length < limit && hasMoreData) {
+            if (Date.now() >= deadline - COUNT_RESERVE_MS) {
+                budgetExhausted = true;
+                break;
+            }
+
             if (searchTerm) {
                 const searchPattern = `%${searchTerm}%`;
                 const componentNamePlaceholders = requiredComponentNames
                     .map((_, index) => `$${index + 2}`)
                     .join(", ");
 
-                entityIdsResult = await db.unsafe(
+                entityIdsResult = await studioExec(
+                    "studio.archetype.entityIds.search",
+                    deadline,
                     `SELECT entity_id FROM (
                          SELECT entity_id, MAX(created_at) as max_created_at
                          FROM components
@@ -119,7 +160,9 @@ export async function handleStudioArcheTypeRecordsRequest(
                     ]
                 );
             } else {
-                entityIdsResult = await db.unsafe(
+                entityIdsResult = await studioExec(
+                    "studio.archetype.entityIds",
+                    deadline,
                     `SELECT entity_id FROM (
                          SELECT c.entity_id, MAX(c.created_at) as max_created_at
                          FROM components c
@@ -148,7 +191,9 @@ export async function handleStudioArcheTypeRecordsRequest(
                 .map((_, index) => `$${componentNameStartIndex + index}`)
                 .join(", ");
 
-            const componentsResult = await db.unsafe(
+            const componentsResult = await studioExec(
+                "studio.archetype.components",
+                deadline,
                 `SELECT c.entity_id, c.name, c.data
                  FROM components c
                  WHERE c.entity_id IN (${entityIdPlaceholders})
@@ -160,7 +205,9 @@ export async function handleStudioArcheTypeRecordsRequest(
             // When including deleted, also fetch entity-level deleted_at
             let entityDeletedMap = new Map<string, string | null>();
             if (includeDeleted) {
-                const entitiesResult = await db.unsafe(
+                const entitiesResult = await studioExec<Record<string, unknown>[]>(
+                    "studio.archetype.entityDeleted",
+                    deadline,
                     `SELECT id, deleted_at FROM entities WHERE id IN (${entityIdPlaceholders})`,
                     entityIds
                 );
@@ -235,7 +282,9 @@ export async function handleStudioArcheTypeRecordsRequest(
                 .map((_, index) => `$${index + 2}`)
                 .join(", ");
 
-            totalResult = await db.unsafe(
+            totalResult = await studioExec(
+                "studio.archetype.count.search",
+                deadline,
                 `SELECT COUNT(DISTINCT c.entity_id) as count
                  FROM components c
                  WHERE TRUE ${deletedFilter}
@@ -260,7 +309,9 @@ export async function handleStudioArcheTypeRecordsRequest(
                 ]
             );
         } else {
-            totalResult = await db.unsafe(
+            totalResult = await studioExec(
+                "studio.archetype.count",
+                deadline,
                 `SELECT COUNT(DISTINCT c.entity_id) as count
                  FROM components c
                  WHERE c.name = $1
@@ -271,6 +322,14 @@ export async function handleStudioArcheTypeRecordsRequest(
 
         const total = Number(totalResult[0]?.count ?? 0);
 
+        if (budgetExhausted) {
+            logger.warn(
+                `ArcheType '${archeTypeName}' record fetch ran out of its ${STUDIO_DB_TIMEOUT_MS}ms budget ` +
+                `after ${validEntities.length}/${limit} records (offset ${offset}) — returning a short page. ` +
+                `Raise BUNSANE_STUDIO_DB_TIMEOUT or narrow the query.`,
+            );
+        }
+
         const responseData: StudioArcheTypeResponse = {
             name: archeTypeName,
             fields: archeTypeFields,
@@ -279,23 +338,14 @@ export async function handleStudioArcheTypeRecordsRequest(
             total,
             limit,
             offset,
+            ...(budgetExhausted ? { partial: true } : {}),
         };
 
         return new Response(JSON.stringify(responseData), {
             headers: { "Content-Type": "application/json" },
         });
     } catch (error) {
-        const errorMessage =
-            error instanceof Error ? error.message : "Unknown error";
-        return new Response(
-            JSON.stringify({
-                error: `Failed to fetch archetype data: ${errorMessage}`,
-            }),
-            {
-                status: 500,
-                headers: { "Content-Type": "application/json" },
-            }
-        );
+        return studioErrorResponse(error, "Failed to fetch archetype data");
     }
 }
 
@@ -322,25 +372,45 @@ export async function handleStudioArcheTypeDeleteRequest(
             .map((_, index) => `$${index + 1}`)
             .join(", ");
 
-        // Delete in correct order to avoid foreign key constraint violations
-        // 1. Delete from components (membership source of truth)
-        await db.unsafe(
-            `DELETE FROM components WHERE entity_id IN (${idPlaceholders})`,
-            entityIds
+        const deadline = studioDeadline();
+
+        // The two core deletes are now one transaction. They were separate
+        // autocommit statements: a failure on the second left every component
+        // row gone and its entity row behind, which is an entity that exists and
+        // has nothing — the delete "half succeeded" with a 500 and no way to
+        // tell how far it got. One transaction also takes ONE admission permit
+        // for the pair instead of competing for two.
+        await dbTransaction(
+            async (trx: any) => {
+                // Order still matters for the FK, now within the transaction.
+                await dbExec(
+                    `DELETE FROM components WHERE entity_id IN (${idPlaceholders})`,
+                    entityIds,
+                    { conn: trx, lane: "background", label: "studio.archetype.delete.components", deadline },
+                );
+                await dbExec(
+                    `DELETE FROM entities WHERE id IN (${idPlaceholders})`,
+                    entityIds,
+                    { conn: trx, lane: "background", label: "studio.archetype.delete.entities", deadline },
+                );
+            },
+            { lane: "background", label: "studio.archetype.delete", deadline },
         );
 
-        // 2. Delete from entities
-        await db.unsafe(
-            `DELETE FROM entities WHERE id IN (${idPlaceholders})`, 
-            entityIds
-        );
-
+        // Projection cleanup stays OUTSIDE that transaction, deliberately. It is
+        // best-effort (failures only warn), and a swallowed error inside a
+        // transaction is worse than useless: Postgres aborts the transaction on
+        // the first failed statement, so catching it and continuing would turn
+        // the COMMIT into a ROLLBACK and silently undo the deletes above while
+        // reporting success.
         if (ProjectionManager.enabled) {
             try {
                 for (const archetype of ProjectionManager.instance.getArchetypeNames()) {
                     const tableName = assertRmTableName(rmTableName(archetype));
-                    await db.unsafe(
-                        `DELETE FROM ${tableName} WHERE entity_id IN (${idPlaceholders})`, 
+                    await studioExec(
+                        "studio.archetype.delete.projection",
+                        deadline,
+                        `DELETE FROM ${tableName} WHERE entity_id IN (${idPlaceholders})`,
                         entityIds
                     );
                 }
@@ -359,16 +429,6 @@ export async function handleStudioArcheTypeDeleteRequest(
             headers: { "Content-Type": "application/json" },
         });
     } catch (error) {
-        const errorMessage =
-            error instanceof Error ? error.message : "Unknown error";
-        return new Response(
-            JSON.stringify({
-                error: `Failed to delete entities: ${errorMessage}`,
-            }),
-            {
-                status: 500,
-                headers: { "Content-Type": "application/json" },
-            }
-        );
+        return studioErrorResponse(error, "Failed to delete entities");
     }
 }

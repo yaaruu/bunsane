@@ -1,15 +1,23 @@
-import db from "../database";
+import { studioDeadline, studioExec, studioErrorResponse } from "./db";
 import { getSerializedMetadataStorage } from "../core/metadata";
 import type { StudioStatsResponse, ComponentTypeStats, ArcheTypeStats } from "./types";
 
 export async function handleStudioStatsRequest(): Promise<Response> {
+    const deadline = studioDeadline();
+
     try {
-        // Run entity counts and component type counts in parallel
+        // Three unbounded COUNT(*) scans issued at once. Under the background
+        // lane that is now a bounded burst rather than three slots taken from
+        // request traffic simultaneously; if the lane is full they queue against
+        // the shared deadline instead of the driver's.
         const [activeCountResult, deletedCountResult, componentTypesResult] =
             await Promise.all([
-                db`SELECT COUNT(*) as count FROM entities WHERE deleted_at IS NULL`,
-                db`SELECT COUNT(*) as count FROM entities WHERE deleted_at IS NOT NULL`,
-                db`SELECT name, COUNT(*) as count FROM components WHERE deleted_at IS NULL GROUP BY name ORDER BY count DESC`,
+                studioExec<any[]>("studio.stats.entities.active", deadline,
+                    `SELECT COUNT(*) as count FROM entities WHERE deleted_at IS NULL`),
+                studioExec<any[]>("studio.stats.entities.deleted", deadline,
+                    `SELECT COUNT(*) as count FROM entities WHERE deleted_at IS NOT NULL`),
+                studioExec<Record<string, unknown>[]>("studio.stats.componentTypes", deadline,
+                    `SELECT name, COUNT(*) as count FROM components WHERE deleted_at IS NULL GROUP BY name ORDER BY count DESC`),
             ]);
 
         const activeCount = Number(activeCountResult[0]?.count ?? 0);
@@ -61,16 +69,6 @@ export async function handleStudioStatsRequest(): Promise<Response> {
             headers: { "Content-Type": "application/json" },
         });
     } catch (error) {
-        const errorMessage =
-            error instanceof Error ? error.message : "Unknown error";
-        return new Response(
-            JSON.stringify({
-                error: `Failed to fetch stats: ${errorMessage}`,
-            }),
-            {
-                status: 500,
-                headers: { "Content-Type": "application/json" },
-            }
-        );
+        return studioErrorResponse(error, "Failed to fetch stats");
     }
 }

@@ -16,9 +16,19 @@
  * Both are measurable, so measure instead of guessing: read back
  * `statement_timeout`, and compare `pg_backend_pid()` across separate
  * statements issued on one reserved pool slot.
+ *
+ * Since then a third assumption joined them, and it is the one that caused the
+ * outage: **that a timeout reclaims the connection.** It does not. The framework
+ * aborts the caller, `runWithSignal` asks the driver to cancel, and on Bun
+ * 1.4.0-canary.1 nothing reaches the server — the statement runs to its natural
+ * end holding its pool slot. That was inferred from pooling mode for a while,
+ * which was wrong twice over: it is a driver property, and pooling mode does not
+ * predict it. So this probe now measures it directly, on the code path the
+ * framework actually uses.
  */
 import type { SQL } from 'bun';
 import db from './index';
+import { runWithSignal, abortMode } from './cancellable';
 import { logger as MainLogger } from '../core/Logger';
 
 const logger = MainLogger.child({ scope: 'db.probe' });
@@ -32,7 +42,33 @@ export interface ConnectionProbeResult {
     statementTimeout?: string;
     /** DB_STATEMENT_TIMEOUT was requested but the server does not have it. */
     statementTimeoutIgnored: boolean;
+    /**
+     * Did aborting a statement actually stop it server-side?
+     *
+     * `null` means UNPROVEN — probe skipped, failed, or preempted — and must
+     * never be read as "fine". Only `true` is evidence that a timeout reclaims
+     * the connection.
+     */
+    cancelEffective: boolean | null;
+    /** Why `cancelEffective` is what it is. See `CancelOutcome`. */
+    cancelOutcome: CancelOutcome;
+    /** How long the statement actually ran after the abort, in ms. */
+    cancelObservedMs?: number;
+    /** The `BUNSANE_ABORT_MODE` in force when the probe ran. */
+    abortMode?: string;
 }
+
+export type CancelOutcome =
+    /** Probe did not run (PGlite, `BUNSANE_PROBE_CANCEL=off`, or an error). */
+    | 'skipped'
+    /** The statement stopped early — cancellation reached the server. */
+    | 'stopped'
+    /** The statement ran to its natural end. The slot stayed pinned. */
+    | 'ran-to-completion'
+    /** A server-side `statement_timeout` killed it first, so the probe proves nothing. */
+    | 'preempted-by-statement-timeout'
+    /** `statement_timeout` is too tight to fit a probe under it. */
+    | 'server-timeout-too-tight';
 
 let cached: ConnectionProbeResult | null = null;
 
@@ -64,6 +100,137 @@ const parseTimeoutMs = (shown: string | undefined): number | null => {
     return parseInt(match[1]!, 10) * (UNIT_MS[match[2] ?? 'ms'] ?? 1);
 };
 
+/** Default probe statement duration. Short: this answers a driver question, once. */
+const DEFAULT_PROBE_SLEEP_MS = 150;
+
+/**
+ * Does aborting a statement actually stop it?
+ *
+ * Runs a short `pg_sleep`, aborts it a quarter of the way in through
+ * `runWithSignal` — the same path a query deadline takes, so the answer is about
+ * THIS deployment rather than about Bun in the abstract, and
+ * `BUNSANE_ABORT_MODE=off` is correctly reported as ineffective — and then
+ * watches the underlying query to see when it really ended.
+ *
+ * Watching the underlying query is the whole trick. `runWithSignal` rejects the
+ * caller immediately by design, so caller-visible latency is fast whether or not
+ * the server heard anything; the only honest signal is when the STATEMENT
+ * settles. If that is near the sleep's natural end, the slot was pinned the
+ * entire time.
+ *
+ * `serverTimeoutMs` is passed in so the probe can tell its own cancellation
+ * apart from a server-side `statement_timeout` doing the killing for it — which
+ * would otherwise read as a success and certify exactly the property that is
+ * broken. Both raise SQLSTATE 57014; the message text is the discriminator.
+ *
+ * Exported so `runDoctor()` can re-run it with a longer, more conclusive sleep
+ * than boot should pay for.
+ */
+export async function probeCancelEffectiveness(
+    conn: any,
+    serverTimeoutMs: number | null,
+    sleepMsOverride?: number,
+): Promise<{ effective: boolean | null; outcome: CancelOutcome; observedMs?: number }> {
+    const fromEnv = parseInt(process.env.BUNSANE_PROBE_CANCEL_SLEEP_MS ?? '', 10);
+    const requested = sleepMsOverride
+        ?? (Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : DEFAULT_PROBE_SLEEP_MS);
+
+    let sleepMs = requested;
+    if (serverTimeoutMs !== null && serverTimeoutMs > 0) {
+        // Stay under the server's own bound, or it kills the probe instead of
+        // the probe measuring the cancel.
+        if (serverTimeoutMs < 80) return { effective: null, outcome: 'server-timeout-too-tight' };
+        sleepMs = Math.max(40, Math.min(sleepMs, Math.floor(serverTimeoutMs / 2)));
+    }
+    const cancelAtMs = Math.max(15, Math.floor(sleepMs / 4));
+
+    const q = conn.unsafe(`SELECT pg_sleep(${(sleepMs / 1000).toFixed(3)})`);
+    // Own the rejection BEFORE anything can reject it. An unowned rejection from
+    // an aborted query has already silently killed a whole `bun test` run in
+    // this repo (see `gatedConn` in tests/unit/database/gateway.test.ts); at boot
+    // it would be worse.
+    Promise.resolve(q).catch(() => { /* observed below */ });
+
+    const t0 = performance.now();
+    let observedMs = 0;
+    let settleErr: unknown;
+    const watcher = Promise.resolve(q).then(
+        () => { observedMs = performance.now() - t0; },
+        (err) => { observedMs = performance.now() - t0; settleErr = err; },
+    );
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error('cancel-effectiveness probe')), cancelAtMs);
+    try {
+        await runWithSignal(q, controller.signal).catch(() => { /* expected: the caller is released */ });
+        await watcher;
+    } finally {
+        clearTimeout(timer);
+    }
+
+    const message = (settleErr as { message?: unknown } | undefined)?.message;
+    if (typeof message === 'string' && message.includes('canceling statement due to statement timeout')) {
+        return { effective: null, outcome: 'preempted-by-statement-timeout', observedMs };
+    }
+
+    // Generous threshold: anything that stopped before 60% of its natural
+    // duration was stopped by something, and the only candidate is the cancel.
+    const stopped = observedMs < sleepMs * 0.6;
+    return {
+        effective: stopped,
+        outcome: stopped ? 'stopped' : 'ran-to-completion',
+        observedMs,
+    };
+}
+
+/**
+ * Report the cancel finding, escalating only on the conjunction that matters.
+ *
+ * An ineffective cancel is survivable if the server has its own bound: the
+ * statement is killed, the slot comes back. `statement_timeout = 0` is
+ * survivable if aborts work. **Both at once is the outage** — nothing can stop a
+ * statement, so every slow query holds its connection to the end, and slots are
+ * lost one at a time until the pool is gone with the database sitting idle.
+ * That pair, and only that pair, is an error.
+ */
+function reportCancelEffectiveness(result: ConnectionProbeResult): void {
+    if (result.cancelEffective !== false) {
+        if (result.cancelOutcome !== 'skipped' && result.cancelEffective === null) {
+            logger.warn(
+                { outcome: result.cancelOutcome, observedMs: result.cancelObservedMs },
+                'Cancel effectiveness unproven — treat query timeouts as caller-side only until it is.',
+            );
+        }
+        return;
+    }
+
+    const effectiveMs = parseTimeoutMs(result.statementTimeout);
+    const noServerBound = effectiveMs === null || effectiveMs === 0;
+    const detail = {
+        observedMs: Math.round(result.cancelObservedMs ?? 0),
+        abortMode: result.abortMode,
+        statementTimeout: result.statementTimeout,
+    };
+
+    if (noServerBound) {
+        logger.error(
+            detail,
+            'NOTHING CAN STOP A SLOW QUERY IN THIS DEPLOYMENT. Aborting a statement does not reach the ' +
+            'server (it ran to its natural end after being cancelled), and no server-side ' +
+            'statement_timeout is in force. Every slow query holds its pool connection to completion, so ' +
+            'the pool is lost one slot at a time while the database looks idle. Fix: ' +
+            'ALTER ROLE <user> SET statement_timeout = \'<ms>\'. See docs/POOLING.md (B8a).',
+        );
+        return;
+    }
+
+    logger.warn(
+        detail,
+        'Aborting a statement does not stop it server-side — query timeouts bound the caller only, not ' +
+        'the pool slot. The server-side statement_timeout is what actually reclaims connections here.',
+    );
+}
+
 /**
  * Probe the live connection. Never throws — a probe failure must not block
  * boot; it logs and reports `transactionPooling: false` (which means
@@ -74,6 +241,8 @@ export async function probeConnection(sql: SQL = db): Promise<ConnectionProbeRes
         transactionPooling: false,
         backendPids: [],
         statementTimeoutIgnored: false,
+        cancelEffective: null,
+        cancelOutcome: 'skipped',
     };
 
     if (process.env.USE_PGLITE === 'true') {
@@ -94,6 +263,17 @@ export async function probeConnection(sql: SQL = db): Promise<ConnectionProbeRes
             }
             const shown = await conn`SHOW statement_timeout`;
             result.statementTimeout = shown[0]?.statement_timeout as string | undefined;
+
+            // Read the timeout BEFORE probing the cancel: the probe has to size
+            // its statement under the server's own bound, or the server does the
+            // killing and the probe certifies a cancel that never happened.
+            if (process.env.BUNSANE_PROBE_CANCEL !== 'off') {
+                result.abortMode = abortMode();
+                const cancel = await probeCancelEffectiveness(conn, parseTimeoutMs(result.statementTimeout));
+                result.cancelEffective = cancel.effective;
+                result.cancelOutcome = cancel.outcome;
+                result.cancelObservedMs = cancel.observedMs;
+            }
         } finally {
             reserved?.release?.();
         }
@@ -123,6 +303,8 @@ export async function probeConnection(sql: SQL = db): Promise<ConnectionProbeRes
             'server-side prepared statements (set DB_DISABLE_PREPARE=true). See docs/LOCKING.md.'
         );
     }
+
+    reportCancelEffectiveness(result);
 
     if (result.statementTimeoutIgnored) {
         logger.error(

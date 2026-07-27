@@ -34,6 +34,7 @@ import type BasePlugin from "../plugins";
 import { preparedStatementCache } from "../database/PreparedStatementCache";
 import db from "../database";
 import { probeConnection } from "../database/connectionProbe";
+import { armGateway } from "../database/gateway";
 import { type Middleware, composeMiddleware } from "./Middleware";
 import { validateEnv } from "./validateEnv";
 import type { RemoteManager, RemoteManagerConfig } from "./remote";
@@ -212,6 +213,10 @@ export default class App {
             }
             logger.trace(`Database prepared...`);
             await InitializeProjections();
+            // Engage DB admission only now: boot DDL and migrations run dozens of
+            // statements that gain nothing from being bounded and would be
+            // serialized behind a limit derived before the pool is warm.
+            armGateway();
             ApplicationLifecycle.setPhase(ApplicationPhase.DATABASE_READY);
             await ComponentRegistry.registerAllComponents();
             ApplicationLifecycle.setPhase(ApplicationPhase.SYSTEM_REGISTERING);

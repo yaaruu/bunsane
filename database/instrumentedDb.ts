@@ -53,13 +53,14 @@ export function setPoolMax(max: number): void {
 /**
  * How long the pool has been continuously saturated, in ms (0 = not saturated).
  *
- * `inFlight` counts calls that go through this module, which today is a SUBSET
- * of the framework's DB traffic (the tagged-template paths in
- * `core/entity/*`, `core/BatchLoader.ts` and most of `database/`,
- * `database/projection/*` and `endpoints/*` bypass it). So this is a LOWER
- * BOUND on real occupancy: it under-reports saturation, never over-reports it.
- * The single execution seam that makes it exact is the next milestone; until
- * then, treat a positive value as certain and a zero as unproven.
+ * `inFlight` counts calls that go through this module. Since the execution seam
+ * landed (W2 step 2) that is every framework query except the documented
+ * exemptions in `tests/unit/db-seam.test.ts` — boot DDL tagged templates, lock
+ * renewal, health probes, and statements on a caller-supplied transaction. So
+ * it is now close to exact rather than the loose lower bound it used to be, but
+ * still a LOWER bound: the exempt paths hold real connections this does not
+ * count, and consumer code calling `getDb()` directly is invisible to it.
+ * Treat a positive value as certain and a zero as very likely but unproven.
  */
 export function poolSaturatedForMs(now: number = Date.now()): number {
     return stats.saturatedSince === 0 ? 0 : Math.max(0, now - stats.saturatedSince);
@@ -89,10 +90,66 @@ export interface PerRequestCounters {
  * `Query.cancel()`. Total ms is recorded into module-level stats; calls
  * over `BUNSANE_DB_SLOW_MS` increment slowCount and emit a warn log.
  */
+/**
+ * `params` is deliberately optional AND distinct from `[]`.
+ *
+ * Bun routes `unsafe(sql)` through the simple query protocol and
+ * `unsafe(sql, [...])` — including an EMPTY array — through the extended one,
+ * where the statement gets PREPARED. The two are not interchangeable:
+ *
+ *  - Bun derives a prepared statement's name from a truncated prefix of the
+ *    SQL, so forcing extra statements onto the prepared path can collide two
+ *    different queries that share their first ~40 characters:
+ *    `prepared statement "PSELECT DISTINCT ec.entity_id as id FROM $8" already
+ *    exists` (42P05). Observed by passing `[]` for statements that previously
+ *    passed nothing.
+ *  - The reverse also bites: on the simple path rows can arrive without named
+ *    columns, which is why `ProjectionManager.syncActiveProjections` passes an
+ *    explicit `[]` on purpose.
+ *
+ * So the caller's choice is forwarded verbatim rather than normalised. Note
+ * that comparing RESULTS of the two forms shows no difference — the divergence
+ * is in the protocol, not the rows.
+ */
+/**
+ * Time and count a query built by the caller.
+ *
+ * Exists so TAGGED TEMPLATES can be instrumented without being rewritten into
+ * `unsafe(sql, params)`. Those are different wire protocols — converting them
+ * changes how Bun names prepared statements and has already broken the suite
+ * once (see the note above) — and templates using the `sql()` fragment helper
+ * (`WHERE id IN ${sql(ids)}`) cannot be expressed as a flat string plus params
+ * without hand-rewriting the SQL. Handing the factory in keeps construction
+ * exactly as it was while still getting the timing, counters and cancellation.
+ */
+export async function timedQuery<T = any>(
+    makeQuery: () => any,
+    describe: string,
+    signal?: AbortSignal,
+    perRequest?: PerRequestCounters,
+): Promise<T> {
+    return await runTimed<T>(makeQuery, describe, signal, perRequest);
+}
+
 export async function timedUnsafe<T = any>(
     db: SQL,
     sql: string,
-    params: any[],
+    params?: any[],
+    signal?: AbortSignal,
+    perRequest?: PerRequestCounters,
+): Promise<T> {
+    return await runTimed<T>(
+        () => (params === undefined ? (db as any).unsafe(sql) : (db as any).unsafe(sql, params)),
+        sql,
+        signal,
+        perRequest,
+    );
+}
+
+async function runTimed<T = any>(
+    makeQuery: () => any,
+    /** SQL text, or a label when the caller built the query itself. Slow-log only. */
+    describe: string,
     signal?: AbortSignal,
     perRequest?: PerRequestCounters,
 ): Promise<T> {
@@ -103,7 +160,7 @@ export async function timedUnsafe<T = any>(
     if (perRequest) perRequest.dbQueryCount++;
     let aborted = false;
     try {
-        const q = (db as any).unsafe(sql, params);
+        const q = makeQuery();
         return await runWithSignal<T>(q, signal);
     } catch (err) {
         if ((err as Error)?.name === 'AbortError' || signal?.aborted) {
@@ -128,7 +185,7 @@ export async function timedUnsafe<T = any>(
                 {
                     durationMs: Math.round(dt),
                     thresholdMs: SLOW_MS,
-                    sqlSnippet: sql.length > 200 ? sql.slice(0, 200) + '…' : sql,
+                    sqlSnippet: describe.length > 200 ? describe.slice(0, 200) + '…' : describe,
                     msg: 'Slow DB call',
                 },
                 'Slow DB call',

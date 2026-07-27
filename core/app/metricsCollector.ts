@@ -2,6 +2,7 @@ import { logger as MainLogger } from "../Logger";
 import { SchedulerManager } from "../SchedulerManager";
 import { preparedStatementCache } from "../../database/PreparedStatementCache";
 import { getDbStats } from "../../database/instrumentedDb";
+import { getGatewayStats } from "../../database/gateway";
 import type { CacheManager } from "../cache/CacheManager";
 
 const logger = MainLogger.child({ scope: "App" });
@@ -23,6 +24,10 @@ export async function collectMetrics(app: any) {
         scheduler: SchedulerManager.getInstance().getMetrics(),
         preparedStatements: preparedStatementCache.getStats(),
         db: getDbStats(),
+        // Admission is the signal that tells saturation ("queue has depth, work
+        // is waiting") apart from a merely busy pool. Alert on queueDepth and
+        // maxWaitMs, not on inFlight alone.
+        dbAdmission: getGatewayStats(),
         remote: app.remote ? app.remote.getMetrics() : null,
     };
 }

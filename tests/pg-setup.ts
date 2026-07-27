@@ -26,6 +26,15 @@
  *                  PG_DIRECT_PORT (so a PgBouncer URL becomes a direct one).
  *   PG_DIRECT_PORT Port of the direct Postgres listener (bypasses PgBouncer).
  *                  Used only when deriving PG_TEST_URL from DB_CONNECTION_URL.
+ *                  Usually you should NOT need to set this: when
+ *                  BUNSANE_PG_DOCKER_CONTAINER is set, the port is discovered
+ *                  from `docker port <container> 5432` on every run. Docker
+ *                  reassigns that host port whenever the container is recreated,
+ *                  so a value pinned in .env.test goes stale and the run fails
+ *                  with ERR_POSTGRES_CONNECTION_REFUSED — which reads like "no
+ *                  real Postgres available" and silently costs real coverage.
+ *                  Precedence: PG_DIRECT_PORT as a process env var (explicit,
+ *                  for this run) > docker discovery > .env.test PG_DIRECT_PORT.
  *   PG_ADMIN_URL   Superuser connection URL (needs CREATEDB) to the `postgres`
  *                  maintenance DB. Used to CREATE/DROP the scratch DB.
  *   BUNSANE_PG_DOCKER_CONTAINER
@@ -69,6 +78,60 @@ function fail(msg: string): never {
 
 // ---- resolve the test-role (direct) connection URL -------------------------
 
+/**
+ * Ask Docker which host port currently maps to the container's 5432.
+ *
+ * Returns undefined (never fails) when Docker or the container is unavailable —
+ * the caller falls back to the configured port. Output looks like:
+ *   0.0.0.0:54420
+ *   [::]:54420
+ */
+function discoverDockerPort(container: string): string | undefined {
+    let out: string;
+    try {
+        out = execFileSync('docker', ['port', container, '5432'], {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+        }).trim();
+    } catch {
+        return undefined;
+    }
+    for (const line of out.split(/\r?\n/)) {
+        const m = /:(\d+)\s*$/.exec(line.trim());
+        if (m) return m[1];
+    }
+    return undefined;
+}
+
+/**
+ * Pick the direct-Postgres port, preferring live Docker state over config.
+ *
+ * The pinned .env.test value is the least trustworthy source: Docker hands out
+ * a new host port on every container recreate, so it is stale by default rather
+ * than by accident.
+ */
+function resolveDirectPort(): { port: string | undefined; source: string } {
+    const fromProcess = process.env.PG_DIRECT_PORT;
+    if (fromProcess) return { port: fromProcess, source: 'PG_DIRECT_PORT env var' };
+
+    const container = cfg('BUNSANE_PG_DOCKER_CONTAINER');
+    const discovered = container ? discoverDockerPort(container) : undefined;
+    const pinned = envTest['PG_DIRECT_PORT'];
+
+    if (discovered) {
+        if (pinned && pinned !== discovered) {
+            console.warn(
+                `[pg-setup] .env.test PG_DIRECT_PORT=${pinned} is stale — container ` +
+                `'${container}' now publishes 5432 on ${discovered}. Using the live value. ` +
+                `Update or delete the pinned key to silence this.`
+            );
+        }
+        return { port: discovered, source: `docker port ${container} 5432` };
+    }
+    if (pinned) return { port: pinned, source: '.env.test PG_DIRECT_PORT' };
+    return { port: undefined, source: 'none' };
+}
+
 function resolveTestUrl(): URL {
     const explicit = cfg('PG_TEST_URL');
     if (explicit) return new URL(explicit);
@@ -76,12 +139,14 @@ function resolveTestUrl(): URL {
     const base = cfg('DB_CONNECTION_URL');
     if (!base) fail('No PG_TEST_URL and no DB_CONNECTION_URL in .env.test to derive from.');
     const u = new URL(base!);
-    const directPort = cfg('PG_DIRECT_PORT');
-    if (directPort) {
-        u.port = directPort;
+    const { port, source } = resolveDirectPort();
+    if (port) {
+        u.port = port;
+        console.log(`[pg-setup] Direct port ${port} (via ${source}).`);
     } else {
         console.warn(
-            '[pg-setup] WARNING: PG_DIRECT_PORT not set; using DB_CONNECTION_URL port as-is. ' +
+            '[pg-setup] WARNING: no direct port resolved (no PG_DIRECT_PORT, and Docker ' +
+            'discovery unavailable); using DB_CONNECTION_URL port as-is. ' +
             'If this points at PgBouncer (transaction pooling), prepared statements + JSONB ' +
             'object params will FAIL. Set PG_DIRECT_PORT to the direct Postgres port.'
         );

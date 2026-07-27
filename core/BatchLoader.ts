@@ -2,6 +2,7 @@ import { Entity } from "./Entity";
 import { BaseComponent } from "./components";
 import { timed } from "./Decorators";
 import db from "../database";
+import { dbRun } from "../database/gateway";
 import { sql } from "bun";
 
 interface CachedRelation {
@@ -277,14 +278,14 @@ export class BatchLoader {
             const batches = this.chunkArray(uncachedParentIds, batchSize);
 
             for (const batch of batches) {
-                const rows = await db`
+                const rows = await dbRun<any[]>((conn) => conn`
                     SELECT c.entity_id, (c.data->>${sql(fieldName)}) AS related_id
                     FROM components c
                     WHERE c.entity_id IN ${sql(batch)}
                       AND c.type_id = ${typeId}
                       AND c.deleted_at IS NULL
                       AND c.data->>${sql(fieldName)} IS NOT NULL
-                `;
+                `, "batchLoader.relatedIds", { lane: "request", label: "batchLoader.relatedIds" });
 
                 // Group by parent entity for caching
                 const parentGroups = new Map<string, string[]>();

@@ -1,4 +1,6 @@
-import db from "../database";
+import { studioExec, studioErrorResponse } from "./db";
+import { isAdmissionTimeout } from "../database/gateway";
+import { isPoolAcquisitionError } from "../database/poolErrors";
 import type { StudioQueryRequest, StudioQueryResponse } from "./types";
 
 const FORBIDDEN_KEYWORDS = /\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|COPY|EXECUTE|DO)\b/i;
@@ -53,15 +55,16 @@ export async function handleStudioQueryRequest(
     try {
         const startTime = Date.now();
 
-        const result = await Promise.race([
-            db.unsafe(queryToRun),
-            new Promise<never>((_, reject) =>
-                setTimeout(
-                    () => reject(new Error("Query timed out")),
-                    QUERY_TIMEOUT_MS
-                )
-            ),
-        ]);
+        // Was a `Promise.race` against a bare `setTimeout`: it rejected the
+        // caller but left the query running with nothing watching it, holding a
+        // pool slot and an un-cleared timer. The gateway's deadline covers both
+        // waiting for capacity and running, and releases the admission permit
+        // either way.
+        const result = await studioExec<unknown>(
+            "studio.query.adhoc",
+            Date.now() + QUERY_TIMEOUT_MS,
+            queryToRun,
+        );
 
         const duration = Date.now() - startTime;
 
@@ -80,6 +83,14 @@ export async function handleStudioQueryRequest(
             headers: { "Content-Type": "application/json" },
         });
     } catch (error) {
+        // 400 stays the default here, unlike the other studio handlers: this is
+        // an ad-hoc query runner, so a malformed statement is the expected
+        // failure and belongs to the caller. Capacity failures are the
+        // exception — the query was never attempted, so blaming the SQL would
+        // send an operator debugging a statement that is fine.
+        if (isAdmissionTimeout(error) || isPoolAcquisitionError(error)) {
+            return studioErrorResponse(error, "Query failed");
+        }
         const errorMessage =
             error instanceof Error ? error.message : "Unknown error";
         return new Response(

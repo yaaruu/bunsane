@@ -5,6 +5,7 @@
 // as the first parameter.
 import { logger } from "../Logger";
 import db, { QUERY_TIMEOUT_MS } from "../../database";
+import { dbTransaction } from "../../database/gateway";
 import { runWithSignal } from "../../database/cancellable";
 import ComponentRegistry from "../components/ComponentRegistry";
 import { uuidv7 } from "../../utils/uuid";
@@ -15,6 +16,23 @@ import { trackSideEffect } from "./pendingOps";
 import { handleCacheAfterSave, runPostDeleteSideEffects } from "./cacheStrategies";
 import { ProjectionManager } from "../../database/projection";
 import type { Entity } from "../Entity";
+
+/**
+ * How long the client-side timer waits BEYOND the deadline it hands the gateway.
+ *
+ * The two used to fire at the same instant, which made the resulting error a
+ * coin flip: the server bound raises `DbStatementTimeoutError` (carrying lane,
+ * label and budget), the client timer raises a plain `Error`, and a caller
+ * matching on the type would catch it only sometimes.
+ *
+ * They are not peers. `SET LOCAL statement_timeout` actually stops the work and
+ * releases the pool slot; the client timer only stops *waiting* — an aborted
+ * statement keeps running (docs/POOLING.md B8a). So the server bound is the
+ * primary and gets to win, and this timer is the backstop for the cases it
+ * cannot cover: PGlite, `BUNSANE_DB_SERVER_TIMEOUT=off`, a caller-supplied
+ * transaction, or work between statements that no statement timeout can see.
+ */
+export const SAVE_CLIENT_BACKSTOP_MS = 2_000;
 
 export async function saveEntity(entity: Entity, trx?: SQL, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<boolean> {
     // Capture pre-save state BEFORE doSave mutates persisted/dirty flags.
@@ -43,20 +61,31 @@ export async function saveEntity(entity: Entity, trx?: SQL, context?: { loaders?
     // callback triggers Bun SQL's auto-ROLLBACK, releasing the pooled connection.
     const controller = new AbortController();
     const timeoutMs = QUERY_TIMEOUT_MS;
+    // One deadline shared with the gateway below, rather than a second clock
+    // starting when admission does. The save's budget must cover WAITING for a
+    // connection as well as using one: two independent 30s timers is how a
+    // request stalls for a minute before failing.
+    const deadline = Date.now() + timeoutMs;
     const timeoutHandle = setTimeout(() => {
         const err = new Error(`Entity save timeout for entity ${entity.id} after ${timeoutMs}ms`);
         logger.error({ scope: 'Entity.save', entityId: entity.id, timeoutMs }, err.message);
         controller.abort(err);
-    }, timeoutMs);
+    }, timeoutMs + SAVE_CLIENT_BACKSTOP_MS);
 
     try {
         const dbStart = profile ? performance.now() : 0;
         if (trx) {
+            // Caller-supplied transaction: it already holds the connection, so
+            // no admission is taken here (and none is available to take —
+            // waiting for a permit while holding a connection deadlocks).
             await doSave(entity, trx, controller.signal);
         } else {
-            await db.transaction(async (newTrx) => {
-                await doSave(entity, newTrx, controller.signal);
-            });
+            await dbTransaction(
+                async (newTrx) => {
+                    await doSave(entity, newTrx, controller.signal);
+                },
+                { lane: 'request', label: 'entity.save', deadline, signal: controller.signal },
+            );
         }
         if (profile) phases.db = performance.now() - dbStart;
 
@@ -326,17 +355,21 @@ export async function doDelete(entity: Entity, force: boolean = false): Promise<
     // pgbouncer transaction pool mode. Same pattern as Entity.save.
     const controller = new AbortController();
     const timeoutMs = QUERY_TIMEOUT_MS;
+    // Shared with the gateway, as in `save` above: one budget covering the wait
+    // for capacity and the transaction itself.
+    const deadline = Date.now() + timeoutMs;
     const timeoutHandle = setTimeout(() => {
         const err = new Error(`Entity delete timeout for entity ${entity.id} after ${timeoutMs}ms`);
         logger.error({ scope: 'Entity.doDelete', entityId: entity.id, timeoutMs }, err.message);
+        // Backstop, same as save: let the server bound produce the legible error.
         controller.abort(err);
-    }, timeoutMs);
+    }, timeoutMs + SAVE_CLIENT_BACKSTOP_MS);
 
     const signal = controller.signal;
     const run = <T>(q: any): Promise<T> => runWithSignal<T>(q, signal);
 
     try {
-        await db.transaction(async (trx) => {
+        await dbTransaction(async (trx) => {
             // Independent tables, no FK constraints. Issued sequentially:
             // multiple concurrent in-flight queries on one connection
             // deadlock single-backend servers (PGlite test harness), and a
@@ -352,7 +385,7 @@ export async function doDelete(entity: Entity, force: boolean = false): Promise<
             if (ProjectionManager.enabled) {
                 await ProjectionManager.instance.deleteProjection(entity.id, force, trx);
             }
-        });
+        }, { lane: 'request', label: 'entity.delete', deadline, signal: controller.signal });
         clearTimeout(timeoutHandle);
 
         // Fire-and-forget post-commit side effects: lifecycle hooks + cache

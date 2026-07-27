@@ -1,4 +1,4 @@
-import db from '../index';
+import { projExec } from './exec';
 import { logger as MainLogger } from '../../core/Logger';
 import { getDistributedLock } from '../../core/scheduler/DistributedLock';
 import { getMetadataStorage } from '../../core/metadata';
@@ -27,7 +27,7 @@ export async function reconcileArchetype(archetypeName: string, sampleSize = 200
         if (!descriptor || (status !== 'READY' && status !== 'SHADOW')) return 0;
 
         const table = assertRmTableName(rmTableName(archetypeName));
-        const sampleRows = await db.unsafe(
+        const sampleRows = await projExec<any[]>('projection.reconcile.sample',
             `SELECT * FROM ${table} WHERE deleted_at IS NULL ORDER BY random() LIMIT $1`,
             [sampleSize]
         );
@@ -43,7 +43,7 @@ export async function reconcileArchetype(archetypeName: string, sampleSize = 200
                 const colName = assertIdentifier(col.columnName, 'projectedColumn');
                 const typeId = storage.getComponentId(col.component) ?? '';
                 const recomputeSql = `SELECT ${projectionSourceExpr(col, typeId, '$1')} AS v`;
-                const recomputedRows = await db.unsafe(recomputeSql, [entityId]);
+                const recomputedRows = await projExec<any[]>('projection.reconcile.recompute', recomputeSql, [entityId]);
                 const recomputed = recomputedRows[0] ? recomputedRows[0].v : null;
                 const actual = row[colName] ?? null;
                 const normActual = actual == null ? null : String(actual);
@@ -73,7 +73,7 @@ export async function reconcileArchetype(archetypeName: string, sampleSize = 200
                     'deleted_at = NULL',
                     'shape_version = EXCLUDED.shape_version',
                 ];
-                await db.unsafe(
+                await projExec('projection.reconcile.repair',
                     `INSERT INTO ${table} (${quotedInsertColumns})
                      SELECT ${selectList}
                      FROM entities e

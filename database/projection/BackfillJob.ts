@@ -1,4 +1,4 @@
-import db from '../index';
+import { projExec } from './exec';
 import { getMetadataStorage } from '../../core/metadata';
 import { getDistributedLock } from '../../core/scheduler/DistributedLock';
 import { assertIdentifier } from '../../query/SqlIdentifier';
@@ -26,7 +26,8 @@ export async function run(archetypeName: string): Promise<void> {
 
         await mgr.setStatus(archetypeName, 'BACKFILLING');
 
-        const stateRows = await db.unsafe(`SELECT watermark FROM projection_state WHERE archetype = $1`, [archetypeName]);
+        const stateRows = await projExec<any[]>('projection.backfill.watermark',
+            `SELECT watermark FROM projection_state WHERE archetype = $1`, [archetypeName]);
         let watermark = stateRows[0]?.watermark ?? ZERO_UUID;
         const batchSize = parseInt(process.env.BUNSANE_QSP_BACKFILL_BATCH ?? '5000', 10);
         const throttle = parseInt(process.env.BUNSANE_QSP_BACKFILL_THROTTLE_MS ?? '50', 10);
@@ -44,7 +45,7 @@ export async function run(archetypeName: string): Promise<void> {
         const membershipSql = membershipPredicates.length > 0 ? ` AND ${membershipPredicates.join(' AND ')}` : '';
 
         while (true) {
-            const batchRows = await db.unsafe(
+            const batchRows = await projExec<any[]>('projection.backfill.batch',
                 `SELECT e.id FROM entities e WHERE e.id > $1 AND e.deleted_at IS NULL${membershipSql} ORDER BY e.id LIMIT $2`,
                 [watermark, batchSize]
             );
@@ -61,7 +62,7 @@ export async function run(archetypeName: string): Promise<void> {
             const selectList = ['e.id', ...selectColumns, 'e.created_at', 'e.updated_at', 'e.deleted_at', '$3'].join(', ');
             const quotedInsertColumns = insertColumns.map(col => projectedColumns.includes(col) ? `"${col}"` : col).join(', ');
 
-            await db.unsafe(
+            await projExec('projection.backfill.upsert',
                 `INSERT INTO ${tableName} (${quotedInsertColumns})
                  SELECT ${selectList}
                  FROM entities e
@@ -72,12 +73,14 @@ export async function run(archetypeName: string): Promise<void> {
             );
 
             watermark = lastId;
-            await db.unsafe(`UPDATE projection_state SET watermark = $1 WHERE archetype = $2`, [watermark, archetypeName]);
+            await projExec('projection.backfill.advance',
+                `UPDATE projection_state SET watermark = $1 WHERE archetype = $2`, [watermark, archetypeName]);
             if (throttle > 0) await sleep(throttle);
         }
 
         await mgr.setStatus(archetypeName, 'SHADOW');
-        await db.unsafe(`UPDATE projection_state SET watermark = NULL WHERE archetype = $1`, [archetypeName]);
+        await projExec('projection.backfill.clearWatermark',
+            `UPDATE projection_state SET watermark = NULL WHERE archetype = $1`, [archetypeName]);
     } finally {
         await lock.release(taskId);
     }

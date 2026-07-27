@@ -17,7 +17,7 @@
  * columns from coverage, filtering, sorting and hydration — and a background
  * fill job populates it for existing rows before flipping it to `READY`.
  */
-import db from '../index';
+import { projExec } from './exec';
 import { logger as MainLogger } from '../../core/Logger';
 import { getMetadataStorage } from '../../core/metadata';
 import { getDistributedLock } from '../../core/scheduler/DistributedLock';
@@ -64,7 +64,7 @@ const invalidatePlannerCache = async (archetype: string): Promise<void> => {
 export async function existingRmColumns(archetype: string): Promise<Set<string>> {
     const table = assertRmTableName(rmTableName(archetype));
     // rmTableName is already schema-less and validated; strip nothing else.
-    const rows = await db.unsafe(
+    const rows = await projExec<any[]>('projection.schema.columns',
         `SELECT column_name FROM information_schema.columns
          WHERE table_schema = current_schema() AND table_name = $1`,
         [table]
@@ -100,7 +100,7 @@ export async function syncRmSchema(
     }
 
     if (missing.length > 0) {
-        await db.unsafe(
+        await projExec('projection.schema.markFilling',
             `UPDATE projection_state
              SET field_state = ${fieldStateBase} || ${fieldStateLiteral(missing, 'FILLING')},
                  shape_hash = $2,
@@ -134,7 +134,8 @@ export async function syncRmSchema(
 
 /** Columns currently marked FILLING for this archetype. */
 async function currentFillingColumns(archetype: string): Promise<Set<string>> {
-    const rows = await db.unsafe(
+    const rows = await projExec<any[]>(
+        'projection.schema.fillingColumns',
         `SELECT field_state FROM projection_state WHERE archetype = $1`,
         [archetype]
     );
@@ -184,14 +185,14 @@ export async function fillColumns(archetype: string, columns: ProjectedColumn[])
             // batch would make RETURNING empty while later rows still hold
             // NULLs, and stopping there would flip the columns to READY with
             // the fill unfinished.
-            const batch = await db.unsafe(
+            const batch = await projExec<any[]>('projection.schema.fill.batch',
                 `SELECT entity_id FROM ${table} WHERE entity_id > $1 ORDER BY entity_id LIMIT $2`,
                 [watermark, batchSize]
             );
             if (batch.length === 0) break;
             const lastId = batch[batch.length - 1].entity_id as string;
 
-            await db.unsafe(
+            await projExec('projection.schema.fill.apply',
                 `UPDATE ${table} r SET ${assignments}
                  WHERE r.entity_id > $1 AND r.entity_id <= $2`,
                 [watermark, lastId]
@@ -201,7 +202,7 @@ export async function fillColumns(archetype: string, columns: ProjectedColumn[])
             if (throttle > 0) await new Promise(resolve => setTimeout(resolve, throttle));
         }
 
-        await db.unsafe(
+        await projExec('projection.schema.markReady',
             `UPDATE projection_state
              SET field_state = ${fieldStateBase} || ${fieldStateLiteral(columns, 'READY')}, updated_at = now()
              WHERE archetype = $1`,

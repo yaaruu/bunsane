@@ -1,10 +1,69 @@
-import db from "./index";
+import db, { DDL_TIMEOUT_MS, QUERY_TIMEOUT_MS } from "./index";
+import { dbExec } from "./gateway";
 import { logger as MainLogger } from "../core/Logger";
 import { getMetadataStorage } from "../core/metadata";
 import { ensureMultipleJSONBPathIndexes } from "./IndexingStrategy";
 import { getMembershipTable } from "../query/membershipSource";
 import { ProjectionManager, qspActive } from "./projection";
 const logger = MainLogger.child({ scope: "DatabaseHelper" });
+
+/**
+ * WHY THE `` db`…` `` TAGGED TEMPLATES IN THIS FILE ARE NOT MIGRATED
+ *
+ * The 37 `db.unsafe(...)` call sites route through the seam below. The 25
+ * tagged-template statements do NOT, and that is deliberate: they are a
+ * different WIRE PROTOCOL, not just different syntax. Bun sends `` db`…` ``
+ * through the extended (prepared) path and `db.unsafe(sql)` through the simple
+ * one, so rewriting one into the other silently changes how every one of those
+ * statements is executed.
+ *
+ * Measured, not assumed: converting all 62 sites made the full suite fail with
+ *   PostgresError: prepared statement
+ *   "PSELECT DISTINCT ec.entity_id as id FROM $8" already exists   (42P05)
+ * in an unrelated Query test. Bun derives a prepared statement's name from a
+ * truncated prefix of the SQL, so shifting statements between protocols
+ * changes which names get registered on a connection and two different queries
+ * sharing a ~40-character prefix collide. Reverting only the tagged templates
+ * (gateway still in place for the other 37) restored 1017/0, and bypassing the
+ * gateway entirely while keeping the rewrite still failed — so the rewrite was
+ * the cause and the seam was not.
+ *
+ * The cost of leaving them is small and bounded: all 25 are boot DDL that runs
+ * before `armGateway()`, where admission is a passthrough anyway, so they would
+ * gain only a timeout. The cost of converting them is a protocol change across
+ * the whole schema path. They stay, with an allow-list entry in the grep ban.
+ */
+
+/**
+ * Schema catalog reads — `information_schema`, `pg_indexes`, `pg_class`.
+ *
+ * Most of this module runs during boot, BEFORE `armGateway()`, so admission is
+ * a passthrough there and the practical effect of routing through the seam is a
+ * timeout, a label and a metric where previously there were none. That matters:
+ * an unbounded catalog read against a wedged database is a boot that hangs
+ * forever instead of failing.
+ *
+ * The lane matters for the calls that happen at RUNTIME — lazy partition attach
+ * (`CreateComponentPartitionTable`), index maintenance, `ANALYZE` — which must
+ * not take pool capacity from request traffic.
+ *
+ * `params` is optional and NOT defaulted to `[]`: see the note on `timedUnsafe`.
+ * An empty array puts Bun on the extended (prepared) path, which is a different
+ * protocol from passing nothing.
+ */
+const schemaQuery = <T = any>(label: string, sql: string, params?: any[]): Promise<T> =>
+    dbExec<T>(sql, params, { lane: "background", label, timeoutMs: QUERY_TIMEOUT_MS });
+
+/**
+ * Schema DDL and bulk data migration.
+ *
+ * `DDL_TIMEOUT_MS` (10 min) because `CREATE INDEX CONCURRENTLY`, partition
+ * attach on a populated table, and the one-off backfills here are long-running
+ * by design. The bound exists so a wedged statement eventually releases its
+ * admission permit, not as a target.
+ */
+const schemaDdl = <T = any>(label: string, sql: string, params?: any[]): Promise<T> =>
+    dbExec<T>(sql, params, { lane: "background", label, timeoutMs: DDL_TIMEOUT_MS });
 
 const BUNSANE_RELATION_TYPED_COLUMN = process.env.BUNSANE_RELATION_TYPED_COLUMN === 'true' || false;
 
@@ -111,14 +170,14 @@ export const MigrateTimestampsToTimestamptz = async () => {
     ];
     for (const { table, columns } of targets) {
         for (const col of columns) {
-            const rows = await db.unsafe(`
+            const rows = await schemaQuery('schema.MigrateTimestampsToTimestamptz.select', `
                 SELECT data_type FROM information_schema.columns
                 WHERE table_schema = 'public' AND table_name = '${table}' AND column_name = '${col}'
             `);
             if (rows.length === 0) continue; // table or column absent
             if ((rows[0] as any).data_type !== "timestamp without time zone") continue; // already timestamptz
             logger.warn(`Migrating ${table}.${col} timestamp → timestamptz (assuming stored values are UTC)...`);
-            await db.unsafe(`ALTER TABLE ${table} ALTER COLUMN ${col} TYPE timestamptz USING ${col} AT TIME ZONE 'UTC'`);
+            await schemaDdl('schema.MigrateTimestampsToTimestamptz.alter', `ALTER TABLE ${table} ALTER COLUMN ${col} TYPE timestamptz USING ${col} AT TIME ZONE 'UTC'`);
         }
     }
 }
@@ -161,7 +220,7 @@ export const CreateEntityTable = async () => {
 
     // Add partial index for soft-delete queries - critical for 1M+ scale
     // This allows efficient filtering of non-deleted entities
-    await db.unsafe(`
+    await schemaDdl('schema.CreateEntityTable.create', `
         CREATE INDEX IF NOT EXISTS idx_entities_deleted_null
         ON entities (id)
         WHERE deleted_at IS NULL
@@ -184,7 +243,7 @@ export const CreateComponentTable = async () => {
 
     // Check if the table already exists and what partitioning strategy it uses
     const existingStrategy = await GetPartitionStrategy();
-    const tableExists = await db.unsafe(`
+    const tableExists = await schemaQuery('schema.CreateComponentTable.select', `
         SELECT 1 FROM information_schema.tables
         WHERE table_name = 'components'
         AND table_schema = 'public'
@@ -196,7 +255,7 @@ export const CreateComponentTable = async () => {
         logger.warn(`Partitioning strategy changed from ${existingStrategy} to ${partitionStrategy}. Recreating components table...`);
 
         // Drop the existing table and all its partitions
-        await db.unsafe(`DROP TABLE IF EXISTS components CASCADE`);
+        await schemaDdl('schema.CreateComponentTable.drop', `DROP TABLE IF EXISTS components CASCADE`);
 
         // Also clean up any orphaned partition tables
         await dropOrphanedPartitionTables();
@@ -253,7 +312,7 @@ export const partitionRecreateRefusal = (
 export const assertComponentDataSafeToDrop = async (existingStrategy: string | null, requestedStrategy: string) => {
     let hasData = false;
     try {
-        const rows = await db.unsafe(`SELECT 1 FROM components LIMIT 1`);
+        const rows = await schemaQuery('schema.assertComponentDataSafeToDrop.select', `SELECT 1 FROM components LIMIT 1`);
         hasData = rows.length > 0;
     } catch (error) {
         logger.warn(`Could not check components table for data before recreate: ${error}`);
@@ -273,7 +332,7 @@ export const assertComponentDataSafeToDrop = async (existingStrategy: string | n
 }
 
 const dropOrphanedPartitionTables = async () => {
-    const orphanedPartitions = await db.unsafe(`
+    const orphanedPartitions = await schemaQuery('schema.assertComponentDataSafeToDrop.select', `
         SELECT tablename
         FROM pg_tables
         WHERE tablename LIKE 'components_%'
@@ -282,7 +341,7 @@ const dropOrphanedPartitionTables = async () => {
     `);
 
     for (const partition of orphanedPartitions) {
-        await db.unsafe(`DROP TABLE IF EXISTS ${partition.tablename} CASCADE`);
+        await schemaDdl('schema.assertComponentDataSafeToDrop.drop', `DROP TABLE IF EXISTS ${partition.tablename} CASCADE`);
     }
 
     if (orphanedPartitions.length > 0) {
@@ -330,7 +389,7 @@ export const CreateHashPartitionedComponentTable = async (partitionCount: number
 
     // Create hash partitions
     for (let i = 0; i < partitionCount; i++) {
-        await db.unsafe(`CREATE TABLE IF NOT EXISTS components_p${i}
+        await schemaDdl('schema.CreateHashPartitionedComponentTable.create', `CREATE TABLE IF NOT EXISTS components_p${i}
             PARTITION OF components
             FOR VALUES WITH (MODULUS ${partitionCount}, REMAINDER ${i});`);
     }
@@ -359,7 +418,7 @@ export const UpdateComponentIndexes = async (table_name: string, indexedProperti
         }
 
         // Check if table is partitioned
-        const partitionCheck = await db.unsafe(`
+        const partitionCheck = await schemaQuery('schema.UpdateComponentIndexes.select', `
             SELECT relkind
             FROM pg_class
             WHERE relname = '${table_name}' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
@@ -367,7 +426,7 @@ export const UpdateComponentIndexes = async (table_name: string, indexedProperti
         const isPartitioned = partitionCheck.length > 0 && partitionCheck[0].relkind === 'p';
         const useConcurrently = !isPartitioned && !process.env.USE_PGLITE; // Cannot use CONCURRENTLY on partitioned tables or PGlite
 
-        const indexes_list = await db.unsafe(`
+        const indexes_list = await schemaQuery('schema.UpdateComponentIndexes.select', `
             SELECT indexname 
             FROM pg_indexes 
             WHERE tablename = '${table_name}'
@@ -383,7 +442,7 @@ export const UpdateComponentIndexes = async (table_name: string, indexedProperti
                     logger.trace(`Creating missing index ${indexName} for property ${prop}`);
                     await retryWithBackoff(async () => {
                         try {
-                            await db.unsafe(`CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} IF NOT EXISTS ${indexName} ON ${table_name} USING GIN ((data->'${prop}'))`);
+                            await schemaDdl('schema.UpdateComponentIndexes.create', `CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} IF NOT EXISTS ${indexName} ON ${table_name} USING GIN ((data->'${prop}'))`);
                         } catch (error: any) {
                             // Check if the error is about duplicate key (index already exists)
                             if (error.message && error.message.includes('duplicate key value violates unique constraint "pg_class_relname_nsp_index"')) {
@@ -408,7 +467,7 @@ export const UpdateComponentIndexes = async (table_name: string, indexedProperti
                 if (!indexedProperties.includes(prop) && !addedIndexes.has(index)) {
                     await retryWithBackoff(async () => {
                         try {
-                            await db.unsafe(`DROP INDEX${useConcurrently ? ' CONCURRENTLY' : ''} IF EXISTS ${index}`);
+                            await schemaDdl('schema.UpdateComponentIndexes.drop', `DROP INDEX${useConcurrently ? ' CONCURRENTLY' : ''} IF EXISTS ${index}`);
                         } catch (error: any) {
                             // Check if the error is about relation does not exist
                             if (error.message && (error.message.includes('does not exist') || error.message.includes('not found'))) {
@@ -462,7 +521,7 @@ export const CreateComponentPartitionTable = async (comp_name: string, type_id: 
         // Original LIST partitioning logic
         const table_name = GenerateTableName(comp_name);
         logger.trace(`Checking for existing partition table: ${table_name}`);
-        const existingPartition = await db.unsafe(`SELECT 1 FROM information_schema.tables 
+        const existingPartition = await schemaQuery('schema.CreateComponentPartitionTable.select', `SELECT 1 FROM information_schema.tables 
             WHERE table_name = '${table_name}' 
             AND table_schema = 'public'`);
         logger.trace(`Existing partition check result: ${existingPartition.length > 0 ? 'found' : 'not found'}`);
@@ -474,7 +533,7 @@ export const CreateComponentPartitionTable = async (comp_name: string, type_id: 
         logger.trace(`Creating partition table: ${table_name}`);
 
         await retryWithBackoff(async () => {
-            await db.unsafe(`CREATE TABLE IF NOT EXISTS ${table_name}
+            await schemaDdl('schema.CreateComponentPartitionTable.create', `CREATE TABLE IF NOT EXISTS ${table_name}
                 PARTITION OF components
                 FOR VALUES IN ('${type_id}')`);
         });
@@ -520,7 +579,7 @@ export const DeleteComponentPartitionTable = async (comp_name: string) => {
         // Original LIST partitioning logic
         const table_name = `components_${comp_name.toLowerCase().replace(/\s+/g, '_')}`;
 
-        const existingPartition = await db.unsafe(`
+        const existingPartition = await schemaQuery('schema.DeleteComponentPartitionTable.select', `
             SELECT 1 FROM information_schema.tables
             WHERE table_name = '${table_name}'
             AND table_schema = 'public'
@@ -532,7 +591,7 @@ export const DeleteComponentPartitionTable = async (comp_name: string) => {
         }
 
         await retryWithBackoff(async () => {
-            await db.unsafe(`DROP TABLE IF EXISTS ${table_name}`);
+            await schemaDdl('schema.DeleteComponentPartitionTable.drop', `DROP TABLE IF EXISTS ${table_name}`);
         });
         logger.info(`Successfully deleted partition table: ${table_name}`);
 
@@ -553,12 +612,12 @@ export const CreateEntityComponentTable = async () => {
         UNIQUE(entity_id, type_id)
     );`;
     const concurrently = process.env.USE_PGLITE ? '' : ' CONCURRENTLY';
-    await db.unsafe(`CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_entity_id ON entity_components (entity_id)`);
-    await db.unsafe(`CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_type_id ON entity_components (type_id)`);
-    await db.unsafe(`CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_type_entity ON entity_components (type_id, entity_id)`);
-    await db.unsafe(`CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_type_entity_deleted ON entity_components (type_id, entity_id, deleted_at)`);
-    await db.unsafe(`CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_deleted_type ON entity_components (deleted_at, type_id) WHERE deleted_at IS NULL`);
-    await db.unsafe(`CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_component_id ON entity_components (component_id)`);
+    await schemaDdl('schema.CreateEntityComponentTable.create', `CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_entity_id ON entity_components (entity_id)`);
+    await schemaDdl('schema.CreateEntityComponentTable.create', `CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_type_id ON entity_components (type_id)`);
+    await schemaDdl('schema.CreateEntityComponentTable.create', `CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_type_entity ON entity_components (type_id, entity_id)`);
+    await schemaDdl('schema.CreateEntityComponentTable.create', `CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_type_entity_deleted ON entity_components (type_id, entity_id, deleted_at)`);
+    await schemaDdl('schema.CreateEntityComponentTable.create', `CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_deleted_type ON entity_components (deleted_at, type_id) WHERE deleted_at IS NULL`);
+    await schemaDdl('schema.CreateEntityComponentTable.create', `CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_component_id ON entity_components (component_id)`);
     
     // Add component_id column if it doesn't exist (for backward compatibility)
     try {
@@ -583,7 +642,7 @@ export const CreateEntityComponentTable = async () => {
  * pre-existing rows, so `deleted_at` drift on them is not reconciled.
  */
 export const PopulateComponentIds = async () => {
-    const tableExists = await db.unsafe(`
+    const tableExists = await schemaQuery('schema.PopulateComponentIds.select', `
         SELECT 1 FROM information_schema.tables
         WHERE table_name = 'entity_components'
         AND table_schema = 'public'
@@ -626,7 +685,7 @@ export const EnsureDatabaseMigrations = async () => {
     // solely in `components` (UNIQUE(entity_id, type_id)). Run
     // `PopulateComponentIds()` manually to backfill the legacy table if a
     // downgrade is ever required.
-    const orphanCheck = await db.unsafe(`
+    const orphanCheck = await schemaQuery('schema.EnsureDatabaseMigrations.select', `
         SELECT 1 FROM information_schema.tables
         WHERE table_name = 'entity_components'
         AND table_schema = 'public'
@@ -658,7 +717,7 @@ export const AnalyzeAllComponentTables = async (): Promise<void> => {
         }
 
         // Get all component partition tables
-        const tables = await db.unsafe(`
+        const tables = await schemaQuery('schema.AnalyzeAllComponentTables.select', `
             SELECT tablename
             FROM pg_tables
             WHERE tablename LIKE '${tablePattern}' AND schemaname = 'public'
@@ -666,7 +725,7 @@ export const AnalyzeAllComponentTables = async (): Promise<void> => {
 
         for (const row of tables) {
             logger.trace(`Running ANALYZE on table ${row.tablename}`);
-            await db.unsafe(`ANALYZE ${row.tablename}`);
+            await schemaDdl('schema.AnalyzeAllComponentTables.analyze', `ANALYZE ${row.tablename}`);
             logger.trace(`Completed ANALYZE on table ${row.tablename}`);
         }
 
@@ -679,7 +738,7 @@ export const AnalyzeAllComponentTables = async (): Promise<void> => {
 
 export const GetPartitionStrategy = async (): Promise<'list' | 'hash' | null> => {
     try {
-        const result = await db.unsafe(`
+        const result = await schemaQuery('schema.GetPartitionStrategy.select', `
             SELECT 
                 CASE 
                     WHEN partstrat = 'l' THEN 'list'
@@ -704,7 +763,7 @@ export const BenchmarkPartitionCounts = async (partitionCounts: number[] = [8, 1
         
         // Create temporary hash partitioned table
         const tempTableName = `components_benchmark_${count}`;
-        await db.unsafe(`CREATE TABLE ${tempTableName} (
+        await schemaDdl('schema.BenchmarkPartitionCounts.create', `CREATE TABLE ${tempTableName} (
             id UUID,
             entity_id UUID,
             type_id varchar(64) NOT NULL,
@@ -719,24 +778,24 @@ export const BenchmarkPartitionCounts = async (partitionCounts: number[] = [8, 1
         
         // Create partitions
         for (let i = 0; i < count; i++) {
-            await db.unsafe(`CREATE TABLE ${tempTableName}_p${i}
+            await schemaDdl('schema.BenchmarkPartitionCounts.create', `CREATE TABLE ${tempTableName}_p${i}
                 PARTITION OF ${tempTableName}
                 FOR VALUES WITH (MODULUS ${count}, REMAINDER ${i});`);
         }
         
         // Copy sample data (limit to avoid long benchmark)
-        await db.unsafe(`INSERT INTO ${tempTableName} (id, entity_id, type_id, name, data, created_at, updated_at, deleted_at)
+        await schemaDdl('schema.BenchmarkPartitionCounts.insert', `INSERT INTO ${tempTableName} (id, entity_id, type_id, name, data, created_at, updated_at, deleted_at)
             SELECT id, entity_id, type_id, name, data, created_at, updated_at, deleted_at
             FROM components 
             TABLESAMPLE BERNOULLI(10) -- Sample 10% of data
             LIMIT 10000;`);
         
         // Create indexes
-        await db.unsafe(`CREATE INDEX idx_${tempTableName}_type_id ON ${tempTableName} (type_id)`);
-        await db.unsafe(`ANALYZE ${tempTableName}`);
+        await schemaDdl('schema.BenchmarkPartitionCounts.create', `CREATE INDEX idx_${tempTableName}_type_id ON ${tempTableName} (type_id)`);
+        await schemaDdl('schema.BenchmarkPartitionCounts.analyze', `ANALYZE ${tempTableName}`);
         
         // Run benchmark query
-        const explainResult = await db.unsafe(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+        const explainResult = await schemaDdl('schema.BenchmarkPartitionCounts.explain', `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
             SELECT DISTINCT ec.entity_id as id
             FROM ${getMembershipTable()} ec
             WHERE ec.type_id = (SELECT type_id FROM ${tempTableName} LIMIT 1)
@@ -753,7 +812,7 @@ export const BenchmarkPartitionCounts = async (partitionCounts: number[] = [8, 1
         });
         
         // Clean up
-        await db.unsafe(`DROP TABLE ${tempTableName} CASCADE;`);
+        await schemaDdl('schema.BenchmarkPartitionCounts.drop', `DROP TABLE ${tempTableName} CASCADE;`);
         
         logger.info(`Partition count ${count}: planning=${planningTime}ms, execution=${executionTime}ms`);
     }
@@ -782,7 +841,7 @@ export const CreateForeignKeyIndex = async (tableName: string, foreignKeyField: 
     const indexName = `idx_${tableName}_fk_${foreignKeyField}`;
 
     // Check if index already exists
-    const existingIndex = await db.unsafe(`
+    const existingIndex = await schemaQuery('schema.CreateForeignKeyIndex.select', `
         SELECT 1 FROM pg_indexes
         WHERE tablename = '${tableName}' AND indexname = '${indexName}'
     `);
@@ -799,7 +858,7 @@ export const CreateForeignKeyIndex = async (tableName: string, foreignKeyField: 
     try {
         await retryWithBackoff(async () => {
             // Use btree index on the extracted text value for equality lookups (faster than GIN for FK)
-            await db.unsafe(`
+            await schemaDdl('schema.CreateForeignKeyIndex.create', `
                 CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} IF NOT EXISTS ${indexName}
                 ON ${tableName} ((data->>'${foreignKeyField}'))
                 WHERE deleted_at IS NULL

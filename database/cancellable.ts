@@ -4,18 +4,26 @@
  *
  * WHAT THIS DOES NOT DO — measured, not assumed (ticket B8a):
  *
- *   A client-side abort CANNOT reclaim server-side work through a transaction
- *   pooler. Aborting a `SELECT pg_sleep(20)` through pgbouncer released the
- *   pool slot at 20.0 s — the query's natural end — whether the client
- *   abandoned it, or called `cancel()` and waited 5 s for it. A Postgres cancel
- *   request travels on a separate connection keyed by backend PID; the pooler
- *   must forward it, and forwarding needs a server connection, which is exactly
- *   what is unavailable when the pool is exhausted.
+ *   `query.cancel()` does not cancel anything server-side. On Bun
+ *   1.4.0-canary.1 it issues no Postgres CancelRequest: watched from a second
+ *   connection, the backend running `pg_sleep(8)` stayed `active` at every
+ *   sample from 1.3 s to 7.7 s after `cancel()` was called at 0.4 s, then the
+ *   query RESOLVED (not rejected) at 8.0 s — its natural end. The `cancel()`
+ *   promise likewise resolves only when the statement finishes on its own.
+ *
+ *   This is a DRIVER property, not a pooling one. An earlier revision of this
+ *   comment blamed cancel-forwarding through pgbouncer; re-measuring on a direct
+ *   connection gave the same slot-recovery time to within 1 ms (5010 ms direct
+ *   vs 5009 ms pooled, for a 5000 ms statement), and the probe above was
+ *   re-run with three pool slots free to rule out the cancel channel being
+ *   queued behind the query it targets. Session pooling does NOT fix this.
  *
  *   So: this bounds the CALLER's wait. It does not bound the STATEMENT, and it
- *   is not a recovery mechanism for slot exhaustion. The only effective bound
- *   on a statement behind a pooler is server-side:
- *   `ALTER ROLE <user> SET statement_timeout = '<ms>'`. See docs/POOLING.md.
+ *   is not a recovery mechanism for slot exhaustion. The only effective bound on
+ *   a statement is server-side — `ALTER ROLE <user> SET statement_timeout` for a
+ *   universal ceiling, or `SET LOCAL statement_timeout` inside a transaction
+ *   (killed a 6 s statement at 1.21 s with the slot reusable 1-2 ms later, on
+ *   both topologies). See docs/POOLING.md.
  *
  * Rejection on abort is immediate (raced) rather than waiting for the driver to
  * honor the cancel — some drivers (PGlite socket bridge) ignore `cancel()`
@@ -33,6 +41,10 @@
  *                                           so a deployment can test whether
  *                                           `cancel()` itself is what wedges
  *                                           the connection.
+ *
+ * As of the 2026-07-27 measurements the two modes are equivalent from the
+ * SERVER's point of view — `cancel()` sends nothing — so this switch can only
+ * bisect client-side effects (driver state corruption), never slot recovery.
  *
  * Read at call time so it can be flipped without a restart in a test harness.
  *

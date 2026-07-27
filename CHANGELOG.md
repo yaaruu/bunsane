@@ -2,6 +2,125 @@
 
 All notable changes to bunsane are documented here.
 
+## Unreleased
+
+### Added
+
+- **Server-side deadline enforcement.** `dbTransaction` now emits
+  `SET LOCAL statement_timeout` derived from its own deadline, so every write
+  path (`entity.save`, `entity.delete`, studio bulk deletes) carries a bound the
+  *server* honours. Until now every timeout in the framework was client-side,
+  and a client-side abort does not stop Postgres — the statement runs to
+  completion and holds its pool slot for its real duration. That is the outage
+  mechanism, and this is the fix for the transaction half of it.
+
+  Measured cost on real PG 17, 200 interleaved samples: **+0.40 ms on a 3.0 ms
+  entity save (13%)** — one extra round trip, paid once per transaction. That
+  was a local Docker Postgres: the round trip is the portable unit, the
+  percentage is not — it scales with your RTT and with how many statements your
+  save already issues. (An
+  earlier micro-benchmark on a bare `BEGIN`/`SELECT 1`/`COMMIT` suggested
+  +0.12 ms; a real save pays the full round trip, and the end-to-end number is
+  the one that counts. Issuing the `SET LOCAL` unawaited so the driver might
+  pipeline it was tried and made no difference — Bun serializes a connection's
+  queue.) Wrapping a *bare* statement in a transaction to carry the setting
+  costs **+0.95 ms (3.7×)** against a 0.35 ms baseline, so bare statements are
+  **opt-in** (`dbExec(..., { serverTimeout: true })`) — taken by the studio
+  endpoints and projection backfill/reconcile, not by the read path. Bare
+  statements that do not opt in remain covered only by
+  `ALTER ROLE <user> SET statement_timeout`, which is why that stays
+  load-bearing.
+
+  Not applied to DDL (`CREATE INDEX CONCURRENTLY` cannot run inside a
+  transaction block) or to a caller-supplied transaction handle (`SET LOCAL` is
+  transaction-scoped, not savepoint-scoped, so it would silently outlive our
+  savepoint and change the caller's setting). Skipped under PGlite, as
+  `DB_STATEMENT_TIMEOUT` already is. Kill switch: `BUNSANE_DB_SERVER_TIMEOUT=off`.
+
+  A server-side kill is re-thrown as `DbStatementTimeoutError` with the lane,
+  label and budget attached, rather than the bare `canceling statement due to
+  statement timeout` — otherwise the new bound would be less legible than the
+  client-side one it replaces.
+
+- **The boot probe measures cancel effectiveness instead of inferring it.**
+  Whether a timeout reclaims its connection was previously deduced from pooling
+  mode, which was wrong twice over: cancellation is a property of the driver,
+  and pooling mode does not predict it. `probeConnection()` now runs a ~150 ms
+  `pg_sleep`, aborts it through the framework's own `runWithSignal` path — so
+  `BUNSANE_ABORT_MODE=off` is reported honestly — and watches the *statement*,
+  not the caller, to see when it really ended.
+
+  Reports at **error** when an ineffective cancel coincides with no server-side
+  `statement_timeout`. That conjunction is the outage precondition: nothing can
+  stop a slow query, so the pool is lost one slot at a time while the database
+  sits idle. Either condition alone is a warning.
+
+  `cancelEffective` is `boolean | null`, and `null` means unproven — a skipped or
+  failed probe must never read as "fine". A live `statement_timeout` killing the
+  probe's own statement is detected by message text rather than credited as a
+  working cancel (both are SQLSTATE 57014), and the probe declines to run under a
+  bound too tight to fit beneath. Knobs: `BUNSANE_PROBE_CANCEL=off`,
+  `BUNSANE_PROBE_CANCEL_SLEEP_MS`. Exported as `probeCancelEffectiveness()` so
+  `runDoctor()` can re-run it with a longer, more conclusive sleep than boot
+  should pay for.
+
+- `entity.save()` / `entity.delete()`: the client-side timer now fires
+  `SAVE_CLIENT_BACKSTOP_MS` (2 s) **after** the deadline it hands the gateway,
+  instead of at the same instant. Both derived from `QUERY_TIMEOUT_MS`, so which
+  one fired was a race — and they raise different types, making a caller that
+  matches on `DbStatementTimeoutError` catch it only sometimes. They are not
+  peers: the server bound stops the work and releases the slot, the client timer
+  only stops waiting. The server bound is now the primary; the client timer
+  remains the backstop for PGlite, `BUNSANE_DB_SERVER_TIMEOUT=off`,
+  caller-supplied transactions, and time spent between statements.
+
+### Corrected
+
+- **B8a is a driver property, not a pooling one — `pool_mode = session` does NOT
+  fix it.** 0.5.11 (below) explained the pinned pool slot as a cancel request
+  that the pooler could not forward. Re-measured on PostgreSQL 17.10 with Bun
+  1.4.0-canary.1, running the same harness against both topologies: a direct
+  connection reacquired the slot at **5010 ms** and pgbouncer
+  `pool_mode = transaction` at **5009 ms**, for a 5000 ms statement. Identical,
+  so the pooler is not in the loop.
+
+  Watching the backend from a second connection shows the actual mechanism:
+  after `cancel()` at 415 ms it stays `active` at every sample through 7717 ms
+  and the query **resolves — does not reject —** at 8018 ms, its natural end.
+  `query.cancel()` issues no Postgres CancelRequest at all. Re-run with three
+  pool slots free (capacity confirmed live) to rule out the cancel channel
+  queueing behind the query it targets; same result.
+
+  **If you are moving to `pool_mode = session`, keep doing it** — it is still
+  required for advisory locks, the `options` startup parameter, and server-side
+  prepared statements (B1/B6). But it buys nothing for B8a, so
+  **`ALTER ROLE <user> SET statement_timeout` is now load-bearing rather than
+  supplementary**: it is the only thing that bounds a statement that is not
+  wrapped in a transaction. Shipping session mode *without* it reproduces the
+  outage signature.
+
+- **`DB_CONNECTION_TIMEOUT` does not fast-fail a busy pool.** 0.5.11 advised
+  request-facing deployments to set `5` so callers fail instead of queueing.
+  Measured: with `connectionTimeout: 1`, a caller arriving at a full pool queued
+  **4860 ms (direct) / 4862 ms (pooled)** and then succeeded — it waited out the
+  statements ahead of it. Bun documents the option as the connection
+  *establishment* timeout, and that is all it is. `5` remains reasonable as an
+  establishment bound; it is not admission control. Bounding the wait is the
+  execution seam's job (`database/gateway.ts`).
+
+- The bound that does work, on both topologies: `SET LOCAL statement_timeout`
+  killed a 6 s statement at ~1214 ms with the slot reusable 1–2 ms later. Use
+  `SET LOCAL`, never plain `SET` — under transaction pooling a session-level
+  `SET` leaks to the next client of that pooled server connection.
+
+### Fixed
+
+- `tests/pg-setup.ts` discovers the direct Postgres port from
+  `docker port <container> 5432` per run instead of trusting a pinned
+  `PG_DIRECT_PORT`. Docker reassigns that host port on every container recreate,
+  and a stale pin fails as `ERR_POSTGRES_CONNECTION_REFUSED` — which reads as
+  "no real Postgres available" and silently skips the real-PG test tier.
+
 ## 0.5.11 — 2026-07-26
 
 Hotfix for the downstream B8 report: a ~7 h production outage where the API
@@ -88,12 +207,22 @@ boot probe.
   unavailable when the pool is exhausted. `DB_QUERY_TIMEOUT` bounds the
   **caller**, not the statement; the only real statement bound behind a pooler is
   `ALTER ROLE … SET statement_timeout`.
+
+  > ⚠️ **The conclusion holds; the explanation above is wrong.** The slot is
+  > pinned, but not because a cancel could not be forwarded — `cancel()` sends
+  > nothing, and the same pinning happens on a direct connection. Corrected under
+  > *Unreleased* at the top of this file; it changes what `pool_mode = session`
+  > is worth.
+
 - `DB_CONNECTION_TIMEOUT` default stays **30 s** on purpose. Request-facing
   deployments should set `5`, and the docs now say so — but one pool is shared
   with background work (scheduler, outbox, projection backfill/reconcile) that
   legitimately waits longer, and there is no per-lane timeout yet. Lowering the
   global default would start failing that work. Per-lane defaults land with the
   execution seam.
+
+  > ⚠️ Setting `5` does **not** make callers fail fast at a busy pool — measured
+  > since; see *Unreleased*. It bounds connection establishment only.
 - `DB_DISABLE_PREPARE=true` is still the advice behind transaction pooling, now
   with the field counter-evidence recorded: one deployment saw `prepare: false`
   produce `unnamed prepared statement does not exist` where `prepare: true` had
