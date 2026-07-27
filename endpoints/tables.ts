@@ -1,4 +1,4 @@
-import db from "../database";
+import { studioDeadline, studioExec, studioErrorResponse } from "./db";
 import type {
     StudioTableQueryParams,
     StudioTableResponse,
@@ -16,18 +16,23 @@ export async function handleStudioTableRequest(
     const offset = Math.max(params.offset ?? 0, 0);
     const searchTerm = params.search ?? "";
 
+    const deadline = studioDeadline();
+
     try {
-        const columnsResult = await db`
-            SELECT 
+        const columnsResult = await studioExec<any[]>(
+            "studio.table.columns",
+            deadline,
+            `SELECT
                 column_name,
                 data_type,
                 is_nullable,
                 column_default
-            FROM information_schema.columns
-            WHERE table_name = ${tableName}
-            AND table_schema = 'public'
-            ORDER BY ordinal_position
-        `;
+             FROM information_schema.columns
+             WHERE table_name = $1
+             AND table_schema = 'public'
+             ORDER BY ordinal_position`,
+            [tableName],
+        );
 
         if (columnsResult.length === 0) {
             return new Response(
@@ -39,16 +44,19 @@ export async function handleStudioTableRequest(
             );
         }
 
-        const primaryKeyResult = await db`
-            SELECT kcu.column_name
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu 
-                ON tc.constraint_name = kcu.constraint_name
-                AND tc.table_schema = kcu.table_schema
-            WHERE tc.constraint_type = 'PRIMARY KEY'
-            AND tc.table_name = ${tableName}
-            AND tc.table_schema = 'public'
-        `;
+        const primaryKeyResult = await studioExec<any[]>(
+            "studio.table.primaryKey",
+            deadline,
+            `SELECT kcu.column_name
+             FROM information_schema.table_constraints tc
+             JOIN information_schema.key_column_usage kcu
+                 ON tc.constraint_name = kcu.constraint_name
+                 AND tc.table_schema = kcu.table_schema
+             WHERE tc.constraint_type = 'PRIMARY KEY'
+             AND tc.table_name = $1
+             AND tc.table_schema = 'public'`,
+            [tableName],
+        );
         const primaryKeyColumns = new Set(
             primaryKeyResult.map((row: { column_name: string }) => row.column_name)
         );
@@ -79,27 +87,35 @@ export async function handleStudioTableRequest(
                 .map((col: string) => `"${col}"::text ILIKE $1`)
                 .join(" OR ");
 
-            rows = await db.unsafe(
-                `SELECT * FROM "${tableName}" 
+            rows = await studioExec(
+                "studio.table.rows.search",
+                deadline,
+                `SELECT * FROM "${tableName}"
                  WHERE ${searchConditions}
                  ORDER BY created_at DESC NULLS LAST
                  LIMIT $2 OFFSET $3`,
                 [searchPattern, limit, offset]
             );
 
-            totalResult = await db.unsafe(
+            totalResult = await studioExec(
+                "studio.table.count.search",
+                deadline,
                 `SELECT COUNT(*) as count FROM "${tableName}" WHERE ${searchConditions}`,
                 [searchPattern]
             );
         } else {
-            rows = await db.unsafe(
-                `SELECT * FROM "${tableName}" 
+            rows = await studioExec(
+                "studio.table.rows",
+                deadline,
+                `SELECT * FROM "${tableName}"
                  ORDER BY created_at DESC NULLS LAST
                  LIMIT $1 OFFSET $2`,
                 [limit, offset]
             );
 
-            totalResult = await db.unsafe(
+            totalResult = await studioExec(
+                "studio.table.count",
+                deadline,
                 `SELECT COUNT(*) as count FROM "${tableName}"`
             );
         }
@@ -119,14 +135,7 @@ export async function handleStudioTableRequest(
             headers: { "Content-Type": "application/json" },
         });
     } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : "Unknown error";
-        return new Response(
-            JSON.stringify({ error: `Failed to fetch table data: ${errorMessage}` }),
-            {
-                status: 500,
-                headers: { "Content-Type": "application/json" },
-            }
-        );
+        return studioErrorResponse(error, "Failed to fetch table data");
     }
 }
 
@@ -149,7 +158,9 @@ export async function handleStudioTableDeleteRequest(
     try {
         const idPlaceholders = ids.map((_, index) => `$${index + 1}`).join(", ");
 
-        await db.unsafe(
+        await studioExec(
+            "studio.table.delete",
+            studioDeadline(),
             `DELETE FROM "${tableName}" WHERE id IN (${idPlaceholders})`,
             ids
         );
@@ -166,14 +177,7 @@ export async function handleStudioTableDeleteRequest(
             headers: { "Content-Type": "application/json" },
         });
     } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : "Unknown error";
-        return new Response(
-            JSON.stringify({ error: `Failed to delete rows: ${errorMessage}` }),
-            {
-                status: 500,
-                headers: { "Content-Type": "application/json" },
-            }
-        );
+        return studioErrorResponse(error, "Failed to delete rows");
     }
 }
 
@@ -188,7 +192,9 @@ export async function handleGetTables(): Promise<Response> {
         const ecsTables = ['components', 'entities', 'entity_components', 'spatial_ref_sys'];
         const ecsTablePlaceholders = ecsTables.map((_, index) => `$${index + 1}`).join(", ");
 
-        const result = await db.unsafe(
+        const result = await studioExec<{ table_name: string }[]>(
+            "studio.tables.list",
+            studioDeadline(),
             `SELECT table_name
              FROM information_schema.tables
              WHERE table_schema = 'public'
@@ -205,13 +211,6 @@ export async function handleGetTables(): Promise<Response> {
             headers: { "Content-Type": "application/json" },
         });
     } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : "Unknown error";
-        return new Response(
-            JSON.stringify({ error: `Failed to fetch tables: ${errorMessage}` }),
-            {
-                status: 500,
-                headers: { "Content-Type": "application/json" },
-            }
-        );
+        return studioErrorResponse(error, "Failed to fetch tables");
     }
 }

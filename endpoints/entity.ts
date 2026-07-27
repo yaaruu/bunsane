@@ -1,4 +1,4 @@
-import db from "../database";
+import { studioDeadline, studioExec, studioErrorResponse } from "./db";
 import type {
     EntityInspectorResponse,
     StudioEntityListQueryParams,
@@ -18,13 +18,17 @@ export async function handleEntityListRequest(
 
     const deletedFilter = includeDeleted ? "" : "AND e.deleted_at IS NULL";
 
+    const deadline = studioDeadline();
+
     try {
         let rows: Record<string, unknown>[];
         let totalResult: { count: number }[];
 
         if (searchTerm) {
             const searchPattern = `%${searchTerm}%`;
-            rows = await db.unsafe(
+            rows = await studioExec(
+                "studio.entity.list.search",
+                deadline,
                 `SELECT e.id, e.created_at, e.updated_at, e.deleted_at,
                         (SELECT COUNT(*) FROM components c
                          WHERE c.entity_id = e.id AND c.deleted_at IS NULL) AS component_count
@@ -34,13 +38,17 @@ export async function handleEntityListRequest(
                  LIMIT $2 OFFSET $3`,
                 [searchPattern, limit, offset]
             );
-            totalResult = await db.unsafe(
+            totalResult = await studioExec(
+                "studio.entity.count.search",
+                deadline,
                 `SELECT COUNT(*) AS count FROM entities e
                  WHERE e.id::text ILIKE $1 ${deletedFilter}`,
                 [searchPattern]
             );
         } else {
-            rows = await db.unsafe(
+            rows = await studioExec(
+                "studio.entity.list",
+                deadline,
                 `SELECT e.id, e.created_at, e.updated_at, e.deleted_at,
                         (SELECT COUNT(*) FROM components c
                          WHERE c.entity_id = e.id AND c.deleted_at IS NULL) AS component_count
@@ -50,7 +58,9 @@ export async function handleEntityListRequest(
                  LIMIT $1 OFFSET $2`,
                 [limit, offset]
             );
-            totalResult = await db.unsafe(
+            totalResult = await studioExec(
+                "studio.entity.count",
+                deadline,
                 `SELECT COUNT(*) AS count FROM entities e WHERE TRUE ${deletedFilter}`
             );
         }
@@ -74,17 +84,7 @@ export async function handleEntityListRequest(
             headers: { "Content-Type": "application/json" },
         });
     } catch (error) {
-        const errorMessage =
-            error instanceof Error ? error.message : "Unknown error";
-        return new Response(
-            JSON.stringify({
-                error: `Failed to fetch entities: ${errorMessage}`,
-            }),
-            {
-                status: 500,
-                headers: { "Content-Type": "application/json" },
-            }
-        );
+        return studioErrorResponse(error, "Failed to fetch entities");
     }
 }
 
@@ -101,12 +101,17 @@ export async function handleEntityInspectorRequest(
         );
     }
 
+    const deadline = studioDeadline();
+
     try {
-        const entityResult = await db`
-            SELECT id, created_at, updated_at, deleted_at
-            FROM entities
-            WHERE id = ${entityId}
-        `;
+        const entityResult = await studioExec<any[]>(
+            "studio.entity.inspect",
+            deadline,
+            `SELECT id, created_at, updated_at, deleted_at
+             FROM entities
+             WHERE id = $1`,
+            [entityId],
+        );
 
         if (entityResult.length === 0) {
             return new Response(
@@ -121,12 +126,15 @@ export async function handleEntityInspectorRequest(
         const entity = entityResult[0];
 
         // Fetch ALL components for this entity (including soft-deleted)
-        const componentsResult = await db`
-            SELECT id, name, type_id, data, created_at, updated_at, deleted_at
-            FROM components
-            WHERE entity_id = ${entityId}
-            ORDER BY name ASC, created_at ASC
-        `;
+        const componentsResult = await studioExec<Record<string, unknown>[]>(
+            "studio.entity.inspect.components",
+            deadline,
+            `SELECT id, name, type_id, data, created_at, updated_at, deleted_at
+             FROM components
+             WHERE entity_id = $1
+             ORDER BY name ASC, created_at ASC`,
+            [entityId],
+        );
 
         const responseData: EntityInspectorResponse = {
             entity: {
@@ -150,16 +158,6 @@ export async function handleEntityInspectorRequest(
             headers: { "Content-Type": "application/json" },
         });
     } catch (error) {
-        const errorMessage =
-            error instanceof Error ? error.message : "Unknown error";
-        return new Response(
-            JSON.stringify({
-                error: `Failed to fetch entity: ${errorMessage}`,
-            }),
-            {
-                status: 500,
-                headers: { "Content-Type": "application/json" },
-            }
-        );
+        return studioErrorResponse(error, "Failed to fetch entity");
     }
 }
