@@ -36,6 +36,14 @@ const logger = MainLogger.child({ scope: 'db.probe' });
 export interface ConnectionProbeResult {
     /** true = separate statements landed on different backends → transaction pooling, proven. */
     transactionPooling: boolean;
+    /**
+     * Why `transactionPooling` is what it is.
+     *
+     * `false` is NOT the negation of `true` here: identical PIDs are consistent
+     * with session pooling AND with a transaction-pooled but idle pool, so the
+     * only two honest states are "proven" and "unproven". See `PoolingOutcome`.
+     */
+    poolingOutcome: PoolingOutcome;
     /** Backend PIDs observed on one reserved connection. */
     backendPids: number[];
     /** Effective server-side statement_timeout, as reported by SHOW. */
@@ -57,6 +65,29 @@ export interface ConnectionProbeResult {
     /** The `BUNSANE_ABORT_MODE` in force when the probe ran. */
     abortMode?: string;
 }
+
+/**
+ * Pooling mode is only ever PROVEN, never disproven, by this probe.
+ *
+ * Distinct backend PIDs across separate statements on one client connection can
+ * only happen under transaction pooling — that direction is sound. Identical
+ * PIDs prove nothing: PgBouncer hands connections back LIFO, so on an idle pool
+ * a transaction-pooled deployment returns the same backend every time and looks
+ * exactly like session pooling. Observed twice — once at 0.5.10 boot on
+ * production, once as a first-run flake after a vendor swap — both times read as
+ * "pooler not detected" when the pooler was right there.
+ *
+ * So a quiet boot is `unproven`, not `false`. A mitigation nobody applied
+ * because the probe said it was unnecessary is the failure this distinction
+ * exists to prevent.
+ */
+export type PoolingOutcome =
+    /** Probe did not run (PGlite) or failed. */
+    | 'skipped'
+    /** Distinct backend PIDs — transaction pooling, proven. */
+    | 'proven'
+    /** One backend served every statement. Consistent with session pooling OR an idle pool. */
+    | 'unproven-idle-pool';
 
 export type CancelOutcome =
     /** Probe did not run (PGlite, `BUNSANE_PROBE_CANCEL=off`, or an error). */
@@ -233,12 +264,15 @@ function reportCancelEffectiveness(result: ConnectionProbeResult): void {
 
 /**
  * Probe the live connection. Never throws — a probe failure must not block
- * boot; it logs and reports `transactionPooling: false` (which means
- * "unproven", NOT "proven safe").
+ * boot; it logs and reports `transactionPooling: false` with
+ * `poolingOutcome: 'skipped'`. Read `poolingOutcome`, not the boolean: only
+ * `'proven'` is evidence, and the boolean cannot express the difference between
+ * "session-pooled" and "could not tell".
  */
 export async function probeConnection(sql: SQL = db): Promise<ConnectionProbeResult> {
     const result: ConnectionProbeResult = {
         transactionPooling: false,
+        poolingOutcome: 'skipped',
         backendPids: [],
         statementTimeoutIgnored: false,
         cancelEffective: null,
@@ -284,6 +318,9 @@ export async function probeConnection(sql: SQL = db): Promise<ConnectionProbeRes
     }
 
     result.transactionPooling = new Set(result.backendPids).size > 1;
+    result.poolingOutcome = result.transactionPooling
+        ? 'proven'
+        : result.backendPids.length > 0 ? 'unproven-idle-pool' : 'skipped';
 
     const requested = process.env.DB_STATEMENT_TIMEOUT;
     if (requested) {
@@ -301,6 +338,18 @@ export async function probeConnection(sql: SQL = db): Promise<ConnectionProbeRes
             'Transaction-pooled connection detected (statements landed on different backends). ' +
             'Session-scoped features are unsafe here: session advisory locks, LISTEN/NOTIFY, SET SESSION, ' +
             'server-side prepared statements (set DB_DISABLE_PREPARE=true). See docs/LOCKING.md.'
+        );
+    } else if (result.poolingOutcome === 'unproven-idle-pool') {
+        // Deliberately not silent. A quiet probe is what let a pooled deployment
+        // read as unpooled twice; saying nothing here means the absence of a
+        // warning gets used as evidence there is no pooler.
+        logger.info(
+            { backendPid: result.backendPids[0] },
+            'Pooling mode UNPROVEN: one backend served every probe statement. That is what session ' +
+            'pooling looks like, and also what a transaction-pooled but idle pool looks like ' +
+            '(PgBouncer returns connections LIFO). Do not read this as "no pooler" — if PgBouncer is ' +
+            'in front of this deployment, keep DB_DISABLE_PREPARE=true and treat session-scoped ' +
+            'features as unsafe. See docs/LOCKING.md.'
         );
     }
 
