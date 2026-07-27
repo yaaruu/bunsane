@@ -2,6 +2,59 @@
 
 All notable changes to bunsane are documented here.
 
+## 0.6.1 — 2026-07-27
+
+Two gaps found by measuring 0.6.0's own admission against a saturated pool.
+Behaviour is byte-identical to 0.6.0 out of the box: both new settings are unset
+by default.
+
+### Added
+
+- **`DB_REQUEST_TIMEOUT` / `DB_BACKGROUND_TIMEOUT` — per-lane deadlines.**
+  0.6.0's admission bounds the QUEUE, which is what `DB_CONNECTION_TIMEOUT`
+  provably does not do. It does not SHED. Measured through the real `dbExec`
+  seam (real PG 17, `poolMax 4` -> `admissionLimit 3`, 20 concurrent
+  `pg_sleep(2)`, identical direct and through PgBouncer):
+
+  | request-lane budget | rejected | reached the server | drained |
+  |---|---|---|---|
+  | 800 ms | **17 / 20** | 3 | **2063 ms** |
+  | 30 000 ms (what 0.6.0 shipped) | **0 / 20** | 20 | **14056 ms** |
+  | admission off (control) | 0 / 20 | 20 | 10034 ms |
+
+  No framework call site passes a per-call `timeoutMs`, so every lane inherited
+  the 30 s `DB_QUERY_TIMEOUT`. A default deployment therefore got bounded,
+  observable queueing — callers waiting 4.3 s on average and 12.0 s at worst —
+  and no shedding, with drain *worse* than admission-off because the seam caps
+  concurrency at `admissionLimit` while the raw pool ran at `poolMax`.
+
+  One global value cannot serve both lanes: a request wants to fail in seconds,
+  while backfill and reconcile legitimately run far longer on the same pool.
+  **Request-facing deployments should set `DB_REQUEST_TIMEOUT` to a few
+  seconds.** It is left unset because shortening it changes which requests fail
+  under load — a deployment's decision, not a patch release's.
+
+  There is deliberately no `DB_HEALTH_TIMEOUT`: `admit()` exempts the health lane
+  outright, so it would bound only the query and never the queue.
+
+- **`getGatewayStats().unarmedCalls`** — queries that bypassed admission because
+  nothing had armed the gateway. `armGateway()`'s only caller is `App.start()`,
+  after migrations, so anything using the framework database without booting an
+  App got no admission and nothing said so. A mitigation that is absent and
+  silent is worse than one that is absent and loud: the metrics look calm
+  precisely because nothing is being measured. A process still unarmed 60 s after
+  start now warns once; `armGateway()` silences it permanently, because
+  migrations on a cold database can legitimately exceed a minute and a warning
+  that fires during a normal slow boot is one people learn to ignore.
+
+### Fixed
+
+- `docs/POOLING.md` and `docs/CONFIGURATION.md` claimed framework admission was
+  the answer to unbounded pool-wait without distinguishing bounding from
+  shedding. Both now carry the measurement and a three-bounds table: role
+  `statement_timeout` bounds the STATEMENT, admission bounds the QUEUE,
+  `DB_REQUEST_TIMEOUT` is the only one that SHEDS.
+
 ## 0.6.0 — 2026-07-27
 
 The release 0.5.11 was a hotfix for: it gives the framework somewhere to put a

@@ -510,8 +510,13 @@ async function admit(
  *
  * Runtime env wins over the import-time `QUERY_TIMEOUT_MS`, for BOTH the
  * per-lane keys and the global, so the two are never read off different clocks.
- * The parse is cached because this sits on the hottest path in the framework;
- * `resetGateway()` clears it.
+ *
+ * The parse is cached because this sits on the hottest path in the framework.
+ * Cached ONCE PER `resetGateway()`, and populated by any read — including
+ * `getGatewayStats()`, which asks for all three lanes. So changing
+ * `DB_REQUEST_TIMEOUT` at runtime takes effect only after `resetGateway()`, and
+ * a caller that reads stats first, then sets the env var, then reads again
+ * without resetting sees the stale value. Tests must reset after mutating env.
  */
 const LANE_BUDGET_ENV: Record<Lane, string | null> = {
     request: 'DB_REQUEST_TIMEOUT',
