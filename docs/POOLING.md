@@ -43,7 +43,7 @@ deployments already have it, or connections fail outright).
 | `LISTEN` / `NOTIFY`, `SET SESSION`, session temp tables | ❌ unsafe | Not used by the framework; avoid in application code. |
 | Lease lock backend (`postgres`, the default) | ✅ safe | One autocommit statement per acquire/renew/release. |
 | Transactions (`Entity.save`, `db.transaction`) | ✅ safe | A transaction is pinned to one backend for its duration. |
-| Query/save wall-clock timeouts as a *slot recovery* mechanism | ❌ ineffective | `query.cancel()` does not free the slot through a pooler: the statement runs to natural completion and holds its connection for the full duration (measured — see B8a below). The timeout still bounds the caller. The only real statement bound is server-side `statement_timeout`. |
+| Query/save wall-clock timeouts as a *slot recovery* mechanism | ❌ ineffective **everywhere** | `query.cancel()` issues no CancelRequest at all: the statement runs to natural completion and holds its connection for the full duration. Measured identically on a direct connection and through the pooler, so this is a driver property, not a pooling one — session mode does not fix it (see B8a below). The timeout still bounds the caller. The only real statement bound is server-side `statement_timeout`. |
 | Projections / QSP dual-write | ✅ safe | Ordinary statements and transactions. |
 
 ### JSONB parameters
@@ -77,8 +77,8 @@ its own stricter probe (`set_config` then read back on a separate statement) and
 
 ## Timeouts, end to end
 
-**Behind a transaction pooler, the only effective bound on a statement is
-server-side.** Everything else bounds the caller, not the work.
+**The only effective bound on a statement is server-side — on every topology,
+not just behind a pooler.** Everything else bounds the caller, not the work.
 
 - `statement_timeout` — **the real one.** Set it on the role:
   `ALTER ROLE <user> SET statement_timeout = '<ms>'`. `DB_STATEMENT_TIMEOUT` is
@@ -88,19 +88,22 @@ server-side.** Everything else bounds the caller, not the work.
 - `DB_QUERY_TIMEOUT` (default 30 000 ms) — JS-side wall clock on
   `Query.exec/count/sum/average`, `Entity.save` and `Entity.doDelete`. It bounds
   **how long the caller waits**. It requests cancellation first, but see B8a
-  below: through a pooler that does not release the slot. Treat it as a caller
-  deadline, never as capacity recovery.
+  below: that request never reaches Postgres, on any topology, so the slot is not
+  released. Treat it as a caller deadline, never as capacity recovery.
 - `DB_CONNECTION_TIMEOUT` (default 30 s) — Bun SQL's connection-**establishment**
   timeout. When it fires, `ERR_POSTGRES_CONNECTION_TIMEOUT` is answered as
   **503 + `Retry-After`** (`code: POOL_EXHAUSTED`) and counted as
-  `poolAcquireFailures` in `/metrics`. ⚠️ Whether it also bounds *waiting for a
-  busy pool* is **unverified**: against the PGlite bridge with `max: 1`, a second
-  caller queued 2.9 s and then succeeded rather than timing out at 1 s. Measure
-  your own topology with `bun run test:pool-saturation` before treating this as
-  fast-fail. **Request-facing deployments should still set `5`.** The default
-  stays 30 s because background work (scheduler, outbox, projection
-  backfill/reconcile) shares the same pool and legitimately waits longer; there
-  is no per-lane timeout yet.
+  `poolAcquireFailures` in `/metrics`. ⚠️ **It does not bound waiting for a busy
+  pool** — no longer "unverified", measured 2026-07-27 on real PostgreSQL 17.10:
+  with `connectionTimeout: 1`, a caller arriving at a full pool queued **4860 ms
+  (direct) / 4862 ms (through pgbouncer)** and then succeeded, waiting out the 5 s
+  statements ahead of it. The earlier PGlite observation (2.9 s on `max: 1`) was
+  not a single-connection artifact. Do **not** treat this as a fast-fail
+  mechanism; framework-side admission (`database/gateway.ts`) is what bounds the
+  wait. Setting `5` is still reasonable for request-facing deployments as an
+  establishment bound. The default stays 30 s because background work (scheduler,
+  outbox, projection backfill/reconcile) shares the same pool and legitimately
+  waits longer.
 - `DB_POOL_IDLE_TIMEOUT` (default 30) and `DB_POOL_MAX_LIFETIME` (default 600) —
   **seconds**, not milliseconds. Connection recycling; see below.
 - `DB_POOL_SATURATION_READY_MS` (default 3000, `0` disables) — how long the pool
@@ -108,24 +111,75 @@ server-side.** Everything else bounds the caller, not the work.
 
 ### B8a — a client-side abort cannot reclaim server-side work
 
-Measured against pgbouncer `pool_mode = transaction`: aborting a
-`SELECT pg_sleep(20)` released the pool slot at **20.0 s** — the query's natural
-end — both when the client abandoned it and when it called `cancel()` and waited
-5 s. A Postgres cancel request travels on a separate connection keyed by backend
-PID and must be forwarded by the pooler; forwarding needs a server connection,
-which is precisely what is missing when the pool is exhausted.
+**This section previously blamed the pooler. That was wrong, and the correction
+matters: it means session pooling does not fix this.** Re-measured 2026-07-27 on
+PostgreSQL 17.10 with Bun 1.4.0-canary.1, running the identical harness
+(`tests/load/pool-saturation.ts`) against both topologies:
 
-Consequence: a wall-clock timeout provides **zero** slot recovery behind a
-pooler. Slots stay pinned for the real duration of every abandoned query, so a
-run of slow queries walks the pool down one slot at a time. The mitigations that
-do work are the server-side `statement_timeout` above, a fast
-`DB_CONNECTION_TIMEOUT` so callers fail instead of queueing, and shedding traffic
-on readiness while the pool drains.
+| topology | abort issued | slot reacquired | statement |
+|---|---|---|---|
+| direct connection, no pooler | 311 ms | **5010 ms** | 5000 ms |
+| pgbouncer `pool_mode = transaction` | 316 ms | **5009 ms** | 5000 ms |
+
+Identical to within 1 ms. The slot is pinned for the statement's full natural
+duration **on a direct connection too**, so cancel-forwarding through a pooler is
+not the mechanism.
+
+The actual mechanism, observed from a second connection via `pg_stat_activity`
+while aborting a `pg_sleep(8)` with three pool slots free (capacity confirmed
+live, so the cancel cannot be queued behind the query it targets):
+
+```
+[408ms]  spare slot usable in 3ms
+[415ms]  cancel() called
+[1323ms] backend 106920: active
+...        active at every 900ms sample
+[7717ms] backend 106920: active
+[8018ms] query RESOLVED          <-- resolves normally, 8s = natural end
+[8623ms] backend 106920: idle
+```
+
+`query.cancel()` exists and returns a promise, but that promise resolves only when
+the statement ends on its own, and the query **resolves rather than rejecting**.
+No CancelRequest is issued to Postgres. `runWithSignal` therefore bounds the
+CALLER and nothing else — on every topology.
+
+Consequence: a wall-clock timeout provides **zero** slot recovery, pooler or not.
+Slots stay pinned for the real duration of every abandoned query, so a run of slow
+queries walks the pool down one slot at a time.
+
+**`DB_CONNECTION_TIMEOUT` is not a mitigation either** — an earlier revision of
+this page listed it as one. With `connectionTimeout: 1`, a caller arriving at a
+full pool queued for **4860 ms (direct) / 4862 ms (pgbouncer)** and then
+succeeded: it waited out the 5 s statements. Bun documents the option as the
+*establishment* timeout, and that is exactly what it is. It does not bound waiting
+for a busy pool. Admission has to be bounded by the framework
+(`database/gateway.ts`), which is why the seam owns its own queue and deadline
+rather than delegating to the driver.
+
+What actually works:
+
+- **`statement_timeout`, server-side** — the only real bound. `SET LOCAL
+  statement_timeout` inside a transaction killed a 6 s statement at **1215 ms
+  (direct) / 1213 ms (pgbouncer)**, with the slot reusable **1–2 ms** later. Use
+  `SET LOCAL`, never plain `SET`: under transaction pooling a session-level `SET`
+  leaks to the next client of that pooled server connection.
+- **Role-level default** — `ALTER ROLE <user> SET statement_timeout = '<ms>'`
+  covers single statements that are not wrapped in a transaction, at zero
+  per-query cost. This is the universal ceiling; set it.
+- **Shedding traffic on readiness** while the pool drains.
+
+Cost note, in case you are tempted to wrap every statement to guard it: on a
+trivial `SELECT 1`, `BEGIN`/`COMMIT` plus `SET LOCAL` costs **+0.95 ms (3.7×)**
+against a 0.35 ms baseline. Inside a transaction that already exists, `SET LOCAL`
+costs **+0.12 ms**. So the framework guards transactions by default and leaves
+bare statements to the role-level default.
 
 `BUNSANE_ABORT_MODE=cancel|off` (default `cancel`) exists **temporarily** so a
 deployment can test whether issuing `cancel()` is itself implicated in
-connections that never return to the pool. It will be removed once that is
-settled.
+connections that never return to the pool. Note that the two modes are now known
+to be equivalent from the server's point of view — the switch can only bisect
+client-side effects. It will be removed once B8b is settled.
 
 ---
 
