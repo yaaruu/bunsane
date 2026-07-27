@@ -174,6 +174,54 @@ for a busy pool. Admission has to be bounded by the framework
 (`database/gateway.ts`), which is why the seam owns its own queue and deadline
 rather than delegating to the driver.
 
+### Admission bounds the QUEUE. Only the lane budget SHEDS.
+
+Measured against a saturated pool through the real `dbExec` seam (real PG 17,
+`poolMax = 4` → `admissionLimit = 3`, 20 concurrent `pg_sleep(2)`), identical on
+both topologies:
+
+| request-lane budget | rejected | reached the server | server drained |
+|---|---|---|---|
+| 800 ms | **17 / 20** | 3 | **2063 ms** |
+| 30 000 ms (the shipped default) | **0 / 20** | 20 | **14056 ms** |
+| admission off (control) | 0 / 20 | 20 | 10034 ms |
+
+Two things follow, and they are easy to conflate:
+
+1. **Admission does bound the wait**, which is what `DB_CONNECTION_TIMEOUT` could
+   not do: a caller was refused at **810 ms** against a 800 ms budget without
+   consuming a slot, versus the raw driver's *4859 ms and then success*. Queue
+   depth, wait times and rejections are all in `getGatewayStats()`.
+2. **Shedding is a property of the budget, not of admission.** At the 30 s default
+   nothing is rejected, every statement executes, and drain is *worse* than with
+   admission off — because the seam caps concurrency at `admissionLimit` while the
+   raw pool ran at `poolMax`. That is the intended trade (headroom keeps liveness
+   answerable), but it is not load shedding.
+
+Since **no framework call site passes a per-call `timeoutMs`**, the 30 s row is
+what a default deployment gets: bounded, observable, instrumented queueing — with
+callers waiting an average of 4.3 s and up to 12.0 s — and no shedding at all.
+
+Three bounds, three different jobs:
+
+| bound | what it limits | where it lives |
+|---|---|---|
+| role `statement_timeout` | the STATEMENT | infra (`ALTER ROLE`) |
+| gateway admission | the QUEUE, and makes it observable | framework, default-on |
+| **`DB_REQUEST_TIMEOUT`** | **what SHEDS under overload** | **framework, unset by default** |
+
+A request-facing deployment wants all three. See
+[CONFIGURATION.md](./CONFIGURATION.md) `DB_REQUEST_TIMEOUT`.
+
+### Admission is inert until something arms it
+
+`armGateway()` is called by `App.start()` after migrations, so boot DDL runs
+unbounded by design. Anything that uses the framework's database *without*
+booting an App — a standalone script, a one-off job — therefore gets no admission
+at all. `getGatewayStats().unarmedCalls` counts queries that took that path, and
+a process still showing `armed: false` a minute after start logs a warning once.
+See [STANDALONE_SCRIPTS.md](./STANDALONE_SCRIPTS.md).
+
 What actually works:
 
 - **`statement_timeout`, server-side** — the only real bound. `SET LOCAL

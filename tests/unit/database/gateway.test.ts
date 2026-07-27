@@ -359,3 +359,151 @@ describe('deadlines cover the query too', () => {
         await Promise.all(held);
     });
 });
+
+/**
+ * Per-lane budgets — the knob that decides whether the seam SHEDS or just queues.
+ *
+ * Measured on real PG 17 (20 concurrent 2 s statements, admissionLimit 3): at an
+ * 800 ms budget 17 of 20 were rejected before reaching the server and drain was
+ * 2063 ms; at the shipped 30 s default nothing was rejected, all 20 executed, and
+ * drain was 14056 ms — worse than admission-off, because admission caps
+ * concurrency below poolMax. Since no framework call site passes `timeoutMs`,
+ * the lane default is the ONLY thing that can produce the first row in
+ * production.
+ */
+describe('per-lane deadlines', () => {
+    const saved = {
+        request: process.env.DB_REQUEST_TIMEOUT,
+        background: process.env.DB_BACKGROUND_TIMEOUT,
+        query: process.env.DB_QUERY_TIMEOUT,
+    };
+
+    afterEach(() => {
+        for (const [key, value] of [
+            ['DB_REQUEST_TIMEOUT', saved.request],
+            ['DB_BACKGROUND_TIMEOUT', saved.background],
+            ['DB_QUERY_TIMEOUT', saved.query],
+        ] as const) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+        resetGateway();
+    });
+
+    test('lanes fall back to the global default when unset', () => {
+        delete process.env.DB_REQUEST_TIMEOUT;
+        delete process.env.DB_BACKGROUND_TIMEOUT;
+        process.env.DB_QUERY_TIMEOUT = '12345';
+        resetGateway();
+
+        const budgets = getGatewayStats().laneBudgetMs;
+        expect(budgets.request).toBe(12345);
+        expect(budgets.background).toBe(12345);
+        expect(budgets.health).toBe(12345);
+    });
+
+    test('each lane can be shortened independently', () => {
+        process.env.DB_QUERY_TIMEOUT = '30000';
+        process.env.DB_REQUEST_TIMEOUT = '2000';
+        process.env.DB_BACKGROUND_TIMEOUT = '90000';
+        resetGateway();
+
+        const budgets = getGatewayStats().laneBudgetMs;
+        expect(budgets.request).toBe(2000);
+        expect(budgets.background).toBe(90000);
+        // health has no override by design: admit() exempts it, so a health
+        // budget would bound only the query and never the queue.
+        expect(budgets.health).toBe(30000);
+    });
+
+    test('a garbage value is ignored rather than silently becoming zero', () => {
+        process.env.DB_QUERY_TIMEOUT = '30000';
+        process.env.DB_REQUEST_TIMEOUT = 'soon';
+        resetGateway();
+        expect(getGatewayStats().laneBudgetMs.request).toBe(30000);
+
+        process.env.DB_REQUEST_TIMEOUT = '0';
+        resetGateway();
+        expect(getGatewayStats().laneBudgetMs.request).toBe(30000);
+    });
+
+    test('the request-lane default actually rejects a queued caller', async () => {
+        // No timeoutMs anywhere — the whole point is that call sites do not pass
+        // one, so the lane default has to be what bounds the wait.
+        process.env.DB_REQUEST_TIMEOUT = '60';
+        resetGateway();
+        armGateway();
+
+        // The holders take an explicit budget: they must occupy the permits, not
+        // expire against the 60 ms lane default themselves.
+        const gate = gatedConn();
+        const held = [
+            dbExec('SELECT 1', [], { conn: gate.conn, timeoutMs: 5_000 }),
+            dbExec('SELECT 1', [], { conn: gate.conn, timeoutMs: 5_000 }),
+        ];
+        await Bun.sleep(20);
+
+        const err = await dbExec('SELECT 1', [], { conn: instantConn }).then(() => null, (e) => e);
+        expect(isAdmissionTimeout(err)).toBe(true);
+
+        gate.releaseAll();
+        await Promise.all(held);
+    });
+
+    test('a per-call timeoutMs still wins over the lane default', async () => {
+        process.env.DB_REQUEST_TIMEOUT = '60';
+        resetGateway();
+        armGateway();
+
+        const gate = gatedConn();
+        const held = [
+            dbExec('SELECT 1', [], { conn: gate.conn, timeoutMs: 5_000 }),
+            dbExec('SELECT 1', [], { conn: gate.conn, timeoutMs: 5_000 }),
+        ];
+        await Bun.sleep(20);
+
+        // Generous per-call budget: this caller must still be waiting when the
+        // 60 ms lane default would already have rejected it.
+        const queued = dbExec('SELECT 1', [], { conn: instantConn, timeoutMs: 5_000 })
+            .then(() => 'admitted', () => 'rejected');
+        await Bun.sleep(150);
+        gate.releaseAll();
+
+        expect(await queued).toBe('admitted');
+        await Promise.all(held);
+    });
+});
+
+/**
+ * The unarmed path — admission's silent failure mode.
+ *
+ * `armGateway()` is called only by App.start(), so anything using the framework
+ * database without booting an App gets no admission and no indication of it.
+ */
+describe('unarmed traffic is counted', () => {
+    test('queries before arming are counted and reported', async () => {
+        resetGateway();               // clears `armed`
+        expect(getGatewayStats().armed).toBe(false);
+        expect(getGatewayStats().unarmedCalls).toBe(0);
+
+        await dbExec('SELECT 1', [], { conn: instantConn });
+        await dbExec('SELECT 1', [], { conn: instantConn });
+
+        const stats = getGatewayStats();
+        expect(stats.armed).toBe(false);
+        expect(stats.unarmedCalls).toBe(2);
+    });
+
+    test('arming stops the counter from growing', async () => {
+        resetGateway();
+        await dbExec('SELECT 1', [], { conn: instantConn });
+        expect(getGatewayStats().unarmedCalls).toBe(1);
+
+        armGateway();
+        await dbExec('SELECT 1', [], { conn: instantConn });
+
+        const stats = getGatewayStats();
+        expect(stats.armed).toBe(true);
+        expect(stats.unarmedCalls).toBe(1);   // unchanged: the second call was admitted
+    });
+});
