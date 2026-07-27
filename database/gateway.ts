@@ -260,6 +260,29 @@ let configuredFor = -1;
 let armed = false;
 let warnedAboutLiveRebuild = false;
 
+/**
+ * UNARMED TRAFFIC — admission's silent failure mode.
+ *
+ * `admit()` is a passthrough until `armGateway()` runs, and the only caller is
+ * `core/App.ts` after migrations. Anything that uses the framework's database
+ * WITHOUT booting an App — a standalone script, a one-off job, a studio endpoint
+ * reached outside the app lifecycle — therefore gets no admission at all, with
+ * nothing in the logs to say so. A mitigation that is absent and silent is worse
+ * than one that is absent and loud: the metrics look calm precisely because
+ * nothing is being measured.
+ *
+ * Counted always, warned about only once the process has plainly stopped booting.
+ * The grace window is not measured from module load: migrations on a cold
+ * database can legitimately exceed a minute, and a warning that fires during a
+ * normal slow boot is one people learn to ignore. `armGateway()` therefore
+ * silences it permanently, so the warning can only ever describe a process that
+ * genuinely never armed.
+ */
+const UNARMED_WARN_AFTER_MS = 60_000;
+const gatewayLoadedAt = Date.now();
+let unarmedCalls = 0;
+let warnedUnarmed = false;
+
 function admissionEnabled(): boolean {
     return process.env.BUNSANE_DB_ADMISSION !== 'off';
 }
@@ -279,7 +302,10 @@ function admissionEnabled(): boolean {
 export function armGateway(): void {
     if (armed) return;
     armed = true;
-    logger.info({ enabled: admissionEnabled() }, 'DB admission armed');
+    // Suppresses the unarmed warning for good — see UNARMED_WARN_AFTER_MS. Boot
+    // traffic that ran before this point was exempt by design, not by accident.
+    warnedUnarmed = true;
+    logger.info({ enabled: admissionEnabled(), unarmedCallsDuringBoot: unarmedCalls }, 'DB admission armed');
 }
 
 export function isGatewayArmed(): boolean {
@@ -341,6 +367,11 @@ export function resetGateway(): void {
     configuredFor = -1;
     armed = false;
     warnedAboutLiveRebuild = false;
+    // Budgets are parsed once and cached on the hot path, so a test (or a runtime
+    // reconfigure) that changes DB_REQUEST_TIMEOUT sees it only after this.
+    laneBudgets = {};
+    unarmedCalls = 0;
+    warnedUnarmed = false;
     for (const lane of Object.keys(laneStats) as Lane[]) laneStats[lane] = newLaneStats();
 }
 
@@ -387,7 +418,23 @@ async function admit(
     // public API rather than through our own call tree.
     //
     // The rule is simply: whoever owns the connection already paid for it.
-    if (!armed || !admissionEnabled() || lane === 'health' || callerOwnsConnection || admittedScope.getStore()) {
+    // Split out from the exemptions below rather than folded into one condition:
+    // the others are deliberate policy, this one is usually a deployment that
+    // never armed and does not know it.
+    if (!armed) {
+        unarmedCalls++;
+        if (!warnedUnarmed && Date.now() - gatewayLoadedAt > UNARMED_WARN_AFTER_MS) {
+            warnedUnarmed = true;
+            logger.warn(
+                { unarmedCalls, lane, label },
+                'DB admission is NOT armed and this process is past boot — every query is running ' +
+                'unbounded. armGateway() is called by App.start(); a standalone script or job that ' +
+                'uses the framework database directly must call it itself.',
+            );
+        }
+        return noop;
+    }
+    if (!admissionEnabled() || lane === 'health' || callerOwnsConnection || admittedScope.getStore()) {
         return noop;
     }
 
@@ -429,9 +476,78 @@ async function admit(
     }
 }
 
-function resolveDeadline(opts: DbExecOptions): number {
+/**
+ * PER-LANE DEADLINES — the only knob that makes the seam SHED rather than queue.
+ *
+ * `timeoutMs` covers the wait for a permit AND the query. That single budget is
+ * therefore what decides whether an overloaded seam refuses work or merely makes
+ * the queue orderly, and the difference is not subtle. Measured on real PG 17,
+ * 20 concurrent 2 s statements against `admissionLimit = 3`:
+ *
+ *   budget 800 ms   17 of 20 REJECTED before touching the server; drain 2063 ms
+ *   budget 30 000 ms  0 of 20 rejected, all 20 executed;          drain 14056 ms
+ *                     callers queued 4.3 s on average, 12.0 s at worst
+ *
+ * The 30 s row is what shipped: no framework call site passes `timeoutMs`, so
+ * every lane inherited `DB_QUERY_TIMEOUT` (default 30 000). Admission bounded the
+ * queue and made it observable — the thing `DB_CONNECTION_TIMEOUT` provably does
+ * not do — but shed nothing, and capped concurrency below `poolMax` while doing
+ * it, so drain was WORSE than with admission off (10034 ms).
+ *
+ * One global value cannot serve both lanes: a request wants to fail in seconds,
+ * while backfill and reconcile legitimately run far longer on the same pool.
+ * Hence a default per lane.
+ *
+ * `health` deliberately has no override. `admit()` exempts the health lane
+ * outright, so a health budget would bound only the query and never the queue —
+ * a knob that looks like it controls admission and does not. It falls through to
+ * the global.
+ *
+ * NOT changed by default: both overrides are unset out of the box, so behaviour
+ * is identical to before. Shortening the request lane changes which requests
+ * fail under load, which is a deployment's call, not a patch release's.
+ * Request-facing deployments should set `DB_REQUEST_TIMEOUT` to a few seconds.
+ *
+ * Runtime env wins over the import-time `QUERY_TIMEOUT_MS`, for BOTH the
+ * per-lane keys and the global, so the two are never read off different clocks.
+ * The parse is cached because this sits on the hottest path in the framework;
+ * `resetGateway()` clears it.
+ */
+const LANE_BUDGET_ENV: Record<Lane, string | null> = {
+    request: 'DB_REQUEST_TIMEOUT',
+    background: 'DB_BACKGROUND_TIMEOUT',
+    health: null,
+};
+
+let laneBudgets: Partial<Record<Lane, number>> = {};
+
+function parseBudget(key: string, raw: string | undefined): number | null {
+    if (raw === undefined) return null;
+    const v = parseInt(raw, 10);
+    if (!Number.isFinite(v) || v <= 0) {
+        logger.warn({ [key]: raw }, `Ignoring ${key}: expected a positive integer in milliseconds`);
+        return null;
+    }
+    return v;
+}
+
+function laneBudgetMs(lane: Lane): number {
+    const cached = laneBudgets[lane];
+    if (cached !== undefined) return cached;
+
+    const key = LANE_BUDGET_ENV[lane];
+    const budget =
+        (key === null ? null : parseBudget(key, process.env[key]))
+        ?? parseBudget('DB_QUERY_TIMEOUT', process.env.DB_QUERY_TIMEOUT)
+        ?? QUERY_TIMEOUT_MS;
+
+    laneBudgets[lane] = budget;
+    return budget;
+}
+
+function resolveDeadline(opts: DbExecOptions, lane: Lane): number {
     if (opts.deadline !== undefined) return opts.deadline;
-    const budget = opts.timeoutMs ?? QUERY_TIMEOUT_MS;
+    const budget = opts.timeoutMs ?? laneBudgetMs(lane);
     return Date.now() + budget;
 }
 
@@ -527,7 +643,7 @@ export async function dbRun<T = any>(
     opts: DbExecOptions = {},
 ): Promise<T> {
     const lane = opts.lane ?? 'request';
-    const deadline = resolveDeadline(opts);
+    const deadline = resolveDeadline(opts, lane);
 
     // Opt-in server-side enforcement. A lone statement has no transaction to
     // hang `SET LOCAL` on, so one is opened for it — hence the +0.95 ms and
@@ -610,7 +726,7 @@ export async function dbTransaction<T>(
 ): Promise<T> {
     const lane = opts.lane ?? 'request';
     const startedAt = Date.now();
-    const deadline = resolveDeadline(opts);
+    const deadline = resolveDeadline(opts, lane);
     // Same exemption as `dbExec`: opening a SAVEPOINT on a handle the caller
     // already holds consumes no new pooled connection, so it must not queue for
     // a permit behind work that does.
@@ -686,6 +802,18 @@ export function getGatewayStats() {
         enabled: admissionEnabled(),
         /** False until `armGateway()` runs (boot DDL is deliberately unbounded). */
         armed,
+        /**
+         * Queries that bypassed admission because nothing had armed the gateway.
+         * Nonzero-and-still-`armed: false` long after start means this process
+         * never armed and is running its database traffic unbounded.
+         */
+        unarmedCalls,
+        /** Effective per-lane default budget in ms (`DB_REQUEST_TIMEOUT` etc.). */
+        laneBudgetMs: {
+            request: laneBudgetMs('request'),
+            background: laneBudgetMs('background'),
+            health: laneBudgetMs('health'),
+        },
         admissionLimit: total.capacity,
         admissionAvailable: total.available,
         backgroundLimit: background.capacity,
