@@ -42,6 +42,28 @@ All notable changes to bunsane are documented here.
   statement timeout` — otherwise the new bound would be less legible than the
   client-side one it replaces.
 
+- **The boot probe measures cancel effectiveness instead of inferring it.**
+  Whether a timeout reclaims its connection was previously deduced from pooling
+  mode, which was wrong twice over: cancellation is a property of the driver,
+  and pooling mode does not predict it. `probeConnection()` now runs a ~150 ms
+  `pg_sleep`, aborts it through the framework's own `runWithSignal` path — so
+  `BUNSANE_ABORT_MODE=off` is reported honestly — and watches the *statement*,
+  not the caller, to see when it really ended.
+
+  Reports at **error** when an ineffective cancel coincides with no server-side
+  `statement_timeout`. That conjunction is the outage precondition: nothing can
+  stop a slow query, so the pool is lost one slot at a time while the database
+  sits idle. Either condition alone is a warning.
+
+  `cancelEffective` is `boolean | null`, and `null` means unproven — a skipped or
+  failed probe must never read as "fine". A live `statement_timeout` killing the
+  probe's own statement is detected by message text rather than credited as a
+  working cancel (both are SQLSTATE 57014), and the probe declines to run under a
+  bound too tight to fit beneath. Knobs: `BUNSANE_PROBE_CANCEL=off`,
+  `BUNSANE_PROBE_CANCEL_SLEEP_MS`. Exported as `probeCancelEffectiveness()` so
+  `runDoctor()` can re-run it with a longer, more conclusive sleep than boot
+  should pay for.
+
 - `entity.save()` / `entity.delete()`: the client-side timer now fires
   `SAVE_CLIENT_BACKSTOP_MS` (2 s) **after** the deadline it hands the gateway,
   instead of at the same instant. Both derived from `QUERY_TIMEOUT_MS`, so which

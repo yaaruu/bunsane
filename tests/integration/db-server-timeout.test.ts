@@ -17,7 +17,9 @@
  * is skipped there (same precedent as `DB_STATEMENT_TIMEOUT`).
  */
 import { describe, test, expect } from 'bun:test';
+import db from '../../database';
 import { dbExec, dbTransaction, DbStatementTimeoutError } from '../../database/gateway';
+import { probeCancelEffectiveness } from '../../database/connectionProbe';
 const isPGlite = process.env.USE_PGLITE === 'true';
 
 /**
@@ -97,6 +99,41 @@ describe.skipIf(isPGlite)('server-side statement timeout', () => {
 
         expect(err).toBeInstanceOf(DbStatementTimeoutError);
         expect(err.label).toBe('spent');
+    });
+
+    test('the boot probe reproduces the known cancel behaviour on this driver', async () => {
+        // TRIPWIRE. `query.cancel()` sends no CancelRequest on Bun
+        // 1.4.0-canary.1, so this must report ineffective. If it ever fails,
+        // the driver changed — and `runWithSignal`, docs/POOLING.md B8a and the
+        // whole justification for the server-side bound need rereading, not
+        // this assertion relaxing.
+        const conn = await (db as any).reserve();
+        try {
+            const r = await probeCancelEffectiveness(conn, null, 250);
+            expect(r.outcome).toBe('ran-to-completion');
+            expect(r.effective).toBe(false);
+        } finally {
+            conn.release?.();
+        }
+    });
+
+    test('a live statement_timeout is not mistaken for a working cancel', async () => {
+        // The probe's own sleep gets killed by the SERVER here, early and with
+        // SQLSTATE 57014 — indistinguishable from a successful cancel on timing
+        // alone. Passing `null` as the server bound simulates a probe that does
+        // not know about the role-level setting, which is precisely when the
+        // message-text check has to carry it.
+        const conn = await (db as any).reserve();
+        try {
+            await conn.unsafe(`SET statement_timeout = '60ms'`);
+            const r = await probeCancelEffectiveness(conn, null, 300);
+
+            expect(r.effective).not.toBe(true);
+            expect(r.outcome).toBe('preempted-by-statement-timeout');
+        } finally {
+            await conn.unsafe(`SET statement_timeout = 0`).catch(() => {});
+            conn.release?.();
+        }
     });
 
     test('BUNSANE_DB_SERVER_TIMEOUT=off restores the old, client-only behaviour', async () => {

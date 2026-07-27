@@ -68,6 +68,23 @@ The framework no longer assumes any of this. On startup, `probeConnection()`
 - **`statement_timeout`** — `SHOW statement_timeout` read back and compared with
   `DB_STATEMENT_TIMEOUT`. A mismatch logs at **error** with the `ALTER ROLE`
   remedy, because the documented mitigation is silently inert.
+- **Cancel effectiveness** — does aborting a statement actually stop it? A
+  ~150 ms `pg_sleep` is aborted a quarter of the way in, through the framework's
+  own `runWithSignal` path (so `BUNSANE_ABORT_MODE=off` reports honestly), and
+  the *statement* is watched to see when it really ended. `runWithSignal`
+  releases the caller immediately by design, so caller latency proves nothing —
+  only the statement's own settle time does.
+
+  Two traps this avoids, both of which would certify the broken property as
+  working: a role-level `statement_timeout` killing the probe's own sleep looks
+  identical to a successful cancel on timing (both are SQLSTATE 57014, so the
+  message text decides, and the probe sizes its sleep under the server bound or
+  declines to run); and a skipped or failed probe reports **`null` — unproven**,
+  never "fine".
+
+  An ineffective cancel **combined with** no server-side `statement_timeout`
+  logs at **error**: that pair means nothing in the deployment can stop a slow
+  query, which is the outage precondition exactly. Either alone is a warning.
 
 The probe never throws; it never blocks boot. The `advisory` lock backend runs
 its own stricter probe (`set_config` then read back on a separate statement) and
