@@ -52,6 +52,14 @@ interface StudioArcheTypeResponse {
     total: number;
     limit: number;
     offset: number;
+    /**
+     * True when the request ran out of its time budget while gathering records,
+     * so `entities` is a SHORT page rather than a complete one. Present because
+     * a short page is otherwise indistinguishable from the end of the data —
+     * the client would stop paging and quietly show partial results as if they
+     * were all of them.
+     */
+    partial?: boolean;
 }
 
 interface DeleteTableRowsRequest {

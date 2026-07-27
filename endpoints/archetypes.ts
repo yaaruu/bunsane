@@ -1,6 +1,6 @@
 import { getSerializedMetadataStorage } from "../core/metadata";
 import { findIndicatorComponentName } from "../utils/archetypeIndicator";
-import { studioDeadline, studioExec, studioErrorResponse } from "./db";
+import { studioDeadline, studioExec, studioErrorResponse, STUDIO_DB_TIMEOUT_MS } from "./db";
 import { dbExec, dbTransaction } from "../database/gateway";
 import { logger as MainLogger } from "../core/Logger";
 import { ProjectionManager, rmTableName, assertRmTableName } from "../database/projection";
@@ -14,6 +14,21 @@ import type {
 } from "./types";
 
 const logger = MainLogger.child({ scope: "archetypes-endpoint" });
+
+/**
+ * Budget held back from the record-gathering loop for the trailing COUNT.
+ *
+ * Both share one request deadline, so without a reserve the loop would consume
+ * it entirely and the COUNT — the last statement, after all the real work — is
+ * what would throw.
+ *
+ * Proportional, not a flat 2 s: a flat reserve larger than the whole budget
+ * would make the loop's first guard fire immediately, so a deployment that set
+ * `BUNSANE_STUDIO_DB_TIMEOUT` below the reserve would get an endpoint that
+ * gathers nothing and then fails on the COUNT anyway. Capping at a quarter of
+ * the budget keeps the reserve meaningful at any configured value.
+ */
+const COUNT_RESERVE_MS = Math.min(2_000, Math.floor(STUDIO_DB_TIMEOUT_MS / 4));
 
 export async function handleStudioArcheTypeRecordsRequest(
     archeTypeName: string,
@@ -86,8 +101,24 @@ export async function handleStudioArcheTypeRecordsRequest(
         let currentOffset = offset;
         const validEntities: ArcheTypeEntityRecord[] = [];
         let hasMoreData = true;
+        let budgetExhausted = false;
 
+        // Stop looping while there is still budget for the trailing COUNT.
+        //
+        // Running the loop to the deadline would make the shared budget DESTROY
+        // completed work: `dbExec` throws once nothing remains, so a handler
+        // holding 40 of 50 assembled records would answer 503 with none of them.
+        // A short page is the better failure for a list view — the operator sees
+        // real data and can page again — so exhausting the budget ends the loop
+        // and returns what was gathered. The reserve exists because the COUNT
+        // below shares this deadline and would otherwise be the statement that
+        // throws instead.
         while (validEntities.length < limit && hasMoreData) {
+            if (Date.now() >= deadline - COUNT_RESERVE_MS) {
+                budgetExhausted = true;
+                break;
+            }
+
             if (searchTerm) {
                 const searchPattern = `%${searchTerm}%`;
                 const componentNamePlaceholders = requiredComponentNames
@@ -291,6 +322,14 @@ export async function handleStudioArcheTypeRecordsRequest(
 
         const total = Number(totalResult[0]?.count ?? 0);
 
+        if (budgetExhausted) {
+            logger.warn(
+                `ArcheType '${archeTypeName}' record fetch ran out of its ${STUDIO_DB_TIMEOUT_MS}ms budget ` +
+                `after ${validEntities.length}/${limit} records (offset ${offset}) — returning a short page. ` +
+                `Raise BUNSANE_STUDIO_DB_TIMEOUT or narrow the query.`,
+            );
+        }
+
         const responseData: StudioArcheTypeResponse = {
             name: archeTypeName,
             fields: archeTypeFields,
@@ -299,6 +338,7 @@ export async function handleStudioArcheTypeRecordsRequest(
             total,
             limit,
             offset,
+            ...(budgetExhausted ? { partial: true } : {}),
         };
 
         return new Response(JSON.stringify(responseData), {
