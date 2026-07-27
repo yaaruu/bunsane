@@ -15,7 +15,10 @@ All notable changes to bunsane are documented here.
   mechanism, and this is the fix for the transaction half of it.
 
   Measured cost on real PG 17, 200 interleaved samples: **+0.40 ms on a 3.0 ms
-  entity save (13%)** — one extra round trip, paid once per transaction. (An
+  entity save (13%)** — one extra round trip, paid once per transaction. That
+  was a local Docker Postgres: the round trip is the portable unit, the
+  percentage is not — it scales with your RTT and with how many statements your
+  save already issues. (An
   earlier micro-benchmark on a bare `BEGIN`/`SELECT 1`/`COMMIT` suggested
   +0.12 ms; a real save pays the full round trip, and the end-to-end number is
   the one that counts. Issuing the `SET LOCAL` unawaited so the driver might
@@ -38,6 +41,16 @@ All notable changes to bunsane are documented here.
   label and budget attached, rather than the bare `canceling statement due to
   statement timeout` — otherwise the new bound would be less legible than the
   client-side one it replaces.
+
+- `entity.save()` / `entity.delete()`: the client-side timer now fires
+  `SAVE_CLIENT_BACKSTOP_MS` (2 s) **after** the deadline it hands the gateway,
+  instead of at the same instant. Both derived from `QUERY_TIMEOUT_MS`, so which
+  one fired was a race — and they raise different types, making a caller that
+  matches on `DbStatementTimeoutError` catch it only sometimes. They are not
+  peers: the server bound stops the work and releases the slot, the client timer
+  only stops waiting. The server bound is now the primary; the client timer
+  remains the backstop for PGlite, `BUNSANE_DB_SERVER_TIMEOUT=off`,
+  caller-supplied transactions, and time spent between statements.
 
 ### Corrected
 

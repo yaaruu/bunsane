@@ -145,6 +145,11 @@ export interface DbExecOptions {
      * Worth opting in for known-heavy work where ~1 ms is invisible next to a
      * multi-second query: studio endpoints, backfill, reconcile. NOT for DDL —
      * `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block.
+     *
+     * The transaction is REQUIRED, not incidental: `SET LOCAL` outside one is a
+     * no-op that Postgres merely warns about. A refactor that drops the wrapper
+     * from the opt-in path below removes the bound silently — nothing fails,
+     * the statement is just unguarded again.
      */
     serverTimeout?: boolean;
 }

@@ -18,8 +18,19 @@
  */
 import { describe, test, expect } from 'bun:test';
 import { dbExec, dbTransaction, DbStatementTimeoutError } from '../../database/gateway';
-
 const isPGlite = process.env.USE_PGLITE === 'true';
+
+/**
+ * NOT covered here: `entity.save()` blowing its own budget.
+ *
+ * `saveEntity`'s client backstop now fires `SAVE_CLIENT_BACKSTOP_MS` after the
+ * deadline it hands the gateway, so the server's `DbStatementTimeoutError` wins
+ * the race instead of a plain `Error` — but forcing a save to exceed its budget
+ * needs `QUERY_TIMEOUT_MS` small at import, and that budget applies to the
+ * harness too: `DB_QUERY_TIMEOUT=15` was not tight enough (a save takes ~3 ms)
+ * and `=3` failed the file during boot. The error-type property is covered by
+ * the transaction tests below, which take the same path.
+ */
 
 describe.skipIf(isPGlite)('server-side statement timeout', () => {
     test('dbTransaction kills a statement that outlives its budget', async () => {

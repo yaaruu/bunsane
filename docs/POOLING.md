@@ -182,8 +182,10 @@ its own deadline, on every transaction it opens. Every write path — `entity.sa
 `entity.delete`, studio bulk deletes — therefore carries a real server-side bound.
 
 Cost, measured end to end rather than projected: **+0.40 ms on a 3.0 ms entity
-save (13%)**, 200 interleaved samples on real PG 17. That is one extra round
-trip, and it is the floor — issuing the `SET LOCAL` unawaited so the driver might
+save (13%)**, 200 interleaved samples on real PG 17 — **a local Docker Postgres,
+so read it as one extra round trip, not as a portable percentage**. The absolute
+cost scales with your RTT; the percentage also depends on how many statements
+your save already issues. It is the floor — issuing the `SET LOCAL` unawaited so the driver might
 pipeline it with the transaction body was tried and changed nothing (0.397 ms vs
 0.400 ms), because Bun serializes a connection's queue. The +0.12 ms quoted above
 is the micro-benchmark figure for a bare `BEGIN`/`SELECT 1`/`COMMIT`; a real save

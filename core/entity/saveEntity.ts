@@ -17,6 +17,23 @@ import { handleCacheAfterSave, runPostDeleteSideEffects } from "./cacheStrategie
 import { ProjectionManager } from "../../database/projection";
 import type { Entity } from "../Entity";
 
+/**
+ * How long the client-side timer waits BEYOND the deadline it hands the gateway.
+ *
+ * The two used to fire at the same instant, which made the resulting error a
+ * coin flip: the server bound raises `DbStatementTimeoutError` (carrying lane,
+ * label and budget), the client timer raises a plain `Error`, and a caller
+ * matching on the type would catch it only sometimes.
+ *
+ * They are not peers. `SET LOCAL statement_timeout` actually stops the work and
+ * releases the pool slot; the client timer only stops *waiting* — an aborted
+ * statement keeps running (docs/POOLING.md B8a). So the server bound is the
+ * primary and gets to win, and this timer is the backstop for the cases it
+ * cannot cover: PGlite, `BUNSANE_DB_SERVER_TIMEOUT=off`, a caller-supplied
+ * transaction, or work between statements that no statement timeout can see.
+ */
+export const SAVE_CLIENT_BACKSTOP_MS = 2_000;
+
 export async function saveEntity(entity: Entity, trx?: SQL, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<boolean> {
     // Capture pre-save state BEFORE doSave mutates persisted/dirty flags.
     const wasNew = !entity._persisted;
@@ -53,7 +70,7 @@ export async function saveEntity(entity: Entity, trx?: SQL, context?: { loaders?
         const err = new Error(`Entity save timeout for entity ${entity.id} after ${timeoutMs}ms`);
         logger.error({ scope: 'Entity.save', entityId: entity.id, timeoutMs }, err.message);
         controller.abort(err);
-    }, timeoutMs);
+    }, timeoutMs + SAVE_CLIENT_BACKSTOP_MS);
 
     try {
         const dbStart = profile ? performance.now() : 0;
@@ -344,8 +361,9 @@ export async function doDelete(entity: Entity, force: boolean = false): Promise<
     const timeoutHandle = setTimeout(() => {
         const err = new Error(`Entity delete timeout for entity ${entity.id} after ${timeoutMs}ms`);
         logger.error({ scope: 'Entity.doDelete', entityId: entity.id, timeoutMs }, err.message);
+        // Backstop, same as save: let the server bound produce the legible error.
         controller.abort(err);
-    }, timeoutMs);
+    }, timeoutMs + SAVE_CLIENT_BACKSTOP_MS);
 
     const signal = controller.signal;
     const run = <T>(q: any): Promise<T> => runWithSignal<T>(q, signal);
