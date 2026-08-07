@@ -90,4 +90,49 @@ describe('relationsByComponentFk loader', () => {
         expect(ra.map(e => e.id)).toEqual([aChild.id]);
         expect(rb.map(e => e.id)).toEqual([bChild.id]);
     });
+
+    /**
+     * RP-05 regression gate: list N parents + load HasMany FK relations in one
+     * tick must not issue one SQL per parent (classic N+1).
+     */
+    test('RP-05: N parents same-tick → O(1) dbQueryCount not O(N)', async () => {
+        const N = 12;
+        const parents: string[] = [];
+        for (let i = 0; i < N; i++) {
+            const p = ctx.tracker.create();
+            p.add(TestProduct, { sku: `n${i}`, name: `P${i}`, price: 1, inStock: true });
+            await p.save();
+            parents.push(p.id);
+            const c = ctx.tracker.create();
+            c.add(TestOrder, {
+                orderNumber: p.id,
+                total: i,
+                status: 'open',
+                createdAt: new Date(),
+            });
+            await c.save();
+        }
+
+        const perRequest = {
+            dbQueryCount: 0,
+            dataLoaderCalls: { entity: 0, component: 0, relation: 0 },
+        };
+        const loaders = createRequestLoaders(db, undefined, undefined, perRequest);
+
+        const results = await Promise.all(
+            parents.map((id) =>
+                loaders.relationsByComponentFk.load({
+                    entityId: id,
+                    componentTypeId: orderTypeId,
+                    foreignKeyField: 'orderNumber',
+                })
+            )
+        );
+
+        expect(results.every((r) => r.length === 1)).toBe(true);
+        // One (or few) batched SELECTs — never one per parent.
+        expect(perRequest.dbQueryCount).toBeLessThan(N);
+        expect(perRequest.dbQueryCount).toBeGreaterThan(0);
+        expect(perRequest.dataLoaderCalls.relation).toBe(1);
+    });
 });

@@ -273,30 +273,12 @@ describe('P0 Ceiling Proof', () => {
         // =======================================================================
         // BEFORE: legacy ECS query path
         //
-        // Using .cursor(entityId) — plain entity-id cursor — to force the
-        // CTE + INTERSECT path, which then uses a correlated scalar-subquery
-        // ORDER BY (cost centres A, B, C combined).  Without the cursor the
-        // sort-driven scan would apply, which is already better; the cursor
-        // is the knob that reliably engages the true worst-case DAG.
+        // Force the expensive DAG without plain cursor+sortBy (now rejected,
+        // RP-06b). Multi-key sort disables sort-driven scan and falls through
+        // to correlated scalar-subquery ORDER BY (cost centres A/B/C).
         //
-        // SQL shape emitted:
-        //   WITH base_entities AS (
-        //     SELECT entity_id FROM (
-        //       (SELECT ec.entity_id FROM components ec WHERE type_id=$1 AND deleted_at IS NULL AND entity_id > $cursor)
-        //       INTERSECT
-        //       (SELECT ec.entity_id FROM components ec WHERE type_id=$2 AND deleted_at IS NULL AND entity_id > $cursor)
-        //     ) AS intersected
-        //     ORDER BY entity_id ASC
-        //   )
-        //   SELECT base_entities.id FROM (
-        //     SELECT DISTINCT base_entities.entity_id AS id FROM base_entities
-        //     WHERE (EXISTS (... type_id=$1 AND status=$3 ...))
-        //       AND (EXISTS (... type_id=$1 AND total::numeric > $4::numeric ...))
-        //       AND (EXISTS (... type_id=$2 AND tier=$5 ...))
-        //   ) AS base_entities
-        //   ORDER BY (SELECT (sort_c.data->>'total')::numeric FROM components_p0order sort_c
-        //             WHERE sort_c.entity_id = base_entities.id ...) DESC NULLS LAST,
-        //            base_entities.id ASC
+        // SQL shape (sketch): CTE/INTERSECT membership + scalar-subquery ORDER BY
+        //   ORDER BY (SELECT (sort_c.data->>'total')::numeric …) DESC, …
         //   LIMIT 21
         // =======================================================================
 
@@ -312,7 +294,7 @@ describe('P0 Ceiling Proof', () => {
                     filters: [Query.filter('tier', FilterOp.EQ, 'gold')],
                 })
                 .sortBy(P0Order, 'total', 'DESC')
-                .cursor(cursorEntityId) // forces CTE+INTERSECT + scalar-subquery ORDER BY
+                .sortBy(P0Order, 'status', 'ASC') // multi-key → scalar-subquery ORDER BY
                 .take(21)
                 .exec();
 
@@ -330,7 +312,7 @@ describe('P0 Ceiling Proof', () => {
                 filters: [Query.filter('tier', FilterOp.EQ, 'gold')],
             })
             .sortBy(P0Order, 'total', 'DESC')
-            .cursor(cursorEntityId)
+            .sortBy(P0Order, 'status', 'ASC')
             .take(21)
             .explainAnalyze(true);
 

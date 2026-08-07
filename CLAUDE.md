@@ -107,9 +107,16 @@ class UserService extends BaseService {
 
 ### Configuration
 
-- All environment variables are documented in `docs/CONFIGURATION.md` (DB, cache, GraphQL, health, S3, logging).
+- All environment variables are documented in `docs/CONFIGURATION.md` (DB, cache, GraphQL, health, S3, logging, QSP).
 - `core/validateEnv.ts` validates a subset on startup.
 - `/health` runs a real DB **write** probe (not just `SELECT 1`) so a wedged write path fails liveness → container restart. Point liveness probes at `/health`.
+
+### List-read performance & QSP
+
+- App authors: `docs/QUERY_LIST_GUIDE.md` (pagination, N+1, tags, when QSP applies).
+- Engine analysis: `docs/READ_PATH_PERFORMANCE.md` (RP-01…08 status, EXPLAIN protocol).
+- QSP ops: `docs/QSP_OPERATIONS.md` (coverage rules, empty tags, multi-archetype limits, reconcile).
+- Tickets: `docs/TICKETS_READ_PATH_PERF_2026-08.md`.
 
 ### Caching
 

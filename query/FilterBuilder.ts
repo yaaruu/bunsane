@@ -8,6 +8,11 @@
 
 import type { QueryFilter } from "./QueryContext";
 import type { QueryContext } from "./QueryContext";
+import { FilterBuilderRegistry } from "./FilterBuilderRegistry";
+import {
+    numericJsonCompareSql,
+    numericJsonTextValidPredicate,
+} from "../database/numericJsonField";
 
 /**
  * Result returned by a custom filter builder function
@@ -107,6 +112,85 @@ export function jsonbInListCast(values: any[]): { lhs: (path: string) => string;
     const allBooleans = values.length > 0 && values.every(v => typeof v === 'boolean');
     if (allBooleans) return { lhs: (p) => `(${p})::boolean`, param: '::boolean' };
     return { lhs: (p) => p, param: '' };
+}
+
+/**
+ * Build a single field predicate against `<alias>.data` for default operators
+ * and registered custom FilterBuilder operators. Shared by INTERSECT/CTE
+ * membership pushdown, EXISTS coalescing, and sort-driven scan so all paths
+ * emit the same SQL shape.
+ */
+export function buildComponentFilterCondition(
+    filter: QueryFilter,
+    alias: string,
+    context: QueryContext
+): string {
+    if (FilterBuilderRegistry.has(filter.operator)) {
+        const options = FilterBuilderRegistry.getOptions(filter.operator);
+        if (options?.validate && !options.validate(filter)) {
+            throw new Error(
+                `Invalid filter value for operator '${filter.operator}': ${JSON.stringify(filter.value)}`
+            );
+        }
+        return FilterBuilderRegistry.get(filter.operator)!(filter, alias, context).sql;
+    }
+
+    const jsonPath = buildJSONPath(filter.field, alias);
+    const valueStr = String(filter.value);
+    const isUUID =
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(valueStr);
+
+    if (isUUID && filter.operator === '=') {
+        return `${jsonPath} = $${context.addParam(filter.value)}`;
+    }
+    if (filter.operator === 'LIKE' || filter.operator === 'NOT LIKE' || filter.operator === 'ILIKE') {
+        return `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
+    }
+    if (filter.operator === 'IN' || filter.operator === 'NOT IN') {
+        if (Array.isArray(filter.value) && filter.value.length > 0) {
+            const cast = jsonbInListCast(filter.value);
+            const placeholders = filter.value
+                .map((v: any) => `$${context.addParam(v)}${cast.param}`)
+                .join(', ');
+            const listPred = `${cast.lhs(jsonPath)} ${filter.operator} (${placeholders})`;
+            // Numeric IN lists need the partial-index validity predicate too.
+            if (cast.param === '::numeric') {
+                return `${numericJsonTextValidPredicate(jsonPath)} AND ${listPred}`;
+            }
+            return listPred;
+        }
+        if (Array.isArray(filter.value) && filter.value.length === 0) {
+            return filter.operator === 'IN' ? 'FALSE' : 'TRUE';
+        }
+        throw new Error(`${filter.operator} operator requires an array of values`);
+    }
+    if (typeof filter.value === 'number') {
+        // Restate partial numeric index predicate (RP-04 / BUG-1).
+        return numericJsonCompareSql(
+            jsonPath,
+            filter.operator,
+            `$${context.addParam(filter.value)}::numeric`
+        );
+    }
+    if (typeof filter.value === 'boolean') {
+        return `(${jsonPath})::boolean ${filter.operator} $${context.addParam(filter.value)}`;
+    }
+    return `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
+}
+
+/**
+ * AND-join every filter for one component into predicates on `alias`.
+ * Returns null when there are no filters (caller keeps membership-only branch).
+ */
+export function buildComponentFilterGroup(
+    filters: QueryFilter[],
+    alias: string,
+    context: QueryContext
+): string | null {
+    if (!filters.length) return null;
+    return filters
+        .map((f) => buildComponentFilterCondition(f, alias, context))
+        .join(' AND ');
 }
 
 /**

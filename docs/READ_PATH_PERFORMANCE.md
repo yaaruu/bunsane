@@ -1,9 +1,10 @@
 # Read-Path Performance: Filtered + Sorted + Paginated List Queries
 
-**Status:** Analysis + measurement guide + incremental roadmap
-**Date:** 2026-07-08
-**Scope:** The query READ path only (`Query` builder → SQL). Writes (`Entity.save`) are out of scope and are not the bottleneck.
-**Audience:** framework maintainers optimizing the ECS-on-Postgres query engine.
+**Status:** Canonical analysis + measurement guide + shipped roadmap (0.6.x)
+**Date:** 2026-08-07 (updated for Wave A/B engine work + product guidance)
+**Scope:** The query READ path only (`Query` builder → SQL → hydrate). Writes (`Entity.save`) are out of scope except QSP dual-write.
+**Audience:** framework maintainers **and** app authors building list/admin endpoints.
+**Related:** `docs/QSP_OPERATIONS.md`, `docs/QUERY_LIST_GUIDE.md`, `docs/TICKETS_READ_PATH_PERF_2026-08.md`, `docs/CONFIGURATION.md`
 
 ---
 
@@ -13,13 +14,26 @@ Writes are fast. The pain is the **filtered + sorted + paginated list read** —
 
 Root cause is structural: a logical record's fields are scattered across **multiple JSONB component rows** (one partition row per component type). A predicate that a relational schema serves with **one composite-index range scan** becomes, in the ECS model, **N index probes + a set INTERSECT + a join**. Postgres cannot build a single covering index over fields that live in different physical rows.
 
-On top of the structural cost sit issues that are **fixable now**:
+### Shipped engine fixes (2026-08, see tickets RP-01…07)
 
-- **BUG-1 (numeric index):** the numeric functional index is created as a *partial* index whose predicate the emitted query never restates, so numeric filters likely fall back to sequential scans.
-- **BUG-2 (per-filter EXISTS):** multiple filters on the *same* component emit one `EXISTS` subquery each — N re-scans of that partition instead of one grouped predicate.
-- **Exact `count()`** for "total pages" runs a second full-cardinality query on every list request — frequently the single most expensive operation on the endpoint.
+| Item | Status | What changed |
+|------|--------|--------------|
+| **BUG-1** numeric partial index unused | **Fixed (RP-04)** | Filters/sorts restate `IS NOT NULL` + numeric regex via `database/numericJsonField.ts` so `idx_*_numeric` is planner-eligible |
+| **BUG-2** N EXISTS per same-component filter | **Fixed (RP-03)** | One predicate group per component; INTERSECT/CTE membership pushdown; sort-driven EXISTS dedupe |
+| Legacy **hasNextPage** without second `count()` | **Shipped (RP-01)** | Explicit `.take(N)` → SQL `LIMIT N+1`, trim, `getLastRouteInfo().hasNextPage` |
+| Plain **cursor(id) + sortBy** footgun | **Throws (RP-06b)** | Use `sortedCursor(token)` for sorted lists |
+| CTE wasted inner `ORDER BY` | **Fixed (RP-07)** | CTE orders only when it owns final order |
+| Relation list N+1 gate | **Shipped (RP-05)** | `RelationsByComponentFkLoader` regression: `dbQueryCount` must not scale with N |
+| QSP (~80× on covered lists, real PG17) | **Engine ready; ops (RP-02)** | Default `BUNSANE_QSP=off`; staged `shadow` → `route` — see `QSP_OPERATIONS.md` |
 
-The roadmap in §6 evolves the working system (Gall's Law); it does not propose a rewrite.
+### Still expensive / not fixed by engine SQL alone
+
+- **Exact `.count()`** for total pages — still a full second scan when the app calls it. Prefer `hasNextPage` (RP-01) or `BUNSANE_QSP_COUNT=n_plus_1` / `estimate` on QSP.
+- **Deep OFFSET** — use `sortedCursor` for component-sorted lists.
+- **GraphQL / service N+1** — `entity.get` and nested `new Query()` per list row. Fix with `eagerLoadComponents` / `populate` / request DataLoaders, not INTERSECT tuning. Diagnose with per-request `dbQueryCount`.
+- **QSP coverage limits** — exact projected component-set match to **one** archetype; empty **tag** components and multi-archetype / `.without` queries stay on legacy (see §11 and `QSP_OPERATIONS.md`).
+
+Practical app patterns: **`docs/QUERY_LIST_GUIDE.md`**.
 
 ---
 
@@ -30,37 +44,39 @@ Data model:
 - `entities(id uuid pk, created_at timestamptz, updated_at timestamptz, deleted_at)` — real indexed columns.
 - `components(id, entity_id, type_id text, data jsonb, created_at, updated_at, deleted_at)` — LIST-partitioned by `type_id`. One row per (entity, component-type). Component fields live inside `data`. This is the single membership source.
 
-`.with(A).with(B)` → **INTERSECT** of per-type membership selects; each `.filter()` bolted on as a separate `EXISTS` (or `CROSS JOIN LATERAL`) subquery:
+`.with(A).with(B)` → **INTERSECT** of per-type membership selects. **After RP-03**, each component’s field filters are **pushed into that component’s membership branch** (and same-component filters are a single AND group — not one `EXISTS` per filter). Outer filter `EXISTS` is skipped when membership already applied the group (`filtersAppliedInMembership`).
 
 ```sql
--- .with(Order,{status='open', total>100}).with(Customer,{tier='gold'})
-SELECT entity_id FROM components WHERE type_id=$order      -- broad membership
+-- .with(Order,{status='open', total>100}).with(Customer,{tier='gold'})  -- post RP-03 shape
+SELECT entity_id FROM components_order   -- or parent + type_id when not direct partition
+  WHERE deleted_at IS NULL
+    AND data->>'status' = $1
+    AND data->>'total' IS NOT NULL
+    AND data->>'total' ~ '^-?[0-9]…'     -- restates partial numeric index (RP-04)
+    AND (data->>'total')::numeric > $2
 INTERSECT
-SELECT entity_id FROM components WHERE type_id=$customer   -- broad membership
--- then on the intersected id-set:
-WHERE EXISTS (SELECT 1 FROM components c WHERE c.entity_id=base.id
-              AND c.type_id=$order AND c.data->>'status'=$1)                 -- filter 1
-  AND EXISTS (... c.type_id=$order AND (c.data->>'total')::numeric > $2)     -- filter 2 (SAME comp → 2nd EXISTS)
-  AND EXISTS (... c.type_id=$customer AND c.data->>'tier'=$3)                -- filter 3
+SELECT entity_id FROM components_customer
+  WHERE deleted_at IS NULL
+    AND data->>'tier' = $3
 ```
 
-The base set is **membership-broad** (all orders ∩ all customers), then narrowed by field filters afterward — backwards for selectivity.
+**Historical (pre-RP-03):** membership was type-only, then N outer `EXISTS` — one per filter, including two for the same Order component. That shape is gone on the legacy INTERSECT/CTE path.
 
 **Index reality:** `@CompData({ indexed: true })` routes by field type (`database/IndexingStrategy.ts:pickScalarIndexType`):
 
 | Field | Index emitted | Serves |
 |---|---|---|
 | text | btree-expr `(data->>'f')` | `=`, `<`, `LIKE 'prefix%'`, `ORDER BY` |
-| Number | partial numeric `((data->>'f')::numeric) WHERE data->>'f' ~ '^-?[0-9]…'` | range/`=` **(see BUG-1)** |
+| Number | partial numeric `((data->>'f')::numeric) WHERE data->>'f' ~ '^-?[0-9]…'` | range/`=` **when query restates predicate (RP-04)** |
 | array/object | GIN `(data->'f') jsonb_path_ops` | `@>`, `<@` containment only |
 
 A **single** field predicate can use an index. A **GIN on whole `data` cannot serve `->>` scalar filters** — only `@>`. **No composite/covering index across fields is ever auto-created.**
 
 Path selection (`query/QueryDAG.ts:buildBasicQuery`, `query/ComponentInclusionNode.ts`):
 
-- **Sort-driven scan** (`canUseSortDrivenScan`): exactly 1 sort key, ≥2 required components, no `findById`, no cursor, no OR. Drives FROM the sort component's table, probes others via `EXISTS`, walks the sort-expression index, stops at `LIMIT`. **This is the fast path.** It *does* support filters on other components and OFFSET.
+- **Sort-driven scan** (`canUseSortDrivenScan`): exactly 1 sort key, ≥2 required components, no `findById`, no plain `cursor(id)` (`cursorId`), no OR. Drives FROM the sort component's table, probes others via `EXISTS`, walks the sort-expression index, stops at `LIMIT`. **This is the fast path.** It *does* support filters on other components, OFFSET, and **`sortedCursor()`** (composite keyset — `sortedCursor` nulls `cursorId` and injects the keyset into the fast scan). Plain `.cursor(id)` disables this path.
 - **Single-pass filter+sort** (`applySinglePassFilterSort`): 1 component, 1 sort, all filters on that component. One scan.
-- **Scalar-subquery ORDER BY** (`applySortingWithComponentJoins`): the fallback for everything else — multi-key sort, OR + component sort, cursor + component sort, CTE path. `ORDER BY (SELECT data->>'f' … LIMIT 1)` forces materializing the full match set, computing the key per row, sorting, then `LIMIT`. **No index serves ordering here.**
+- **Scalar-subquery ORDER BY** (`applySortingWithComponentJoins`): the fallback for everything else — multi-key sort, OR + component sort, plain `cursor(id)` + component sort, CTE path. `ORDER BY (SELECT data->>'f' … LIMIT 1)` forces materializing the full match set, computing the key per row, sorting, then `LIMIT`. **No index serves ordering here.**
 
 ---
 
@@ -69,11 +85,11 @@ Path selection (`query/QueryDAG.ts:buildBasicQuery`, `query/ComponentInclusionNo
 | # | Cost center | What happens | Severity |
 |---|---|---|---|
 | **A** | Cross-component filters can't share an index | `order.status AND customer.tier` = INTERSECT + separate EXISTS probes joined by `entity_id`. One composite seek becomes N probes + join. Selectivity estimation on `data->>'x'` expression indexes is also weaker than on real columns. | High — structural |
-| **B** | Same-component multi-filter not coalesced | 2 filters on `Order` = 2 separate `EXISTS`, each re-scanning the order partition. `ComponentInclusionNode.ts:1016-1017,1144`. | High — fixable (**BUG-2**) |
-| **C** | Component sort in an ineligible shape → scalar-subquery ORDER BY | Full match-set materialize + sort, no index for ordering. Triggers on OR + component sort, cursor + component sort, multi-key sort, CTE path. (Narrower than first thought: plain different-component-filter + OFFSET still uses the fast sort-driven scan.) | High — narrow |
+| **B** | Same-component multi-filter not coalesced | **Fixed (RP-03):** one predicate group per component; INTERSECT/CTE pushdown. | Was high |
+| **C** | Component sort in an ineligible shape → scalar-subquery ORDER BY | Full match-set materialize + sort. Triggers on OR + component sort, **plain `cursor(id)`** + component sort, multi-key sort, CTE path. **`sortedCursor` does not trigger this** — it rides sort-driven scan. | High — narrow |
 | **D** | Exact `count()` for "total pages" | `SELECT COUNT(*) FROM (<full id query>)`, strips LIMIT/sort → full cardinality every request. A second full scan, often the most expensive. | Highest ROI to kill |
-| **E** | Deep OFFSET pagination | O(offset) scan-and-discard. Keyset exists (`sortedCursor`) but single-key, forward-only, no NULLS FIRST; multi-key throws. | Medium |
-| **F** | Numeric partial-index mismatch | Index built with `WHERE data->>'f' ~ '^-?[0-9]…'`; query emits plain `(data->>'f')::numeric > $1` with no matching predicate → planner can't prove partiality → **index unused**, and can error on dirty non-numeric JSON. `IndexingStrategy.ts:219-222`. | High — latent (**BUG-1**) |
+| **E** | Deep OFFSET pagination | O(offset) scan-and-discard. Prefer **`sortedCursor`** for component-sorted lists (fast path). Single-key, forward-only; multi-key / `before` throw. | Medium |
+| **F** | Numeric partial-index mismatch | **Fixed (RP-04):** queries restate `IS NOT NULL` + numeric regex via `database/numericJsonField.ts` so partial `idx_*_numeric` is eligible. | Was high |
 
 **Additional planner notes:**
 
@@ -86,66 +102,52 @@ Path selection (`query/QueryDAG.ts:buildBasicQuery`, `query/ComponentInclusionNo
 
 ## 4. Worst-case combo (the endpoint that melts)
 
-`.with(Order,{2 filters}).with(Customer,{1 filter}).sortBy(Order,'total').sortedCursor(token)` + `count()`:
+**Still expensive today:**
 
-1. Cursor makes sort-driven scan **ineligible** → CTE + INTERSECT (broad membership).
-2. Filters as N `EXISTS` on the intersected set (BUG-2 doubles same-component ones).
-3. Component sort via **scalar subquery** → full materialize + sort (cost center C).
-4. `count()` → **second full query**, full cardinality (cost center D).
+`.with(Order,{2 filters}).with(Customer,{1 filter}).sortBy(Order,'total').cursor(id)` + `count()`:
 
-Three expensive passes for one screen.
+1. **Plain `cursor(id)`** makes sort-driven scan ineligible → CTE + INTERSECT.
+2. Component sort via **scalar subquery** → full materialize + sort (cost center C).
+3. Exact `count()` → **second full query** (cost center D).
 
----
-
-## 5. Two confirmed bugs (ticket now)
-
-**BUG-1 — numeric partial index unused.** `IndexingStrategy.ts:219-222` builds a partial index whose `WHERE … ~ '^-?[0-9]…'` predicate the query never restates. Fix options: restate the predicate in the emitted SQL, drop the partial `WHERE` (index all rows), or back it with a generated column (§6 step 4). Confirm with `EXPLAIN` on a numeric filter over a seeded partition — look for `Seq Scan` where an `Index Scan` on `idx_<t>_<f>_numeric` was expected.
-
-**BUG-2 — same-component filters → N EXISTS.** `ComponentInclusionNode.ts:1016-1017` iterates per-filter. Group filters by `compId` and emit one predicate group (one `EXISTS`, or inline on the driving table) per component.
+**Not the melt path (corrected 2026-08):**  
+`.sortedCursor(token)` keeps the sort-driven fast path (composite keyset). Prefer it for sorted pages. After RP-03, multi-filter same-component coalesce + INTERSECT pushdown also shrink membership cost when not on the fast path.
 
 ---
 
-## 6. Roadmap (ROI-ranked, evolve-don't-rewrite)
+## 5. Historical bugs (fixed)
 
-Each step ships alone and improves the worst case. §7 defines how to measure each one.
+**BUG-1 — numeric partial index unused.** **Fixed 2026-08-07 (RP-04):** index DDL and query emission share `database/numericJsonField.ts`. Filters/sorts restate `IS NOT NULL` + numeric regex so partial `idx_*_numeric` is planner-eligible. Dirty non-numeric JSON is excluded, not cast-errored. Confirm on real PG with `EXPLAIN`: expect Index Scan on `idx_<t>_<f>_numeric`. Tests: `tests/unit/query/NumericIndexPredicate.test.ts`, `tests/integration/query/Query.numericFilter.test.ts`.
 
-**Step 1 — Kill exact count by default (biggest win, smallest change).**
-Fetch `LIMIT page_size + 1`, derive `hasNextPage` from the extra row. Make exact `count()` opt-in. Removes one full pass from every list request. For real totals: short-TTL cache keyed by query signature, or a planner estimate via `EXPLAIN (FORMAT JSON)` labeled as estimate (not `pg_class.reltuples` — whole-partition only; `Query.estimatedCount` already does this and is not valid for filtered sets).
+**BUG-2 — same-component filters → N EXISTS.** **Fixed 2026-08-05 (RP-03):** filters are AND-coalesced per component; membership INTERSECT/CTE branches push field filters when non-legacy; sort-driven path dedupes presence EXISTS when filter EXISTS already proves membership. Tests: `tests/unit/query/FilterPushdown.test.ts`, `tests/integration/query/Query.filterPushdown.test.ts`.
 
-**Step 2 — Push filters into INTERSECT branches + coalesce same-component filters (fixes BUG-2).**
-```sql
-SELECT entity_id FROM components_order
-  WHERE deleted_at IS NULL AND data->>'status'=$1 AND (data->>'total')::numeric>$2
-INTERSECT
-SELECT entity_id FROM components_customer
-  WHERE deleted_at IS NULL AND data->>'tier'=$3
-```
-Smaller set-op inputs, per-component composite indexes now matter, better cardinalities. Local engine change, large upside.
+---
 
-**Step 3 — Fix numeric index (BUG-1) + declared composite/covering indexes.**
-Give a declarative per-component list-shape index (equality cols → range/sort key → `entity_id` tiebreak):
-```sql
-CREATE INDEX CONCURRENTLY ON components_order
-  ((data->>'status'), ((data->>'total')::numeric),
-   ((data->>'updatedAt')::timestamptz) DESC, entity_id)
-  WHERE deleted_at IS NULL;
-```
-Declared first; auto-recommend from telemetry later.
+## 6. Roadmap (ROI-ranked) — status as of 0.6.x / 2026-08
 
-**Step 4 — Generated projected columns for hot scalar fields.**
-```sql
-ALTER TABLE components_order
-  ADD COLUMN proj_status text    GENERATED ALWAYS AS (data->>'status') STORED,
-  ADD COLUMN proj_total  numeric GENERATED ALWAYS AS ((data->>'total')::numeric) STORED;
-```
-Emit `c.proj_status=$1 AND c.proj_total>$2`. Fixes cast fragility, the BUG-1 partial-index problem, planner stats (real typed columns beat expression indexes), and SQL simplicity. This is the M1 tier of `RFC_MATERIALIZED_READ_MODELS.md`; pair it with the index from step 3 (the Phase-0 benchmark showed the *index*, not the column, is the win).
+Each step ships alone. §7 defines how to measure. Full ticket text: `docs/TICKETS_READ_PATH_PERF_2026-08.md`.
 
-**Step 5 — Keyset default + opt-in projection tables for hot screens.**
-Make keyset (`sort_expr, entity_id`) the default for component-sorted lists; OFFSET becomes legacy/explicit. For the handful of genuinely hot list views, a flat projection table (one row per entity, columnar) turns filter+sort+count into ordinary relational SQL served by one composite index. Components stay source of truth; the projection is **disposable — rebuild, don't migrate**. M2/M3 tiers of the read-models RFC.
+| Step | Status | Notes |
+|------|--------|-------|
+| **1 — hasNextPage / avoid default exact count** | **Done (RP-01)** for explicit `.take(N)`. Exact `.count()` still available when apps call it. GraphQL list schemas that always twin `exec+count` are app-layer. |
+| **2 — filter coalesce + INTERSECT pushdown** | **Done (RP-03)** | |
+| **3a — numeric index usable** | **Done (RP-04)** | |
+| **3b — declared composite list-shape indexes** | Open (F-02) | Equality → range/sort → `entity_id` |
+| **4 — generated projected columns (M1)** | Open (RP-08) | `@CompData({ projected: true })` — deferred |
+| **5a — keyset ergonomics** | **Partial (RP-06)** | Docs + throw on `cursor(id)+sortBy`. `sortedCursor` is the fast path; OFFSET still default in product apps. |
+| **5b — QSP projection tables for hot screens** | **Engine ready; ops open (RP-02)** | `rm_<archetype>`; see `QSP_OPERATIONS.md` |
+| **N+1 instrumentation gate** | **Done (RP-05)** | Relation FK loader batching |
 
-**Projection failure modes:** sync lag (recently-saved entity missing — update in the write transaction or tolerate eventual consistency), write amplification (a `Customer.tier` change fans out to every order projection row), schema drift (rename/type change → DDL + backfill), partial projections (a non-projected field must fall back to ECS or hard-error — silent fallback re-introduces the cliff), reconciliation on soft-delete/component-removal (where most bugs live). Treat it as a rebuildable cache, never as source data.
+**Still recommended product defaults (not automatic):**
 
-**What is already good (don't touch):** sort-driven scan LIMIT pushdown, INTERSECT over GROUP-BY-HAVING, entity-column sort on real `entities.created_at/updated_at`, OrNode single-pass, keyset scaffolding, per-field btree/numeric routing, SQL-identifier allow-listing.
+- Prefer `hasNextPage` over exact `count()` for infinite scroll / “load more”.
+- Prefer `sortedCursor` over deep OFFSET for sorted lists.
+- Index every field you filter/sort (`@CompData({ indexed: true })`).
+- For hot multi-component lists with a stable shape, declare a **list archetype** and turn on QSP (`shadow` → `route`).
+
+**Projection failure modes (QSP):** sync lag, write amplification, schema drift, partial projections, soft-delete reconciliation. Treat `rm_` as a rebuildable cache, never as source of truth. Components remain SoT.
+
+**What is already good (don't regress):** sort-driven scan LIMIT pushdown, INTERSECT over GROUP-BY-HAVING, entity-column sort on real `entities.created_at/updated_at`, OrNode single-pass (`BUNSANE_ORNODE_SINGLE_PASS`), keyset scaffolding, per-field btree/numeric routing, SQL-identifier allow-listing, RP-03/04/07 SQL shapes.
 
 ---
 
@@ -165,7 +167,7 @@ Performance claims here are **hypotheses until measured**. This section defines 
    ```
    Read the node types (see §7.5). This is per-query and deterministic — the primary tool.
 
-2. **Framework-level (per-request cost):** the instrumented DB layer (`database/instrumentedDb.ts`) counts `dbQueryCount` per request via the `perRequest` counter threaded through `exec/count`. Access/timeout logs report it. Use it to catch N+1 fan-out and count how many round-trips one list endpoint costs. `DB_SAVE_PROFILE=true` profiles the write path (not reads) — do not use it for query timing.
+2. **Framework-level (per-request cost):** the instrumented DB layer (`database/instrumentedDb.ts`) counts `dbQueryCount` per request via the `perRequest` counter threaded through `exec/count` and `createRequestLoaders(..., perRequest)`. Access/timeout logs report it. Use it to catch N+1 fan-out and count how many round-trips one list endpoint costs. **Diagnosing N+1:** if `dbQueryCount` scales with page size (or relation count) while SQL plans look fine, fix batching (`RequestLoaders` / DataLoader), not INTERSECT. Regression gate: `tests/integration/database/RelationsByComponentFkLoader.test.ts` (“RP-05”). `DB_SAVE_PROFILE=true` profiles the write path (not reads) — do not use it for query timing.
 
 3. **Macro-level (throughput/latency):** the benchmark harness (§7.2) and the k6 load harness (`tests/load/`, see the `k6-load-harness` memory) for full HTTP-stack numbers. Report p50/p95/p99, not mean.
 
@@ -331,19 +333,89 @@ POOL_TEST_URL=postgres://user:pw@host:5432/db bun run test:pool-saturation
 
 ---
 
-## 8. References
+## 8. List pagination API (current)
 
-- Query builder: `query/Query.ts`, `query/ComponentInclusionNode.ts`, `query/CTENode.ts`, `query/QueryDAG.ts`, `query/OrNode.ts`
-- Indexing: `database/IndexingStrategy.ts`, `core/decorators/IndexedField.ts`, `core/components/Decorators.ts`
-- Benchmark harness: `tests/benchmark/scripts/{generate-db,run-benchmarks}.ts`, `tests/benchmark/scenarios/`
-- Real-PG harness: `tests/pg-setup.ts`
-- Related: `docs/RFC_MATERIALIZED_READ_MODELS.md`, `docs/RFC_ECS_PG_SORT_DENORMALIZATION.md`, `docs/SCALABILITY_PLAN.md`, `docs/QUERY_SORT_PAGINATION_PLAN.md`
+```ts
+// Preferred list page (legacy + QSP when covered):
+const items = await new Query()
+  .with(OrderStatus, Query.filters(Query.filter('status', Query.filterOp.EQ, 'open')))
+  .with(OrderInfo)
+  .with(OrderTimeline)
+  .sortBy(OrderTimeline, 'createdAt', 'DESC')
+  .take(20) // explicit take → LIMIT 21; result trimmed to 20
+  .exec();
 
-## P0 ceiling-proof result (real PG17)
+const { hasNextPage, routed, surface, archetype } = query.getLastRouteInfo();
+// hasNextPage: true iff a 21st row existed (RP-01). Framework default LIMIT (no .take) does NOT n+1.
 
-Worst-case archetype list query (filter + sort + keyset + count), hand-built rm_order with a partial covering index vs the legacy INTERSECT+EXISTS+scalar-subquery path, measured on a real PG17 scratch DB:
-- Page query: 52.55ms -> 0.66ms (79.8x).
-- Count query: 59.14ms -> 0.71ms (83.9x).
+// Next page on a sorted list — keep sort-driven / QSP keyset path:
+const last = items[items.length - 1]!;
+const token = Query.encodeSortedCursor(
+  /* sort value from last row's component data */,
+  last.id
+);
+await new Query()
+  .with(/* same */)
+  .sortBy(OrderTimeline, 'createdAt', 'DESC')
+  .take(20)
+  .sortedCursor(token)
+  .exec();
+
+// THROWS (RP-06b):
+// .sortBy(...).cursor(entityId)  — plain id cursor is not sort order
+// Use sortedCursor, or drop sortBy to page by entity_id only.
+```
+
+Exact totals: still `.count()` (full scan). QSP: `BUNSANE_QSP_COUNT=n_plus_1|estimate|exact`. Planner estimate via `Query.estimatedCount` is **not** valid for filtered multi-component sets (whole-partition-ish).
+
+---
+
+## 9. N+1 vs bad SQL (how to tell)
+
+| Signal | Likely cause | Fix |
+|--------|--------------|-----|
+| One slow statement; `EXPLAIN` shows Seq Scan / external Sort / huge rows scanned | Membership/filter/sort plan | Indexes, sort-driven shape, filter pushdown (shipped), QSP for hot archetype |
+| `dbQueryCount` scales with page size N | Per-row `get` / nested Query / unbatched relations | `eagerLoadComponents` / `.populate()` / request DataLoaders; batch FK `IN` queries |
+| Fast SQL + still multi-second request | Field resolvers / `@ArcheTypeFunction` per row | Batch loaders; avoid Query-per-parent in list GraphQL |
+
+Instrumentation: `database/instrumentedDb.ts` + `createRequestLoaders(..., perRequest)`. Gate: `tests/integration/database/RelationsByComponentFkLoader.test.ts` (RP-05).
+
+---
+
+## 10. QSP coverage limits (summary)
+
+Full runbook: **`docs/QSP_OPERATIONS.md`**. Product patterns: **`docs/QUERY_LIST_GUIDE.md`**.
+
+| Query shape | Routes on QSP? |
+|-------------|----------------|
+| `.with` set **exactly equals** one archetype’s **projected** component set; supported ops (`= != > < >= <= IN NOT IN`); ≤1 sort; keyset `after` | Yes when READY |
+| Empty **tag** component in `.with()` | **No** — tags emit no projected columns, set equality fails |
+| Optional components on full archetype but not on most entities | Under-counts if projected as membership — use a **list-only archetype** without optionals |
+| Multi-archetype join / cross-entity | **No** — app batches FK `IN` (or wait for M3) |
+| `.without` / excluded components / OR / spatial / ILIKE | **No** — legacy (OR may still use single-pass OrNode) |
+| `BUNSANE_QSP=off` (default) | Always legacy |
+
+---
+
+## 11. References
+
+- Query builder: `query/Query.ts`, `query/ComponentInclusionNode.ts`, `query/CTENode.ts`, `query/QueryDAG.ts`, `query/OrNode.ts`, `query/FilterBuilder.ts`
+- Numeric predicates: `database/numericJsonField.ts`, `database/IndexingStrategy.ts`
+- QSP: `query/planner/SurfacePlanner.ts`, `database/projection/*`, `docs/QSP_OPERATIONS.md`
+- App list guide: `docs/QUERY_LIST_GUIDE.md`
+- Tickets: `docs/TICKETS_READ_PATH_PERF_2026-08.md`
+- Benchmark: `tests/benchmark/scripts/{generate-db,run-benchmarks}.ts`
+- Real-PG: `tests/pg-setup.ts`
+- Related RFCs: `RFC_MATERIALIZED_READ_MODELS.md`, `RFC_QUERY_SURFACE_PLANNER.md`, `RFC_QSP_ROW_HYDRATION.md`, `QUERY_SORT_PAGINATION_PLAN.md`
+
+---
+
+## Appendix A — P0 ceiling-proof result (real PG17)
+
+Worst-case archetype list query (filter + sort + keyset + count), hand-built `rm_order` with a partial covering index vs the legacy INTERSECT+EXISTS+scalar-subquery path, measured on a real PG17 scratch DB:
+
+- Page query: 52.55ms → 0.66ms (**79.8×**).
+- Count query: 59.14ms → 0.71ms (**83.9×**).
 - AFTER plan: Index Only Scan, Heap Fetches: 0, zero SubPlan in ORDER BY, no Seq Scan.
 
-Gate (>=5x page, >=10x count): PASS. Proceeding to P1.
+Gate (≥5× page, ≥10× count): **PASS**. This is the QSP promise for **covered** list shapes only.

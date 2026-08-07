@@ -17,7 +17,12 @@ export type FilterSchema<T = any> = {
 
 // Custom Filter Builder exports
 export type { FilterBuilder, FilterResult, FilterBuilderOptions } from "./FilterBuilder";
-export { buildJSONPath, buildJSONBPath } from "./FilterBuilder";
+export {
+    buildJSONPath,
+    buildJSONBPath,
+    buildComponentFilterCondition,
+    buildComponentFilterGroup,
+} from "./FilterBuilder";
 export { FilterBuilderRegistry } from "./FilterBuilderRegistry";
 
 // JSONB Array Builder exports

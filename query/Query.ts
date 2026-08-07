@@ -188,6 +188,18 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         hasNextPage?: boolean;
     } = { routed: false, surface: 'legacy' };
 
+    /**
+     * True only when the caller invoked `.take(N)`. Framework default LIMIT
+     * does not set this — used for LIMIT n+1 / hasNextPage (RP-01).
+     */
+    private explicitTake: boolean = false;
+
+    /**
+     * When set for a legacy exec, SQL was built with pageSize+1 and the result
+     * is trimmed after fetch to derive hasNextPage without a second count().
+     */
+    private nPlus1PageSize: number | null = null;
+
     /** Component constructors added to this query for type-safe access */
     private _componentCtors: ComponentConstructor[] = [];
 
@@ -364,6 +376,7 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
 
     public take(limit: number): this {
         this.context.limit = limit;
+        this.explicitTake = true;
         return this;
     }
 
@@ -393,6 +406,8 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         this.context.cursorDirection = direction;
         // Clear offset when using cursor-based pagination
         this.context.offsetValue = 0;
+        // Plain entity_id cursor is incompatible with component sortBy (pages by
+        // id order, not sort order). Fail at exec if both are set (RP-06b).
         return this;
     }
 
@@ -1205,8 +1220,19 @@ AND c.deleted_at IS NULL`;
             );
         }
 
+        // RP-06b: plain cursor(id) walks entity_id order — wrong page boundaries
+        // under component sortBy. Prefer sortedCursor() (composite keyset).
+        if (this.context.cursorId !== null && this.context.sortOrders.length > 0) {
+            throw new Error(
+                'cursor(entityId) cannot be combined with sortBy(). ' +
+                'Use sortedCursor(token) for composite keyset pagination over the sort key, ' +
+                'or remove sortBy() to page by entity_id.'
+            );
+        }
+
         // QSP: resolve coverage once (before pagination is neutralized below). Route only when
         // READY; shadow-compare in SHADOW. On any route error fall through to the legacy body unchanged.
+        // QSP does its own LIMIT n+1 inside doExecRouted — do not bump limit here first.
         let qspReq: CoverageRequest | undefined;
         let qspRes: PlanResolution | undefined;
         if (qspActive() && !this.orQuery) {
@@ -1225,7 +1251,14 @@ AND c.deleted_at IS NULL`;
                 void ProjectionManager.instance.ensureProjection(qspRes.triggerArchetype);
             }
         }
-        this._lastRouteInfo = { routed: false, surface: 'legacy' };
+
+        // RP-01: explicit .take(N) → fetch N+1 so hasNextPage is free (no count()).
+        // Only on the legacy path (after QSP). Default LIMIT does not set explicitTake.
+        this.nPlus1PageSize = null;
+        if (this.explicitTake && this.context.limit !== null && this.context.limit >= 0) {
+            this.nPlus1PageSize = this.context.limit;
+            this.context.limit = this.context.limit + 1;
+        }
 
         // Native entity-column sort (created_at/updated_at) is applied as an
         // outer ORDER BY over the resolved id-set. The inner nodes must emit
@@ -1575,7 +1608,24 @@ AND c.deleted_at IS NULL`;
         const entities: any[] = await this.execSql<any[]>('query.entities', dbConn, result.sql, result.params, this.execSignal, this.execPerRequest);
 
         // Convert to Entity objects
-        const entityIds: string[] = entities.map((row: any) => row.id);
+        let entityIds: string[] = entities.map((row: any) => row.id);
+
+        // RP-01: trim the extra row and report hasNextPage (legacy path).
+        let hasNextPage: boolean | undefined;
+        if (this.nPlus1PageSize !== null) {
+            hasNextPage = entityIds.length > this.nPlus1PageSize;
+            if (hasNextPage) {
+                entityIds = entityIds.slice(0, this.nPlus1PageSize);
+            }
+            // Restore caller-visible limit (was temporarily N+1 for the build).
+            this.context.limit = this.nPlus1PageSize;
+            this.nPlus1PageSize = null;
+        }
+        this._lastRouteInfo = {
+            routed: false,
+            surface: 'legacy',
+            ...(hasNextPage !== undefined ? { hasNextPage } : {}),
+        };
 
         if (qspReq && qspRes) {
             const m = qspMode();
@@ -1776,6 +1826,15 @@ AND c.deleted_at IS NULL`;
         this.applyExecOptions(opts);
         // Reset context for fresh execution
         this.context.reset();
+
+        // Same API guards as doExec (RP-06b).
+        if (this.context.cursorId !== null && this.context.sortOrders.length > 0) {
+            throw new Error(
+                'cursor(entityId) cannot be combined with sortBy(). ' +
+                'Use sortedCursor(token) for composite keyset pagination over the sort key, ' +
+                'or remove sortBy() to page by entity_id.'
+            );
+        }
 
         // Build the DAG (same as exec)
         const dag = new QueryDAG();

@@ -1,6 +1,7 @@
 import { DDL_TIMEOUT_MS, QUERY_TIMEOUT_MS } from "./index";
 import { dbExec } from "./gateway";
 import { logger } from "../core/Logger";
+import { numericJsonTextValidPredicate } from "./numericJsonField";
 
 /**
  * Catalog lookup — "does this index exist", "is this table partitioned".
@@ -242,12 +243,12 @@ export const ensureNumericIndex = async (
         const isPartitioned = partitionCheck.length > 0 && partitionCheck[0].relkind === 'p';
         const useConcurrently = !isPartitioned && !process.env.USE_PGLITE;
 
-        // Create a partial index that only includes rows where the field is a valid number
-        // This prevents errors when some rows have non-numeric values
+        // Partial index: only rows where the field is a valid number. Prevents
+        // cast errors on dirty JSON. Query emission MUST restate this predicate
+        // (see numericJsonField.ts) or the planner cannot use the index (BUG-1).
         const indexSQL = `CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} ${indexName}
             ON ${tableName} (((data->>'${field}')::numeric))
-            WHERE data->>'${field}' IS NOT NULL
-            AND data->>'${field}' ~ '^-?[0-9]+\\.?[0-9]*$'`;
+            WHERE ${numericJsonTextValidPredicate(`data->>'${field}'`)}`;
 
         logger.trace(`Creating numeric index with SQL: ${indexSQL}`);
         await ddlStatement("index.create", indexSQL);

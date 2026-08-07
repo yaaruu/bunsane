@@ -2,8 +2,10 @@ import { QueryNode } from "./QueryNode";
 import type { QueryResult } from "./QueryNode";
 import { QueryContext } from "./QueryContext";
 import { shouldUseLateralJoins, shouldUseDirectPartition } from "../core/Config";
-import { FilterBuilderRegistry } from "./FilterBuilderRegistry";
-import { jsonbInListCast } from "./FilterBuilder";
+import {
+    buildComponentFilterCondition,
+    buildComponentFilterGroup,
+} from "./FilterBuilder";
 import { ComponentRegistry } from "../core/components";
 import { getMetadataStorage } from "../core/metadata";
 import { assertIdentifier } from "./SqlIdentifier";
@@ -63,52 +65,52 @@ export class ComponentInclusionNode extends QueryNode {
     }
 
     /**
-     * Build a filter condition against `<alias>.data`. Mirrors the default
-     * logic in applyComponentFiltersWithState but with a configurable alias
-     * so the sort-driven scan can filter the driving table (`s`) and EXISTS
-     * probes (`cf`) without string surgery.
+     * Build a filter condition against `<alias>.data`. Shared implementation
+     * lives in FilterBuilder so INTERSECT/CTE pushdown and EXISTS coalesce
+     * emit the same SQL (RP-03).
      */
-    private buildFilterCondition(filter: { field: string; operator: string; value: any }, alias: string, context: QueryContext): string {
-        if (FilterBuilderRegistry.has(filter.operator)) {
-            const options = FilterBuilderRegistry.getOptions(filter.operator);
-            if (options?.validate && !options.validate(filter as any)) {
-                throw new Error(`Invalid filter value for operator '${filter.operator}': ${JSON.stringify(filter.value)}`);
+    private buildFilterCondition(
+        filter: { field: string; operator: string; value: any },
+        alias: string,
+        context: QueryContext
+    ): string {
+        return buildComponentFilterCondition(filter as any, alias, context);
+    }
+
+    /**
+     * Membership (+ optional field filters) branch for INTERSECT. Non-legacy
+     * sources can push field filters into the branch because membership rows
+     * carry `data`. Legacy entity_components has no data column.
+     */
+    private buildMembershipIntersectBranch(
+        compId: string,
+        context: QueryContext,
+        componentParamIndices: Map<string, number>
+    ): string {
+        const source = getMembershipSource();
+        let table = getMembershipTable();
+        let canPushFilters = !source.isLegacy;
+        if (!source.isLegacy && shouldUseDirectPartition()) {
+            const partition = ComponentRegistry.getPartitionTableName(compId);
+            if (partition) table = partition;
+        }
+
+        if (!componentParamIndices.has(compId)) {
+            componentParamIndices.set(compId, context.addParam(compId));
+        }
+        const typeParam = componentParamIndices.get(compId)!;
+        let branch =
+            `SELECT ec.entity_id FROM ${table} ec WHERE ec.type_id = $${typeParam}::text AND ec.deleted_at IS NULL`;
+
+        if (canPushFilters) {
+            const filters = context.componentFilters.get(compId) ?? [];
+            const group = buildComponentFilterGroup(filters, 'ec', context);
+            if (group) {
+                branch += ` AND ${group}`;
+                context.filtersAppliedInMembership = true;
             }
-            return FilterBuilderRegistry.get(filter.operator)!(filter as any, alias, context).sql;
         }
-
-        let jsonPath: string;
-        if (filter.field.includes('.')) {
-            const parts = filter.field.split('.');
-            const lastPart = parts.pop()!;
-            const nestedPath = parts.map(p => `'${p}'`).join('->');
-            jsonPath = `${alias}.data->${nestedPath}->>'${lastPart}'`;
-        } else {
-            jsonPath = `${alias}.data->>'${filter.field}'`;
-        }
-
-        const valueStr = String(filter.value);
-        const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(valueStr);
-
-        if (isUUID && filter.operator === '=') {
-            return `${jsonPath} = $${context.addParam(filter.value)}`;
-        } else if (filter.operator === 'LIKE' || filter.operator === 'NOT LIKE' || filter.operator === 'ILIKE') {
-            return `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
-        } else if (filter.operator === 'IN' || filter.operator === 'NOT IN') {
-            if (Array.isArray(filter.value) && filter.value.length > 0) {
-                const cast = jsonbInListCast(filter.value);
-                const placeholders = filter.value.map((v: any) => `$${context.addParam(v)}${cast.param}`).join(', ');
-                return `${cast.lhs(jsonPath)} ${filter.operator} (${placeholders})`;
-            } else if (Array.isArray(filter.value) && filter.value.length === 0) {
-                return filter.operator === 'IN' ? 'FALSE' : 'TRUE';
-            }
-            throw new Error(`${filter.operator} operator requires an array of values`);
-        } else if (typeof filter.value === 'number') {
-            return `(${jsonPath})::numeric ${filter.operator} $${context.addParam(filter.value)}::numeric`;
-        } else if (typeof filter.value === 'boolean') {
-            return `(${jsonPath})::boolean ${filter.operator} $${context.addParam(filter.value)}`;
-        }
-        return `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
+        return branch;
     }
 
     /**
@@ -229,35 +231,32 @@ export class ComponentInclusionNode extends QueryNode {
         const conditions: string[] = [];
 
         // Filters on the sort component apply inline on the driving table.
-        for (const filter of context.componentFilters.get(sortTypeId) ?? []) {
-            conditions.push(this.buildFilterCondition(filter, 's', context));
+        // Do NOT restate the partial numeric-index predicate for ORDER BY alone:
+        // that would filter out NULL sort keys (breaks NULLS LAST / keyset).
+        // Numeric *filters* restate it via buildComponentFilterGroup (RP-04).
+        const sortFilters = context.componentFilters.get(sortTypeId) ?? [];
+        const sortFilterGroup = buildComponentFilterGroup(sortFilters, 's', context);
+        if (sortFilterGroup) {
+            conditions.push(sortFilterGroup);
         }
 
-        // Presence probe per other required component.
-        for (const compId of otherComponentIds) {
-            conditions.push(`EXISTS (
-                SELECT 1 FROM ${getMembershipTable()} ec_r
-                WHERE ec_r.entity_id = s.entity_id
-                AND ec_r.type_id = $${context.addParam(compId)}::text
-                AND ec_r.deleted_at IS NULL
-            )`);
-        }
-
-        // Filters on other components probe their own table.
+        // Other required components: one probe each.
+        // When field filters exist on that component, a single filter-EXISTS
+        // also proves membership (UNIQUE(entity_id, type_id)) — skip the
+        // separate presence-EXISTS (RP-03 / BUG-2 + fast-path dedupe).
         for (const compId of otherComponentIds) {
             const filters = context.componentFilters.get(compId) ?? [];
-            for (const filter of filters) {
-                const condition = this.buildFilterCondition(filter, 'cf', context);
+            const filterGroup = buildComponentFilterGroup(filters, 'cf', context);
+
+            if (filterGroup) {
                 const compTable = this.getComponentTableName(compId);
                 const filterDirect = shouldUseDirectPartition() && compTable !== 'components';
                 if (filterDirect || !getMembershipSource().isLegacy) {
-                    // Single-table predicate on the component (partition) table:
-                    // membership lives in the same row, so no junction join.
                     conditions.push(`EXISTS (
                         SELECT 1 FROM ${compTable} cf
                         WHERE cf.entity_id = s.entity_id
                         AND cf.type_id = $${context.addParam(compId)}::text
-                        AND ${condition}
+                        AND ${filterGroup}
                         AND cf.deleted_at IS NULL
                     )`);
                 } else {
@@ -266,11 +265,19 @@ export class ComponentInclusionNode extends QueryNode {
                         JOIN ${compTable} cf ON ec_f.component_id = cf.id
                         WHERE ec_f.entity_id = s.entity_id
                         AND ec_f.type_id = $${context.addParam(compId)}::text
-                        AND ${condition}
+                        AND ${filterGroup}
                         AND ec_f.deleted_at IS NULL
                         AND cf.deleted_at IS NULL
                     )`);
                 }
+            } else {
+                // Presence-only probe (no field filters on this component).
+                conditions.push(`EXISTS (
+                    SELECT 1 FROM ${getMembershipTable()} ec_r
+                    WHERE ec_r.entity_id = s.entity_id
+                    AND ec_r.type_id = $${context.addParam(compId)}::text
+                    AND ec_r.deleted_at IS NULL
+                )`);
             }
         }
 
@@ -402,7 +409,22 @@ export class ComponentInclusionNode extends QueryNode {
                     )`;
                 }
             } else {
-                sql = `SELECT DISTINCT ec.entity_id as id FROM ${getMembershipTable()} ec WHERE ec.type_id = $${context.addParam(componentId)}::text AND ec.deleted_at IS NULL`;
+                // Prefer partition leaf when available (better pruning + filter indexes).
+                let singleTable = getMembershipTable();
+                if (!getMembershipSource().isLegacy && shouldUseDirectPartition()) {
+                    singleTable = this.getComponentTableName(componentId) || singleTable;
+                }
+                sql = `SELECT DISTINCT ec.entity_id as id FROM ${singleTable} ec WHERE ec.type_id = $${context.addParam(componentId)}::text AND ec.deleted_at IS NULL`;
+                // Push field filters into the membership scan when `data` is available
+                // (non-legacy) — avoids a separate EXISTS re-scan (RP-03).
+                if (!getMembershipSource().isLegacy) {
+                    const filters = context.componentFilters.get(componentId) ?? [];
+                    const group = buildComponentFilterGroup(filters, 'ec', context);
+                    if (group) {
+                        sql += ` AND ${group}`;
+                        context.filtersAppliedInMembership = true;
+                    }
+                }
             }
 
             if (context.withId) {
@@ -433,9 +455,8 @@ export class ComponentInclusionNode extends QueryNode {
                 sql += ` ${whereKeyword} ${tableAlias}.entity_id NOT IN (${entityPlaceholders})`;
             }
 
-            // Apply component filters for single component (normal path)
-            // For single component, alias is 'ec' (or CTE name if using CTE)
-            // Single component queries have WHERE from the initial select, so pass true
+            // Apply component filters for single component (normal path).
+            // Skipped when already pushed into the membership scan above.
             const singleCompHasWhere = sql.includes(' WHERE ');
             sql = this.applyComponentFilters(context, componentIds, useCTE, useLateralJoins, lateralJoins, lateralConditions, sql, new Map(), useCTE ? context.cteName : "ec", singleCompHasWhere);
 
@@ -494,15 +515,12 @@ export class ComponentInclusionNode extends QueryNode {
                 });
                 sql += componentChecks.join(' AND ') + `)`;
             } else {
-                // Use INTERSECT for multi-component queries (much faster than GROUP BY + HAVING)
-                // INTERSECT lets PostgreSQL use index scans independently on each component type
-                // then merge the results efficiently with a hash or merge join
-                const intersectQueries = componentIds.map((compId) => {
-                    if (!componentParamIndices.has(compId)) {
-                        componentParamIndices.set(compId, context.addParam(compId));
-                    }
-                    return `SELECT ec.entity_id FROM ${getMembershipTable()} ec WHERE ec.type_id = $${componentParamIndices.get(compId)}::text AND ec.deleted_at IS NULL`;
-                });
+                // Use INTERSECT for multi-component queries (much faster than GROUP BY + HAVING).
+                // Field filters are pushed into each branch when membership rows
+                // carry `data` (non-legacy) so INTERSECT inputs are selective (RP-03).
+                const intersectQueries = componentIds.map((compId) =>
+                    this.buildMembershipIntersectBranch(compId, context, componentParamIndices)
+                );
                 sql = `SELECT intersected.entity_id as id FROM (${intersectQueries.join(' INTERSECT ')}) AS intersected`;
             }
 
@@ -787,45 +805,9 @@ export class ComponentInclusionNode extends QueryNode {
         const componentTableName = this.getComponentTableName(sortTypeId);
         const useDirectPartition = shouldUseDirectPartition() && componentTableName !== 'components';
 
-        // Build filter conditions
-        const filterConditions: string[] = [];
-        for (const filter of filters) {
-            // Build JSON path
-            let jsonPath: string;
-            if (filter.field.includes('.')) {
-                const parts = filter.field.split('.');
-                const lastPart = parts.pop()!;
-                const nestedPath = parts.map(p => `'${p}'`).join('->');
-                jsonPath = `c.data->${nestedPath}->>'${lastPart}'`;
-            } else {
-                jsonPath = `c.data->>'${filter.field}'`;
-            }
-
-            // Build condition based on type
-            let condition: string;
-            if (typeof filter.value === 'number') {
-                condition = `(${jsonPath})::numeric ${filter.operator} $${context.addParam(filter.value)}::numeric`;
-            } else if (typeof filter.value === 'boolean') {
-                condition = `(${jsonPath})::boolean ${filter.operator} $${context.addParam(filter.value)}`;
-            } else if (filter.operator === 'IN' || filter.operator === 'NOT IN') {
-                if (Array.isArray(filter.value) && filter.value.length > 0) {
-                    const cast = jsonbInListCast(filter.value);
-                    const placeholders = filter.value.map((v: any) => `$${context.addParam(v)}${cast.param}`).join(', ');
-                    condition = `${cast.lhs(jsonPath)} ${filter.operator} (${placeholders})`;
-                } else {
-                    return null; // Invalid or empty array - fall back to normal path
-                }
-            } else if (filter.operator === 'LIKE' || filter.operator === 'NOT LIKE' || filter.operator === 'ILIKE') {
-                condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}::text`;
-            } else {
-                condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}::text`;
-            }
-
-            filterConditions.push(condition);
-        }
-
-        // Guard: if no conditions were built, fall back to normal path
-        if (filterConditions.length === 0) return null;
+        // Shared filter emission (includes numeric partial-index restatement).
+        const filterGroup = buildComponentFilterGroup(filters, 'c', context);
+        if (!filterGroup) return null;
 
         const nullsClause = sortOrder.nullsFirst ? 'NULLS FIRST' : 'NULLS LAST';
         const isNumeric = isNumericProperty(sortOrder.component, sortOrder.property);
@@ -835,6 +817,8 @@ export class ComponentInclusionNode extends QueryNode {
             : `c.data->>'${safeProperty}'`;
 
         // Composite keyset predicate (AND because WHERE already has other conditions).
+        // Note: do not AND partial-index validity for sort alone — NULL sort keys
+        // must remain (NULLS LAST/FIRST + keyset). Filters already restate it.
         const cursorWhere = this.buildCompositeCursorWhere(context, sortExpr, isNumeric, 'c.entity_id', 'AND');
 
         let sql: string;
@@ -844,7 +828,7 @@ export class ComponentInclusionNode extends QueryNode {
             sql = `SELECT c.entity_id as id FROM ${componentTableName} c
                 WHERE c.type_id = $${context.addParam(sortTypeId)}::text
                 AND c.deleted_at IS NULL
-                AND ${filterConditions.join(' AND ')}${cursorWhere}
+                AND ${filterGroup}${cursorWhere}
                 ORDER BY ${sortExpr} ${sortOrder.direction} ${nullsClause}, c.entity_id ASC`;
         } else {
             // Use entity_components junction
@@ -853,7 +837,7 @@ export class ComponentInclusionNode extends QueryNode {
                 JOIN ${componentTableName} c ON c.id = ec.component_id AND c.deleted_at IS NULL
                 WHERE ec.type_id = $${context.addParam(sortTypeId)}::text
                 AND ec.deleted_at IS NULL
-                AND ${filterConditions.join(' AND ')}${cursorWhere}
+                AND ${filterGroup}${cursorWhere}
                 ORDER BY ${sortExpr} ${sortOrder.direction} ${nullsClause}, c.entity_id ASC`;
         }
 
@@ -993,8 +977,13 @@ export class ComponentInclusionNode extends QueryNode {
     }
 
     /**
-     * Apply component filters using either EXISTS subqueries or LATERAL joins
-     * Returns both SQL and updated WHERE state for proper tracking
+     * Apply component filters using either EXISTS subqueries or LATERAL joins.
+     * Returns both SQL and updated WHERE state for proper tracking.
+     *
+     * RP-03: filters for one component are AND-coalesced into a single EXISTS
+     * (or one LATERAL) instead of one subquery per filter. When membership
+     * INTERSECT/CTE already applied field filters, this is a no-op.
+     *
      * @param entityTableAlias - The alias for the entity table (e.g., 'ec', 'intersected', or CTE name)
      * @param outerHasWhere - Track if outer query already has WHERE clause (for INTERSECT queries)
      */
@@ -1010,159 +999,79 @@ export class ComponentInclusionNode extends QueryNode {
         entityTableAlias?: string,
         outerHasWhere: boolean = false
     ): { sql: string; hasWhere: boolean } {
-        // Track whether we've added WHERE to the outer query
         let hasOuterWhere = outerHasWhere;
 
+        // Filters already pushed into INTERSECT/CTE membership branches.
+        if (context.filtersAppliedInMembership) {
+            return { sql, hasWhere: hasOuterWhere };
+        }
+
         for (const [compId, filters] of context.componentFilters) {
-            for (const filter of filters) {
-                let condition: string;
+            if (!filters.length) continue;
 
-                // Check for custom filter builder first
-                if (FilterBuilderRegistry.has(filter.operator)) {
-                    // Validate filter if validator is provided
-                    const options = FilterBuilderRegistry.getOptions(filter.operator);
-                    if (options?.validate && !options.validate(filter)) {
-                        throw new Error(`Invalid filter value for operator '${filter.operator}': ${JSON.stringify(filter.value)}`);
-                    }
+            // One predicate group per component (BUG-2 coalesce).
+            const condition = buildComponentFilterGroup(filters, 'c', context);
+            if (!condition) continue;
 
-                    const customBuilder = FilterBuilderRegistry.get(filter.operator)!;
-                    const result = customBuilder(filter, "c", context);
-                    condition = result.sql;
-                    // Note: custom builder is responsible for adding parameters via context.addParam()
-                } else {
-                    // Default filter logic. Empty-string values are permitted
-                    // here — `c.data->>'field'` extracts text, so `=`/`!=`/
-                    // `LIKE` against '' is legitimate. The UUID-cast path
-                    // below is gated on a regex that empty string cannot
-                    // match, so unsafe casts never fire.
+            const tableAlias = entityTableAlias || (useCTE ? context.cteName : "ec");
+            const whereKeyword = hasOuterWhere ? 'AND' : 'WHERE';
+            if (!componentParamIndices.has(compId)) {
+                componentParamIndices.set(compId, context.addParam(compId));
+            }
+            const typeParam = componentParamIndices.get(compId)!;
+            const componentTableName = this.getComponentTableName(compId);
+            const useDirectPartition = shouldUseDirectPartition() && componentTableName !== 'components';
 
-                    // Check if value looks like a UUID (case-insensitive, with or without hyphens)
-                    const valueStr = String(filter.value);
-                    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(valueStr);
+            if (useLateralJoins) {
+                const compIdShort = compId.substring(0, 8);
+                const lateralAlias = `lat_${compIdShort}_${lateralJoins.length}`;
 
-                    // Build JSON path for nested fields (e.g., "device.unique_id" -> "c.data->'device'->>'unique_id'")
-                    let jsonPath: string;
-                    if (filter.field.includes('.')) {
-                        const parts = filter.field.split('.');
-                        const lastPart = parts.pop()!;
-                        const nestedPath = parts.map(p => `'${p}'`).join('->');
-                        jsonPath = `c.data->${nestedPath}->>'${lastPart}'`;
-                    } else {
-                        jsonPath = `c.data->>'${filter.field}'`;
-                    }
-
-                    if (isUUID && filter.operator === '=') {
-                        // UUID equality comparison - only cast the parameter, compare as text
-                        // This allows matching UUID parameter against both UUID and text fields
-                        condition = `${jsonPath} = $${context.addParam(filter.value)}`;
-                    } else if (filter.operator === 'LIKE' || filter.operator === 'NOT LIKE' || filter.operator === 'ILIKE') {
-                        // String LIKE/ILIKE comparison - no casting
-                        condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
-                    } else if (filter.operator === 'IN' || filter.operator === 'NOT IN') {
-                        // IN/NOT IN comparison - handle arrays properly. Numeric/
-                        // boolean lists need a cast on both the JSONB text field
-                        // and each parameter, else `text IN (1, 2)` errors.
-                        if (Array.isArray(filter.value) && filter.value.length > 0) {
-                            const cast = jsonbInListCast(filter.value);
-                            let placeholders = '';
-                            for (let i = 0; i < filter.value.length; i++) {
-                                if (i) placeholders += ', ';
-                                placeholders += '$' + context.addParam(filter.value[i]) + cast.param;
-                            }
-                            condition = `${cast.lhs(jsonPath)} ${filter.operator} (${placeholders})`;
-                        } else if (Array.isArray(filter.value) && filter.value.length === 0) {
-                            // Empty array: IN () is always false, NOT IN () is always true
-                            condition = filter.operator === 'IN' ? 'FALSE' : 'TRUE';
-                        } else {
-                            throw new Error(`${filter.operator} operator requires an array of values`);
-                        }
-                    } else if (typeof filter.value === 'number') {
-                        // Only treat as numeric if the value is actually a number type, not a string
-                        condition = `(${jsonPath})::numeric ${filter.operator} $${context.addParam(filter.value)}::numeric`;
-                    } else if (typeof filter.value === 'boolean') {
-                        // Boolean comparison - cast JSON text to boolean
-                        condition = `(${jsonPath})::boolean ${filter.operator} $${context.addParam(filter.value)}`;
-                    } else {
-                        // Default: text comparison without casting
-                        condition = `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
-                    }
-                }
-
-                // Use provided alias, or fall back to CTE name or 'ec'
-                const tableAlias = entityTableAlias || (useCTE ? context.cteName : "ec");
-                // Use tracked WHERE state instead of sql.includes() to handle INTERSECT correctly
-                const whereKeyword = hasOuterWhere ? 'AND' : 'WHERE';
-
-                if (useLateralJoins) {
-                    // Use LATERAL join approach
-                    // Create a short, unique alias (PostgreSQL has 63 char limit)
-                    // Use first 8 chars of component ID + field name + index
-                    const compIdShort = compId.substring(0, 8);
-                    const fieldShort = filter.field.replace(/\./g, '_').substring(0, 20);
-                    const lateralAlias = `lat_${compIdShort}_${fieldShort}_${lateralJoins.length}`;
-                    
-                    const componentTableName = this.getComponentTableName(compId);
-                    const useDirectPartition = shouldUseDirectPartition() && componentTableName !== 'components';
-                    
-                    if (useDirectPartition || !getMembershipSource().isLegacy) {
-                        // Single-table predicate on the component (partition)
-                        // table — membership is the same row, no junction join.
-                        lateralJoins.push(
-                            `CROSS JOIN LATERAL (
+                if (useDirectPartition || !getMembershipSource().isLegacy) {
+                    lateralJoins.push(
+                        `CROSS JOIN LATERAL (
                             SELECT 1 FROM ${componentTableName} c
                             WHERE c.entity_id = ${tableAlias}.entity_id
-                            AND c.type_id = $${componentParamIndices.has(compId) ? componentParamIndices.get(compId) : context.addParam(compId)}::text
+                            AND c.type_id = $${typeParam}::text
                             AND ${condition}
                             AND c.deleted_at IS NULL
                             LIMIT 1
                         ) AS ${lateralAlias}`
-                        );
-                    } else {
-                        // Use entity_components junction table
-                        lateralJoins.push(
-                            `CROSS JOIN LATERAL (
+                    );
+                } else {
+                    lateralJoins.push(
+                        `CROSS JOIN LATERAL (
                             SELECT 1 FROM entity_components ec_f
                             JOIN ${componentTableName} c ON ec_f.component_id = c.id
                             WHERE ec_f.entity_id = ${tableAlias}.entity_id
-                            AND ec_f.type_id = $${componentParamIndices.has(compId) ? componentParamIndices.get(compId) : context.addParam(compId)}::text
+                            AND ec_f.type_id = $${typeParam}::text
                             AND ${condition}
                             AND ec_f.deleted_at IS NULL
                             AND c.deleted_at IS NULL
                             LIMIT 1
                         ) AS ${lateralAlias}`
-                        );
-                    }
-                    lateralConditions.push(`${lateralAlias} IS NOT NULL`);
-                } else {
-                    // Use traditional EXISTS subquery
-                    const componentTableName = this.getComponentTableName(compId);
-                    const useDirectPartition = shouldUseDirectPartition() && componentTableName !== 'components';
-
-                    if (useDirectPartition || !getMembershipSource().isLegacy) {
-                        // Single-table predicate on the component (partition)
-                        // table — membership is the same row, no junction join.
-                        sql += ` ${whereKeyword} EXISTS (
+                    );
+                }
+                lateralConditions.push(`${lateralAlias} IS NOT NULL`);
+            } else if (useDirectPartition || !getMembershipSource().isLegacy) {
+                sql += ` ${whereKeyword} EXISTS (
                         SELECT 1 FROM ${componentTableName} c
                         WHERE c.entity_id = ${tableAlias}.entity_id
-                        AND c.type_id = $${componentParamIndices.has(compId) ? componentParamIndices.get(compId) : context.addParam(compId)}::text
+                        AND c.type_id = $${typeParam}::text
                         AND ${condition}
                         AND c.deleted_at IS NULL
                     )`;
-                    } else {
-                        // Use entity_components junction table
-                        sql += ` ${whereKeyword} EXISTS (
+                hasOuterWhere = true;
+            } else {
+                sql += ` ${whereKeyword} EXISTS (
                         SELECT 1 FROM entity_components ec_f
                         JOIN ${componentTableName} c ON ec_f.component_id = c.id
                         WHERE ec_f.entity_id = ${tableAlias}.entity_id
-                        AND ec_f.type_id = $${componentParamIndices.has(compId) ? componentParamIndices.get(compId) : context.addParam(compId)}::text
+                        AND ec_f.type_id = $${typeParam}::text
                         AND ${condition}
                         AND ec_f.deleted_at IS NULL
                         AND c.deleted_at IS NULL
                     )`;
-                    }
-                    // Mark that we've added WHERE to the outer query
-                    hasOuterWhere = true;
-                }
+                hasOuterWhere = true;
             }
         }
 

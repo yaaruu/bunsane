@@ -4,7 +4,21 @@ All notable changes to bunsane are documented here.
 
 ## Unreleased
 
-Everything here came out of a downstream verification of 0.6.1 that reached three
+### Documentation (2026-08-07)
+
+- **Read-path / list Query docs aligned with 0.6.x engine work:** RP-01…07 status,
+  filter pushdown + numeric index, `hasNextPage`, `cursor`+`sortBy` throw,
+  N+1 diagnosis, QSP coverage limits (exact set, empty tags, multi-archetype).
+  - `docs/READ_PATH_PERFORMANCE.md` — canonical analysis updated
+  - `docs/QSP_OPERATIONS.md` — coverage rules, hydrate flags, reconcile not
+    auto-started, first-archetype checklist
+  - `docs/QUERY_LIST_GUIDE.md` — **new** app-author guide
+  - `docs/CONFIGURATION.md` — `BUNSANE_QSP_HYDRATE*`, coverage notes
+  - `docs/TICKETS_READ_PATH_PERF_2026-08.md` — RP-06b done + product follow-ups
+
+### Fixed (0.6.1 verification follow-through)
+
+Everything below came out of a downstream verification of 0.6.1 that reached three
 wrong conclusions — and every one of them traced back to something this repo
 either stated inaccurately or left unasserted. No behaviour change.
 

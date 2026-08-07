@@ -62,6 +62,13 @@ export class QueryContext {
     public cteName: string = "";
     public eagerComponents: Set<string> = new Set();
     public paginationAppliedInCTE: boolean = false;
+    /**
+     * True when field filters for required components were already applied
+     * inside membership / INTERSECT branches (CTENode or ComponentInclusionNode).
+     * Downstream EXISTS/LATERAL filter application must skip those filters to
+     * avoid double predicates and duplicate params (RP-03).
+     */
+    public filtersAppliedInMembership: boolean = false;
     // Set by Query when an OrQuery participates. OrNode embeds its
     // ComponentInclusionNode dependency's SQL as a base set, so base-level
     // optimizations that bake in ORDER BY/LIMIT (sort-driven scan) must be
@@ -106,6 +113,12 @@ export class QueryContext {
         this.paramIndex = 1;
         this.tableAliases.clear();
         this.sqlFragments = [];
+        // Execution flags rebuilt per DAG run — must not leak across exec/count.
+        this.hasCTE = false;
+        this.cteName = "";
+        this.paginationAppliedInCTE = false;
+        this.filtersAppliedInMembership = false;
+        this.suppressNodeOrdering = false;
     }
 
     public addParams(values: any[]): number[] {

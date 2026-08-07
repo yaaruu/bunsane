@@ -1,10 +1,13 @@
 # Query Sort & Pagination — Deferred Fixes
 
-Status: **Fix #1 DONE, Fix #2 DONE (2026-06-21)** — implemented via multi-agent
-workflow with adversarial review + fix round. 166/170 query tests pass, source
-tsc-clean. Context: native entity-column sort
-(`sortByCreatedAt`/`sortByUpdatedAt`) shipped 2026-06-21; while auditing the
-sort paths we found two pre-existing correctness gaps. Both now fixed.
+Status: **Fix #1 DONE, Fix #2 DONE (2026-06-21)**; **RP-06b DONE (2026-08-07)** —
+`cursor(entityId)` + `sortBy()` throws at exec (use `sortedCursor`). See also
+`docs/QUERY_LIST_GUIDE.md` and `docs/READ_PATH_PERFORMANCE.md` §8.
+
+Original work: multi-agent workflow with adversarial review + fix round.
+Context: native entity-column sort (`sortByCreatedAt`/`sortByUpdatedAt`) shipped
+2026-06-21; while auditing the sort paths we found two pre-existing correctness
+gaps. Both fixed.
 
 ## DONE — what shipped
 
