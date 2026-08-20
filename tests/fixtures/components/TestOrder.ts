@@ -19,5 +19,8 @@ export class TestOrder extends BaseComponent {
     createdAt!: Date;
 
     @CompData({ nullable: true })
+    completedAt?: Date | null;
+
+    @CompData({ nullable: true })
     notes?: string;
 }

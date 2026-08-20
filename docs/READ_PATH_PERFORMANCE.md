@@ -391,7 +391,7 @@ Full runbook: **`docs/QSP_OPERATIONS.md`**. Product patterns: **`docs/QUERY_LIST
 | `.with` set **exactly equals** one archetype’s **projected** component set; supported ops (`= != > < >= <= IN NOT IN`); ≤1 sort; keyset `after` | Yes when READY |
 | Empty **tag** component in `.with()` | **No** — tags emit no projected columns, set equality fails |
 | Optional components on full archetype but not on most entities | Under-counts if projected as membership — use a **list-only archetype** without optionals |
-| Multi-archetype join / cross-entity | **No** — app batches FK `IN` (or wait for M3) |
+| Multi-archetype join / cross-entity | **No** on QSP. Use `@ReadModel` (`m3_*`) or app-side FK `IN` |
 | `.without` / excluded components / OR / spatial / ILIKE | **No** — legacy (OR may still use single-pass OrNode) |
 | `BUNSANE_QSP=off` (default) | Always legacy |
 

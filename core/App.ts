@@ -10,6 +10,7 @@ import {
     EnsureDatabaseMigrations,
     InitializeProjections,
 } from "../database/DatabaseHelper";
+import { InitializeReadModels } from "../database/readmodel";
 import { ComponentRegistry } from "./components";
 import { logger as MainLogger } from "./Logger";
 import { readFileSync } from "fs";
@@ -219,6 +220,8 @@ export default class App {
             armGateway();
             ApplicationLifecycle.setPhase(ApplicationPhase.DATABASE_READY);
             await ComponentRegistry.registerAllComponents();
+            // After partitions exist so M3 rebuild can scan LIST leaves.
+            await InitializeReadModels();
             ApplicationLifecycle.setPhase(ApplicationPhase.SYSTEM_REGISTERING);
         }
     }

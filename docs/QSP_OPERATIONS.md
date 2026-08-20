@@ -62,7 +62,7 @@ Implemented in `query/planner/SurfacePlanner.ts` (`isCovered`) + column derivati
 |-------|-----|
 | **Empty tag components** in `.with(OrderTag)` | Tags have zero `@CompData` fields → emit **no** projected columns → drop out of the descriptor set → set sizes never match. |
 | **Full GraphQL archetype** with optional comps (void/receipt/…) | Optionals enter projection membership if listed; most entities lack them → under-count vs “all real orders.” Use a **list-only archetype**. |
-| **Multi-archetype / cross-entity** lists | No `rm_A ⋈ rm_B`. App does FK batching (`orderId IN (…)`) or waits for M3 read models. |
+| **Multi-archetype / cross-entity** lists | No `rm_A ⋈ rm_B`. App does FK batching (`orderId IN (…)`) or `@ReadModel` (`m3_*`, `ReadModel(T).where/groupBy/sum`). |
 | **`.without(Tag)`** / exclusions | Explicitly rejected by planner (`excludedComponentIds`). |
 | **OR / ILIKE / spatial / nested JSON path** filters | Unsupported ops or OR flag → legacy. |
 | **Multi-key sort** | `req.sorts.length > 1` → legacy. |

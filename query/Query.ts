@@ -35,6 +35,7 @@ import { hydrateEntityFromRow } from "./planner/RmRowHydrator";
 import { PlannerCache } from "./planner/PlannerCache";
 import { qspMode, qspCountStrategy, qspActive, qspHydrate } from "../database/projection/qspConfig";
 import { ProjectionManager } from "../database/projection/ProjectionManager";
+import { sqlTimeBucketFromTs, type TimeTrunc } from "./timeBucket";
 
 // Parsed once at module load instead of on every exec() (process.env read +
 // parseInt was on the query hot path). 0 disables the default limit.
@@ -92,7 +93,22 @@ const getTypedDescriptor: PropertyDescriptor = {
     configurable: false,
 };
 
-export type FilterOperator = "=" | ">" | "<" | ">=" | "<=" | "!=" | "LIKE" | "ILIKE" | "IN" | "NOT IN" | string;
+export type FilterOperator =
+    | "="
+    | ">"
+    | "<"
+    | ">="
+    | "<="
+    | "!="
+    | "LIKE"
+    | "ILIKE"
+    | "IN"
+    | "NOT IN"
+    | "IS NULL"
+    | "IS NOT NULL"
+    | string;
+
+export type GroupAggCast = "timestamptz" | "numeric" | "text";
 
 export const FilterOp = {
     EQ: "=" as FilterOperator,
@@ -105,6 +121,8 @@ export const FilterOp = {
     ILIKE: "ILIKE" as FilterOperator,
     IN: "IN" as FilterOperator,
     NOT_IN: "NOT IN" as FilterOperator,
+    IS_NULL: "IS NULL" as FilterOperator,
+    IS_NOT_NULL: "IS NOT NULL" as FilterOperator,
     CONTAINS: "CONTAINS" as FilterOperator,
     CONTAINED_BY: "CONTAINED_BY" as FilterOperator,
     HAS_ANY: "HAS_ANY" as FilterOperator,
@@ -202,6 +220,13 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
 
     /** Component constructors added to this query for type-safe access */
     private _componentCtors: ComponentConstructor[] = [];
+
+    private groupBySpec: {
+        ctor: new (...args: any[]) => BaseComponent;
+        field: string;
+        trunc?: TimeTrunc;
+        tzOffsetMinutes: number;
+    } | null = null;
 
     constructor(trx?: SQL) {
         this.trx = trx;
@@ -383,6 +408,115 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
     public offset(offset: number): this {
         this.context.offsetValue = offset;
         return this;
+    }
+
+    /**
+     * SQL GROUP BY on one component field. Does not hydrate entities.
+     * `trunc: 'day'|'week'` buckets a Date/timestamptz JSON field after shifting
+     * by `tzOffsetMinutes` (same convention as Isoiresik sales local days).
+     * Pair with {@link countBy} / {@link sumBy} / {@link maxBy} / {@link minBy}.
+     * Cannot combine with OR queries.
+     */
+    public groupBy<T extends BaseComponent>(
+        componentCtor: new (...args: any[]) => T,
+        field: keyof ComponentDataType<T> | string,
+        opts?: { trunc?: TimeTrunc; tzOffsetMinutes?: number }
+    ): this {
+        if (this.orQuery) {
+            throw new Error("Query.groupBy cannot be combined with OR queries");
+        }
+        const ident = assertIdentifier(String(field), "Query.groupBy.field");
+        const typeId = this.context.getComponentId(componentCtor);
+        if (!typeId) {
+            throw new Error(`Component ${componentCtor.name} is not registered.`);
+        }
+        if (!this.context.componentIds.has(typeId)) {
+            throw new Error(
+                `Query.groupBy(${componentCtor.name}, '${ident}') requires .with(${componentCtor.name}) first`
+            );
+        }
+        this.groupBySpec = {
+            ctor: componentCtor,
+            field: ident,
+            trunc: opts?.trunc,
+            tzOffsetMinutes: opts?.tzOffsetMinutes ?? 0,
+        };
+        return this;
+    }
+
+    /**
+     * GROUP BY + COUNT(*). Requires {@link groupBy}. Ignores .take() / sort.
+     */
+    public countBy(): Promise<Array<Record<string, unknown>>> {
+        if (!this.groupBySpec) {
+            throw new Error("Query.countBy() requires .groupBy() first");
+        }
+        return this.runWithTimeout("Query countBy execution", () => this.doCountBy());
+    }
+
+    /**
+     * GROUP BY + SUM(field). Requires {@link groupBy}. Ignores .take() / sort.
+     */
+    public sumBy<T extends BaseComponent>(
+        componentCtor: new (...args: any[]) => T,
+        field: keyof ComponentDataType<T>
+    ): Promise<Array<Record<string, unknown>>> {
+        if (!this.groupBySpec) {
+            throw new Error("Query.sumBy() requires .groupBy() first");
+        }
+        return this.runWithTimeout("Query sumBy execution", () =>
+            this.doSumBy(componentCtor, field as string)
+        );
+    }
+
+    /**
+     * GROUP BY + MAX(field). Default cast is timestamptz (ISO Date fields).
+     * Pass `{ cast: "numeric" }` for numbers, `{ cast: "text" }` for raw JSON text.
+     */
+    public maxBy<T extends BaseComponent>(
+        componentCtor: new (...args: any[]) => T,
+        field: keyof ComponentDataType<T>,
+        opts?: { cast?: GroupAggCast }
+    ): Promise<Array<Record<string, unknown>>> {
+        if (!this.groupBySpec) {
+            throw new Error("Query.maxBy() requires .groupBy() first");
+        }
+        return this.runWithTimeout("Query maxBy execution", () =>
+            this.doMinMaxBy("MAX", componentCtor, field as string, opts?.cast ?? "timestamptz")
+        );
+    }
+
+    /**
+     * GROUP BY + MIN(field). Same cast rules as {@link maxBy}.
+     */
+    public minBy<T extends BaseComponent>(
+        componentCtor: new (...args: any[]) => T,
+        field: keyof ComponentDataType<T>,
+        opts?: { cast?: GroupAggCast }
+    ): Promise<Array<Record<string, unknown>>> {
+        if (!this.groupBySpec) {
+            throw new Error("Query.minBy() requires .groupBy() first");
+        }
+        return this.runWithTimeout("Query minBy execution", () =>
+            this.doMinMaxBy("MIN", componentCtor, field as string, opts?.cast ?? "timestamptz")
+        );
+    }
+
+    /**
+     * GROUP BY + AVG(end − start) in minutes for two Date JSON fields on the
+     * same component. Null/blank timestamps are skipped (AVG ignores NULL).
+     */
+    public avgIntervalMinutesBy<T extends BaseComponent>(
+        componentCtor: new (...args: any[]) => T,
+        startField: keyof ComponentDataType<T>,
+        endField: keyof ComponentDataType<T>
+    ): Promise<Array<Record<string, unknown>>> {
+        if (!this.groupBySpec) {
+            throw new Error("Query.avgIntervalMinutesBy() requires .groupBy() first");
+        }
+        return this.runWithTimeout("Query avgIntervalMinutesBy execution", () =>
+            this.doAvgIntervalMinutesBy(componentCtor, startField as string, endField as string)
+        );
     }
 
     /**
@@ -849,6 +983,239 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         field: keyof ComponentDataType<T>
     ): Promise<number> {
         return this.runWithTimeout('Query average execution', () => this.doAggregate('AVG', componentCtor, field as string));
+    }
+
+    private compileMembershipSql(): { sql: string; params: any[] } {
+        this.context.reset();
+        const dag = new QueryDAG();
+        if (this.orQuery) {
+            throw new Error("Query.groupBy cannot be combined with OR queries");
+        }
+        const optimizedDag = QueryDAG.buildBasicQuery(this.context);
+        for (const node of optimizedDag.getNodes()) {
+            dag.addNode(node);
+        }
+        if (optimizedDag.getRootNode()) {
+            dag.setRootNode(optimizedDag.getRootNode()!);
+        }
+        const result = dag.execute(this.context);
+        return { sql: result.sql, params: result.params };
+    }
+
+    private partitionTable(typeId: string, ctx: string): string {
+        const raw = shouldUseDirectPartition()
+            ? ComponentRegistry.getPartitionTableName(typeId) || "components"
+            : "components";
+        return assertComponentTableName(raw, ctx);
+    }
+
+    private groupKeyName(): string {
+        return this.groupBySpec?.trunc ? "bucket" : this.groupBySpec!.field;
+    }
+
+    private groupSqlExpr(alias: string, nextParam: () => number): { expr: string; params: unknown[] } {
+        const spec = this.groupBySpec!;
+        const json = `${alias}.data->>'${spec.field}'`;
+        if (!spec.trunc) {
+            return { expr: json, params: [] };
+        }
+        const idx = nextParam();
+        const ts = `NULLIF(${json}, '')::timestamptz`;
+        return {
+            expr: sqlTimeBucketFromTs(ts, spec.trunc, `$${idx}`),
+            params: [spec.tzOffsetMinutes],
+        };
+    }
+
+    private async doCountBy(): Promise<Array<Record<string, unknown>>> {
+        const spec = this.groupBySpec!;
+        const savedLimit = this.context.limit;
+        const savedOffset = this.context.offsetValue;
+        const savedSorts = this.context.sortOrders;
+        this.context.limit = null;
+        this.context.offsetValue = 0;
+        this.context.sortOrders = [];
+        try {
+            const membership = this.compileMembershipSql();
+            const params: unknown[] = [...membership.params];
+            const typeId = this.context.getComponentId(spec.ctor)!;
+            const table = this.partitionTable(typeId, "countBy.table");
+            params.push(typeId);
+            const typeIdx = params.length;
+            const { expr, params: gParams } = this.groupSqlExpr("g", () => {
+                params.push(undefined);
+                return params.length;
+            });
+            if (gParams.length > 0) {
+                params[params.length - 1] = gParams[0];
+            }
+            const key = this.groupKeyName();
+            const sql = `SELECT ${expr} AS "${key}", COUNT(*)::int AS count
+                         FROM (${membership.sql}) AS entity_subq
+                         JOIN ${table} g ON g.entity_id = entity_subq.id
+                         WHERE g.type_id = $${typeIdx}
+                           AND g.deleted_at IS NULL
+                         GROUP BY 1`;
+            const rows = await this.execSql<any[]>(
+                "query.countBy",
+                this.getDb(),
+                sql,
+                params as any[],
+                this.execSignal,
+                this.execPerRequest
+            );
+            return (rows ?? []).map((r) => ({
+                [key]: r[key],
+                count: r.count == null ? 0 : Number(r.count),
+            }));
+        } finally {
+            this.context.limit = savedLimit;
+            this.context.offsetValue = savedOffset;
+            this.context.sortOrders = savedSorts;
+        }
+    }
+
+    private jsonTextExpr(alias: string, field: string, ctx: string): string {
+        assertFieldPath(field, ctx);
+        if (field.includes(".")) {
+            const parts = field.split(".");
+            const last = parts.pop()!;
+            const nested = parts.map((p) => `'${p}'`).join("->");
+            return `${alias}.data->${nested}->>'${last}'`;
+        }
+        return `${alias}.data->>'${field}'`;
+    }
+
+    private async doSumBy(
+        metricCtor: new (...args: any[]) => BaseComponent,
+        field: string
+    ): Promise<Array<Record<string, unknown>>> {
+        const jsonPath = this.jsonTextExpr("c", field, "sumBy.field");
+        return this.doGroupAgg(
+            metricCtor,
+            field,
+            `COALESCE(SUM((${jsonPath})::numeric), 0)::numeric`,
+            "query.sumBy",
+            (v) => (v == null ? 0 : Number(v))
+        );
+    }
+
+    private async doMinMaxBy(
+        fn: "MAX" | "MIN",
+        metricCtor: new (...args: any[]) => BaseComponent,
+        field: string,
+        cast: GroupAggCast
+    ): Promise<Array<Record<string, unknown>>> {
+        const jsonPath = this.jsonTextExpr("c", field, `${fn.toLowerCase()}By.field`);
+        let metricSql: string;
+        let coerce: (v: unknown) => unknown;
+        if (cast === "numeric") {
+            metricSql = `${fn}((${jsonPath})::numeric)`;
+            coerce = (v) => (v == null ? 0 : Number(v));
+        } else if (cast === "text") {
+            metricSql = `${fn}(${jsonPath})`;
+            coerce = (v) => v ?? null;
+        } else {
+            metricSql = `${fn}(NULLIF(${jsonPath}, '')::timestamptz)`;
+            coerce = (v) => {
+                if (v == null) return null;
+                if (v instanceof Date) return Number.isNaN(v.getTime()) ? null : v;
+                const d = new Date(String(v));
+                return Number.isNaN(d.getTime()) ? null : d;
+            };
+        }
+        return this.doGroupAgg(metricCtor, field, metricSql, `query.${fn.toLowerCase()}By`, coerce);
+    }
+
+    private async doAvgIntervalMinutesBy(
+        metricCtor: new (...args: any[]) => BaseComponent,
+        startField: string,
+        endField: string
+    ): Promise<Array<Record<string, unknown>>> {
+        const start = this.jsonTextExpr("c", startField, "avgIntervalMinutesBy.startField");
+        const end = this.jsonTextExpr("c", endField, "avgIntervalMinutesBy.endField");
+        const metricSql = `AVG(EXTRACT(EPOCH FROM (NULLIF(${end}, '')::timestamptz - NULLIF(${start}, '')::timestamptz)) / 60.0)`;
+        return this.doGroupAgg(
+            metricCtor,
+            "avgIntervalMinutes",
+            metricSql,
+            "query.avgIntervalMinutesBy",
+            (v) => (v == null ? 0 : Number(v))
+        );
+    }
+
+    private async doGroupAgg(
+        metricCtor: new (...args: any[]) => BaseComponent,
+        resultField: string,
+        metricSql: string,
+        logName: string,
+        coerce: (value: unknown) => unknown
+    ): Promise<Array<Record<string, unknown>>> {
+        const spec = this.groupBySpec!;
+        const metricTypeId = this.context.getComponentId(metricCtor);
+        if (!metricTypeId) {
+            throw new Error(`Component ${metricCtor.name} is not registered.`);
+        }
+        if (!this.context.componentIds.has(metricTypeId)) {
+            throw new Error(
+                `Cannot aggregate on component ${metricCtor.name} that is not included in the query.`
+            );
+        }
+        const savedLimit = this.context.limit;
+        const savedOffset = this.context.offsetValue;
+        const savedSorts = this.context.sortOrders;
+        this.context.limit = null;
+        this.context.offsetValue = 0;
+        this.context.sortOrders = [];
+        try {
+            const membership = this.compileMembershipSql();
+            const params: unknown[] = [...membership.params];
+            const groupTypeId = this.context.getComponentId(spec.ctor)!;
+            const same = groupTypeId === metricTypeId;
+            const metricTable = this.partitionTable(metricTypeId, `${logName}.metricTable`);
+            params.push(metricTypeId);
+            const metricTypeIdx = params.length;
+            let groupAlias = "c";
+            let extraJoin = "";
+            if (!same) {
+                const groupTable = this.partitionTable(groupTypeId, `${logName}.groupTable`);
+                params.push(groupTypeId);
+                const groupTypeIdx = params.length;
+                extraJoin = `JOIN ${groupTable} g ON g.entity_id = entity_subq.id AND g.type_id = $${groupTypeIdx} AND g.deleted_at IS NULL`;
+                groupAlias = "g";
+            }
+            const { expr, params: gParams } = this.groupSqlExpr(groupAlias, () => {
+                params.push(undefined);
+                return params.length;
+            });
+            if (gParams.length > 0) {
+                params[params.length - 1] = gParams[0];
+            }
+            const key = this.groupKeyName();
+            const sql = `SELECT ${expr} AS "${key}", ${metricSql} AS "${resultField}"
+                         FROM (${membership.sql}) AS entity_subq
+                         JOIN ${metricTable} c ON c.entity_id = entity_subq.id
+                         ${extraJoin}
+                         WHERE c.type_id = $${metricTypeIdx}
+                           AND c.deleted_at IS NULL
+                         GROUP BY 1`;
+            const rows = await this.execSql<any[]>(
+                logName,
+                this.getDb(),
+                sql,
+                params as any[],
+                this.execSignal,
+                this.execPerRequest
+            );
+            return (rows ?? []).map((r) => ({
+                [key]: r[key],
+                [resultField]: coerce(r[resultField]),
+            }));
+        } finally {
+            this.context.limit = savedLimit;
+            this.context.offsetValue = savedOffset;
+            this.context.sortOrders = savedSorts;
+        }
     }
 
     /**
@@ -1925,3 +2292,4 @@ export function or(branches: ComponentWithFilters[]): OrQuery {
 }
 
 export { Query };
+export type { TimeTrunc } from "./timeBucket";

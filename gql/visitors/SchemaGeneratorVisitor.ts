@@ -56,6 +56,16 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
         // Add default scalars
         this.typeDefs += 'scalar Upload\n';
         this.typeDefs += 'scalar Date\n';
+
+        // M3 derived types + Query fields only (never Mutation).
+        const {
+            readModelTypeDefs,
+            readModelQueryFields,
+        } = require("../../core/readmodel");
+        this.typeDefs += readModelTypeDefs();
+        for (const field of readModelQueryFields()) {
+            this.queryFields.push(field);
+        }
     }
     
     /**

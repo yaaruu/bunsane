@@ -4,6 +4,11 @@ All notable changes to bunsane are documented here.
 
 ## Unreleased
 
+### Added
+
+- **M3 `@ReadModel` Stage A** — cross-entity derived tables (`m3_*`, not QSP `rm_*`), write-through on `Entity.save` / `doDelete`, SQL `where` / range / `IN` / `count` / `avg` / `groupBy`+`sum`, covering + timestamptz indexes, read-only GraphQL Query resolvers. Docs: `QUERY_LIST_GUIDE` reports section replaces `take(50000)` + JS as the report path.
+- **`Query.maxBy` / `minBy` / `avgIntervalMinutesBy`** — SQL `GROUP BY` + `MAX`/`MIN` (timestamptz default, `{ cast: "numeric"|"text" }`) and `AVG(end − start)` in minutes for two Date JSON fields. **`FilterOp.IS_NULL` / `IS_NOT_NULL`** treats missing / JSON null / `''` as blank. Last-order and open-assignment reports no longer need `take(50000)` + JS.
+
 ### Documentation (2026-08-07)
 
 - **Read-path / list Query docs aligned with 0.6.x engine work:** RP-01…07 status,

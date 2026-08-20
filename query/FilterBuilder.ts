@@ -146,6 +146,12 @@ export function buildComponentFilterCondition(
     if (filter.operator === 'LIKE' || filter.operator === 'NOT LIKE' || filter.operator === 'ILIKE') {
         return `${jsonPath} ${filter.operator} $${context.addParam(filter.value)}`;
     }
+    if (filter.operator === 'IS NULL') {
+        return `(${jsonPath} IS NULL OR ${jsonPath} = '')`;
+    }
+    if (filter.operator === 'IS NOT NULL') {
+        return `(${jsonPath} IS NOT NULL AND ${jsonPath} <> '')`;
+    }
     if (filter.operator === 'IN' || filter.operator === 'NOT IN') {
         if (Array.isArray(filter.value) && filter.value.length > 0) {
             const cast = jsonbInListCast(filter.value);

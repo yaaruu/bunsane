@@ -38,6 +38,8 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Benchmark databases (generated, large files)
 tests/benchmark/databases/
+# Postgres dumps (may contain PII) — never commit
+*.sql.gz
 # Claude Code runtime artifacts
 .claude/scheduled_tasks.lock
 .claude/worktrees/

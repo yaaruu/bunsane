@@ -312,7 +312,7 @@ Filter+sort on single hot component: index-only or index scan on `proj_*`; compa
 | F-03 | CTE LIMIT pushdown when filters selective | Harder correctness; after RP-03 |
 | F-04 | OR + component sort uses sort-driven or rm_ | Currently JOIN wrapper full sort |
 | F-05 | Count result cache (short TTL by query signature) | Alternative to estimate for dashboards |
-| F-06 | M2/M3 explicit `@ReadModel` for cross-entity reports | Beyond QSP archetype lists |
+| F-06 | M2/M3 explicit `@ReadModel` for cross-entity reports | **Stage A shipped 2026-08-20** (`m3_*`, write-through, range/`IN`/`count`/`avg`, live GraphQL Query resolvers). Remaining: outbox/multi-instance, daily fact grain, typed join |
 | F-07 | Tag / `.without` membership columns on `rm_*` | Empty tags currently break QSP coverage; product lists often need tags |
 | F-08 | List-archetype subset / explicit `routeAs` | Route when query set matches list surface without hand-dropping tags |
 | F-09 | GraphQL list hydrate / ArcheTypeFunction DataLoaders by default | N+1 in admin UIs is mostly resolvers, not INTERSECT |

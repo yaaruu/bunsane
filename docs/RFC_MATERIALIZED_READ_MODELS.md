@@ -1,6 +1,6 @@
 # RFC: Materialized Read Models — ECS Projection Layer
 
-**Status:** Draft
+**Status:** Draft (M3 Stage A implemented 2026-08-20 — see §4.3)
 **Author:** yaaruu (drafted with Claude)
 **Date:** 2026-06-27
 **Companion:** `docs/RFC_ECS_PG_SORT_DENORMALIZATION.md` — defines the L0–L4 solution ladder. This RFC operationalizes its **L1 (generated columns)** and **L3 (projection tables)** rungs, and adds the developer-facing API + GraphQL integration story that the companion left open.
@@ -131,6 +131,8 @@ await ReadModel(InvoiceReport).where("status", "paid").groupBy("region").sum("to
 
 A `ReadModel` contributes a **read-only** GraphQL type (no mutations — it is derived) into the same weaver pipeline an archetype uses. The framework owns table DDL, sync wiring, and reconcile. Developers write **zero** sync code.
 
+**Stage A (2026-08-20), in tree:** `@ReadModel` / `@Project` in `core/readmodel/`, tables prefixed **`m3_`** (not QSP `rm_`), write-through in the `Entity.save` / `doDelete` transaction (outbox not required for single-instance). Reader: equality, range (`gt`/`gte`/`lt`/`lte`), `IN`, `count`, `avg`, SQL `GROUP BY` + `SUM`. Covering + timestamptz indexes. GraphQL Query fields have live resolvers; mutation fields stay empty. Rebuild scans LIST partitions when direct-partition is on. **Not in Stage A:** outbox/multi-instance fan-out, typed join (string `on` with identifier checks remains), daily fact grain, F-10 `Query.groupBy`.
+
 ## 5. Refresh paths (Gall's Law — simplest that works)
 
 All M2-`table` and M3 sync reuses existing infrastructure. No new transport.
@@ -167,7 +169,7 @@ The `handleCacheAfterSave` step in `core/entity/cacheStrategies.ts` is the exact
 |------|----------|-----------------|-----------|
 | **M1** | add `projected?: boolean` to `ComponentPropertyMetadata` (`core/metadata/definitions/Component.ts:7`), thread through `CompData()` (`core/components/Decorators.ts:54`) | new `ensureGeneratedColumn()` in `database/DatabaseHelper.ts`, called from `ComponentRegistry.setupComponentFeatures()` (`core/components/ComponentRegistry.ts:295`, after the index block ~323), LIST-guarded | `getProjectedColumn()` consulted in the 4 SQL-build sites (§6.3) |
 | **M2** | `materialize` option on `@ArcheType` decorator (`core/archetype/decorators.ts:28`) | reuse M1 for `"generated"`; new `rm_<archetype>` table DDL for `"table"` | branch in `buildFieldResolvers()` (`core/archetype/fieldResolvers.ts:30`) before the DataLoader waterfall (lines 69-154) — SDL untouched |
-| **M3** | new `@ReadModel` / `@Project` decorators + storage map | new `rm_<name>` table DDL; sync handler registered on `EntityHookManager` / `RemoteManager` | register ZodObject via `allArchetypeZodObjects.set()` (`core/archetype/weaver.ts:14`) + `@GraphQLOperation` Query-only service; live via `ServiceRegistry.rebuildSchema()` (`service/ServiceRegistry.ts:87`) |
+| **M3** | new `@ReadModel` / `@Project` decorators + storage map | new `m3_<name>` table DDL (`database/readmodel/`); write-through from `saveEntity` / `doDelete` | SDL + live Query resolvers via `SchemaGeneratorVisitor` / `ResolverGeneratorVisitor`; `ReadModel(T)` reader |
 | **sync** | — | `remote_outbox` (`core/remote/outboxSchema.ts`), `OutboxWorker` (`core/remote/OutboxWorker.ts`) | post-commit step in `runPostCommitSideEffects` (`core/entity/saveEntity.ts:101-136`), modeled on `cacheStrategies.ts:17-73` |
 
 ## 8. Phases (each ships working) — RE-PRIORITIZED after Phase 0

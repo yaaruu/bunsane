@@ -78,7 +78,7 @@ Matcher-style queries (many tags + `.without` + spatial) stay on **legacy** — 
 | Hydrate | `get` after `exec` without eager load | `.eagerLoadComponents([A,B,C])` or `.populate()` |
 | GraphQL relations | N queries for `@BelongsTo` / `@HasMany` | Request DataLoaders (`createRequestLoaders`) |
 | GraphQL computed fields | Query-per-parent in `@ArcheTypeFunction` | Batch by parent ids once; attach map |
-| Stats / dashboards | `take(50000)` + sum in JS | Prefer SQL aggregates / dedicated report queries (framework aggregate API is limited) |
+| Stats / dashboards | `take(50000)` + sum in JS | Cross-entity: `@ReadModel` + `ReadModel(T).where/groupBy/sum`. Same entity: `Query.groupBy` + `countBy`/`sumBy`/`maxBy`. Open rows: `FilterOp.IS_NULL` |
 
 **Diagnose:** per-request `dbQueryCount` in access logs. If it scales with page size while `EXPLAIN` looks fine, you have N+1, not a bad INTERSECT.
 
@@ -140,7 +140,43 @@ Avoid / accept cost:
 
 ---
 
-## 8. Code map
+## 8. Reports (not lists)
+
+`Query.exec()` hydrates entities. Do **not** pull a month of orders with `take(50000)` and reduce in JS.
+
+| Need | API |
+|------|-----|
+| Cross-entity join + `GROUP BY` | `@ReadModel` / `@Project`, then `ReadModel(T).where(...).where("paidAt", "gte", start).groupBy("region").sum("total")` |
+| Date range / `IN` / count / avg | `where(field, op, value)` with `gte`/`lte`/`in`, `.count()`, `.avg()` — SQL on `m3_*`, not a JS loop |
+| Single-component scalar SUM/AVG | `new Query().with(C).sum(C, "amount")` / `.average(C, "amount")` |
+| Per-key COUNT/SUM/MAX/MIN | `new Query().with(C).groupBy(C, "customerId").countBy()` / `.sumBy(C, "total")` / `.maxBy(C, "createdAt")` / `.minBy(...)` |
+| Open rows / last event | `FilterOp.IS_NULL` / `IS_NOT_NULL` (missing, JSON null, or `''`). Last-seen: `.groupBy(C, "ownerId").maxBy(C, "createdAt")` |
+| Average duration | `.groupBy(C, "techId").avgIntervalMinutesBy(C, "assignedAt", "completedAt")` (same component, Date fields) |
+| List screens | QSP / `Query.exec` (this guide) |
+
+```ts
+@ReadModel({
+  from: [Invoice, Customer],
+  join: { on: "Invoice.customerId = Customer.id" },
+})
+class InvoiceReport {
+  @Project(Invoice, "total") total!: number;
+  @Project(Customer, "region") region!: string;
+  @Project(Invoice, "status") status!: string;
+  @Project(Invoice, "paidAt") paidAt!: Date;
+}
+
+await ReadModel(InvoiceReport)
+  .where("status", "paid")
+  .where("paidAt", "gte", start)
+  .where("paidAt", "lte", end)
+  .groupBy("region")
+  .sum("total");
+```
+
+Grain today is **one row per join pair**, not a daily fact `(outlet, day)`. Daily KPIs either group a date column at read time or wait for F-10 / a later rollup. QSP `rm_*` tables are list coverage, not this.
+
+## 9. Code map
 
 | Concern | Location |
 |---------|----------|
@@ -149,5 +185,6 @@ Avoid / accept cost:
 | Numeric index predicates | `database/numericJsonField.ts` |
 | QSP planner | `query/planner/SurfacePlanner.ts` |
 | Projection metadata | `database/projection/ProjectionMetadata.ts` |
+| M3 read models | `core/readmodel/`, `database/readmodel/` |
 | Request DataLoaders | `core/RequestLoaders.ts` |
 | Config flags | `docs/CONFIGURATION.md` |

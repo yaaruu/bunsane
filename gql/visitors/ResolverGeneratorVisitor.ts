@@ -127,6 +127,15 @@ export class ResolverGeneratorVisitor extends GraphVisitor {
         if (!resolvers.Query) {
             resolvers.Query = {};
         }
+
+        const { readModelResolvers } = require("../../core/readmodel");
+        const m3 = readModelResolvers() as { Query: Record<string, Function> };
+        for (const [name, fn] of Object.entries(m3.Query || {})) {
+            if (!resolvers.Query[name]) {
+                resolvers.Query[name] = fn as Function;
+            }
+        }
+
         if (Object.keys(resolvers.Query).length === 0) {
             resolvers.Query._empty = () => null;
         }

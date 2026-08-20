@@ -15,6 +15,7 @@ import { EntityCreatedEvent, EntityUpdatedEvent } from "../events/EntityLifecycl
 import { trackSideEffect } from "./pendingOps";
 import { handleCacheAfterSave, runPostDeleteSideEffects } from "./cacheStrategies";
 import { ProjectionManager } from "../../database/projection";
+import { ReadModelManager } from "../../database/readmodel";
 import type { Entity } from "../Entity";
 
 /**
@@ -339,6 +340,9 @@ export async function doSave(entity: Entity, trx: SQL, signal?: AbortSignal): Pr
         await ProjectionManager.instance.upsertProjection(entity, qspTouched, trx);
     }
 
+    // M3 derived tables: same transaction as the ECS write (no second write API).
+    await ReadModelManager.instance.syncOnSave(entity, trx);
+
     entity.setDirty(false);
 
     return true;
@@ -385,6 +389,7 @@ export async function doDelete(entity: Entity, force: boolean = false): Promise<
             if (ProjectionManager.enabled) {
                 await ProjectionManager.instance.deleteProjection(entity.id, force, trx);
             }
+            await ReadModelManager.instance.syncOnDelete(entity.id, force, trx);
         }, { lane: 'request', label: 'entity.delete', deadline, signal: controller.signal });
         clearTimeout(timeoutHandle);
 
