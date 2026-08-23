@@ -1,3 +1,4 @@
+import path from "path";
 import type { UploadConfiguration, StorageResult, FileMetadata } from "../types/upload.types";
 
 /**
@@ -101,10 +102,15 @@ export abstract class StorageProvider {
     }
 
     /**
-     * Sanitize path to prevent directory traversal
+     * Sanitize path to prevent directory traversal (SEC-07).
+     *
+     * Hardened: backslashes are normalized FIRST (on Windows `..\` is a
+     * separator pair the old forward-slash-only logic never saw), then
+     * iterative `..` removal handles nested payloads (`....//`), and the
+     * result must not contain drive/UNC roots.
      */
     protected sanitizePath(path: string): string {
-        let sanitized = path;
+        let sanitized = String(path).replace(/\\/g, '/');
         // Iterative removal to prevent bypass via nested payloads (e.g. "....//")
         while (sanitized.includes('..')) {
             sanitized = sanitized.replace(/\.\./g, '');
@@ -112,5 +118,25 @@ export abstract class StorageProvider {
         return sanitized
             .replace(/\/+/g, '/')
             .replace(/^\/+/, '');
+    }
+
+    /**
+     * Containment check (SEC-07): resolve both paths absolutely and require
+     * the target to stay inside the base directory. Works for drive letters
+     * and UNC paths on Windows. Call this in EVERY provider method after
+     * joining — sanitization alone is not a containment guarantee.
+     */
+    protected assertInsideBase(fullPath: string, basePath: string, context: string): string {
+        const resolvedBase = path.resolve(basePath);
+        const resolvedFull = path.resolve(fullPath);
+        const baseWithSep = resolvedBase.endsWith(path.sep)
+            ? resolvedBase
+            : resolvedBase + path.sep;
+        if (!resolvedFull.startsWith(baseWithSep) && resolvedFull !== resolvedBase) {
+            throw new Error(
+                `${context}: resolved path escapes storage base (${resolvedFull})`
+            );
+        }
+        return resolvedFull;
     }
 }

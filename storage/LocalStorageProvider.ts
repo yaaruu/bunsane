@@ -46,8 +46,26 @@ export class LocalStorageProvider extends StorageProvider {
         metadata: FileMetadata,
         config: UploadConfiguration
     ): Promise<StorageResult> {
-        const uploadDir = path.join(this.basePath, config.uploadPath);
-        const fullPath = path.join(uploadDir, metadata.fileName);
+        // SEC-07: store() historically skipped containment entirely — a
+        // hostile fileName under namingStrategy:"original" could escape the
+        // base directory. Resolve and verify BEFORE any filesystem effect.
+        const uploadDir = this.assertInsideBase(
+            path.join(this.basePath, config.uploadPath ?? ''),
+            this.basePath,
+            'LocalStorage.store(uploadPath)',
+        );
+        const fullPath = this.assertInsideBase(
+            path.join(uploadDir, metadata.fileName),
+            this.basePath,
+            'LocalStorage.store(fileName)',
+        );
+        // Windows-reserved characters would fail at open() with a confusing
+        // ENOENT (or worse, ADS syntax "file:stream"); reject explicitly.
+        if (/[:*?"<>|]/.test(metadata.fileName)) {
+            throw new Error(
+                `LocalStorage.store: fileName contains reserved characters: ${metadata.fileName}`
+            );
+        }
         const relativePath = this.buildPath(config.uploadPath, metadata.fileName);
         
         logger.info(`Storing file: ${metadata.fileName} to ${fullPath}`);
@@ -91,7 +109,11 @@ export class LocalStorageProvider extends StorageProvider {
     }
 
     public async delete(filePath: string): Promise<boolean> {
-        const fullPath = path.join(this.basePath, this.sanitizePath(filePath));
+        const fullPath = this.assertInsideBase(
+            path.join(this.basePath, this.sanitizePath(filePath)),
+            this.basePath,
+            'LocalStorage.delete',
+        );
         
         try {
             if (fs.existsSync(fullPath)) {
@@ -113,12 +135,20 @@ export class LocalStorageProvider extends StorageProvider {
     }
 
     public async exists(filePath: string): Promise<boolean> {
-        const fullPath = path.join(this.basePath, this.sanitizePath(filePath));
+        const fullPath = this.assertInsideBase(
+            path.join(this.basePath, this.sanitizePath(filePath)),
+            this.basePath,
+            'LocalStorage.read',
+        );
         return fs.existsSync(fullPath);
     }
 
     public async getMetadata(filePath: string): Promise<FileMetadata | null> {
-        const fullPath = path.join(this.basePath, this.sanitizePath(filePath));
+        const fullPath = this.assertInsideBase(
+            path.join(this.basePath, this.sanitizePath(filePath)),
+            this.basePath,
+            'LocalStorage.read',
+        );
         
         try {
             if (!fs.existsSync(fullPath)) {
@@ -145,7 +175,11 @@ export class LocalStorageProvider extends StorageProvider {
     }
 
     public async list(directoryPath: string): Promise<string[]> {
-        const fullPath = path.join(this.basePath, this.sanitizePath(directoryPath));
+        const fullPath = this.assertInsideBase(
+            path.join(this.basePath, this.sanitizePath(directoryPath)),
+            this.basePath,
+            'LocalStorage.list',
+        );
         
         try {
             if (!fs.existsSync(fullPath)) {
@@ -165,7 +199,11 @@ export class LocalStorageProvider extends StorageProvider {
     }
 
     public async getStream(filePath: string): Promise<ReadableStream> {
-        const fullPath = path.join(this.basePath, this.sanitizePath(filePath));
+        const fullPath = this.assertInsideBase(
+            path.join(this.basePath, this.sanitizePath(filePath)),
+            this.basePath,
+            'LocalStorage.read',
+        );
         
         if (!fs.existsSync(fullPath)) {
             throw new Error(`File not found: ${filePath}`);
@@ -191,8 +229,16 @@ export class LocalStorageProvider extends StorageProvider {
     }
 
     public async copy(sourcePath: string, destinationPath: string): Promise<boolean> {
-        const sourceFullPath = path.join(this.basePath, this.sanitizePath(sourcePath));
-        const destFullPath = path.join(this.basePath, this.sanitizePath(destinationPath));
+        const sourceFullPath = this.assertInsideBase(
+            path.join(this.basePath, this.sanitizePath(sourcePath)),
+            this.basePath,
+            'LocalStorage.copy.source',
+        );
+        const destFullPath = this.assertInsideBase(
+            path.join(this.basePath, this.sanitizePath(destinationPath)),
+            this.basePath,
+            'LocalStorage.copy.dest',
+        );
         
         try {
             if (!fs.existsSync(sourceFullPath)) {

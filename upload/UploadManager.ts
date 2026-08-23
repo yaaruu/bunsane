@@ -243,8 +243,11 @@ export class UploadManager {
                 fileName = `${Date.now()}_${this.sanitizeFileName(file.name)}`;
                 break;
             case "original":
-                fileName = config.sanitizeFileName ? 
-                    this.sanitizeFileName(file.name) : file.name;
+                // SEC-07: the raw name is never used, regardless of
+                // sanitizeFileName:false — a hostile original name ("../x",
+                // "C:\\evil") must not reach path building. The sanitized form
+                // keeps [a-zA-Z0-9.-] only, which cannot traverse.
+                fileName = this.sanitizeFileName(file.name);
                 break;
             default:
                 fileName = `${uploadId}${extension}`;
