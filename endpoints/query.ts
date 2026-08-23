@@ -1,24 +1,53 @@
 import { studioExec, studioErrorResponse } from "./db";
+import { assertRunnableSingleSelect } from "./sqlGuard";
 import { isAdmissionTimeout } from "../database/gateway";
 import { isPoolAcquisitionError } from "../database/poolErrors";
 import type { StudioQueryRequest, StudioQueryResponse } from "./types";
 
-const FORBIDDEN_KEYWORDS = /\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|COPY|EXECUTE|DO)\b/i;
 const MAX_ROWS = 500;
 const QUERY_TIMEOUT_MS = 10_000;
+
+/**
+ * SEC-02: the runner exists only when explicitly opted in. The previous gate
+ * (`NODE_ENV !== 'production'`) left it enabled whenever the variable was
+ * unset — which is the common state in dev containers, CI images and staging.
+ */
+function isStudioQueryEnabled(): boolean {
+    const v = process.env.BUNSANE_STUDIO_QUERY;
+    return v === "on" || v === "true";
+}
+
+function notFound(): Response {
+    return new Response(JSON.stringify({ error: "Not found" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+    });
+}
+
+/**
+ * Short classified failure text instead of raw Postgres internals. The
+ * verbose message stays available to operators via server logs; clients of
+ * an unauthenticated-capable endpoint do not need `relation "x"` detail.
+ */
+function classifyQueryError(message: string): string {
+    if (/syntax error/i.test(message)) return "Syntax error in SQL statement";
+    if (/does not exist/i.test(message)) return "Relation or column does not exist";
+    if (/permission denied/i.test(message)) return "Permission denied";
+    if (/canceling statement due to (statement )?timeout|statement timeout/i.test(message)) {
+        return "Query timed out";
+    }
+    if (/must appear in the GROUP BY|aggregate functions/i.test(message)) {
+        return "Invalid aggregate/GROUP BY usage";
+    }
+    return "Query failed";
+}
 
 export async function handleStudioQueryRequest(
     requestBody: StudioQueryRequest
 ): Promise<Response> {
-    // Only allow in non-production
-    if (process.env.NODE_ENV === "production") {
-        return new Response(
-            JSON.stringify({ error: "Query runner is disabled in production" }),
-            {
-                status: 403,
-                headers: { "Content-Type": "application/json" },
-            }
-        );
+    // Explicit opt-in only — default OFF regardless of NODE_ENV (SEC-02).
+    if (!isStudioQueryEnabled()) {
+        return notFound();
     }
 
     const { sql } = requestBody;
@@ -33,37 +62,33 @@ export async function handleStudioQueryRequest(
         );
     }
 
-    const trimmed = sql.trim();
-
-    // Block write operations
-    if (FORBIDDEN_KEYWORDS.test(trimmed)) {
+    // Literal/comment-aware vetting: single statement, read-only keywords
+    // only. The old regex checks were fooled by text inside comments and
+    // string literals, and missed SET/CALL/VACUUM/MERGE entirely.
+    const guard = assertRunnableSingleSelect(sql);
+    if (!guard.ok || !guard.statement) {
         return new Response(
-            JSON.stringify({
-                error: "Only read-only (SELECT) queries are allowed",
-            }),
+            JSON.stringify({ error: guard.error ?? "Rejected" }),
             {
-                status: 400,
+                status: guard.status,
                 headers: { "Content-Type": "application/json" },
             }
         );
     }
 
-    // Enforce LIMIT if not present
-    const hasLimit = /\bLIMIT\b/i.test(trimmed);
-    const queryToRun = hasLimit ? trimmed : `${trimmed} LIMIT ${MAX_ROWS}`;
+    // Server-side row bound on EVERY query. Wrapping as a derived table means
+    // a comment containing "LIMIT" can no longer suppress the limit, and the
+    // full result set never reaches this process. A trailing terminator was
+    // already removed by the guard.
+    const wrapped = `SELECT * FROM (${guard.statement}) _bunsane_studio_q LIMIT ${MAX_ROWS}`;
 
     try {
         const startTime = Date.now();
 
-        // Was a `Promise.race` against a bare `setTimeout`: it rejected the
-        // caller but left the query running with nothing watching it, holding a
-        // pool slot and an un-cleared timer. The gateway's deadline covers both
-        // waiting for capacity and running, and releases the admission permit
-        // either way.
         const result = await studioExec<unknown>(
             "studio.query.adhoc",
             Date.now() + QUERY_TIMEOUT_MS,
-            queryToRun,
+            wrapped,
         );
 
         const duration = Date.now() - startTime;
@@ -83,18 +108,13 @@ export async function handleStudioQueryRequest(
             headers: { "Content-Type": "application/json" },
         });
     } catch (error) {
-        // 400 stays the default here, unlike the other studio handlers: this is
-        // an ad-hoc query runner, so a malformed statement is the expected
-        // failure and belongs to the caller. Capacity failures are the
-        // exception — the query was never attempted, so blaming the SQL would
-        // send an operator debugging a statement that is fine.
         if (isAdmissionTimeout(error) || isPoolAcquisitionError(error)) {
             return studioErrorResponse(error, "Query failed");
         }
-        const errorMessage =
+        const rawMessage =
             error instanceof Error ? error.message : "Unknown error";
         return new Response(
-            JSON.stringify({ error: errorMessage }),
+            JSON.stringify({ error: classifyQueryError(rawMessage) }),
             {
                 status: 400,
                 headers: { "Content-Type": "application/json" },
