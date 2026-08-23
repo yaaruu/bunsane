@@ -62,6 +62,13 @@ export class ResolverBuilder {
       try {
         const inputArgs = args.input || args;
 
+        // SEC-06: validate-only sweep for files arriving through ANY argument
+        // shape (nested inputs, undecorated methods). Configured @Upload /
+        // @UploadField params are processed (stored) inside the service
+        // wrapper; this net catches everything else.
+        const { sweepValidateArgs } = await import("../uploadGuard");
+        await sweepValidateArgs([inputArgs]);
+
         // Automatically validate with Zod schema if provided
         if (zodSchema) {
           try {
@@ -100,6 +107,10 @@ export class ResolverBuilder {
   private createResolverWithoutInput(service: any, propertyKey: string): Function {
     return async (_: any, args: any, context: any, info: any) => {
       try {
+        // SEC-06: same safety net for no-input resolvers (bare File scalars).
+        const { sweepValidateArgs } = await import("../uploadGuard");
+        await sweepValidateArgs([args]);
+
         const result = await service[propertyKey]({}, context, info);
         return result;
       } catch (error) {

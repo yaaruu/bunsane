@@ -2,7 +2,7 @@ import { logger as MainLogger } from "../core/Logger";
 import { uuidv7 } from "../utils/uuid";
 import type { StorageProvider } from "../storage/StorageProvider";
 import { LocalStorageProvider } from "../storage/LocalStorageProvider";
-import type { UploadConfiguration, UploadResult, UploadError, FileMetadata } from "../types/upload.types";
+import type { UploadConfiguration, UploadResult, UploadError, FileMetadata, ValidationResult } from "../types/upload.types";
 import { FileValidator } from "./FileValidator";
 
 const logger = MainLogger.child({ scope: "UploadManager" });
@@ -37,6 +37,20 @@ export class UploadManager {
     public registerStorageProvider(name: string, provider: StorageProvider): void {
         logger.info(`Registering storage provider: ${name}`);
         this.storageProviders.set(name, provider);
+    }
+
+    /**
+     * Validate a file WITHOUT storing it (SEC-06). Used by the GraphQL upload
+     * guard for files discovered in argument positions that have no dedicated
+     * @Upload/@UploadField configuration — nested input objects, unlisted
+     * scalars, batch entries. Same rules as the full upload path.
+     */
+    public async validateOnly(
+        file: File,
+        config?: Partial<UploadConfiguration>
+    ): Promise<ValidationResult> {
+        const mergedConfig = { ...this.globalConfig, ...config };
+        return this.fileValidator.validate(file, mergedConfig);
     }
 
     /**
