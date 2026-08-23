@@ -6,7 +6,13 @@ export function assertValidCorsConfig(cors: CorsConfig): void {
         throw new Error('[CORS] `origin` is required. Pass an explicit string, array, function, or "*" if you truly want to allow everyone.');
     }
     if (cors.credentials && cors.origin === '*') {
-        console.warn('[CORS] Warning: credentials=true with origin="*" is invalid per spec. Origin will be reflected from request.');
+        // SEC-04: this combination previously warned and then REFLECTED any
+        // request Origin — every site could make credentialed cross-origin
+        // reads. Refuse it at configuration time instead.
+        throw new Error(
+            '[CORS] credentials=true with origin="*" is not supported. ' +
+            'List the exact origins that may send credentials, e.g. origin: ["https://app.example.com"].'
+        );
     }
 }
 
@@ -21,7 +27,11 @@ export function validateOrigin(
     if (configOrigin === undefined) return null;
 
     if (configOrigin === '*') {
-        return cors.credentials ? requestOrigin : '*';
+        // SEC-04: never reflect the request Origin when credentials are on,
+        // even if a caller constructed this config without going through
+        // assertValidCorsConfig. Defence in depth at the point of use.
+        if (cors.credentials) return null;
+        return '*';
     }
 
     if (typeof configOrigin === 'string') {

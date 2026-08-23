@@ -35,13 +35,32 @@ export function rateLimit(options: RateLimitOptions = {}): Middleware {
     const pathPrefixes = options.pathPrefixes;
     const status = options.status ?? 429;
     const trustProxy = options.trustProxy ?? false;
+
+    let warnedSharedBucket = false;
+    function warnSharedBucketOnce() {
+        if (warnedSharedBucket) return;
+        warnedSharedBucket = true;
+        logger.warn(
+            { scope: 'RateLimit' },
+            'rate-limit key is shared ("anonymous"): set trustProxy=true behind a proxy you control, or provide keyExtractor, for per-client limiting',
+        );
+    }
+
     const keyExtractor = options.keyExtractor ?? ((req: Request) => {
+        // SEC-05: client-supplied IP headers are only honoured when the
+        // deployment explicitly declares a trusted proxy. Reading X-Real-IP
+        // unconditionally let any client rotate its bucket at will.
         if (trustProxy) {
             const xff = req.headers.get('x-forwarded-for');
             if (xff) return xff.split(',')[0]!.trim();
+            const realIp = req.headers.get('x-real-ip');
+            if (realIp) return realIp;
         }
-        const realIp = req.headers.get('x-real-ip');
-        if (realIp) return realIp;
+        // Without proxy headers there is no per-client identity available to
+        // middleware (Bun only exposes socket IP via the Server handle). All
+        // un-keyed traffic shares one global bucket: a coarse fuse, not a
+        // per-client limit. Warn once so deployments notice.
+        warnSharedBucketOnce();
         return 'anonymous';
     });
 
