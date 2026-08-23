@@ -8,7 +8,7 @@ import {
 } from "./FilterBuilder";
 import { ComponentRegistry } from "../core/components";
 import { getMetadataStorage } from "../core/metadata";
-import { assertIdentifier } from "./SqlIdentifier";
+import { assertIdentifier, normalizeSortDirection } from "./SqlIdentifier";
 import { getMembershipSource, getMembershipTable } from "./membershipSource";
 
 /**
@@ -310,13 +310,13 @@ export class ComponentInclusionNode extends QueryNode {
             sql = `SELECT s.entity_id as id FROM ${sortTable} s
                 WHERE s.type_id = $${context.addParam(sortTypeId)}::text
                 AND s.deleted_at IS NULL${extraConditions}${cursorWhere}
-                ORDER BY ${sortExpr} ${sortOrder.direction} ${nullsClause}, s.entity_id ASC`;
+                ORDER BY ${sortExpr} ${normalizeSortDirection(sortOrder.direction)} ${nullsClause}, s.entity_id ASC`;
         } else {
             sql = `SELECT s.entity_id as id FROM entity_components ec
                 JOIN ${sortTable} s ON s.id = ec.component_id AND s.deleted_at IS NULL
                 WHERE ec.type_id = $${context.addParam(sortTypeId)}::text
                 AND ec.deleted_at IS NULL${extraConditions}${cursorWhere}
-                ORDER BY ${sortExpr} ${sortOrder.direction} ${nullsClause}, s.entity_id ASC`;
+                ORDER BY ${sortExpr} ${normalizeSortDirection(sortOrder.direction)} ${nullsClause}, s.entity_id ASC`;
         }
 
         if (context.limit !== null) {
@@ -683,7 +683,7 @@ export class ComponentInclusionNode extends QueryNode {
                 LIMIT 1
             )`;
 
-            orderByClauses.push(`${subquery} ${sortOrder.direction} ${nullsClause}`);
+            orderByClauses.push(`${subquery} ${normalizeSortDirection(sortOrder.direction)} ${nullsClause}`);
         }
 
         if (context.compositeCursor && orderByClauses.length === 1 && context.sortOrders.length === 1) {
@@ -736,7 +736,7 @@ export class ComponentInclusionNode extends QueryNode {
             )
             SELECT _sorted.id FROM _sorted
             WHERE ${keysetWhere}
-            ORDER BY _sorted._sv ${sortOrder.direction} ${nullsClauseSv}, _sorted.id ASC`;
+            ORDER BY _sorted._sv ${normalizeSortDirection(sortOrder.direction)} ${nullsClauseSv}, _sorted.id ASC`;
 
             if (!context.paginationAppliedInCTE && context.limit !== null) {
                 sql += ` LIMIT $${context.addParam(context.limit)}`;
@@ -829,7 +829,7 @@ export class ComponentInclusionNode extends QueryNode {
                 WHERE c.type_id = $${context.addParam(sortTypeId)}::text
                 AND c.deleted_at IS NULL
                 AND ${filterGroup}${cursorWhere}
-                ORDER BY ${sortExpr} ${sortOrder.direction} ${nullsClause}, c.entity_id ASC`;
+                ORDER BY ${sortExpr} ${normalizeSortDirection(sortOrder.direction)} ${nullsClause}, c.entity_id ASC`;
         } else {
             // Use entity_components junction
             // No DISTINCT needed since each entity has one component of this type
@@ -838,7 +838,7 @@ export class ComponentInclusionNode extends QueryNode {
                 WHERE ec.type_id = $${context.addParam(sortTypeId)}::text
                 AND ec.deleted_at IS NULL
                 AND ${filterGroup}${cursorWhere}
-                ORDER BY ${sortExpr} ${sortOrder.direction} ${nullsClause}, c.entity_id ASC`;
+                ORDER BY ${sortExpr} ${normalizeSortDirection(sortOrder.direction)} ${nullsClause}, c.entity_id ASC`;
         }
 
         // Add pagination
@@ -931,7 +931,7 @@ export class ComponentInclusionNode extends QueryNode {
             )
             SELECT _sorted.id FROM _sorted
             WHERE ${keysetWhere}
-            ORDER BY _sorted._sv ${sortOrder.direction} ${nullsClause}, _sorted.id ASC`;
+            ORDER BY _sorted._sv ${normalizeSortDirection(sortOrder.direction)} ${nullsClause}, _sorted.id ASC`;
 
             if (!context.paginationAppliedInCTE && context.limit !== null) {
                 sql += ` LIMIT $${context.addParam(context.limit)}`;
@@ -940,7 +940,7 @@ export class ComponentInclusionNode extends QueryNode {
         }
 
         let sql = `SELECT base.id FROM (${baseQuery}) AS base
-            ORDER BY ${sortSubquery} ${sortOrder.direction} ${nullsClause}, base.id ASC`;
+            ORDER BY ${sortSubquery} ${normalizeSortDirection(sortOrder.direction)} ${nullsClause}, base.id ASC`;
 
         // Add LIMIT and OFFSET only if not already applied in CTE
         // When pagination is applied at CTE level, skip it here to avoid double pagination

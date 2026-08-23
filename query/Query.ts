@@ -15,7 +15,7 @@ import { getMetadataStorage } from "../core/metadata";
 import { shouldUseDirectPartition } from "../core/Config";
 import type { SQL } from "bun";
 import type { ComponentConstructor, TypedEntity, ComponentRecord } from "../types/query.types";
-import { assertComponentTableName, assertFieldPath, assertIdentifier } from "./SqlIdentifier";
+import { assertComponentTableName, assertFieldPath, assertIdentifier, normalizeSortDirection } from "./SqlIdentifier";
 import { getMembershipSource } from "./membershipSource";
 import { isNumericProperty } from "./ComponentInclusionNode";
 import { buildCoverageRequest } from "./planner/CoverageSet";
@@ -624,7 +624,9 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         this.context.sortOrders.push({
             component: componentName,
             property: property as string,
-            direction,
+            // SEC-03: normalized to the closed ASC/DESC set at the source so
+            // no downstream ORDER BY emission can receive anything else.
+            direction: normalizeSortDirection(direction),
             nullsFirst
         });
 
@@ -2059,6 +2061,8 @@ AND c.deleted_at IS NULL`;
             // Single component type - use direct partition if available
             const partitionTableName = ComponentRegistry.getPartitionTableName(componentTypeIds[0]!);
             if (partitionTableName) {
+                // SEC-03: registry-derived name is asserted before interpolation.
+                assertComponentTableName(partitionTableName, 'Query.populate.partitionTable');
                 components = await this.execSql<any[]>('query.components.partition', dbConn, `
                     SELECT id, entity_id, type_id, data, created_at, updated_at
                     FROM ${partitionTableName}
