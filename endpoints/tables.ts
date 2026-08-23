@@ -8,6 +8,40 @@ import type {
     TableRowData,
 } from "./types";
 
+/** Framework-internal tables hidden from the Studio listing AND direct access. */
+const ECS_INTERNAL_TABLES = [
+    "components",
+    "entities",
+    "entity_components",
+    "spatial_ref_sys",
+];
+
+/**
+ * Allow-list check for user-supplied table names (SEC-01). The listing hides
+ * framework tables, but without this check a direct `/table/<name>` path
+ * still dumped them. Both the GET and DELETE handlers must call this before
+ * interpolating the name into SQL.
+ */
+async function isTableAllowed(tableName: string): Promise<boolean> {
+    const placeholders = ECS_INTERNAL_TABLES
+        .map((_, index) => `$${index + 1}`)
+        .join(", ");
+
+    const result = await studioExec<{ table_name: string }[]>(
+        "studio.tables.allowed",
+        studioDeadline(),
+        `SELECT table_name
+         FROM information_schema.tables
+         WHERE table_schema = 'public'
+         AND table_type = 'BASE TABLE'
+         AND table_name NOT IN (${placeholders})
+         AND table_name NOT LIKE 'components_%'`,
+        ECS_INTERNAL_TABLES
+    );
+
+    return result.some((row) => row.table_name === tableName);
+}
+
 export async function handleStudioTableRequest(
     tableName: string,
     params: StudioTableQueryParams = {}
@@ -19,6 +53,18 @@ export async function handleStudioTableRequest(
     const deadline = studioDeadline();
 
     try {
+        // SEC-01: hidden framework tables are not merely hidden from the
+        // listing — they are unreachable by direct path as well.
+        if (!(await isTableAllowed(tableName))) {
+            return new Response(
+                JSON.stringify({ error: `Table '${tableName}' not found` }),
+                {
+                    status: 404,
+                    headers: { "Content-Type": "application/json" },
+                }
+            );
+        }
+
         const columnsResult = await studioExec<any[]>(
             "studio.table.columns",
             deadline,
@@ -76,7 +122,10 @@ export async function handleStudioTableRequest(
             .filter((col: { data_type: string }) =>
                 ["character varying", "text", "varchar", "char", "uuid"].includes(col.data_type)
             )
-            .map((col: { column_name: string }) => col.column_name);
+            .map((col: { column_name: string }) => col.column_name)
+            // Interpolated into `"${col}"` below — only plain identifiers may
+            // take that path (defence-in-depth against hostile column names).
+            .filter((col) => /^[A-Za-z_][A-Za-z0-9_$]*$/.test(col));
 
         let rows: TableRowData[];
         let totalResult: { count: number }[];
@@ -156,6 +205,16 @@ export async function handleStudioTableDeleteRequest(
     }
 
     try {
+        if (!(await isTableAllowed(tableName))) {
+            return new Response(
+                JSON.stringify({ error: `Table '${tableName}' not found` }),
+                {
+                    status: 404,
+                    headers: { "Content-Type": "application/json" },
+                }
+            );
+        }
+
         const idPlaceholders = ids.map((_, index) => `$${index + 1}`).join(", ");
 
         await studioExec(
@@ -189,8 +248,9 @@ export async function handleGetTables(): Promise<Response> {
         // in upgraded databases. Keeping it out of the Studio listing avoids
         // exposing a confusingly schema'd legacy table with no ECS UI support.
         // Users are directed to drop it via the startup orphan-notice log.
-        const ecsTables = ['components', 'entities', 'entity_components', 'spatial_ref_sys'];
-        const ecsTablePlaceholders = ecsTables.map((_, index) => `$${index + 1}`).join(", ");
+        const ecsTablePlaceholders = ECS_INTERNAL_TABLES
+            .map((_, index) => `$${index + 1}`)
+            .join(", ");
 
         const result = await studioExec<{ table_name: string }[]>(
             "studio.tables.list",
@@ -202,7 +262,7 @@ export async function handleGetTables(): Promise<Response> {
              AND table_name NOT IN (${ecsTablePlaceholders})
              AND table_name NOT LIKE 'components_%'
              ORDER BY table_name`,
-            ecsTables
+            ECS_INTERNAL_TABLES
         );
 
         const tables = result.map((row: { table_name: string }) => row.table_name);

@@ -1,4 +1,22 @@
 import studioEndpoint from "../../endpoints";
+import { createHash, timingSafeEqual } from "crypto";
+
+function sha256(value: string): Buffer {
+    return createHash("sha256").update(value).digest();
+}
+
+function bearerToken(headerValue: string | null): string | null {
+    if (!headerValue) return null;
+    const match = /^Bearer\s+(.+)$/i.exec(headerValue.trim());
+    return match ? match[1]! : null;
+}
+
+function jsonResponse(status: number, body: Record<string, unknown>): Response {
+    return new Response(JSON.stringify(body), {
+        status,
+        headers: { "Content-Type": "application/json" },
+    });
+}
 
 export async function routeStudio(
     app: any,
@@ -7,6 +25,26 @@ export async function routeStudio(
     method: string,
 ): Promise<Response | null> {
     if (!app.studioEnabled || !url.pathname.startsWith("/studio/api/")) return null;
+
+    // SEC-01: the studio API is an unauthenticated-by-design admin surface
+    // (raw table dumps and deletes), so it is deny-by-default. No token
+    // configured → pretend the route does not exist at all. A configured
+    // token must be presented as `Authorization: Bearer <token>` or
+    // `x-studio-token`; comparison is constant-time over SHA-256 digests.
+    const expected = app.studioAuthToken as string | null | undefined;
+    if (!expected) {
+        return jsonResponse(404, { error: "Studio API endpoint not found" });
+    }
+
+    const provided =
+        bearerToken(req.headers.get("authorization")) ??
+        req.headers.get("x-studio-token");
+    if (
+        !provided ||
+        !timingSafeEqual(sha256(provided), sha256(expected))
+    ) {
+        return jsonResponse(401, { error: "Unauthorized" });
+    }
 
     if (url.pathname === "/studio/api/tables") {
         return await studioEndpoint.getTables();

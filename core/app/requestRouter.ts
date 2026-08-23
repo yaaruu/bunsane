@@ -171,6 +171,20 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
             }));
         }
 
+        // SEC-01: studio is deny-by-default. When it was never enabled, every
+        // /studio path 404s explicitly instead of falling through to the
+        // GraphQL catch-all (which would serve a landing page for GETs).
+        if (
+            !app.studioEnabled &&
+            (url.pathname === "/studio" || url.pathname.startsWith("/studio/"))
+        ) {
+            clearTimeout(timeoutId);
+            return wrap(new Response(
+                JSON.stringify({ error: "Not found" }),
+                { status: 404, headers: { "Content-Type": "application/json" } },
+            ));
+        }
+
         const studioApiResponse = await routeStudio(app, url, req, method);
         if (studioApiResponse) {
             clearTimeout(timeoutId);
