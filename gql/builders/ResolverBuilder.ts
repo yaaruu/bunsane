@@ -2,6 +2,7 @@ import { GraphQLError } from "graphql";
 import { logger } from "../../core/Logger";
 import { type ZodType } from "zod";
 import * as z from "zod";
+import { isVerboseErrors } from "../../core/envMode";
 
 /** Check if error is a GraphQLError (handles cross-package version mismatches) */
 function isGraphQLError(error: unknown): error is GraphQLError {
@@ -94,7 +95,7 @@ export class ResolverBuilder {
         throw new GraphQLError(`Internal error`, {
           extensions: {
             code: "INTERNAL_ERROR",
-            originalError: process.env.NODE_ENV !== 'production' ? error : undefined
+            originalError: isVerboseErrors() ? error : undefined
           }
         });
       }
@@ -122,7 +123,7 @@ export class ResolverBuilder {
         throw new GraphQLError(`Internal error`, {
           extensions: {
             code: "INTERNAL_ERROR",
-            originalError: process.env.NODE_ENV !== 'production' ? error : undefined
+            originalError: isVerboseErrors() ? error : undefined
           }
         });
       }
@@ -162,7 +163,7 @@ export class ResolverBuilder {
           throw new GraphQLError(`Internal error in subscription`, {
             extensions: {
               code: "INTERNAL_ERROR",
-              originalError: process.env.NODE_ENV !== 'production' ? error : undefined
+              originalError: isVerboseErrors() ? error : undefined
             }
           });
         }
@@ -188,7 +189,7 @@ export class ResolverBuilder {
           throw new GraphQLError(`Internal error in subscription`, {
             extensions: {
               code: "INTERNAL_ERROR",
-              originalError: process.env.NODE_ENV !== 'production' ? error : undefined
+              originalError: isVerboseErrors() ? error : undefined
             }
           });
         }

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { warnIfNodeEnvUnset } from "./envMode";
 
 const envSchema = z
     .object({
@@ -123,4 +124,8 @@ export function validateEnv(): void {
             `Environment validation failed:\n${messages.join("\n")}`,
         );
     }
+
+    // SEC-08: NODE_ENV drives error masking, the studio surface and HSTS.
+    // Its absence is security-relevant — say so once, loudly, at boot.
+    warnIfNodeEnvUnset();
 }
