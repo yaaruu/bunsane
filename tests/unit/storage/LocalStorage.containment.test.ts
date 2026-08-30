@@ -125,3 +125,33 @@ describe('read-path containment', () => {
         ).rejects.toThrow(/escapes storage base|File not found/);
     });
 });
+
+describe('symlink containment (realpath, SEC-07)', () => {
+    test('a symlink INSIDE base pointing outside is refused', async () => {
+        // The lexical resolve of `escape/secret.txt` stays inside base and would
+        // pass a path.resolve-only check; realpath resolves the symlink to its
+        // true (outside) location and fails containment.
+        const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunsane-sec07-out-'));
+        fs.writeFileSync(path.join(outsideDir, 'secret.txt'), 'top-secret');
+        const linkPath = path.join(BASE, 'escape');
+
+        let linked = false;
+        for (const type of ['dir', 'junction'] as const) {
+            try { fs.symlinkSync(outsideDir, linkPath, type); linked = true; break; } catch { /* try next */ }
+        }
+        if (!linked) {
+            // win32 symlink/junction needs privilege (admin or Developer Mode).
+            console.warn('SEC-07 symlink test SKIPPED: cannot create symlink/junction on this platform/privilege.');
+            fs.rmSync(outsideDir, { recursive: true, force: true });
+            return;
+        }
+
+        try {
+            const p = provider();
+            await expect(p.getStream('escape/secret.txt')).rejects.toThrow(/escapes storage base/);
+        } finally {
+            try { fs.rmSync(linkPath, { recursive: true, force: true }); } catch { /* best effort */ }
+            fs.rmSync(outsideDir, { recursive: true, force: true });
+        }
+    });
+});
