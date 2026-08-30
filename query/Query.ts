@@ -36,14 +36,17 @@ import { PlannerCache } from "./planner/PlannerCache";
 import { qspMode, qspCountStrategy, qspActive, qspHydrate } from "../database/projection/qspConfig";
 import { ProjectionManager } from "../database/projection/ProjectionManager";
 import { sqlTimeBucketFromTs, type TimeTrunc } from "./timeBucket";
+import { isVerboseErrors } from "../core/envMode";
 
 // Parsed once at module load instead of on every exec() (process.env read +
 // parseInt was on the query hot path). 0 disables the default limit.
 const DEFAULT_QUERY_LIMIT = parseInt(process.env.BUNSANE_DEFAULT_QUERY_LIMIT ?? '10000', 10);
 let warnedDefaultLimit = false;
 
-// Gated once — dev keeps param diagnostics, production skips the loop entirely.
-const DEBUG_PARAMS = process.env.NODE_ENV !== 'production';
+// Gated once through the single SEC-08 verbosity gate: only NODE_ENV=development
+// logs params. Fail-closed — unset/staging/typo'd NODE_ENV masks, matching every
+// other verbose-error decision (was `!== 'production'`, which leaked when unset).
+const DEBUG_PARAMS = isVerboseErrors();
 
 // QSP gates read env at call time via qspConfig.
 /** Extract Plan Rows from EXPLAIN (FORMAT JSON) result (object or string). */
