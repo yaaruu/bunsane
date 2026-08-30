@@ -1,33 +1,47 @@
 # Tickets: Security Audit Hardening
 
-**Status:** All open  
-**Date:** 2026-08-23  
+**Status:** SEC-01…SEC-08 shipped on `fix/security-audit-2026-08` (round 1 + a round-2 hardening pass); SEC-09…SEC-17 open.  
+**Date:** 2026-08-23 (status refreshed 2026-08-30)  
 **Basis:** Full-repo security audit; every finding verified directly against source (see audit session notes). No live exploitation was performed.  
 **Scope:** Framework surfaces: endpoints/, core/app/, core/middleware/, gql/, query/, storage/, upload/, core/cache/, core/remote/. App-authored resolvers out of scope except where the framework provides no guardrail.  
 
 ### Consensus priorities
 
-| Order | Ticket | Effort | Impact | Depends on |
-|------:|--------|--------|--------|------------|
-| 1 | **SEC-01** Studio API authentication + static gating | S | Highest (unauth data dump/delete) | — |
-| 2 | **SEC-02** Ad-hoc SQL runner: opt-in flag + real limits | S | Highest (raw SQL console) | — |
-| 3 | **SEC-03** Filter/sort identifier & operator allow-listing | M | High (SQL injection primitives) | — |
-| 4 | **SEC-04** CORS wildcard+credentials reflection | S | High (credentialed cross-origin reads) | — |
-| 5 | **SEC-05** Rate-limit key trust (`X-Real-IP` / `anonymous`) | S | High (bypass + shared-bucket DoS) | — |
-| 6 | **SEC-06** GraphQL upload validation bypass | S | High (size/MIME checks skipped) | — |
-| 7 | **SEC-07** Local storage path containment | S | Medium-High (traversal, Windows) | — |
-| 8 | **SEC-08** Fail-closed error masking | S | Medium-High (stack/SQL leakage) | — |
-| 9 | **SEC-09** GraphQL recon surface (introspection/GraphiQL/complexity) | M | Medium (recon + DoS) | — |
-| 10 | **SEC-10** Info endpoints (`/metrics`, `/health`, Swagger) | S | Medium (internals disclosure, write amplification) | — |
-| 11 | **SEC-11** Pub/sub invalidation authenticity (HMAC) | S | Medium-High (cluster cache wipe) | — |
-| 12 | **SEC-12** RPC/outbox trust boundary documentation + signing | M | Medium-High (impersonation/replay) | — |
-| 13 | **SEC-13** Cache pattern-invalidation DoS bounds | S | Medium | — |
-| 14 | **SEC-14** Request body limits + REST upload streaming | S | Medium (memory DoS) | — |
-| 15 | **SEC-15** Security headers default-on | S | Medium | — |
-| 16 | **SEC-16** Env validation hardening | S | Medium (config footguns) | — |
-| 17 | **SEC-17** Low-severity hardening sweep | S | Low | — |
+| Order | Ticket | Effort | Impact | Depends on | Status | Commits |
+|------:|--------|--------|--------|------------|--------|---------|
+| 1 | **SEC-01** Studio API authentication + static gating | S | Highest (unauth data dump/delete) | — | **Done** | `df5e599` |
+| 2 | **SEC-02** Ad-hoc SQL runner: opt-in flag + real limits | S | Highest (raw SQL console) | — | **Done** | `7b0f38e, bd8a1be` |
+| 3 | **SEC-03** Filter/sort identifier & operator allow-listing | M | High (SQL injection primitives) | — | **Done** | `5707360, a0c2600` |
+| 4 | **SEC-04** CORS wildcard+credentials reflection | S | High (credentialed cross-origin reads) | — | **Done** | `5dde06b` |
+| 5 | **SEC-05** Rate-limit key trust (`X-Real-IP` / `anonymous`) | S | High (bypass + shared-bucket DoS) | — | **Done** | `5dde06b` |
+| 6 | **SEC-06** GraphQL upload validation bypass | S | High (size/MIME checks skipped) | — | **Done** | `b507bd2, 8a0c140, 48e61cc` |
+| 7 | **SEC-07** Local storage path containment | S | Medium-High (traversal, Windows) | — | **Done** | `ec5d5cf, c8a6066` |
+| 8 | **SEC-08** Fail-closed error masking | S | Medium-High (stack/SQL leakage) | — | **Done** | `3678a15, 77bc0e4` |
+| 9 | **SEC-09** GraphQL recon surface (introspection/GraphiQL/complexity) | M | Medium (recon + DoS) | — | Open | — |
+| 10 | **SEC-10** Info endpoints (`/metrics`, `/health`, Swagger) | S | Medium (internals disclosure, write amplification) | — | Open | — |
+| 11 | **SEC-11** Pub/sub invalidation authenticity (HMAC) | S | Medium-High (cluster cache wipe) | — | Open | — |
+| 12 | **SEC-12** RPC/outbox trust boundary documentation + signing | M | Medium-High (impersonation/replay) | — | Open | — |
+| 13 | **SEC-13** Cache pattern-invalidation DoS bounds | S | Medium | — | Open | — |
+| 14 | **SEC-14** Request body limits + REST upload streaming | S | Medium (memory DoS) | — | Open | — |
+| 15 | **SEC-15** Security headers default-on | S | Medium | — | Open | — |
+| 16 | **SEC-16** Env validation hardening | S | Medium (config footguns) | — | Open | — |
+| 17 | **SEC-17** Low-severity hardening sweep | S | Low | — | Open | — |
 
 Each ticket ships alone. Tests run under `bun tests/pglite-setup.ts tests/unit/...` and, where SQL behaviour matters, `bun run test:pg`.
+
+**Round-2 pass (2026-08-30).** A review of the shipped tickets found five gaps in the
+first cut, each fixed with tests: SEC-02 needed `SET LOCAL transaction_read_only` because
+the keyword vetting cannot see writes performed by functions (`nextval()`, `lo_import()`);
+SEC-03 now warns when `standard_conforming_strings` is off, which breaks the quote-doubling
+escape; SEC-06 skipped whole parameter indices rather than individual files, so a File nested
+inside a configured object param went unvalidated, and the resolver-level net double-checked
+already-wrapped methods against the global defaults; SEC-07's containment check was lexical,
+so a symlink planted inside the base escaped it; SEC-08 missed `DEBUG_PARAMS` in `query/Query.ts`.
+
+**Known unrelated failure.** `tests/integration/qsp-legacy-demotion.test.ts` ("true INTERSECT
+worst-case") fails on real PG with `cursor(entityId) cannot be combined with sortBy()`. Pre-existing
+on `main` since `5acb390` (2026-08-07) added that guard to `explainAnalyze`; the test predates it
+(`fa4df14`, 2026-07-09). PGlite never runs the file, so nothing surfaced it. Not a security ticket.
 
 ---
 
