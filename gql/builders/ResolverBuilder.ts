@@ -64,11 +64,15 @@ export class ResolverBuilder {
         const inputArgs = args.input || args;
 
         // SEC-06: validate-only sweep for files arriving through ANY argument
-        // shape (nested inputs, undecorated methods). Configured @Upload /
-        // @UploadField params are processed (stored) inside the service
-        // wrapper; this net catches everything else.
-        const { sweepValidateArgs } = await import("../uploadGuard");
-        await sweepValidateArgs([inputArgs]);
+        // shape (nested inputs, undecorated methods). Skip it when the method is
+        // already @Upload/@UploadField-wrapped — that wrapper does a complete,
+        // config-aware sweep of its own, and running this global-config net on
+        // top would falsely reject a file the method's own permissive config
+        // allows.
+        const { sweepValidateArgs, isUploadWrapped } = await import("../uploadGuard");
+        if (!isUploadWrapped(service[propertyKey])) {
+          await sweepValidateArgs([inputArgs]);
+        }
 
         // Automatically validate with Zod schema if provided
         if (zodSchema) {
@@ -108,9 +112,12 @@ export class ResolverBuilder {
   private createResolverWithoutInput(service: any, propertyKey: string): Function {
     return async (_: any, args: any, context: any, info: any) => {
       try {
-        // SEC-06: same safety net for no-input resolvers (bare File scalars).
-        const { sweepValidateArgs } = await import("../uploadGuard");
-        await sweepValidateArgs([args]);
+        // SEC-06: same safety net for no-input resolvers (bare File scalars),
+        // skipped when the method's own upload wrapper already covers it.
+        const { sweepValidateArgs, isUploadWrapped } = await import("../uploadGuard");
+        if (!isUploadWrapped(service[propertyKey])) {
+          await sweepValidateArgs([args]);
+        }
 
         const result = await service[propertyKey]({}, context, info);
         return result;

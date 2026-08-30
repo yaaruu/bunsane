@@ -7,7 +7,7 @@
  */
 import { describe, test, expect } from 'bun:test';
 import 'reflect-metadata';
-import { collectFiles, wrapUploadValidation } from '../../../gql/uploadGuard';
+import { collectFiles, wrapUploadValidation, isUploadWrapped } from '../../../gql/uploadGuard';
 import { UPLOAD_CONFIG_KEY } from '../../../gql/decorators/Upload';
 import { ResolverBuilder } from '../../../gql/builders/ResolverBuilder';
 
@@ -121,6 +121,34 @@ describe('wrapUploadValidation', () => {
         const tmp = { uploadOneTmp(file?: File) { return 'x'; } };
         applyUploadGuard(tmp, 'uploadOneTmp', 0, { field: 'f', required: true });
         await expect((tmp as any).uploadOneTmp(undefined)).rejects.toThrow(/Required upload/);
+    });
+
+    // SEC-06 (identity-based Pass 2): a File smuggled INSIDE a configured object
+    // param was skipped by the old index-based Pass 2 (that index counted as
+    // "configured", and Pass 1 never descends into the object). The sweep now
+    // skips by File identity, so this reaches validation.
+    test('oversized file nested inside a configured object param is still rejected', async () => {
+        const tmp = { uploadInput(_input: { avatar: File }) { return 'ran'; } };
+        applyUploadGuard(tmp, 'uploadInput', 0, { field: 'input', maxFileSize: 64 });
+        await expect(
+            (tmp as any).uploadInput({ avatar: makeFile('huge.bin', 999_999_999, 'application/octet-stream') })
+        ).rejects.toThrow();
+    });
+
+    test('small file nested inside a configured object param passes', async () => {
+        const tmp = { uploadInput2(_input: { avatar: File }) { return 'ran'; } };
+        applyUploadGuard(tmp, 'uploadInput2', 0, { field: 'input', maxFileSize: 64 });
+        const r = await (tmp as any).uploadInput2({ avatar: makeFile('tiny.png', 32) });
+        expect(r).toBe('ran');
+    });
+});
+
+describe('isUploadWrapped', () => {
+    test('detects wrapped vs plain methods', () => {
+        expect(isUploadWrapped(GuardedService.prototype.uploadOne)).toBe(true);
+        expect(isUploadWrapped((x: unknown) => x)).toBe(false);
+        expect(isUploadWrapped(undefined)).toBe(false);
+        expect(isUploadWrapped(null)).toBe(false);
     });
 });
 

@@ -114,6 +114,13 @@ export function wrapUploadValidation(
         const uploadMetadata: Record<string, any> =
             Reflect.getMetadata(UPLOAD_CONFIG_KEY, target, propertyKey) ?? {};
 
+        // Files that Pass 1 actually stored under a per-param config. Pass 2
+        // skips these by IDENTITY, not by parameter index — an index-based skip
+        // waves through a File nested INSIDE a configured object param (e.g.
+        // `@Upload() input: { avatar: File }`, where Pass 1 sees a non-File
+        // object and consumes nothing), leaving that File unvalidated.
+        const consumed = new WeakSet<object>();
+
         // Pass 1 — configured positions: validate + store + replace (legacy
         // semantics, extended to arrays).
         for (const [paramIndexRaw, rawConfig] of Object.entries(uploadMetadata)) {
@@ -127,6 +134,7 @@ export function wrapUploadValidation(
                 for (const entry of slot) {
                     if (looksLikeFile(entry)) {
                         sawFile = true;
+                        consumed.add(entry);
                         const result = await uploadManager.uploadFile(entry, config);
                         if (!result.success) {
                             throw new Error(
@@ -149,6 +157,7 @@ export function wrapUploadValidation(
 
             if (looksLikeFile(slot)) {
                 logger.info(`Processing upload for parameter ${paramIdx} in ${target.constructor?.name}.${propertyKey}`);
+                consumed.add(slot);
                 const result = await uploadManager.uploadFile(slot, config);
                 if (!result.success) {
                     throw new Error(
@@ -166,13 +175,15 @@ export function wrapUploadValidation(
             }
         }
 
-        // Pass 2 — sweep for unconfigured Files (nested inputs, unlisted
-        // scalars): validate-only, no storage side effects.
-        const configuredSlots = new Set(Object.keys(uploadMetadata).map(Number));
+        // Pass 2 — sweep EVERY argument (including configured indices, whose
+        // nested Files Pass 1 does not reach) and validate-only any File that
+        // Pass 1 did not already store. Skipping by identity, so a File stored
+        // under its own permissive config is not re-checked against the global
+        // defaults, while a File smuggled inside a configured object param is.
         for (let i = 0; i < args.length; i++) {
-            if (configuredSlots.has(i)) continue;
             const files = collectFiles(args[i]);
             for (const file of files) {
+                if (consumed.has(file)) continue;
                 await validateOnly(file);
             }
         }
@@ -183,4 +194,15 @@ export function wrapUploadValidation(
     (wrapped as any)[WRAPPED_KEY] = true;
     descriptor.value = wrapped;
     return descriptor;
+}
+
+/**
+ * True when `fn` is a method already wrapped by `wrapUploadValidation` (i.e. it
+ * carries an @Upload / @UploadField decorator). The resolver-level sweep uses
+ * this to skip methods the wrapper already covers completely — running both
+ * would re-validate a configured file against the GLOBAL defaults and falsely
+ * reject an upload the method's own (more permissive) config allows. (SEC-06)
+ */
+export function isUploadWrapped(fn: unknown): boolean {
+    return typeof fn === "function" && (fn as any)[WRAPPED_KEY] === true;
 }
