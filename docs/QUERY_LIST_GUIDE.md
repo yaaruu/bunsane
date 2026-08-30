@@ -140,7 +140,7 @@ Avoid / accept cost:
 
 ---
 
-## 8. Reports (not lists)
+## 8. Aggregates (not lists)
 
 `Query.exec()` hydrates entities. Do **not** pull a month of orders with `take(50000)` and reduce in JS.
 
@@ -174,7 +174,9 @@ await ReadModel(InvoiceReport)
   .sum("total");
 ```
 
-Grain today is **one row per join pair**, not a daily fact `(outlet, day)`. Daily KPIs either group a date column at read time or wait for F-10 / a later rollup. QSP `rm_*` tables are list coverage, not this.
+Grain today is **one row per join pair**, not a daily fact `(outlet, day)`. Daily KPIs either group a date column at read time (`trunc` / `timeBucket`) or wait for a later rollup. QSP `rm_*` tables are list coverage, not this.
+
+Site: `bunsane-docs/docs/query-aggregates.md`, `bunsane-docs/docs/read-models.md`.
 
 ## 9. Code map
 
