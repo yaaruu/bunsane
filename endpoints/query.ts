@@ -1,4 +1,4 @@
-import { studioExec, studioErrorResponse } from "./db";
+import { studioReadOnlyQuery, studioErrorResponse } from "./db";
 import { assertRunnableSingleSelect } from "./sqlGuard";
 import { isAdmissionTimeout } from "../database/gateway";
 import { isPoolAcquisitionError } from "../database/poolErrors";
@@ -85,7 +85,7 @@ export async function handleStudioQueryRequest(
     try {
         const startTime = Date.now();
 
-        const result = await studioExec<unknown>(
+        const result = await studioReadOnlyQuery<unknown>(
             "studio.query.adhoc",
             Date.now() + QUERY_TIMEOUT_MS,
             wrapped,

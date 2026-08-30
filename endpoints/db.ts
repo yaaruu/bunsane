@@ -26,7 +26,7 @@
  * handler and returns the admission permit; the server-side `statement_timeout`
  * is what stops the work.
  */
-import { dbExec, isAdmissionTimeout } from "../database/gateway";
+import { dbExec, dbTransaction, isAdmissionTimeout } from "../database/gateway";
 import { isPoolAcquisitionError } from "../database/poolErrors";
 
 /**
@@ -60,6 +60,39 @@ export function studioExec<T = any>(
     // what turns the note above ("the deadline is not a statement bound") into
     // one for studio specifically.
     return dbExec<T>(sql, params, { lane: "background", label, deadline, serverTimeout: true });
+}
+
+/**
+ * Run the ad-hoc studio query inside a READ-ONLY transaction (SEC-02).
+ *
+ * The keyword blacklist in `sqlGuard` stops DML/DDL/multi-statement payloads,
+ * but a statement that stays a valid SELECT subquery can still cause writes
+ * through functions — `nextval()`, `lo_import()`, a VOLATILE writing function —
+ * none of which are keywords. `SET LOCAL transaction_read_only = on` makes
+ * Postgres itself refuse those, turning "we blacklisted the write keywords we
+ * thought of" into an enforced guarantee.
+ *
+ * `SET LOCAL` (not `SET TRANSACTION READ ONLY`) so ordering is a non-issue:
+ * `dbTransaction` emits `SET LOCAL statement_timeout` as the transaction's first
+ * statement, so this is the second — and `SET TRANSACTION READ ONLY` carries a
+ * "before the first query" constraint that `SET LOCAL <guc>` does not.
+ *
+ * NOTE this bounds WRITES only. Privileged READS (`pg_read_file`, `pg_authid`)
+ * are indifferent to a read-only transaction and remain a DB-role least-privilege
+ * concern, not something the framework can close here.
+ */
+export function studioReadOnlyQuery<T = any>(
+    label: string,
+    deadline: number,
+    sql: string,
+): Promise<T> {
+    return dbTransaction<T>(
+        async (trx) => {
+            await trx.unsafe("SET LOCAL transaction_read_only = on");
+            return await trx.unsafe(sql);
+        },
+        { lane: "background", label, deadline },
+    );
 }
 
 /**
