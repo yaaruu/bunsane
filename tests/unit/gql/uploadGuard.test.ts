@@ -194,6 +194,60 @@ describe('ResolverBuilder safety net', () => {
         // Resolver passes the INNER input object to the service.
         expect(received.f).toBeInstanceOf(File);
     });
+
+    // SEC-06 (isUploadWrapped skip): the net must NOT run on a method whose own
+    // @Upload config is more permissive than the global defaults, or it rejects
+    // uploads that method explicitly allows. Discriminating shape: a bare File
+    // input with a MIME the globals forbid (application/octet-stream) and the
+    // method's config permits. Without the skip this fails under the defaults
+    // before the wrapper ever sees it.
+    test('wrapped method with a permissive config is not re-checked against global defaults', async () => {
+        const svc: any = {
+            uploadBlob(file: File) { return (file as any).originalFileName ?? file.name; },
+        };
+        applyUploadGuard(svc, 'uploadBlob', 0, {
+            field: 'file',
+            maxFileSize: 1024,
+            allowedMimeTypes: ['application/octet-stream'],
+            allowedExtensions: ['.bin'],
+        });
+
+        const rb = new ResolverBuilder();
+        rb.addResolver({
+            name: 'uploadBlob',
+            type: 'Mutation',
+            service: svc,
+            propertyKey: 'uploadBlob',
+            hasInput: true,
+        });
+
+        const resolver = rb.getResolvers().Mutation!['uploadBlob']!;
+        const result = await resolver(
+            null,
+            { input: makeFile('payload.bin', 256, 'application/octet-stream') },
+            {},
+            {},
+        );
+        expect(result).toBe('payload.bin');
+    });
+
+    test('the same permissive-config file IS rejected by the net when unwrapped', async () => {
+        // Control for the test above: identical file through a method with no
+        // upload decorator, so the net runs and the global defaults apply.
+        const rb = new ResolverBuilder();
+        rb.addResolver({
+            name: 'uploadBlobBare',
+            type: 'Mutation',
+            service: { uploadBlobBare: async (input: any) => 'ran' },
+            propertyKey: 'uploadBlobBare',
+            hasInput: true,
+        });
+
+        const resolver = rb.getResolvers().Mutation!['uploadBlobBare']!;
+        await expect(
+            resolver(null, { input: makeFile('payload.bin', 256, 'application/octet-stream') }, {}, {})
+        ).rejects.toThrow(/Internal error/);
+    });
 });
 
 
