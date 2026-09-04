@@ -100,7 +100,10 @@ export const defaultCacheConfig: CacheConfig = {
     component: {
         enabled: process.env.CACHE_COMPONENT_ENABLED !== 'false', // Default true
         ttl: parseInt(process.env.CACHE_COMPONENT_TTL || '1800000'), // 30 minutes
-        negativeCacheEnabled: process.env.CACHE_COMPONENT_NEGATIVE_ENABLED === 'true',
+        // Default ON: absent optional components are the common case in ECS,
+        // and without tombstones every list request re-probes each absent
+        // (entity, type) pair. Set to 'false' to disable.
+        negativeCacheEnabled: process.env.CACHE_COMPONENT_NEGATIVE_ENABLED !== 'false',
         negativeCacheTtl: process.env.CACHE_COMPONENT_NEGATIVE_TTL
             ? parseInt(process.env.CACHE_COMPONENT_NEGATIVE_TTL)
             : undefined

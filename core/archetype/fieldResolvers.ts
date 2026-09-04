@@ -486,7 +486,11 @@ export function buildFieldResolvers(archetype: any): FieldResolverEntry[] {
                             }
                         }
 
-                        if (!foreignId) {
+                        // Only reach for entity.get() when no loaders were mounted.
+                        // With loaders, an unresolved foreign key means the owning
+                        // component is absent — re-querying per parent is the same
+                        // N+1 the component-field resolvers had.
+                        if (!foreignId && !context?.loaders?.componentsByEntityType) {
                             const entity = await ensureEntity(parent, context);
                             const foreignKey = relationOptions.foreignKey;
                             if (foreignKey && foreignKey.includes('.')) {
@@ -530,10 +534,8 @@ export function buildFieldResolvers(archetype: any): FieldResolverEntry[] {
                         }
 
                         if (context?.loaders?.entityById) {
-                            const relatedEntity = await context.loaders.entityById.load(foreignId);
-                            if (relatedEntity) {
-                                return relatedEntity;
-                            }
+                            // Loader null == no live entity with that id; do not re-query.
+                            return (await context.loaders.entityById.load(foreignId)) ?? null;
                         }
 
                         return Entity.FindById(foreignId);

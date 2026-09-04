@@ -166,8 +166,8 @@ full guide.
 | `CACHE_ENTITY_TTL` | `3600000` | Entity cache TTL (1h). |
 | `CACHE_COMPONENT_ENABLED` | `true` | Component cache. |
 | `CACHE_COMPONENT_TTL` | `1800000` | Component cache TTL (30m). |
-| `CACHE_COMPONENT_NEGATIVE_ENABLED` | `false` | Cache "component missing" results. |
-| `CACHE_COMPONENT_NEGATIVE_TTL` | unset | Negative component cache TTL. |
+| `CACHE_COMPONENT_NEGATIVE_ENABLED` | `true` | Cache "component missing" results as tombstones (default ON since 0.6.2; set `false` to disable). A later save of that component overwrites the tombstone immediately. |
+| `CACHE_COMPONENT_NEGATIVE_TTL` | `min(CACHE_COMPONENT_TTL, 60000)` | Negative component cache TTL in ms. |
 | `CACHE_RELATION_NEGATIVE_ENABLED` | `false` | Cache empty relation results. |
 | `CACHE_RELATION_NEGATIVE_TTL` | `60000` | Negative relation cache TTL (60s). |
 | `CACHE_QUERY_ENABLED` | `true` | Query result cache. |

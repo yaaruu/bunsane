@@ -4,6 +4,17 @@ All notable changes to bunsane are documented here.
 
 ## Unreleased
 
+### Fixed (2026-09-05, read-path N+1 quick wins)
+
+- **Archetype component-field resolvers re-queried absent optional components.** When the request DataLoader answered null for a `nullable: true` component, the resolver fell through to a bare `entity.get()` — one un-batched `SELECT` per parent per absent field on every list request (measured 40 of 51 statements on a 20-row order list). The loader's null is now authoritative. Same fix applied to the `belongsTo` foreign-key fallback and the related-entity fallback.
+- **Bare `entity.get()` now consults the shared cache.** The non-loader path (auth, schedulers, reconcile sweeps, `@ArcheTypeFunction` bodies outside a request scope) went straight to SQL, ignoring cached rows and tombstones. It now reads the same `component:<entity>:<type>` key the DataLoader path uses, writes through on miss, and tombstones absences. Skipped inside an explicit transaction.
+- **`logger.error({ error })` printed `error: {}`.** Pino serializers for `err` and `error` added so message/stack/type reach the log.
+
+### Changed
+
+- **`CACHE_COMPONENT_NEGATIVE_ENABLED` defaults to `true`.** Absent optional components are the common case in ECS; tombstones (60 s default TTL, overwritten by the next save) stop every request re-probing them. Set `false` to restore the old behaviour.
+- **Cache boot self-check.** `CacheManager.initialize()` waits for a remote provider to report ready (3 s) and pings it; an unreachable Redis now logs one clear warning at startup instead of failing silently per call. New optional `CacheProvider.waitReady()`.
+
 ### Added
 
 - **M3 `@ReadModel` Stage A** — cross-entity derived tables (`m3_*`, not QSP `rm_*`), write-through on `Entity.save` / `doDelete`, SQL `where` / range / `IN` / `count` / `avg` / `groupBy`+`sum`, covering + timestamptz indexes, read-only GraphQL Query resolvers. Docs: `QUERY_LIST_GUIDE` reports section replaces `take(50000)` + JS as the report path.

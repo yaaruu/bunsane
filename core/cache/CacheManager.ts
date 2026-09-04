@@ -83,6 +83,23 @@ export class CacheManager {
         await this.setupPubSub();
 
         logger.info({ scope: 'cache', component: 'CacheManager', msg: 'CacheManager initialized', provider: this.config.provider, enabled: this.config.enabled });
+
+        // Boot self-check. A remote provider that never connects (wrong host,
+        // IPv6 `localhost` → `::1` half-open, auth) does not fail initialize():
+        // every read then errors per call and the app silently runs on 100%
+        // cache misses. Surface that once, loudly, at startup.
+        if (this.config.enabled && this.config.provider !== 'memory' && this.config.provider !== 'noop') {
+            const ready = this.provider.waitReady ? await this.provider.waitReady(3000).catch(() => false) : true;
+            const reachable = ready && await this.ping().catch(() => false);
+            if (!reachable) {
+                logger.warn({
+                    scope: 'cache',
+                    component: 'CacheManager',
+                    provider: this.config.provider,
+                    msg: 'Cache provider unreachable at boot — running on cache misses until it connects. Check REDIS_HOST/REDIS_PORT (prefer 127.0.0.1 over localhost) and credentials.',
+                });
+            }
+        }
     }
 
     /**
