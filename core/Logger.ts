@@ -3,6 +3,13 @@ import pino from "pino";
 const usePretty = process.env.LOG_PRETTY === 'true';
 export const logger = pino({
     level: process.env.LOG_LEVEL || 'info',
+    // Error objects have non-enumerable message/stack, so without a
+    // serializer `logger.error({ error })` prints `error: {}`. The framework
+    // logs under both `err` and `error`; serialize both.
+    serializers: {
+        err: pino.stdSerializers.err,
+        error: pino.stdSerializers.err,
+    },
     redact: {
         paths: [
             'password', 'secret', 'token', 'authorization',

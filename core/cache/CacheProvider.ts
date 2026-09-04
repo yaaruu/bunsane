@@ -29,6 +29,11 @@ export interface CacheProvider {
 
     // Health check
     ping(): Promise<boolean>;
+    /**
+     * Optional: resolve true once the provider's connection is usable, false
+     * if not within `timeoutMs`. In-memory providers omit it (always ready).
+     */
+    waitReady?(timeoutMs?: number): Promise<boolean>;
 
     // Statistics
     getStats(): Promise<CacheStats>;

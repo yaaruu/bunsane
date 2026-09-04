@@ -147,6 +147,10 @@ export class MultiLevelCache implements CacheProvider {
     }
   }
 
+  waitReady(timeoutMs?: number): Promise<boolean> {
+    return this.l2Cache?.waitReady ? this.l2Cache.waitReady(timeoutMs) : Promise.resolve(true);
+  }
+
   async ping(): Promise<boolean> {
     const l1Ping = await this.l1Cache.ping();
 

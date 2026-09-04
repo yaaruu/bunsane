@@ -342,6 +342,28 @@ export class RedisCache implements CacheProvider {
     }
 
     /**
+     * Resolve true once the client reports `ready`, false if that does not
+     * happen within `timeoutMs`. ioredis connects asynchronously and, with
+     * the offline queue disabled, every command issued before `ready` fails
+     * — so a boot-time health probe must wait here first.
+     */
+    waitReady(timeoutMs = 3000): Promise<boolean> {
+        if (this.client.status === 'ready') return Promise.resolve(true);
+        return new Promise<boolean>((resolve) => {
+            const timer = setTimeout(() => { cleanup(); resolve(false); }, timeoutMs);
+            const onReady = () => { cleanup(); resolve(true); };
+            const onEnd = () => { cleanup(); resolve(false); };
+            const cleanup = () => {
+                clearTimeout(timer);
+                this.client.off('ready', onReady);
+                this.client.off('end', onEnd);
+            };
+            this.client.once('ready', onReady);
+            this.client.once('end', onEnd);
+        });
+    }
+
+    /**
      * Get cache statistics
      */
     async getStats(): Promise<CacheStats> {

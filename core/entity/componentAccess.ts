@@ -15,6 +15,7 @@ import { ComponentAddedEvent, ComponentUpdatedEvent, ComponentRemovedEvent } fro
 import { getRequestScope } from "../requestScope";
 import { trackCacheOp } from "./pendingOps";
 import { getCacheManager } from "./getCacheManager";
+import { COMPONENT_TOMBSTONE } from "../cache/CacheManager";
 import type { Entity } from "../Entity";
 
 export function addComponent(entity: Entity, component: BaseComponent): Entity {
@@ -330,18 +331,61 @@ async function loadComponent<T extends BaseComponent>(entity: Entity, ctor: new 
                 componentId = loaderResult.id;
             }
         } else {
-            // Route through runWithSignal so a request/wall-clock abort can
-            // cancel this in-flight read. When dbConn is context.trx, an
-            // uncancelled read leaks the backend into `idle in transaction`
-            // on timeout (matches the d1dde84 save/delete fix, which missed
-            // the read path).
-            const rows = await runWithSignal<any[]>(
-                dbConn`SELECT id, data FROM components WHERE entity_id = ${entity.id} AND type_id = ${typeId} AND deleted_at IS NULL`,
-                signal
-            );
-            if (rows.length > 0) {
-                componentData = rows[0].data;
-                componentId = rows[0].id;
+            // Bare path (no request loaders): consult the shared cache first,
+            // exactly like the DataLoader path does. Skipped inside an explicit
+            // transaction — the cache cannot see the trx's uncommitted writes.
+            // A tombstone hit is a confirmed absence.
+            const cacheManager = context?.trx ? null : getCacheManager().getInstance();
+            const cacheConfig = cacheManager?.getConfig();
+            const cacheOn = !!cacheConfig?.enabled && !!cacheConfig?.component?.enabled;
+            let cacheDecided = false;
+            if (cacheOn) {
+                try {
+                    const [cached] = await cacheManager!.getComponents([{ entityId: entity.id, typeId }]);
+                    if (cached === COMPONENT_TOMBSTONE) {
+                        cacheDecided = true;
+                    } else if (cached) {
+                        componentData = cached.data;
+                        componentId = cached.id;
+                        cacheDecided = true;
+                    }
+                } catch (error) {
+                    logger.warn({ scope: 'cache', component: 'componentAccess', msg: 'Cache read failed, falling back to database', error });
+                }
+            }
+
+            if (!cacheDecided) {
+                // Route through runWithSignal so a request/wall-clock abort can
+                // cancel this in-flight read. When dbConn is context.trx, an
+                // uncancelled read leaks the backend into `idle in transaction`
+                // on timeout (matches the d1dde84 save/delete fix, which missed
+                // the read path).
+                const rows = await runWithSignal<any[]>(
+                    dbConn`SELECT id, entity_id, type_id, data, created_at, updated_at, deleted_at FROM components WHERE entity_id = ${entity.id} AND type_id = ${typeId} AND deleted_at IS NULL`,
+                    signal
+                );
+                if (rows.length > 0) {
+                    componentData = rows[0].data;
+                    componentId = rows[0].id;
+                }
+                if (cacheOn) {
+                    // Write-through (or tombstone the absence). Fire-and-forget
+                    // like the other cache writes in this module.
+                    const requested = [{ entityId: entity.id, typeId }];
+                    const found = rows.length > 0 ? [{
+                        id: rows[0].id,
+                        entityId: rows[0].entity_id,
+                        typeId: rows[0].type_id,
+                        data: rows[0].data,
+                        createdAt: rows[0].created_at,
+                        updatedAt: rows[0].updated_at,
+                        deletedAt: rows[0].deleted_at,
+                    }] : [];
+                    trackCacheOp(
+                        cacheManager!.setComponentsWriteThrough(found, requested, cacheConfig!.component!.ttl)
+                            .catch((error) => logger.warn({ scope: 'cache', component: 'componentAccess', msg: 'Cache write failed after component fetch', error }))
+                    );
+                }
             }
         }
 
