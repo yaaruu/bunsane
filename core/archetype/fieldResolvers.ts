@@ -90,9 +90,11 @@ export function buildFieldResolvers(archetype: any): FieldResolverEntry[] {
                                 entityId: entityId,
                                 typeId: typeIdHex,
                             });
-                        if (componentData?.data?.value !== undefined) {
-                            return normalizeDateValue(componentData.data.value);
-                        }
+                        // The loader's answer is authoritative for this key: a null
+                        // means the row is absent. Falling through to entity.get()
+                        // here re-issued one bare SELECT per absent optional
+                        // component per parent (N+1 on nullable archetype fields).
+                        return normalizeDateValue(componentData?.data?.value);
                     }
 
                     const entity = await ensureEntity(parent, context);
@@ -124,9 +126,11 @@ export function buildFieldResolvers(archetype: any): FieldResolverEntry[] {
                                 entityId: entityId,
                                 typeId: typeIdHex,
                             });
-                        if (componentData?.data) {
-                            return componentData.data;
-                        }
+                        // Loader null == absent row. Do not fall through to a bare
+                        // entity.get(): that fired one un-batched SELECT per absent
+                        // nullable component per parent (measured 40 of 51
+                        // statements on a 20-row order list).
+                        return componentData?.data ?? null;
                     }
 
                     const entity = await ensureEntity(parent, context);
