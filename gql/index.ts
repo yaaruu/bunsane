@@ -6,6 +6,7 @@ import { complexityLimitRule } from './complexityLimit';
 import { GraphQLObjectType, GraphQLField, GraphQLOperation, GraphQLScalarType, GraphQLSubscription } from './Generator';
 import {GraphQLFieldTypes} from "./types"
 import {logger as MainLogger} from "../core/Logger"
+import { isVerboseErrors } from "../core/envMode"
 import { isFieldRequested } from './helpers';
 import * as z from "zod";
 
@@ -31,6 +32,7 @@ export {
 }
 export { GraphQLSchemaOrchestrator } from "./orchestration";
 export { generateGraphQLSchemaV2 } from "./GeneratorV2";
+export { maskError };
 export { Middleware, composeOperationMiddleware } from "./middleware";
 export type { OperationMiddleware } from "./middleware";
 export type {
@@ -80,8 +82,12 @@ const staticResolvers = {
 };
 
 const maskError = (error: any, message: string): GraphQLError => {
+    // SEC-08: a thrown non-Error (string, plain object) has no message —
+    // guard before touching it so the masker itself can never crash.
+    const rawMessage = typeof error?.message === 'string' ? error.message : String(message ?? 'Error');
+
     // Handle authentication errors
-    if (error.message === 'Unauthenticated' || error.extensions?.http?.status === 401 || error.extensions?.code === 'UNAUTHENTICATED') {
+    if (rawMessage === 'Unauthenticated' || error.extensions?.http?.status === 401 || error.extensions?.code === 'UNAUTHENTICATED') {
         return new GraphQLError('Unauthorized', {
             extensions: {
                 code: 'UNAUTHORIZED',
@@ -101,39 +107,43 @@ const maskError = (error: any, message: string): GraphQLError => {
     }
 
     // Handle GraphQL validation errors for missing required fields
-    if (error.message.includes('was not provided')) {
-        const match = error.message.match(/Field "([^"]+)" of required type "([^"]+)" was not provided/);
+    if (rawMessage.includes('was not provided')) {
+        const match = rawMessage.match(/Field "([^"]+)" of required type "([^"]+)" was not provided/);
         if (match) {
             const fieldName = match[1];
             return new GraphQLError(`Missing required field: ${fieldName}`, {
                 extensions: {
                     code: 'VALIDATION_ERROR',
                     field: fieldName,
-                    originalMessage: error.message
+                    // SEC-08: the raw validation message can carry type names;
+                    // include it only when verbosity is explicitly on.
+                    originalMessage: isVerboseErrors() ? rawMessage : undefined
                 }
             });
         }
     }
-    
+
     // Pass through known application-level GraphQL error codes
     const isGQLError = (e: any): e is { message: string; extensions?: Record<string, unknown> } =>
         e instanceof GraphQLError ||
-        (e !== null && typeof e === 'object' && 'extensions' in e && 'message' in e && typeof e.message === 'string');
+        (e !== null && typeof e === 'object' && 'extensions' in e && typeof e.message === 'string');
     const knownCodes = ['FORBIDDEN', 'NOT_FOUND', 'BAD_USER_INPUT', 'BAD_REQUEST'];
     if (isGQLError(error) && knownCodes.includes(error.extensions?.code as string)) {
         return error instanceof GraphQLError ? error : new GraphQLError(error.message, { extensions: error.extensions });
     }
 
-    if (process.env.NODE_ENV === 'production') {
-        logger.error("GraphQL Error:", error);
-        // Mask sensitive error details in production
+    logger.error("GraphQL Error:", error);
+
+    if (!isVerboseErrors()) {
+        // SEC-08: fail closed. Only the exact value 'development' gets the
+        // original error; unset, 'staging', 'test-server', typos — everything
+        // else masks.
         return new GraphQLError('Internal server error', {
             extensions: {
                 code: 'INTERNAL_SERVER_ERROR',
             },
         });
     }
-    // In development, return the original error
     return isGQLError(error) ? (error instanceof GraphQLError ? error : new GraphQLError(error.message, { extensions: error.extensions })) : new GraphQLError(message, { originalError: error });
 };
 

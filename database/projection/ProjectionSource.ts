@@ -21,14 +21,20 @@ export const castFor = (column: ProjectedColumn): string => {
  * and the reconcile sweep so the two can never compute a column differently.
  *
  * `entityRef` is the entity-id expression in the enclosing scope (`e.id` for the INSERT..SELECT
- * form, a bind placeholder for the single-row recompute).
+ * form, a bind placeholder for the single-row recompute). It is interpolated into SQL text,
+ * so it is allow-listed to identifier/dotted-identifier/placeholder shapes. (SEC-03)
  */
+const ENTITY_REF_RE = /^(?:[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*|\$\d+)$/;
+
 export const projectionSourceExpr = (
     column: ProjectedColumn,
     typeId: string,
     entityRef: string
 ): string => {
     const safeTypeId = assertTypeId(typeId);
+    if (!ENTITY_REF_RE.test(entityRef)) {
+        throw new Error(`Invalid projection entity reference: ${entityRef}`);
+    }
     const where = `c.entity_id = ${entityRef} AND c.type_id = '${safeTypeId}' AND c.deleted_at IS NULL`;
 
     // Component-id columns come from the row's own id — there is no data key to read.

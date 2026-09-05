@@ -6,6 +6,7 @@ import { ComponentRegistry } from "../core/components";
 import { shouldUseDirectPartition } from "../core/Config";
 import { getMembershipTable } from "./membershipSource";
 import { jsonbInListCast } from "./FilterBuilder";
+import { escapeJsonLiteral, assertComponentTableName } from "./SqlIdentifier";
 
 /**
  * Gate for the base-dependency single-pass OR rewrite (base scanned once,
@@ -34,7 +35,11 @@ export class OrNode extends QueryNode {
 
     private getComponentTableName(compId: string): string {
         if (shouldUseDirectPartition()) {
-            return ComponentRegistry.getPartitionTableName(compId) || 'components';
+            // SEC-03: registry-derived name is asserted before interpolation.
+            return assertComponentTableName(
+                ComponentRegistry.getPartitionTableName(compId) || 'components',
+                'OrNode.partitionTable',
+            );
         }
         return 'components';
     }
@@ -92,7 +97,7 @@ export class OrNode extends QueryNode {
                 throw new Error(`Component ${branch.component.name} is not registered`);
             }
 
-            const partitionTable = ComponentRegistry.getPartitionTableName(componentId) || 'components';
+        const partitionTable = assertComponentTableName(ComponentRegistry.getPartitionTableName(componentId) || 'components', 'OrNode.partitionTable');
 
             // Simple, direct query to partition table - no EXISTS, no subqueries
             let branchSql = `SELECT entity_id FROM ${partitionTable} WHERE type_id = $${paramIndex} AND deleted_at IS NULL`;
@@ -104,7 +109,7 @@ export class OrNode extends QueryNode {
             if (branch.filters && branch.filters.length > 0) {
                 for (const filter of branch.filters) {
                     const { field, operator, value } = filter;
-                    const jsonPath = `data->>'${field}'`;
+                    const jsonPath = `data->>'${escapeJsonLiteral(field)}'`;
 
                     switch (operator) {
                         case "=":
@@ -220,7 +225,7 @@ export class OrNode extends QueryNode {
             throw new Error(`Component ${branch.component.name} is not registered`);
         }
 
-        const partitionTable = ComponentRegistry.getPartitionTableName(componentId) || 'components';
+        const partitionTable = assertComponentTableName(ComponentRegistry.getPartitionTableName(componentId) || 'components', 'OrNode.partitionTable');
 
         // Build WHERE conditions for all branches
         const orConditions: string[] = [];
@@ -235,7 +240,7 @@ export class OrNode extends QueryNode {
             if (branch.filters && branch.filters.length > 0) {
                 for (const filter of branch.filters) {
                     const { field, operator, value } = filter;
-                    const jsonPath = `data->>'${field}'`;
+                    const jsonPath = `data->>'${escapeJsonLiteral(field)}'`;
 
                     switch (operator) {
                         case "=":
@@ -244,10 +249,22 @@ export class OrNode extends QueryNode {
                         case ">=":
                         case "<=":
                         case "!=":
+                            // SEC-03 + bugfix: numbers need the numeric cast.
+                            // `data->>'k'` is text, so a raw number param made
+                            // PG fail with `text = integer`. Mirrors the
+                            // buildBranchExists switch below.
+                            if (typeof value === "number") {
+                                conditions.push(`(${jsonPath})::numeric ${operator} $${paramIndex}`);
+                            } else if (typeof value === "boolean") {
+                                conditions.push(`(${jsonPath})::boolean ${operator} $${paramIndex}`);
+                            } else {
+                                conditions.push(`${jsonPath} ${operator} $${paramIndex}`);
+                            }
+                            context.params.push(value);
+                            paramIndex++;
+                            break;
                         case "LIKE":
                         case "ILIKE":
-                            // Note: data->>'field' returns text, so no cast needed
-                            // Explicit casting can cause issues with Bun's SQL parameter type inference
                             conditions.push(`${jsonPath} ${operator} $${paramIndex}`);
                             context.params.push(value);
                             paramIndex++;
@@ -435,7 +452,7 @@ export class OrNode extends QueryNode {
                     const { field, operator, value } = filter;
 
                     // Build JSON path for nested properties
-                    const jsonPath = `c.data->>'${field}'`;
+                    const jsonPath = `c.data->>'${escapeJsonLiteral(field)}'`;
 
                     switch (operator) {
                         case "=":
@@ -591,7 +608,7 @@ export class OrNode extends QueryNode {
         if (branch.filters && branch.filters.length > 0) {
             for (const filter of branch.filters) {
                 const { field, operator, value } = filter;
-                const jsonPath = `c.data->>'${field}'`;
+                const jsonPath = `c.data->>'${escapeJsonLiteral(field)}'`;
 
                 switch (operator) {
                     case "=":

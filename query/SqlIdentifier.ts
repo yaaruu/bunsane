@@ -97,6 +97,38 @@ export function assertTsLanguage(value: unknown, context: string = 'tsLanguage')
     return value.toLowerCase();
 }
 
+/**
+ * Escape a value for interpolation inside a single-quoted PostgreSQL string
+ * literal (`data->>'${key}'`). Unlike `assertFieldPath` this does NOT restrict
+ * characters: JSONB keys legitimately contain dashes, spaces or dots, and
+ * rejecting them would break working queries. Escaping makes injection
+ * impossible while preserving every key. (SEC-03)
+ */
+export function escapeJsonLiteral(value: unknown): string {
+    return String(value).replace(/'/g, "''");
+}
+
+/**
+ * Normalize an ORDER BY direction to the closed ASC/DESC set. Anything that
+ * is not exactly 'DESC' becomes 'ASC' — a malformed direction can never reach
+ * SQL text. (SEC-03)
+ */
+export function normalizeSortDirection(value: unknown): 'ASC' | 'DESC' {
+    return value === 'DESC' ? 'DESC' : 'ASC';
+}
+
+/**
+ * Operators accepted by the default (non-registered) filter predicate path.
+ * Custom operators are dispatched through FilterBuilderRegistry before this
+ * set is consulted, so plugin operators are unaffected.
+ */
+export const KNOWN_FILTER_OPERATORS: ReadonlySet<string> = new Set([
+    '=', '>', '<', '>=', '<=', '!=',
+    'LIKE', 'NOT LIKE', 'ILIKE', 'NOT ILIKE',
+    'IN', 'NOT IN', 'IS NULL', 'IS NOT NULL',
+    'CONTAINS', 'CONTAINED_BY', 'HAS_ANY', 'HAS_ALL',
+]);
+
 export class InvalidIdentifierError extends Error {
     constructor(context: string, value: string) {
         super(`Invalid SQL identifier in ${context}: ${JSON.stringify(value)}`);

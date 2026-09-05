@@ -2,6 +2,7 @@ import { GraphQLError } from "graphql";
 import { logger } from "../../core/Logger";
 import { type ZodType } from "zod";
 import * as z from "zod";
+import { isVerboseErrors } from "../../core/envMode";
 
 /** Check if error is a GraphQLError (handles cross-package version mismatches) */
 function isGraphQLError(error: unknown): error is GraphQLError {
@@ -62,6 +63,17 @@ export class ResolverBuilder {
       try {
         const inputArgs = args.input || args;
 
+        // SEC-06: validate-only sweep for files arriving through ANY argument
+        // shape (nested inputs, undecorated methods). Skip it when the method is
+        // already @Upload/@UploadField-wrapped — that wrapper does a complete,
+        // config-aware sweep of its own, and running this global-config net on
+        // top would falsely reject a file the method's own permissive config
+        // allows.
+        const { sweepValidateArgs, isUploadWrapped } = await import("../uploadGuard");
+        if (!isUploadWrapped(service[propertyKey])) {
+          await sweepValidateArgs([inputArgs]);
+        }
+
         // Automatically validate with Zod schema if provided
         if (zodSchema) {
           try {
@@ -87,7 +99,7 @@ export class ResolverBuilder {
         throw new GraphQLError(`Internal error`, {
           extensions: {
             code: "INTERNAL_ERROR",
-            originalError: process.env.NODE_ENV !== 'production' ? error : undefined
+            originalError: isVerboseErrors() ? error : undefined
           }
         });
       }
@@ -100,6 +112,13 @@ export class ResolverBuilder {
   private createResolverWithoutInput(service: any, propertyKey: string): Function {
     return async (_: any, args: any, context: any, info: any) => {
       try {
+        // SEC-06: same safety net for no-input resolvers (bare File scalars),
+        // skipped when the method's own upload wrapper already covers it.
+        const { sweepValidateArgs, isUploadWrapped } = await import("../uploadGuard");
+        if (!isUploadWrapped(service[propertyKey])) {
+          await sweepValidateArgs([args]);
+        }
+
         const result = await service[propertyKey]({}, context, info);
         return result;
       } catch (error) {
@@ -111,7 +130,7 @@ export class ResolverBuilder {
         throw new GraphQLError(`Internal error`, {
           extensions: {
             code: "INTERNAL_ERROR",
-            originalError: process.env.NODE_ENV !== 'production' ? error : undefined
+            originalError: isVerboseErrors() ? error : undefined
           }
         });
       }
@@ -151,7 +170,7 @@ export class ResolverBuilder {
           throw new GraphQLError(`Internal error in subscription`, {
             extensions: {
               code: "INTERNAL_ERROR",
-              originalError: process.env.NODE_ENV !== 'production' ? error : undefined
+              originalError: isVerboseErrors() ? error : undefined
             }
           });
         }
@@ -177,7 +196,7 @@ export class ResolverBuilder {
           throw new GraphQLError(`Internal error in subscription`, {
             extensions: {
               code: "INTERNAL_ERROR",
-              originalError: process.env.NODE_ENV !== 'production' ? error : undefined
+              originalError: isVerboseErrors() ? error : undefined
             }
           });
         }

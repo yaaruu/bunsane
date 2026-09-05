@@ -2,24 +2,28 @@ import "reflect-metadata";
 import type { UploadDecoratorConfig } from "../../types/upload.types";
 import { UploadManager } from "../../upload";
 import { logger as MainLogger } from "../../core/Logger";
+import { UPLOAD_CONFIG_KEY, wrapUploadValidation } from "../uploadGuard";
+
+// Back-compat re-export: existing code imported the symbol from here.
+export { UPLOAD_CONFIG_KEY };
 
 const logger = MainLogger.child({ scope: "UploadDecorator" });
 
 /**
- * Metadata key for upload configuration
- */
-export const UPLOAD_CONFIG_KEY = Symbol("upload:config");
-
-/**
  * @Upload decorator for GraphQL mutation parameters
  * Automatically handles file uploads and stores metadata
+ *
+ * SEC-06: this decorator now ALSO installs the shared validation guard on the
+ * method (parameter decorators receive no property descriptor, so it is taken
+ * from the prototype). Using @Upload without @UploadField no longer means
+ * "record metadata, enforce nothing".
  */
 export function Upload(config?: UploadDecoratorConfig) {
     return function (target: any, propertyKey: string, parameterIndex: number) {
         logger.trace(`Registering @Upload decorator for ${target.constructor.name}.${propertyKey} parameter ${parameterIndex}`);
-        
+
         const existingMetadata = Reflect.getMetadata(UPLOAD_CONFIG_KEY, target, propertyKey) || {};
-        
+
         existingMetadata[parameterIndex] = {
             field: config?.field || propertyKey,
             batch: config?.batch || false,
@@ -27,8 +31,16 @@ export function Upload(config?: UploadDecoratorConfig) {
             validationMessage: config?.validationMessage,
             ...config
         };
-        
+
         Reflect.defineMetadata(UPLOAD_CONFIG_KEY, existingMetadata, target, propertyKey);
+
+        // Install the validation guard once per method (idempotent).
+        const descriptor = Object.getOwnPropertyDescriptor(target, propertyKey);
+        if (descriptor && typeof descriptor.value === "function") {
+            wrapUploadValidation(target, propertyKey, descriptor);
+            // wrapUploadValidation mutated descriptor.value in place.
+            Object.defineProperty(target, propertyKey, descriptor);
+        }
     };
 }
 
@@ -39,49 +51,7 @@ export function Upload(config?: UploadDecoratorConfig) {
 export function UploadField(config: UploadDecoratorConfig) {
     return function (target: any, propertyKey: string, descriptor: PropertyDescriptor) {
         logger.trace(`Registering @UploadField decorator for ${target.constructor.name}.${propertyKey}`);
-        
-        const originalMethod = descriptor.value;
-        
-        descriptor.value = async function (...args: any[]) {
-            const uploadManager = UploadManager.getInstance();
-            
-            // Check if this method has upload parameters
-            const uploadMetadata = Reflect.getMetadata(UPLOAD_CONFIG_KEY, target, propertyKey);
-            
-            if (uploadMetadata) {
-                // Process uploads before calling the original method
-                for (const [paramIndex, uploadConfig] of Object.entries(uploadMetadata)) {
-                    const paramIdx = parseInt(paramIndex);
-                    const file = args[paramIdx];
-                    const config = uploadConfig as any;
-                    
-                    if (file && file instanceof File) {
-                        logger.info(`Processing upload for parameter ${paramIdx} in ${target.constructor.name}.${propertyKey}`);
-                        
-                        try {
-                            const result = await uploadManager.uploadFile(file, config);
-                            
-                            if (!result.success) {
-                                throw new Error(config.validationMessage || result.error?.message || "Upload failed");
-                            }
-                            
-                            // Replace file parameter with upload result
-                            args[paramIdx] = result;
-                            
-                        } catch (error) {
-                            logger.error(`Upload failed for ${target.constructor.name}.${propertyKey}: ${error instanceof Error ? error.message : 'Unknown error'}`);
-                            throw error;
-                        }
-                    } else if (config.required) {
-                        throw new Error(`Required upload file missing for parameter ${paramIdx}`);
-                    }
-                }
-            }
-            
-            return await originalMethod.apply(this, args);
-        };
-        
-        return descriptor;
+        return wrapUploadValidation(target, propertyKey, descriptor);
     };
 }
 
@@ -147,7 +117,7 @@ export class UploadDecorators {
             maxFileSize: 25 * 1024 * 1024, // 25MB
             allowedMimeTypes: [
                 "application/pdf",
-                "text/plain", 
+                "text/plain",
                 "application/msword",
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             ],

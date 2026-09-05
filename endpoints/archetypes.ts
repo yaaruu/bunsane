@@ -367,12 +367,81 @@ export async function handleStudioArcheTypeDeleteRequest(
         );
     }
 
+    // SEC-01: the URL names an archetype; only entities that actually belong
+    // to it may be deleted through this route. Without this check a caller
+    // could bulk-delete arbitrary entities by id regardless of archetype.
+    const metadataStorage = getSerializedMetadataStorage();
+    const archeTypeFields: ArcheTypeField[] | undefined =
+        metadataStorage.archeTypes[archeTypeName];
+
+    if (!archeTypeFields || archeTypeFields.length === 0) {
+        return new Response(
+            JSON.stringify({
+                error: `ArcheType '${archeTypeName}' not found`,
+            }),
+            {
+                status: 404,
+                headers: { "Content-Type": "application/json" },
+            }
+        );
+    }
+
+    const indicatorComponentName = findIndicatorComponentName(
+        archeTypeName,
+        archeTypeFields
+    );
+
+    if (!indicatorComponentName) {
+        return new Response(
+            JSON.stringify({
+                error: `No indicator component found for '${archeTypeName}'`,
+            }),
+            {
+                status: 400,
+                headers: { "Content-Type": "application/json" },
+            }
+        );
+    }
+
     try {
+        const deadline = studioDeadline();
+
         const idPlaceholders = entityIds
             .map((_, index) => `$${index + 1}`)
             .join(", ");
+        // Verify query binds the indicator component name first, so its
+        // entity-id placeholders shift by one.
+        const verifyPlaceholders = entityIds
+            .map((_, index) => `$${index + 2}`)
+            .join(", ");
 
-        const deadline = studioDeadline();
+        const ownedResult = await studioExec<{ entity_id: string }[]>(
+            "studio.archetype.delete.verify",
+            deadline,
+            `SELECT DISTINCT entity_id
+             FROM components
+             WHERE name = $1
+             AND entity_id IN (${verifyPlaceholders})`,
+            [indicatorComponentName, ...entityIds]
+        );
+
+        const ownedSet = new Set(ownedResult.map((row) => row.entity_id));
+        const foreign = entityIds.filter((id) => !ownedSet.has(id));
+
+        if (foreign.length > 0) {
+            return new Response(
+                JSON.stringify({
+                    error:
+                        `Refused: ${foreign.length} of ${entityIds.length} entityIds ` +
+                        `do not belong to archetype '${archeTypeName}'`,
+                    foreignEntityIds: foreign.slice(0, 50),
+                }),
+                {
+                    status: 400,
+                    headers: { "Content-Type": "application/json" },
+                }
+            );
+        }
 
         // The two core deletes are now one transaction. They were separate
         // autocommit statements: a failure on the second left every component

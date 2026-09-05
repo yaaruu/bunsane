@@ -48,6 +48,16 @@ export interface ConnectionProbeResult {
     backendPids: number[];
     /** Effective server-side statement_timeout, as reported by SHOW. */
     statementTimeout?: string;
+    /** `standard_conforming_strings` as reported by SHOW ('on'/'off'). */
+    standardConformingStrings?: string;
+    /**
+     * The server has `standard_conforming_strings = off` (SEC-03). JSONB-key
+     * escaping in `SqlIdentifier.escapeJsonLiteral` doubles `'` only, which is
+     * complete under the default `on` but leaves a backslash-based break-out
+     * open when it is `off`. Deprecated since PG 9.1, so this is a loud-warn,
+     * not a fail — but it must not be silent.
+     */
+    standardConformingStringsOff: boolean;
     /** DB_STATEMENT_TIMEOUT was requested but the server does not have it. */
     statementTimeoutIgnored: boolean;
     /**
@@ -275,6 +285,7 @@ export async function probeConnection(sql: SQL = db): Promise<ConnectionProbeRes
         poolingOutcome: 'skipped',
         backendPids: [],
         statementTimeoutIgnored: false,
+        standardConformingStringsOff: false,
         cancelEffective: null,
         cancelOutcome: 'skipped',
     };
@@ -297,6 +308,15 @@ export async function probeConnection(sql: SQL = db): Promise<ConnectionProbeRes
             }
             const shown = await conn`SHOW statement_timeout`;
             result.statementTimeout = shown[0]?.statement_timeout as string | undefined;
+
+            // SEC-03: JSONB-key escaping assumes `standard_conforming_strings=on`
+            // (the default since PG 9.1). Read it back so a deployment that turned
+            // it off is told, rather than silently opening a backslash break-out.
+            const scs = await conn`SHOW standard_conforming_strings`;
+            result.standardConformingStrings =
+                scs[0]?.standard_conforming_strings as string | undefined;
+            result.standardConformingStringsOff =
+                result.standardConformingStrings === 'off';
 
             // Read the timeout BEFORE probing the cancel: the probe has to size
             // its statement under the server's own bound, or the server does the
@@ -362,6 +382,16 @@ export async function probeConnection(sql: SQL = db): Promise<ConnectionProbeRes
             '`options` startup parameter was dropped (PgBouncer ignores it). This deployment has NO ' +
             'server-side statement timeout. Set it on the role instead: ' +
             'ALTER ROLE <user> SET statement_timeout = \'<ms>\'.'
+        );
+    }
+
+    if (result.standardConformingStringsOff) {
+        logger.error(
+            { standardConformingStrings: result.standardConformingStrings },
+            'standard_conforming_strings is OFF. JSONB-key escaping (SqlIdentifier.escapeJsonLiteral) ' +
+            'doubles single quotes only, which is complete under the default ON but leaves a ' +
+            'backslash-based break-out open when OFF. Set it back ON: ' +
+            "ALTER SYSTEM SET standard_conforming_strings = 'on'; (or per-role/per-db). See SEC-03."
         );
     }
 

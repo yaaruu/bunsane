@@ -9,6 +9,7 @@
 import type { QueryFilter } from "./QueryContext";
 import type { QueryContext } from "./QueryContext";
 import { FilterBuilderRegistry } from "./FilterBuilderRegistry";
+import { escapeJsonLiteral, KNOWN_FILTER_OPERATORS } from "./SqlIdentifier";
 import {
     numericJsonCompareSql,
     numericJsonTextValidPredicate,
@@ -60,13 +61,16 @@ export interface FilterBuilderOptions {
  * buildJSONPath("latitude", "c") // "c.data->>'latitude'"
  */
 export function buildJSONPath(field: string, alias: string): string {
+    // SEC-03: keys are escaped for the single-quoted literal, so a crafted
+    // field ("x' OR true --") stays a literal instead of breaking out. Exotic
+    // but legal keys (dashes, spaces) keep working.
     if (field.includes('.')) {
         const parts = field.split('.');
         const lastPart = parts.pop()!;
-        const nestedPath = parts.map(p => `'${p}'`).join('->');
-        return `${alias}.data->${nestedPath}->>'${lastPart}'`;
+        const nestedPath = parts.map(p => `'${escapeJsonLiteral(p)}'`).join('->');
+        return `${alias}.data->${nestedPath}->>'${escapeJsonLiteral(lastPart)}'`;
     } else {
-        return `${alias}.data->>'${field}'`;
+        return `${alias}.data->>'${escapeJsonLiteral(field)}'`;
     }
 }
 
@@ -86,13 +90,14 @@ export function buildJSONPath(field: string, alias: string): string {
  * buildJSONBPath("metadata.tags", "c") // "c.data->'metadata'->'tags'"
  */
 export function buildJSONBPath(field: string, alias: string): string {
+    // SEC-03: same escaping discipline as buildJSONPath.
     if (field.includes('.')) {
         const parts = field.split('.');
         const lastPart = parts.pop()!;
-        const nestedPath = parts.map(p => `'${p}'`).join('->');
-        return `${alias}.data->${nestedPath}->'${lastPart}'`;
+        const nestedPath = parts.map(p => `'${escapeJsonLiteral(p)}'`).join('->');
+        return `${alias}.data->${nestedPath}->'${escapeJsonLiteral(lastPart)}'`;
     }
-    return `${alias}.data->'${field}'`;
+    return `${alias}.data->'${escapeJsonLiteral(field)}'`;
 }
 
 /**
@@ -133,6 +138,16 @@ export function buildComponentFilterCondition(
             );
         }
         return FilterBuilderRegistry.get(filter.operator)!(filter, alias, context).sql;
+    }
+
+    // SEC-03: the operator is interpolated into SQL text below. Custom
+    // operators were dispatched above; anything reaching this point must be
+    // in the closed known set, or it is either a typo or an injection attempt.
+    if (!KNOWN_FILTER_OPERATORS.has(String(filter.operator))) {
+        throw new Error(
+            `Unsupported filter operator: ${JSON.stringify(filter.operator)}. ` +
+            `Register custom operators via FilterBuilderRegistry.`
+        );
     }
 
     const jsonPath = buildJSONPath(filter.field, alias);

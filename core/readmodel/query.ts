@@ -3,7 +3,7 @@ import db from "../../database";
 import { assertIdentifier } from "../../query/SqlIdentifier";
 import { sqlTimeBucketFromTs, type TimeTrunc } from "../../query/timeBucket";
 import { ReadModelRegistry } from "./ReadModelRegistry";
-import { M3_WHERE_OPS, type M3WhereOp, type ReadModelProjectSpec } from "./types";
+import { M3_WHERE_OPS, type M3WhereOp, type ReadModelDescriptor, type ReadModelProjectSpec } from "./types";
 
 interface Predicate {
     spec: ReadModelProjectSpec;

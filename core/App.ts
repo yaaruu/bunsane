@@ -94,6 +94,8 @@ export default class App {
     private composedHandler: ((req: Request) => Promise<Response>) | null = null;
 
     private studioEnabled: boolean = false;
+    private studioAuthToken: string | null = null;
+    private studioAssetsPath: string | null = null;
     private remote: RemoteManager | null = null;
     private remoteConfig: Partial<RemoteManagerConfig> | null = null;
     private server: ReturnType<typeof Bun.serve> | null = null;
@@ -129,7 +131,9 @@ export default class App {
             this.version
         );
 
-        // Automatically serve the studio if it exists
+        // Detect the studio bundle but do NOT register it here. Serving is
+        // opt-in via enableStudio({ token }) — an app that never calls it
+        // must serve nothing under /studio (SEC-01, deny-by-default).
         const studioPath = path.join(
             import.meta.dirname,
             "..",
@@ -139,8 +143,7 @@ export default class App {
         try {
             const studioDir = Bun.file(studioPath);
             if (studioDir) {
-                this.addStaticAssets("/studio", studioPath);
-                logger.info("Studio assets loaded from:" + studioPath);
+                this.studioAssetsPath = studioPath;
             }
         } catch (error) {
             logger.warn(
@@ -324,9 +327,37 @@ export default class App {
         this.enforceDocs = value;
     }
 
-    public enableStudio() {
+    /**
+     * Enable the Studio admin UI + API. Requires a bearer token: pass
+     * `{ token }` or set `BUNSANE_STUDIO_TOKEN` (min 16 chars). Without a
+     * token the call is REFUSED and studio stays fully disabled — every
+     * /studio route 404s (SEC-01, deny-by-default).
+     */
+    public enableStudio(options?: { token?: string }): boolean {
+        const token =
+            options?.token ??
+            process.env.BUNSANE_STUDIO_TOKEN ??
+            null;
+
+        if (!token || token.length < 16) {
+            logger.error(
+                "enableStudio() refused: a studio access token is required " +
+                "(pass { token } or set BUNSANE_STUDIO_TOKEN, min 16 chars). " +
+                "Studio remains fully disabled."
+            );
+            return false;
+        }
+
+        this.studioAuthToken = token;
+
+        if (this.studioAssetsPath) {
+            this.addStaticAssets("/studio", this.studioAssetsPath);
+            logger.info("Studio assets loaded from:" + this.studioAssetsPath);
+        }
+
         this.studioEnabled = true;
-        logger.info("Studio API enabled");
+        logger.info("Studio API enabled (token required)");
+        return true;
     }
 
     /**

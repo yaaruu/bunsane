@@ -147,7 +147,7 @@ describe('Query filter pushdown / coalesce (RP-03)', () => {
         for (let i = 1; i < scores.length; i++) {
             expect(scores[i]!).toBeLessThanOrEqual(scores[i - 1]!);
         }
-        expect(scores[0]).toBe(expected[0]);
+        expect(scores[0]!).toBe(expected[0]!);
     });
 
     test('count/exec parity with multi-filter multi-component', async () => {

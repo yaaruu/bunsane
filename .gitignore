@@ -43,3 +43,8 @@ tests/benchmark/databases/
 # Claude Code runtime artifacts
 .claude/scheduled_tasks.lock
 .claude/worktrees/
+
+# LocalStorageProvider default base ("./public") — runtime upload artifacts
+/public/
+# Local working notes / throwaway probes
+/scratchpad/

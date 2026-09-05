@@ -15,7 +15,7 @@ import { getMetadataStorage } from "../core/metadata";
 import { shouldUseDirectPartition } from "../core/Config";
 import type { SQL } from "bun";
 import type { ComponentConstructor, TypedEntity, ComponentRecord } from "../types/query.types";
-import { assertComponentTableName, assertFieldPath, assertIdentifier } from "./SqlIdentifier";
+import { assertComponentTableName, assertFieldPath, assertIdentifier, normalizeSortDirection } from "./SqlIdentifier";
 import { getMembershipSource } from "./membershipSource";
 import { isNumericProperty } from "./ComponentInclusionNode";
 import { buildCoverageRequest } from "./planner/CoverageSet";
@@ -36,14 +36,17 @@ import { PlannerCache } from "./planner/PlannerCache";
 import { qspMode, qspCountStrategy, qspActive, qspHydrate } from "../database/projection/qspConfig";
 import { ProjectionManager } from "../database/projection/ProjectionManager";
 import { sqlTimeBucketFromTs, type TimeTrunc } from "./timeBucket";
+import { isVerboseErrors } from "../core/envMode";
 
 // Parsed once at module load instead of on every exec() (process.env read +
 // parseInt was on the query hot path). 0 disables the default limit.
 const DEFAULT_QUERY_LIMIT = parseInt(process.env.BUNSANE_DEFAULT_QUERY_LIMIT ?? '10000', 10);
 let warnedDefaultLimit = false;
 
-// Gated once — dev keeps param diagnostics, production skips the loop entirely.
-const DEBUG_PARAMS = process.env.NODE_ENV !== 'production';
+// Gated once through the single SEC-08 verbosity gate: only NODE_ENV=development
+// logs params. Fail-closed — unset/staging/typo'd NODE_ENV masks, matching every
+// other verbose-error decision (was `!== 'production'`, which leaked when unset).
+const DEBUG_PARAMS = isVerboseErrors();
 
 // QSP gates read env at call time via qspConfig.
 /** Extract Plan Rows from EXPLAIN (FORMAT JSON) result (object or string). */
@@ -624,7 +627,9 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         this.context.sortOrders.push({
             component: componentName,
             property: property as string,
-            direction,
+            // SEC-03: normalized to the closed ASC/DESC set at the source so
+            // no downstream ORDER BY emission can receive anything else.
+            direction: normalizeSortDirection(direction),
             nullsFirst
         });
 
@@ -2059,6 +2064,8 @@ AND c.deleted_at IS NULL`;
             // Single component type - use direct partition if available
             const partitionTableName = ComponentRegistry.getPartitionTableName(componentTypeIds[0]!);
             if (partitionTableName) {
+                // SEC-03: registry-derived name is asserted before interpolation.
+                assertComponentTableName(partitionTableName, 'Query.populate.partitionTable');
                 components = await this.execSql<any[]>('query.components.partition', dbConn, `
                     SELECT id, entity_id, type_id, data, created_at, updated_at
                     FROM ${partitionTableName}
