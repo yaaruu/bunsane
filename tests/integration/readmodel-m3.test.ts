@@ -15,6 +15,8 @@ import {
     readModelResolvers,
 } from "../../core/readmodel";
 import { ReadModelManager, readModelScanTable } from "../../database/readmodel";
+import { armGateway, getGatewayStats, isGatewayArmed, resetGateway } from "../../database/gateway";
+import { getDbStats, resetDbStats } from "../../database/instrumentedDb";
 import { createTestContext, ensureComponentsRegistered } from "../utils";
 
 @Component
@@ -262,5 +264,151 @@ describe("RFC M3 read model (cross-entity join)", () => {
         await inv.set(M3InvComp, { total: 99 });
         await inv.save();
         expect(await ReadModel(M3InvoiceReport).where("status", "right-del").count()).toBe(0);
+    });
+
+    async function seedPair(status: string, total: number): Promise<string> {
+        const cust = ctx.tracker.create();
+        cust.add(M3CustComp, { region: status });
+        await cust.save();
+        const inv = ctx.tracker.create();
+        inv.add(M3InvComp, {
+            total,
+            status,
+            customerId: cust.id,
+            paidAt: new Date("2026-08-01T00:00:00.000Z"),
+        });
+        await inv.save();
+        return inv.id;
+    }
+
+    async function invoiceList(limit: number, status: string, offset = 0) {
+        const schema = createSchema({
+            typeDefs: buildReadModelGraphQLSDL(),
+            resolvers: {
+                Date: {
+                    serialize: (value: unknown) =>
+                        value instanceof Date ? value.toISOString() : value,
+                },
+                ...readModelResolvers(),
+            },
+        });
+        const result = await graphql({
+            schema,
+            source: `query($limit: Int!, $offset: Int!, $status: String!) {
+                m3InvoiceReports(where: [{ field: "status", value: $status }], limit: $limit, offset: $offset) {
+                    hasNextPage
+                    nodes { leftEntityId status }
+                }
+            }`,
+            variableValues: { limit, offset, status },
+        });
+        expect(result.errors, JSON.stringify(result.errors)).toBeUndefined();
+        const data = result.data as {
+            m3InvoiceReports: {
+                hasNextPage: boolean;
+                nodes: Array<{ leftEntityId: string; status: string }>;
+            };
+        };
+        return data.m3InvoiceReports;
+    }
+
+    test("ordered pages stay stable when the sort key ties", async () => {
+        const status = "tie-page";
+        const ids: string[] = [];
+        for (let i = 0; i < 5; i++) ids.push(await seedPair(status, 7));
+        const expected = ids.map((id) => id.toLowerCase()).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+
+        const full = await ReadModel(M3InvoiceReport).where("status", status).orderBy("total").rows();
+        expect(full.map((row) => String(row.leftEntityId).toLowerCase())).toEqual(expected);
+
+        const pageSize = 2;
+        const paged: string[] = [];
+        for (let offset = 0; offset < expected.length; offset += pageSize) {
+            const page = await ReadModel(M3InvoiceReport)
+                .where("status", status)
+                .orderBy("total", "DESC")
+                .limit(pageSize)
+                .offset(offset)
+                .rows();
+            paged.push(...page.map((row) => String(row.leftEntityId).toLowerCase()));
+        }
+        expect(paged).toEqual(expected);
+        expect(new Set(paged).size).toBe(paged.length);
+
+        const again = await ReadModel(M3InvoiceReport)
+            .where("status", status)
+            .orderBy("total")
+            .limit(pageSize)
+            .offset(pageSize)
+            .rows();
+        expect(again.map((row) => String(row.leftEntityId).toLowerCase())).toEqual(
+            expected.slice(pageSize, pageSize * 2)
+        );
+    });
+
+    test("GraphQL offset returns the next page and hasNextPage is false at the end", async () => {
+        const status = "gql-offset";
+        const ids: string[] = [];
+        for (let i = 0; i < 4; i++) ids.push((await seedPair(status, 1)).toLowerCase());
+        ids.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+
+        const page1 = await invoiceList(2, status, 0);
+        expect(page1.nodes.map((node) => node.leftEntityId.toLowerCase())).toEqual(ids.slice(0, 2));
+        expect(page1.hasNextPage).toBe(true);
+
+        const page2 = await invoiceList(2, status, 2);
+        expect(page2.nodes.map((node) => node.leftEntityId.toLowerCase())).toEqual(ids.slice(2, 4));
+        expect(page2.hasNextPage).toBe(false);
+    });
+
+    test("GraphQL list hasNextPage is false at exactly N and true at N+1", async () => {
+        const status = "page-edge";
+        const n = 3;
+        for (let i = 0; i < n; i++) await seedPair(status, 1);
+
+        const exact = await invoiceList(n, status);
+        expect(exact.nodes).toHaveLength(n);
+        expect(exact.hasNextPage).toBe(false);
+
+        const shorter = await invoiceList(n - 1, status);
+        expect(shorter.nodes).toHaveLength(n - 1);
+        expect(shorter.hasNextPage).toBe(true);
+
+        await seedPair(status, 1);
+        const over = await invoiceList(n, status);
+        expect(over.nodes).toHaveLength(n);
+        expect(over.hasNextPage).toBe(true);
+    });
+
+    test("reads go through the gateway, including on a caller-owned transaction", async () => {
+        const status = "gw-route";
+        await seedPair(status, 3);
+        const wasArmed = isGatewayArmed();
+        resetGateway();
+        armGateway();
+        try {
+            resetDbStats();
+            const before = getGatewayStats().admitted.request;
+            expect(await ReadModel(M3InvoiceReport).where("status", status).count()).toBe(1);
+            const page = await ReadModel(M3InvoiceReport)
+                .where("status", status)
+                .orderBy("total")
+                .limit(1)
+                .rows();
+            expect(page).toHaveLength(1);
+            expect(getGatewayStats().admitted.request).toBe(before + 2);
+            expect(getDbStats().totalCount).toBeGreaterThanOrEqual(2);
+
+            const admittedAfterPool = getGatewayStats().admitted.request;
+            resetDbStats();
+            await db.transaction(async (trx) => {
+                expect(await ReadModel(M3InvoiceReport).where("status", status).count(trx)).toBe(1);
+            });
+            expect(getDbStats().totalCount).toBeGreaterThanOrEqual(1);
+            expect(getGatewayStats().admitted.request).toBe(admittedAfterPool);
+        } finally {
+            resetGateway();
+            if (wasArmed) armGateway();
+        }
     });
 });

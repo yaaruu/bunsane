@@ -72,8 +72,6 @@ const ALLOWED: Record<string, string> = {
     // pooled connection, and their enclosing transaction already holds the
     // permit. Routing them is optional; leaving them raw is safe.
     'core/entity/saveEntity.ts': 'statements inside its own admitted transaction',
-    'database/projection/ProjectionManager.ts': 'dual-write on a caller-supplied trx',
-    'database/projection/DDLGenerator.ts': 'executes on a caller-supplied trx',
     'core/components/BaseComponent.ts': 'operates on a caller-supplied trx',
     'core/cache/txInvalidation.ts': 'owns the transaction wrapper itself',
 
@@ -92,6 +90,12 @@ const ALLOWED: Record<string, string> = {
 
 /** `db.unsafe(`, `sql.unsafe(`, a `` db`…` `` / `` sql`…` `` template, or a `` dbConn`…` `` alias. */
 const RAW_DB = /(?:^|[^.\w])(?:dbConn|db|sql)\s*(?:\.unsafe\s*\(|`)/;
+/**
+ * `(expr ?? db).unsafe(` / `(expr || db).unsafe(` — the pool fallback the plain
+ * pattern misses, because `)` sits between the identifier and `.unsafe`.
+ * `dbConn` is listed before `db` so the longer name wins.
+ */
+const RAW_POOL_FALLBACK = /(?:\?\?|\|\|)\s*(?:dbConn|db|sql)\s*\)\s*\.unsafe\s*\(/;
 /** A raw `db.transaction(` — should be `dbTransaction`. */
 const RAW_TXN = /(?:^|[^.\w])db\s*\.\s*transaction\s*\(/;
 
@@ -101,6 +105,17 @@ describe('DB execution seam patterns', () => {
         expect(RAW_DB.test('dbConn.unsafe("select 1")')).toBe(true);
         expect(RAW_DB.test('await trx`SELECT 1`')).toBe(false);
         expect(RAW_DB.test('await opts.trx`SELECT 1`')).toBe(false);
+        expect(RAW_DB.test('return (trx ?? db).unsafe(sql, params)')).toBe(false);
+    });
+
+    test('pool fallback via ?? or || is raw driver access', () => {
+        expect(RAW_POOL_FALLBACK.test('return (trx ?? db).unsafe(sql, params)')).toBe(true);
+        expect(RAW_POOL_FALLBACK.test('await (trx || db).unsafe(sql)')).toBe(true);
+        expect(RAW_POOL_FALLBACK.test('(opts.trx ?? sql).unsafe("select 1")')).toBe(true);
+        expect(RAW_POOL_FALLBACK.test('(getDb() ?? dbConn).unsafe(sql)')).toBe(true);
+        expect(RAW_POOL_FALLBACK.test('await trx.unsafe(sql)')).toBe(false);
+        expect(RAW_POOL_FALLBACK.test('makeQuery(opts.conn ?? db)')).toBe(false);
+        expect(RAW_POOL_FALLBACK.test('await (trx ?? db).query(sql)')).toBe(false);
     });
 });
 
@@ -149,7 +164,7 @@ function scan(): Array<{ file: string; line: number; text: string; kind: string 
             const lines = stripNonCode(readFileSync(file, 'utf8')).split(/\r?\n/);
             lines.forEach((text, i) => {
                 if (RAW_TXN.test(text)) findings.push({ file: rel, line: i + 1, text: text.trim(), kind: 'db.transaction' });
-                else if (RAW_DB.test(text)) findings.push({ file: rel, line: i + 1, text: text.trim(), kind: 'raw db access' });
+                else if (RAW_DB.test(text) || RAW_POOL_FALLBACK.test(text)) findings.push({ file: rel, line: i + 1, text: text.trim(), kind: 'raw db access' });
             });
         }
     }

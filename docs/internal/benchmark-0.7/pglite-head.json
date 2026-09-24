@@ -1,0 +1,129 @@
+{
+  "capturedAt": "2026-09-24T11:22:16.971Z",
+  "environment": {
+    "engine": "pglite",
+    "tier": "md",
+    "poolMax": 10,
+    "bunsaneVersion": "0.7.0",
+    "bunVersion": "1.4.0",
+    "platform": "win32-x64"
+  },
+  "calibrationMedian": 0.767,
+  "calibrationP95": 2.36,
+  "scenarios": {
+    "calibration-single-row": {
+      "p95": 2.36,
+      "median": 0.767,
+      "normalized": 1,
+      "rowsReturned": 200
+    },
+    "indexed-filter-status": {
+      "p95": 1.81,
+      "median": 0.414,
+      "normalized": 0.5399,
+      "rowsReturned": 100
+    },
+    "indexed-filter-category": {
+      "p95": 7.06,
+      "median": 3.82,
+      "normalized": 4.9778,
+      "rowsReturned": 100
+    },
+    "numeric-range-price": {
+      "p95": 29.6,
+      "median": 27.164,
+      "normalized": 35.3976,
+      "rowsReturned": 100
+    },
+    "sort-rating-desc": {
+      "p95": 14.1,
+      "median": 11.154,
+      "normalized": 14.5353,
+      "rowsReturned": 50
+    },
+    "multi-2-components": {
+      "p95": 21.98,
+      "median": 19.554,
+      "normalized": 25.4807,
+      "rowsReturned": 0
+    },
+    "multi-3-components": {
+      "p95": 17.46,
+      "median": 15.508,
+      "normalized": 20.2085,
+      "rowsReturned": 0
+    },
+    "fk-orders-by-user": {
+      "p95": 32.44,
+      "median": 29.229,
+      "normalized": 38.0882,
+      "rowsReturned": 4
+    },
+    "fk-reviews-by-product": {
+      "p95": 28.68,
+      "median": 26.195,
+      "normalized": 34.1345,
+      "rowsReturned": 0
+    },
+    "fk-items-by-order": {
+      "p95": 31.55,
+      "median": 29.012,
+      "normalized": 37.8056,
+      "rowsReturned": 1
+    },
+    "complex-filter-sort": {
+      "p95": 6.97,
+      "median": 5.564,
+      "normalized": 7.2507,
+      "rowsReturned": 0
+    },
+    "date-range-sorted": {
+      "p95": 11.92,
+      "median": 8.897,
+      "normalized": 11.5941,
+      "rowsReturned": 0
+    },
+    "pagination-offset-1000": {
+      "p95": 4.92,
+      "median": 3.19,
+      "normalized": 4.1574,
+      "rowsReturned": 50
+    },
+    "pagination-offset-5000": {
+      "p95": 5.76,
+      "median": 4.377,
+      "normalized": 5.7033,
+      "rowsReturned": 50
+    },
+    "count-products": {
+      "p95": 10.89,
+      "median": 9.121,
+      "normalized": 11.886,
+      "rowsReturned": 1
+    },
+    "sum-order-totals": {
+      "p95": 41.63,
+      "median": 36.494,
+      "normalized": 47.5553,
+      "rowsReturned": 1
+    },
+    "avg-product-price": {
+      "p95": 11.4,
+      "median": 9.462,
+      "normalized": 12.3302,
+      "rowsReturned": 1
+    },
+    "populate-single": {
+      "p95": 5.21,
+      "median": 1.166,
+      "normalized": 1.5197,
+      "rowsReturned": 50
+    },
+    "populate-multi": {
+      "p95": 13.63,
+      "median": 11.599,
+      "normalized": 15.114,
+      "rowsReturned": 0
+    }
+  }
+}

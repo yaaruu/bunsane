@@ -174,6 +174,10 @@ await ReadModel(InvoiceReport)
   .sum("total");
 ```
 
+Paged reads of that table are `.orderBy(field).limit(n).offset(m).rows()`, not `Query.exec()`. `.limit()` or `.offset()` without `.orderBy()` throws — an unordered page is not stable. `.orderBy()` always appends the primary key (`left_entity_id`, `right_entity_id`; also accepted as `leftEntityId` / `rightEntityId`) so tied keys do not shuffle between pages. `.listPage()` fetches `n+1` and returns `{ nodes, hasNextPage }`.
+
+GraphQL list fields (`invoiceReports`) return `InvoiceReportPage` `{ nodes, hasNextPage }`, not `[InvoiceReport!]!`. Pass `offset` for the next page (`hasNextPage` is otherwise a dead end). `offset` must be a non-negative integer and `offset + limit` must be ≤ 10000, the same window as the list cap. The resolver orders by `leftEntityId` unless `orderBy` / `direction` are set, and uses the same `n+1` probe. Count, sum, and avg fields are unchanged.
+
 Grain today is **one row per join pair**, not a daily fact `(outlet, day)`. Daily KPIs either group a date column at read time (`trunc` / `timeBucket`) or wait for a later rollup. QSP `rm_*` tables are list coverage, not this.
 
 Site: `bunsane-docs/docs/query-aggregates.md`, `bunsane-docs/docs/read-models.md`.

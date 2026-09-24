@@ -121,6 +121,8 @@
         "bench:baseline:xs": "BENCH_BASELINE=write bun tests/benchmark/scripts/run-benchmarks.ts xs",
         "bench:baseline:md": "BENCH_BASELINE=write bun tests/benchmark/scripts/run-benchmarks.ts md",
         "bench:gate": "bun tests/benchmark/scripts/run-benchmarks.ts md",
+        "bench:pg:compare": "bun tests/benchmark/scripts/compare-pg.ts",
+        "bench:pg:gate": "bun tests/benchmark/scripts/compare-pg.ts --gate",
         "test:pool-saturation": "bun tests/load/pool-saturation.ts",
         "knip": "knip --dependencies"
     },

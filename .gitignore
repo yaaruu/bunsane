@@ -48,3 +48,6 @@ tests/benchmark/databases/
 /public/
 # Local working notes / throwaway probes
 /scratchpad/
+
+# Benchmark run output (snapshots cited by reports live under docs/internal/)
+tests/benchmark/results/

@@ -7,15 +7,11 @@
  * timeout. The lane caps them at half the admission limit, so a running backfill
  * can never be the reason a user request cannot get a connection.
  *
- * NOT everything in these modules routes through here. Statements that execute
- * on a caller-supplied `trx` handle — `ProjectionManager.setStatus(…, trx)`, the
- * dual-write in `applyProjection`, `DDLGenerator`'s `executor(trx)` — stay on
- * the raw handle until their enclosing transaction is itself migrated
- * (`saveEntity`, W2 slice 4). Routing them now would take an admission permit
- * while the caller's transaction already holds a pooled connection, which is the
- * nested-acquire deadlock the seam exists to prevent: admission is per
- * TRANSACTION, and there is no admitted scope to inherit until the transaction
- * owner opens it via `dbTransaction`.
+ * NOT everything in these modules routes through here. Dual-write in
+ * `applyProjection` and `DDLGenerator` statements on a caller-supplied trx stay
+ * on that raw handle: they never touch the pool. Without a trx, `setStatus`
+ * goes through `dbExec` and `DDLGenerator` through `projDdl`, so a pool
+ * fallback is always admitted.
  */
 import { dbExec } from '../gateway';
 import { DDL_TIMEOUT_MS } from '../index';

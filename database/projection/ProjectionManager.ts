@@ -1,5 +1,5 @@
 import type { SQL } from 'bun';
-import db from '../index';
+import { dbExec } from '../gateway';
 import { projExec } from './exec';
 import { logger as MainLogger } from '../../core/Logger';
 import { getMetadataStorage } from '../../core/metadata';
@@ -92,14 +92,12 @@ export class ProjectionManager {
     }
 
     async setStatus(archetype: string, status: ProjectionStatus, trx?: SQL): Promise<void> {
-        // Deliberately NOT routed through the gateway (see ./exec.ts). Callers
-        // may pass a `trx` opened by a not-yet-migrated transaction, and taking
-        // an admission permit while that transaction already holds a pooled
-        // connection is the nested-acquire deadlock the seam exists to prevent.
-        // Migrate together with `saveEntity` (W2 slice 4).
-        await (trx ?? db).unsafe(
+        // callerOwnsConn: a trx opened outside dbTransaction already holds its
+        // connection. Admitting here would wait for a permit while holding one.
+        await dbExec(
             `UPDATE projection_state SET status = $1, updated_at = now() WHERE archetype = $2`,
-            [status, archetype]
+            [status, archetype],
+            { conn: trx, callerOwnsConn: !!trx, lane: 'request', label: 'projection.setStatus' },
         );
         this.statusCache.set(archetype, status);
         try {

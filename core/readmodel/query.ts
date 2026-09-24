@@ -1,5 +1,5 @@
 import type { SQL } from "bun";
-import db from "../../database";
+import { dbExec } from "../../database/gateway";
 import { assertIdentifier } from "../../query/SqlIdentifier";
 import { sqlTimeBucketFromTs, type TimeTrunc } from "../../query/timeBucket";
 import { ReadModelRegistry } from "./ReadModelRegistry";
@@ -12,8 +12,32 @@ interface Predicate {
     not?: boolean;
 }
 
+interface SqlRow {
+    [column: string]: unknown;
+}
+
+interface OrderKey {
+    /** Column name already validated (projected column or primary-key column). */
+    column: string;
+    dir: "ASC" | "DESC";
+}
+
 const DEFAULT_LIST_LIMIT = 1000;
 const MAX_LIST_LIMIT = 10000;
+
+/**
+ * Primary key of every `m3_*` table. Appended after the caller's ORDER BY so
+ * tied projected columns cannot reshuffle between pages.
+ */
+const TIEBREAKER_COLUMNS = ["left_entity_id", "right_entity_id"] as const;
+
+/** Identity columns exposed on every row. Not `@Project` fields. */
+const IDENTITY_COLUMNS: Record<string, (typeof TIEBREAKER_COLUMNS)[number]> = {
+    leftEntityId: "left_entity_id",
+    left_entity_id: "left_entity_id",
+    rightEntityId: "right_entity_id",
+    right_entity_id: "right_entity_id",
+};
 
 function isOp(value: unknown): value is M3WhereOp {
     return typeof value === "string" && (M3_WHERE_OPS as readonly string[]).includes(value);
@@ -23,17 +47,51 @@ function numericOf(value: unknown): number {
     return value == null ? 0 : Number(value);
 }
 
+function parseDirection(direction: string, model: string): "ASC" | "DESC" {
+    const dir = direction.toUpperCase();
+    if (dir === "ASC" || dir === "DESC") return dir;
+    throw new Error(`ReadModel '${model}'.orderBy() direction must be ASC or DESC`);
+}
+
+/**
+ * One statement on the request lane.
+ *
+ * A caller-supplied transaction already holds its connection (often opened
+ * outside the framework, with no admitted scope to inherit). `callerOwnsConn`
+ * keeps that path from waiting for a permit it already paid for — the same
+ * rule as `Query.execSql`. Pool reads omit it, so they get admission, a
+ * deadline, cancellation, and metrics.
+ */
+function execRead<T>(label: string, sql: string, params: unknown[], trx?: SQL): Promise<T> {
+    return dbExec<T>(sql, params, {
+        conn: trx,
+        callerOwnsConn: !!trx,
+        lane: "request",
+        label,
+    });
+}
+
+export interface ReadModelPage {
+    nodes: Array<Record<string, unknown>>;
+    hasNextPage: boolean;
+}
+
 /**
  * Reader for an M3 derived table. Never hydrates entities.
  * `sum()` / `avg()` emit SQL GROUP BY — they do not `Query.exec()` + JS reduce.
+ *
+ * `.limit()` / `.offset()` require `.orderBy(...)`. The primary key is always
+ * appended after the caller's order so pages stay stable when sort keys tie.
  */
 export class M3Query {
     private readonly descriptor: ReadModelDescriptor;
     private readonly preds: Predicate[] = [];
+    private readonly orders: OrderKey[] = [];
     private groupColumn: ReadModelProjectSpec | null = null;
     private bucket: { spec: ReadModelProjectSpec; trunc: TimeTrunc; tzOffsetMinutes: number } | null =
         null;
     private limitN: number | null = null;
+    private offsetN: number | null = null;
 
     constructor(ctor: Function) {
         this.descriptor = ReadModelRegistry.requireByCtor(ctor);
@@ -72,6 +130,20 @@ export class M3Query {
         return this;
     }
 
+    /**
+     * Sort by a projected field, or by `leftEntityId` / `rightEntityId` (the
+     * primary key). A later call for the same column replaces the direction.
+     * `rows()` appends the primary key after these keys.
+     */
+    orderBy(field: string, direction: string = "ASC"): this {
+        const dir = parseDirection(direction, this.descriptor.name);
+        const column = this.orderColumn(field);
+        const existing = this.orders.findIndex((order) => order.column === column);
+        if (existing >= 0) this.orders.splice(existing, 1);
+        this.orders.push({ column, dir });
+        return this;
+    }
+
     timeBucket(field: string, trunc: TimeTrunc, tzOffsetMinutes = 0): this {
         const spec = this.specOf(field);
         if (spec.sqlType !== "timestamptz") {
@@ -89,6 +161,14 @@ export class M3Query {
         return this;
     }
 
+    offset(n: number): this {
+        if (!Number.isInteger(n) || n < 0) {
+            throw new Error("ReadModel.offset() requires a non-negative integer");
+        }
+        this.offsetN = n;
+        return this;
+    }
+
     async sum(field: string, trx?: SQL): Promise<number | Array<Record<string, unknown>>> {
         return this.aggregate("SUM", field, trx);
     }
@@ -102,8 +182,8 @@ export class M3Query {
         const params: unknown[] = [];
         const whereSql = this.buildWhere(table, params);
         const sql = `SELECT COUNT(*)::int AS result FROM ${table} ${whereSql}`;
-        const rows = await (trx ?? db).unsafe(sql, params as any[]);
-        return numericOf((rows as any[])[0]?.result);
+        const rows = await execRead<SqlRow[]>("readmodel.count", sql, params, trx);
+        return numericOf(rows[0]?.result);
     }
 
     async countBy(trx?: SQL): Promise<Array<Record<string, unknown>>> {
@@ -117,26 +197,27 @@ export class M3Query {
         const sql = `SELECT ${groups.select.join(", ")}, COUNT(*)::int AS count
                      FROM ${table} ${whereSql}
                      GROUP BY ${groups.select.map((_, i) => String(i + 1)).join(", ")}`;
-        const rows = await (trx ?? db).unsafe(sql, params as any[]);
-        return (rows as any[]).map((r) => this.mapGroupRow(r, null, r.count));
+        const rows = await execRead<SqlRow[]>("readmodel.countBy", sql, params, trx);
+        return rows.map((r) => this.mapGroupRow(r, null, r.count));
     }
 
     async rows(trx?: SQL): Promise<Array<Record<string, unknown>>> {
-        const table = this.descriptor.tableName;
-        const params: unknown[] = [];
-        const whereSql = this.buildWhere(table, params);
-        const cols = [
-            "left_entity_id",
-            "right_entity_id",
-            ...this.descriptor.projects.map((p) => `"${p.columnName}"`),
-        ].join(", ");
-        let sql = `SELECT ${cols} FROM ${table} ${whereSql}`;
-        if (this.limitN != null) {
-            params.push(this.limitN);
-            sql += ` LIMIT $${params.length}`;
+        return this.fetchRows(0, trx);
+    }
+
+    /**
+     * One page of `.limit(n)` rows plus whether another row exists.
+     * Fetches `n + 1` (the probe may be one past the public list cap) and trims.
+     * Same order rule as `rows()`.
+     */
+    async listPage(trx?: SQL): Promise<ReadModelPage> {
+        if (this.limitN == null) {
+            throw new Error(`ReadModel '${this.descriptor.name}'.listPage() requires .limit(n)`);
         }
-        const raw = (await (trx ?? db).unsafe(sql, params as any[])) as any[];
-        return raw.map((row) => this.mapRow(row));
+        const size = this.limitN;
+        const fetched = await this.fetchRows(1, trx);
+        const hasNextPage = fetched.length > size;
+        return { nodes: hasNextPage ? fetched.slice(0, size) : fetched, hasNextPage };
     }
 
     private async aggregate(
@@ -153,18 +234,71 @@ export class M3Query {
         const key = spec.propertyKey;
         const params: unknown[] = [];
         const whereSql = this.buildWhere(table, params);
-        const conn = trx ?? db;
         const groups = this.groupSelect(table, params);
         if (groups.select.length > 0) {
             const sql = `SELECT ${groups.select.join(", ")}, ${fn}("${metric}")::numeric AS "${metric}"
                          FROM ${table} ${whereSql}
                          GROUP BY ${groups.select.map((_, i) => String(i + 1)).join(", ")}`;
-            const rows = await conn.unsafe(sql, params as any[]);
-            return (rows as any[]).map((r) => this.mapGroupRow(r, key, r[metric]));
+            const rows = await execRead<SqlRow[]>(`readmodel.${fn.toLowerCase()}`, sql, params, trx);
+            return rows.map((r) => this.mapGroupRow(r, key, r[metric]));
         }
         const sql = `SELECT COALESCE(${fn}("${metric}"), 0)::numeric AS result FROM ${table} ${whereSql}`;
-        const rows = await conn.unsafe(sql, params as any[]);
-        return numericOf((rows as any[])[0]?.result);
+        const rows = await execRead<SqlRow[]>(`readmodel.${fn.toLowerCase()}`, sql, params, trx);
+        return numericOf(rows[0]?.result);
+    }
+
+    private async fetchRows(extra: number, trx?: SQL): Promise<Array<Record<string, unknown>>> {
+        this.requireExplicitOrder();
+        const table = this.descriptor.tableName;
+        const params: unknown[] = [];
+        const whereSql = this.buildWhere(table, params);
+        const cols = [
+            "left_entity_id",
+            "right_entity_id",
+            ...this.descriptor.projects.map((p) => `"${p.columnName}"`),
+        ].join(", ");
+        let sql = `SELECT ${cols} FROM ${table} ${whereSql}`;
+        const orderSql = this.orderClause(table);
+        if (orderSql.length > 0) sql += ` ${orderSql}`;
+        if (this.limitN != null) {
+            params.push(this.limitN + extra);
+            sql += ` LIMIT $${params.length}`;
+        }
+        if (this.offsetN != null && this.offsetN > 0) {
+            params.push(this.offsetN);
+            sql += ` OFFSET $${params.length}`;
+        }
+        const raw = await execRead<SqlRow[]>("readmodel.rows", sql, params, trx);
+        return raw.map((row) => this.mapRow(row));
+    }
+
+    private requireExplicitOrder(): void {
+        const paging = this.limitN != null || this.offsetN != null;
+        if (!paging || this.orders.length > 0) return;
+        throw new Error(
+            `ReadModel '${this.descriptor.name}'.rows() cannot apply limit/offset without an explicit order (pages would be unstable). Call .orderBy(...) before .rows().`
+        );
+    }
+
+    private orderClause(table: string): string {
+        if (this.orders.length === 0) return "";
+        const parts: string[] = [];
+        const seen = new Set<string>();
+        for (const order of this.orders) {
+            seen.add(order.column);
+            parts.push(`"${table}"."${order.column}" ${order.dir}`);
+        }
+        for (const column of TIEBREAKER_COLUMNS) {
+            if (seen.has(column)) continue;
+            parts.push(`"${table}"."${column}" ASC`);
+        }
+        return `ORDER BY ${parts.join(", ")}`;
+    }
+
+    private orderColumn(field: string): string {
+        const identity = Object.hasOwn(IDENTITY_COLUMNS, field) ? IDENTITY_COLUMNS[field] : undefined;
+        if (identity) return identity;
+        return this.specOf(field).columnName;
     }
 
     private groupSelect(
@@ -326,4 +460,23 @@ export function clampReadModelListLimit(n: unknown): number {
         throw new Error("ReadModel list limit must be a non-negative integer");
     }
     return Math.min(v, MAX_LIST_LIMIT);
+}
+
+/**
+ * GraphQL `offset`. Non-negative, and `offset + limit` stays inside the same
+ * 10000-row window as `.limit()` so a page cannot walk past the list cap.
+ * Omitted offset is 0.
+ */
+export function clampReadModelListOffset(offset: unknown, limit: number): number {
+    if (offset == null) return 0;
+    const v = Number(offset);
+    if (!Number.isInteger(v) || v < 0) {
+        throw new Error("ReadModel list offset must be a non-negative integer");
+    }
+    if (v + limit > MAX_LIST_LIMIT) {
+        throw new Error(
+            `ReadModel list offset+limit must be <= ${MAX_LIST_LIMIT} (got offset ${v} + limit ${limit})`
+        );
+    }
+    return v;
 }

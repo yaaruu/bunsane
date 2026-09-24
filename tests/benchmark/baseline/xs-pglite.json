@@ -1,128 +1,128 @@
 {
-  "capturedAt": "2026-07-26T14:44:36.194Z",
+  "capturedAt": "2026-09-24T11:22:29.021Z",
   "environment": {
     "engine": "pglite",
     "tier": "xs",
     "poolMax": 10,
-    "bunsaneVersion": "0.5.11",
+    "bunsaneVersion": "0.7.0",
     "bunVersion": "1.4.0",
     "platform": "win32-x64"
   },
-  "calibrationMedian": 3.652,
-  "calibrationP95": 5.77,
+  "calibrationMedian": 0.793,
+  "calibrationP95": 2.83,
   "scenarios": {
     "calibration-single-row": {
-      "p95": 5.77,
-      "median": 3.652,
+      "p95": 2.83,
+      "median": 0.793,
       "normalized": 1,
       "rowsReturned": 200
     },
     "indexed-filter-status": {
-      "p95": 4.51,
-      "median": 2.286,
-      "normalized": 0.6259,
+      "p95": 0.6,
+      "median": 0.477,
+      "normalized": 0.6006,
       "rowsReturned": 100
     },
     "indexed-filter-category": {
-      "p95": 2.98,
-      "median": 1.309,
-      "normalized": 0.3584,
+      "p95": 4.38,
+      "median": 1.154,
+      "normalized": 1.4547,
       "rowsReturned": 100
     },
     "numeric-range-price": {
-      "p95": 7.22,
-      "median": 2.344,
-      "normalized": 0.6417,
+      "p95": 7,
+      "median": 3.55,
+      "normalized": 4.4742,
       "rowsReturned": 100
     },
     "sort-rating-desc": {
-      "p95": 6.89,
-      "median": 5.808,
-      "normalized": 1.5904,
+      "p95": 3.86,
+      "median": 1.644,
+      "normalized": 2.0725,
       "rowsReturned": 50
     },
     "multi-2-components": {
-      "p95": 3.32,
-      "median": 1.898,
-      "normalized": 0.5196,
+      "p95": 4.76,
+      "median": 2.126,
+      "normalized": 2.6795,
       "rowsReturned": 0
     },
     "multi-3-components": {
-      "p95": 3.63,
-      "median": 1.75,
-      "normalized": 0.4792,
+      "p95": 3.51,
+      "median": 2.131,
+      "normalized": 2.6858,
       "rowsReturned": 0
     },
     "fk-orders-by-user": {
-      "p95": 2.71,
-      "median": 0.924,
-      "normalized": 0.253,
+      "p95": 18.07,
+      "median": 3.103,
+      "normalized": 3.9103,
       "rowsReturned": 2
     },
     "fk-reviews-by-product": {
-      "p95": 2.84,
-      "median": 0.817,
-      "normalized": 0.2238,
+      "p95": 4.67,
+      "median": 3.029,
+      "normalized": 3.8168,
       "rowsReturned": 2
     },
     "fk-items-by-order": {
-      "p95": 2.55,
-      "median": 0.892,
-      "normalized": 0.2442,
+      "p95": 4.03,
+      "median": 3.185,
+      "normalized": 4.0136,
       "rowsReturned": 1
     },
     "complex-filter-sort": {
-      "p95": 2.7,
-      "median": 0.88,
-      "normalized": 0.2408,
+      "p95": 1.66,
+      "median": 0.693,
+      "normalized": 0.8732,
       "rowsReturned": 0
     },
     "date-range-sorted": {
-      "p95": 2.23,
-      "median": 0.835,
-      "normalized": 0.2287,
+      "p95": 2.81,
+      "median": 0.972,
+      "normalized": 1.2255,
       "rowsReturned": 0
     },
     "pagination-offset-1000": {
-      "p95": 2.9,
-      "median": 0.892,
-      "normalized": 0.2443,
+      "p95": 1.51,
+      "median": 0.775,
+      "normalized": 0.9766,
       "rowsReturned": 50
     },
     "pagination-offset-5000": {
-      "p95": 3.78,
-      "median": 2.625,
-      "normalized": 0.7187,
+      "p95": 5.63,
+      "median": 2.629,
+      "normalized": 3.3128,
       "rowsReturned": 0
     },
     "count-products": {
-      "p95": 5.1,
-      "median": 3.463,
-      "normalized": 0.9481,
+      "p95": 2.68,
+      "median": 1.059,
+      "normalized": 1.335,
       "rowsReturned": 1
     },
     "sum-order-totals": {
-      "p95": 8.36,
-      "median": 6.672,
-      "normalized": 1.8268,
+      "p95": 5.13,
+      "median": 4.111,
+      "normalized": 5.1803,
       "rowsReturned": 1
     },
     "avg-product-price": {
-      "p95": 2.96,
-      "median": 1.26,
-      "normalized": 0.345,
+      "p95": 2.41,
+      "median": 1.052,
+      "normalized": 1.3256,
       "rowsReturned": 1
     },
     "populate-single": {
-      "p95": 4.67,
-      "median": 2.538,
-      "normalized": 0.6949,
+      "p95": 6.5,
+      "median": 1.61,
+      "normalized": 2.0294,
       "rowsReturned": 50
     },
     "populate-multi": {
-      "p95": 2.12,
-      "median": 0.981,
-      "normalized": 0.2686,
+      "p95": 5.98,
+      "median": 1.125,
+      "normalized": 1.4173,
       "rowsReturned": 0
     }
   }

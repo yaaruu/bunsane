@@ -11,6 +11,7 @@ import {
     buildReadModelGraphQLSDL,
     readModelResolvers,
     clampReadModelListLimit,
+    clampReadModelListOffset,
 } from "../../core/readmodel";
 import { BaseComponent } from "../../core/components/BaseComponent";
 import { Component, CompData } from "../../core/components/Decorators";
@@ -97,5 +98,41 @@ describe("M3 query API", () => {
         expect(clampReadModelListLimit(25)).toBe(25);
         expect(clampReadModelListLimit(999999)).toBe(10000);
         expect(() => clampReadModelListLimit(-1)).toThrow();
+    });
+
+    test("limit or offset without orderBy throws and names the model", async () => {
+        const paging = /M3UnitReport[\s\S]*\.orderBy\(\.\.\.\)/;
+        await expect(ReadModel(M3UnitReport).limit(2).rows()).rejects.toThrow(paging);
+        await expect(ReadModel(M3UnitReport).offset(1).rows()).rejects.toThrow(paging);
+        await expect(ReadModel(M3UnitReport).offset(0).limit(1).rows()).rejects.toThrow(paging);
+        await expect(ReadModel(M3UnitReport).limit(1).listPage()).rejects.toThrow(paging);
+    });
+
+    test("orderBy rejects an unknown field or direction before querying", () => {
+        expect(() => ReadModel(M3UnitReport).orderBy("status", "sideways")).toThrow(/ASC or DESC/);
+        expect(() => ReadModel(M3UnitReport).orderBy("nope")).toThrow(/Unknown ReadModel field/);
+        for (const inherited of ["constructor", "__proto__", "toString"]) {
+            expect(() => ReadModel(M3UnitReport).orderBy(inherited)).toThrow(/Unknown ReadModel field/);
+        }
+        expect(() => ReadModel(M3UnitReport).orderBy("leftEntityId").orderBy("rightEntityId", "desc")).not.toThrow();
+    });
+
+    test("list field is a page with hasNextPage, not a bare list", () => {
+        const sdl = buildReadModelGraphQLSDL();
+        expect(sdl).toContain("type M3UnitReportPage");
+        expect(sdl).toContain("nodes: [M3UnitReport!]!");
+        expect(sdl).toContain("hasNextPage: Boolean!");
+        expect(sdl).toContain(
+            "m3UnitReports(where: [ReadModelWhere!], limit: Int, offset: Int, orderBy: String, direction: String): M3UnitReportPage!"
+        );
+        expect(sdl).not.toContain("m3UnitReports(where: [ReadModelWhere!], limit: Int): [M3UnitReport!]!");
+    });
+
+    test("offset is a non-negative integer inside the list window", () => {
+        expect(clampReadModelListOffset(undefined, 10)).toBe(0);
+        expect(clampReadModelListOffset(20, 10)).toBe(20);
+        expect(() => clampReadModelListOffset(-1, 10)).toThrow(/non-negative integer/);
+        expect(() => clampReadModelListOffset(1.5, 10)).toThrow(/non-negative integer/);
+        expect(() => clampReadModelListOffset(9991, 10)).toThrow(/offset\+limit must be <= 10000/);
     });
 });

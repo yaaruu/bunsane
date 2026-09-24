@@ -1,5 +1,6 @@
 import type { SQL } from "bun";
-import db from "../index";
+import { dbExec } from "../gateway";
+import { DDL_TIMEOUT_MS } from "../index";
 import { logger as MainLogger } from "../../core/Logger";
 import { getMetadataStorage } from "../../core/metadata";
 import { ComponentRegistry } from "../../core/components";
@@ -15,8 +16,18 @@ const logger = MainLogger.child({ scope: "ReadModelManager" });
 
 const UUID_RE = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$";
 
-function exec<T = any>(sql: string, params: any[] = [], trx?: SQL): Promise<T> {
-    return (trx ?? db).unsafe(sql, params) as Promise<T>;
+/**
+ * `bulk` = full-table rebuild: background lane with the DDL budget, so a large
+ * rebuild at boot neither competes with requests nor dies at the request deadline.
+ */
+function exec<T>(sql: string, params: unknown[] = [], trx?: SQL, bulk = false): Promise<T> {
+    return dbExec<T>(sql, params, {
+        conn: trx,
+        callerOwnsConn: !!trx,
+        lane: bulk ? "background" : "request",
+        label: bulk ? "readmodel.rebuild" : "readmodel.exec",
+        timeoutMs: bulk ? DDL_TIMEOUT_MS : undefined,
+    });
 }
 
 function typeId(componentName: string): string {
@@ -56,7 +67,7 @@ export function readModelScanTable(componentName: string): string {
     return assertComponentTableName(raw, "m3.partition");
 }
 
-function joinFrom(desc: ReadModelDescriptor): { sql: string; params: any[] } {
+function joinFrom(desc: ReadModelDescriptor): { sql: string; params: string[] } {
     const leftType = typeId(desc.join.leftComponent);
     const rightType = typeId(desc.join.rightComponent);
     const leftTable = readModelScanTable(desc.join.leftComponent);
@@ -99,11 +110,11 @@ export class ReadModelManager {
     }
 
     async ensureModel(desc: ReadModelDescriptor): Promise<void> {
-        const rows = await exec<any[]>(
+        const rows = await exec<Array<{ shape_hash: string }>>(
             `SELECT shape_hash FROM ${STATE_TABLE} WHERE name = $1`,
             [desc.name]
         );
-        const existing = rows[0]?.shape_hash as string | undefined;
+        const existing = rows[0]?.shape_hash;
         if (existing && existing !== desc.shapeHash) {
             logger.warn(
                 { scope: "m3.reconcile", name: desc.name, existing, next: desc.shapeHash },
@@ -129,12 +140,10 @@ export class ReadModelManager {
         }
         this.readyNames.add(desc.name);
     }
-
-    /** Full rebuild from live JSONB components. Source of truth stays ECS. */
     async rebuild(desc: ReadModelDescriptor, trx?: SQL): Promise<number> {
         const table = assertM3TableName(desc.tableName);
         const { sql: fromSql, params } = joinFrom(desc);
-        await exec(`DELETE FROM ${table}`, undefined as any, trx);
+        await exec(`DELETE FROM ${table}`, [], trx, true);
         const insertSql = `INSERT INTO ${table} (${insertColumnList(desc)})
             SELECT ${insertSelectList(desc)}
             ${fromSql}
@@ -142,7 +151,7 @@ export class ReadModelManager {
             ${desc.projects.map((p) => `"${p.columnName}" = EXCLUDED."${p.columnName}"`).join(", ")},
             updated_at = now(),
             deleted_at = NULL`;
-        const inserted = await exec<any[]>(insertSql, params, trx);
+        const inserted = await exec<unknown[]>(insertSql, params, trx, true);
         return Array.isArray(inserted) ? inserted.length : 0;
     }
 

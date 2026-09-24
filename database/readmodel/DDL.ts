@@ -1,5 +1,6 @@
 import type { SQL } from "bun";
-import db from "../index";
+import { DDL_TIMEOUT_MS } from "../index";
+import { dbExec } from "../gateway";
 import { assertIdentifier } from "../../query/SqlIdentifier";
 import { assertM3TableName } from "../../core/readmodel/join";
 import type { ReadModelDescriptor } from "../../core/readmodel/types";
@@ -13,18 +14,30 @@ const SQL_TYPES: Record<ProjectionSqlType, string> = {
     uuid: "uuid",
 };
 
-const executor = (trx?: SQL) => trx ?? db;
+/**
+ * Schema DDL. Background lane, long budget, no serverTimeout: that option
+ * opens a transaction, and CREATE INDEX CONCURRENTLY cannot run inside one.
+ */
+function execDdl(sql: string, trx?: SQL): Promise<unknown> {
+    return dbExec(sql, undefined, {
+        conn: trx,
+        callerOwnsConn: !!trx,
+        lane: "background",
+        label: "readmodel.ddl",
+        timeoutMs: DDL_TIMEOUT_MS,
+    });
+}
 
 export const STATE_TABLE = "m3_readmodel_state";
 
 export async function ensureStateTable(trx?: SQL): Promise<void> {
-    await executor(trx).unsafe(`CREATE TABLE IF NOT EXISTS ${STATE_TABLE} (
+    await execDdl(`CREATE TABLE IF NOT EXISTS ${STATE_TABLE} (
         name text PRIMARY KEY,
         shape_hash text NOT NULL,
         status text NOT NULL DEFAULT 'READY',
         shape_version int NOT NULL DEFAULT 1,
         updated_at timestamptz NOT NULL DEFAULT now()
-    )`);
+    )`, trx);
 }
 
 export async function createM3Table(desc: ReadModelDescriptor, trx?: SQL): Promise<void> {
@@ -36,7 +49,7 @@ export async function createM3Table(desc: ReadModelDescriptor, trx?: SQL): Promi
         return `"${columnName}" ${mapped}`;
     });
     const extra = columnDefs.length > 0 ? `,\n        ${columnDefs.join(",\n        ")}` : "";
-    await executor(trx).unsafe(`CREATE TABLE IF NOT EXISTS ${tableName} (
+    await execDdl(`CREATE TABLE IF NOT EXISTS ${tableName} (
         left_entity_id uuid NOT NULL,
         right_entity_id uuid NOT NULL${extra},
         created_at timestamptz NOT NULL DEFAULT now(),
@@ -44,7 +57,7 @@ export async function createM3Table(desc: ReadModelDescriptor, trx?: SQL): Promi
         deleted_at timestamptz,
         shape_version int NOT NULL DEFAULT 1,
         PRIMARY KEY (left_entity_id, right_entity_id)
-    )`);
+    )`, trx);
     await createM3Indexes(desc, trx);
 }
 
@@ -55,12 +68,13 @@ export async function createM3Table(desc: ReadModelDescriptor, trx?: SQL): Promi
 export async function createM3Indexes(desc: ReadModelDescriptor, trx?: SQL): Promise<void> {
     const tableName = assertM3TableName(desc.tableName);
     const concurrently = trx ? "" : process.env.USE_PGLITE ? "" : " CONCURRENTLY";
-    const run = executor(trx);
     const ident = (name: string, ctx: string) => assertIdentifier(name.slice(0, 63), ctx);
 
+
     const rightName = ident(`idx_${tableName}__right`, "m3Index");
-    await run.unsafe(
-        `CREATE INDEX${concurrently} IF NOT EXISTS ${rightName} ON ${tableName} (right_entity_id) WHERE deleted_at IS NULL`
+    await execDdl(
+        `CREATE INDEX${concurrently} IF NOT EXISTS ${rightName} ON ${tableName} (right_entity_id) WHERE deleted_at IS NULL`,
+        trx
     );
 
     const filterCols = desc.projects.filter((p) => p.sqlType !== "numeric");
@@ -76,21 +90,23 @@ export async function createM3Indexes(desc: ReadModelDescriptor, trx?: SQL): Pro
                       .map((p) => `"${assertIdentifier(p.columnName, "m3IndexInclude")}"`)
                       .join(", ")})`
                 : "";
-        await run.unsafe(
-            `CREATE INDEX${concurrently} IF NOT EXISTS ${coverName} ON ${tableName} (${keys})${include} WHERE deleted_at IS NULL`
+        await execDdl(
+            `CREATE INDEX${concurrently} IF NOT EXISTS ${coverName} ON ${tableName} (${keys})${include} WHERE deleted_at IS NULL`,
+            trx
         );
     }
 
     for (const p of desc.projects.filter((col) => col.sqlType === "timestamptz")) {
         const col = assertIdentifier(p.columnName, "m3IndexColumn");
         const rangeName = ident(`idx_${tableName}__${col.toLowerCase()}`, "m3Index");
-        await run.unsafe(
-            `CREATE INDEX${concurrently} IF NOT EXISTS ${rangeName} ON ${tableName} ("${col}") WHERE deleted_at IS NULL`
+        await execDdl(
+            `CREATE INDEX${concurrently} IF NOT EXISTS ${rangeName} ON ${tableName} ("${col}") WHERE deleted_at IS NULL`,
+            trx
         );
     }
 }
 
 export async function dropM3Table(desc: ReadModelDescriptor, trx?: SQL): Promise<void> {
     const tableName = assertM3TableName(desc.tableName);
-    await executor(trx).unsafe(`DROP TABLE IF EXISTS ${tableName}`);
+    await execDdl(`DROP TABLE IF EXISTS ${tableName}`, trx);
 }

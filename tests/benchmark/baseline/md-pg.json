@@ -1,0 +1,51 @@
+{
+  "capturedAt": "2026-09-24T11:34:59.710Z",
+  "sourceCommit": "7255442423096cae8331cf3872bb3307610a5813",
+  "shapes": {
+    "a-sort-rating-20": {
+      "p50Ms": 4.72,
+      "p95Ms": 6.03,
+      "meanMs": 4.94
+    },
+    "a-sort-rating-100": {
+      "p50Ms": 4.99,
+      "p95Ms": 6.55,
+      "meanMs": 5.22
+    },
+    "b-created-at-20": {
+      "p50Ms": 11.94,
+      "p95Ms": 13.62,
+      "meanMs": 11.88
+    },
+    "b-created-at-100": {
+      "p50Ms": 12.88,
+      "p95Ms": 14.19,
+      "meanMs": 12.85
+    },
+    "c-two-filter-sort-20": {
+      "p50Ms": 8.67,
+      "p95Ms": 10.72,
+      "meanMs": 8.91
+    },
+    "d-populate-100": {
+      "p50Ms": 12.36,
+      "p95Ms": 14.77,
+      "meanMs": 12.54
+    },
+    "e-graphql-list-50": {
+      "p50Ms": 5.5,
+      "p95Ms": 8.04,
+      "meanMs": 5.85
+    },
+    "e2-graphql-list-50-batched": {
+      "p50Ms": 3.68,
+      "p95Ms": 6.98,
+      "meanMs": 4.11
+    },
+    "f-keyset-next-20": {
+      "p50Ms": 6.45,
+      "p95Ms": 8.19,
+      "meanMs": 6.76
+    }
+  }
+}

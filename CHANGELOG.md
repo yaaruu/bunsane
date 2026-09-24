@@ -12,17 +12,23 @@ All notable changes to bunsane are documented here.
 - **`sortedCursor()` token width must match the sort key count**, and `sortedCursor()` without a sort throws.
 - **Identifier guards (SEC-17):** `withIndexHint` names must match `^[A-Za-z0-9_]+$`; schema DSL and operation-input names must be GraphQL identifiers; `sqlTimeBucketFromTs` only accepts identifier / `$n` / known column expressions. Advisory lock tokens are random per acquisition; re-acquiring a key this instance already holds returns `null`.
 - `BUNSANE_STRICT_ENV=on` fails boot for production Redis on a non-loopback host without TLS.
+- **M3 read-model pages must be ordered.** `ReadModel(T).rows()` / `.listPage()` throw when `.limit()` or `.offset()` is set without `.orderBy(...)`; ordered reads always append `left_entity_id, right_entity_id` as a tiebreaker. Unbounded `.rows()` is unchanged.
+- **M3 GraphQL list fields return `${Name}Page { nodes, hasNextPage }`** instead of `[${Name}!]!`, with new optional args `offset`, `orderBy` (defaults to `leftEntityId`) and `direction`. `offset + limit` must be ≤ 10000.
+- **M3 read models and projection/read-model maintenance run through the DB gateway.** M3 reads (`count`/`countBy`/`rows`/`sum`/`avg`), M3 write-through on save/delete and QSP `setStatus` get request-lane admission and deadline, so a query that previously ran unbounded can now fail with `DbStatementTimeoutError` / `DbAdmissionTimeoutError`. Full M3 rebuilds and pool-side `rm_*` / `m3_*` DDL run on the background lane with `DDL_TIMEOUT_MS`. Statements on a caller-supplied `trx` stay on that handle and take no extra permit.
 
 ### Added
 
 - **Multi-key keyset pagination.** `sortedCursor` works for several `sortBy` keys (same or different components), `sortByCreatedAt` + `sortByUpdatedAt`, and OR + multi-sort, with mixed ASC/DESC, per-key NULLS placement, and `'before'`. `Query.encodeSortedCursor([k1, k2, …], id)`; existing single-key tokens still decode. Multi-key component sorts keep the leaf-driven `ORDER BY expr1, expr2, …, entity_id LIMIT n` scan.
 - **Batched `@ArcheTypeFunction({ batch: true })`.** Parents are collected per request (one batch per distinct args) and the method is called once with `(parents: Entity[], ctx, args?)`, returning a `Map` keyed by entity id. Non-batch methods unchanged.
 - `REDIS_TLS_SERVERNAME`, `REDIS_TLS_REJECT_UNAUTHORIZED`; shared ioredis options builder (`buildRedisConnectionOptions`); explicit `RedisCache` config and `redisFactory` still win over env.
+- M3 `.orderBy(field, 'ASC' | 'DESC')`, `.offset(n)` and `.listPage()` (`limit + 1` probe → `{ nodes, hasNextPage }`).
+- **Real-PostgreSQL before/after benchmark** (`bun run bench:pg:compare`, gate `bench:pg:gate` at +50% and +2 ms p50, baseline `tests/benchmark/baseline/md-pg.json`). 0.6.2 → 0.7 on 100k entities, p50: single-field top-N sort −87…88%, keyset next page −89%, GraphQL list with relation + computed field −81%, two filters + sort −19%, `sortByCreatedAt` −14…15%, populate −3% (noise). A `batch: true` computed field cuts that GraphQL list from 54 statements to 5 (p50 5.5 → 3.7 ms). Method, plans and raw numbers: `docs/internal/BENCHMARK_0.7.md`. PGlite baselines refreshed.
 
 ### Fixed
 
 - FK-less relations query with `type_id` pinned (one partition) instead of scanning every component partition.
 - Importing `bunsane` no longer registers the local storage provider or logs; registration happens on first upload use.
+- The DB-seam test now catches pool fallbacks written as `(trx ?? db).unsafe(…)` / `(trx || db).unsafe(…)`; the M3 reader, `ReadModelManager`, read-model `DDL`, `ProjectionManager.setStatus` and `DDLGenerator` sites it found are routed (the `DDLGenerator` allow-list waiver is gone).
 
 ## 0.7.0 — 2026-09-24
 

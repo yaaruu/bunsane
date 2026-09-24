@@ -1,5 +1,5 @@
 import { ReadModelRegistry } from "./ReadModelRegistry";
-import { M3Query, clampReadModelListLimit } from "./query";
+import { M3Query, clampReadModelListLimit, clampReadModelListOffset } from "./query";
 import type { M3WhereOp } from "./types";
 import type { ReadModelDescriptor, ReadModelProjectSpec } from "./types";
 
@@ -53,6 +53,10 @@ function usesDateScalar(): boolean {
 /**
  * SDL for registered read models. Query fields only — mutationFields is always empty.
  * Used by SchemaGeneratorVisitor and by tests that inspect the shipped surface.
+ *
+ * List fields return `${Name}Page` (`nodes` + `hasNextPage`), not a bare list.
+ * Archetype GraphQL lists do not expose pageInfo; this matches the flat
+ * `hasNextPage` the query engine already reports on `getLastRouteInfo()`.
  */
 export function readModelTypeDefs(): string {
     const models = ReadModelRegistry.all();
@@ -70,6 +74,7 @@ export function readModelTypeDefs(): string {
             .map((p) => `  ${p.propertyKey}: ${gqlScalar(p.sqlType)}`)
             .join("\n");
         out += `type ${typeName(d)} {\n  leftEntityId: ID!\n  rightEntityId: ID\n${fields}\n}\n`;
+        out += `type ${d.name}Page {\n  nodes: [${typeName(d)}!]!\n  hasNextPage: Boolean!\n}\n`;
         const numeric = numerics(d);
         if (numeric.length > 0) {
             const aggFields = [
@@ -85,8 +90,10 @@ export function readModelTypeDefs(): string {
 export function readModelQueryFields(): string[] {
     const fields: string[] = [];
     for (const d of ReadModelRegistry.all()) {
-        const t = typeName(d);
-        fields.push(`${listField(d)}(where: [ReadModelWhere!], limit: Int): [${t}!]!`);
+        const page = `${d.name}Page`;
+        fields.push(
+            `${listField(d)}(where: [ReadModelWhere!], limit: Int, offset: Int, orderBy: String, direction: String): ${page}!`
+        );
         fields.push(`${countField(d)}(where: [ReadModelWhere!]): Int!`);
         if (numerics(d).length > 0) {
             const agg = aggTypeName(d);
@@ -154,17 +161,34 @@ function wrapAggregate(
     return [{ [metricKey]: result }];
 }
 
+interface ListArgs {
+    where?: GqlWhere[];
+    limit?: number;
+    offset?: number | null;
+    orderBy?: string | null;
+    direction?: string | null;
+}
+
 /**
  * Live Query resolvers. Wired by ResolverGeneratorVisitor so injected SDL is not a stub.
+ *
+ * The list resolver always orders (client `orderBy`, or the primary-key
+ * tiebreaker) before applying limit, so a paged read never throws for missing
+ * order. It fetches limit+1 and reports `hasNextPage`.
  */
 export function readModelResolvers(): { Query: Record<string, Function> } {
     const Query: Record<string, Function> = {};
     for (const d of ReadModelRegistry.all()) {
-        Query[listField(d)] = async (_parent: unknown, args: { where?: GqlWhere[]; limit?: number }) => {
+        Query[listField(d)] = async (_parent: unknown, args: ListArgs) => {
             const q = new M3Query(d.target);
             applyGqlWhere(q, args.where);
-            q.limit(clampReadModelListLimit(args.limit));
-            return q.rows();
+            const field = args.orderBy && args.orderBy.length > 0 ? args.orderBy : "leftEntityId";
+            const direction = args.direction && args.direction.length > 0 ? args.direction : "ASC";
+            const limit = clampReadModelListLimit(args.limit);
+            q.orderBy(field, direction);
+            q.limit(limit);
+            q.offset(clampReadModelListOffset(args.offset, limit));
+            return q.listPage();
         };
         Query[countField(d)] = async (_parent: unknown, args: { where?: GqlWhere[] }) => {
             const q = new M3Query(d.target);

@@ -1,5 +1,5 @@
 import type { SQL } from 'bun';
-import db from '../index';
+import { projDdl } from './exec';
 import { getMetadataStorage } from '../../core/metadata';
 import { assertIdentifier, InvalidIdentifierError } from '../../query/SqlIdentifier';
 import type { ProjectedColumn, ProjectionSqlType } from './types';
@@ -28,7 +28,11 @@ const sqlType = (type: ProjectionSqlType): string => {
     return mapped;
 };
 
-const executor = (trx?: SQL) => trx ?? db;
+/** Caller-owned trx: raw on that handle (no pool slot). Otherwise pool DDL through the gateway. */
+const runDdl = async (label: string, sql: string, trx?: SQL): Promise<void> => {
+    if (trx) await trx.unsafe(sql);
+    else await projDdl(label, sql);
+};
 
 export const createRmTable = async (
     archetypeName: string,
@@ -42,13 +46,13 @@ export const createRmTable = async (
     });
     const projectedColumns = columnDefs.length > 0 ? `,\n        ${columnDefs.join(',\n        ')}` : '';
 
-    await executor(trx).unsafe(`CREATE TABLE IF NOT EXISTS ${tableName} (
+    await runDdl('projection.createRmTable', `CREATE TABLE IF NOT EXISTS ${tableName} (
         entity_id uuid PRIMARY KEY${projectedColumns},
         created_at timestamptz NOT NULL,
         updated_at timestamptz NOT NULL,
         deleted_at timestamptz,
         shape_version int NOT NULL DEFAULT 1
-    )`);
+    )`, trx);
 };
 
 export const createCoveringIndex = async (
@@ -64,8 +68,10 @@ export const createCoveringIndex = async (
     const indexColumns = [...equalityColumns, ...sortColumn, 'entity_id'].join(', ');
     const concurrently = trx ? '' : (process.env.USE_PGLITE ? '' : ' CONCURRENTLY');
 
-    await executor(trx).unsafe(
-        `CREATE INDEX${concurrently} IF NOT EXISTS ${indexName} ON ${tableName} (${indexColumns}) INCLUDE (created_at, updated_at) WHERE deleted_at IS NULL`
+    await runDdl(
+        'projection.createCoveringIndex',
+        `CREATE INDEX${concurrently} IF NOT EXISTS ${indexName} ON ${tableName} (${indexColumns}) INCLUDE (created_at, updated_at) WHERE deleted_at IS NULL`,
+        trx,
     );
 };
 
@@ -76,5 +82,5 @@ export const addColumn = async (
 ): Promise<void> => {
     const tableName = assertRmTableName(rmTableName(archetypeName));
     const columnName = assertIdentifier(column.columnName, 'projectedColumn');
-    await executor(trx).unsafe(`ALTER TABLE ${tableName} ADD COLUMN IF NOT EXISTS "${columnName}" ${sqlType(column.sqlType)}`);
+    await runDdl('projection.addColumn', `ALTER TABLE ${tableName} ADD COLUMN IF NOT EXISTS "${columnName}" ${sqlType(column.sqlType)}`, trx);
 };
