@@ -1,6 +1,6 @@
 {
     "name": "bunsane",
-    "version": "0.7.0",
+    "version": "0.8.0",
     "description": "Experimental TypeScript API framework for Bun: entity-component storage on PostgreSQL, a fluent query builder, and GraphQL via Yoga.",
     "author": {
         "name": "yaaruu"
