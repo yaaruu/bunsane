@@ -1,6 +1,6 @@
 import { QueryNode } from "./QueryNode";
 import type { QueryResult } from "./QueryNode";
-import { QueryContext } from "./QueryContext";
+import { QueryContext, sortedCursorValues } from "./QueryContext";
 import { shouldUseLateralJoins, shouldUseDirectPartition } from "../core/Config";
 import {
     buildComponentFilterCondition,
@@ -50,19 +50,47 @@ export function isNumericProperty(componentName: string, propertyName: string): 
     return numeric;
 }
 
+export type KeysetValueCast = '::text' | '::numeric' | '::timestamptz';
+
+export interface KeysetCursorKey {
+    sortExpr: string;
+    /** Fetch ORDER BY direction (already flipped for 'before'). */
+    direction: 'ASC' | 'DESC';
+    /** Fetch NULLS placement (already flipped for 'before'). */
+    nullsFirst: boolean;
+    valueCast: KeysetValueCast;
+    /** Cursor value for this key. null means the cursor row's key was NULL. */
+    value: string | null;
+}
+
+export interface MultiKeysetCursorArgs {
+    keys: KeysetCursorKey[];
+    entityIdCol: string;
+    connective: 'WHERE' | 'AND';
+    cursorId: string;
+    addParam: (value: unknown) => number;
+    /** Tie-break direction matching ORDER BY entity_id. Default ASC. */
+    idDirection?: 'ASC' | 'DESC';
+}
+
 /**
- * Composite keyset WHERE fragment for a single sort key.
- * Shared by ComponentInclusionNode and Query's OR / entity-sort wrappers.
+ * Composite keyset WHERE fragment.
  *
- * Returns ` ${connective} <predicate>` (leading space). Does not read
- * QueryContext and does not throw — callers that reject 'before' do so
- * before calling. Params are pushed only through `addParam`, which must
- * return the 1-based placeholder index of the value just pushed.
+ * Single-key callers may pass the legacy shape (`sortExpr` + `cursor`).
+ * N-key callers pass `keys` (each with its own direction, NULLS placement,
+ * cast, and cursor value) plus `cursorId`.
  *
- * `direction` is the fetch ORDER BY direction (already flipped for 'before').
- * `idDirection` is the entity_id tie-break in that same ORDER BY. Forward
- * pages use ASC (`id > $id`). 'before' fetches use DESC (`id < $id`), including
- * the NULL-cursor walk. Row comparison is only valid when both columns are ASC.
+ * Returns ` ${connective} <predicate>` (leading space). Params are pushed
+ * only through `addParam`, which must return the 1-based placeholder index.
+ *
+ * N-key predicate is the expanded lexicographic OR-chain:
+ * `(k1 op1 v1) OR (k1 = v1 AND k2 op2 v2) OR ... OR (all equal AND id op id)`
+ * with IS NULL / IS NOT NULL branches so NULLS FIRST/LAST match ORDER BY.
+ * A row-value comparison is used only when every direction matches (including
+ * the id tie-break) and no key can be NULL (timestamptz entity columns).
+ *
+ * One-key `keys` arrays delegate to the legacy emitter so issued single-key
+ * SQL (and tokens) stay stable.
  */
 export function buildKeysetCursorWhere(args: {
     sortExpr: string;
@@ -70,12 +98,15 @@ export function buildKeysetCursorWhere(args: {
     connective: 'WHERE' | 'AND';
     direction: 'ASC' | 'DESC';
     nullsFirst: boolean;
-    valueCast: '::text' | '::numeric' | '::timestamptz';
+    valueCast: KeysetValueCast;
     cursor: { v: string | null; id: string };
     addParam: (value: unknown) => number;
     /** Tie-break direction matching ORDER BY entity_id. Default ASC. */
     idDirection?: 'ASC' | 'DESC';
-}): string {
+} | MultiKeysetCursorArgs): string {
+    if ('keys' in args) {
+        return buildKeysetFromKeys(args);
+    }
     const { sortExpr, entityIdCol, connective, direction, nullsFirst, valueCast, cursor, addParam } = args;
     const idDesc = args.idDirection === 'DESC';
     const idOp = idDesc ? '<' : '>';
@@ -101,8 +132,124 @@ export function buildKeysetCursorWhere(args: {
     return ` ${connective} (${sortExpr} < $${vLtIdx}${valueCast} OR (${sortExpr} = $${vEqIdx}${valueCast} AND ${entityIdCol} ${idOp} $${idIdx}::uuid))`;
 }
 
+function buildKeysetFromKeys(args: MultiKeysetCursorArgs): string {
+    if (args.keys.length === 0) {
+        throw new Error('sortedCursor() requires at least one sort key.');
+    }
+    if (args.keys.length === 1) {
+        const key = args.keys[0]!;
+        return buildKeysetCursorWhere({
+            sortExpr: key.sortExpr,
+            entityIdCol: args.entityIdCol,
+            connective: args.connective,
+            direction: key.direction,
+            nullsFirst: key.nullsFirst,
+            valueCast: key.valueCast,
+            cursor: { v: key.value, id: args.cursorId },
+            addParam: args.addParam,
+            idDirection: args.idDirection,
+        });
+    }
+    const rowCompare = tryRowValueComparison(args);
+    if (rowCompare) return rowCompare;
+    return buildExpandedKeysetOr(args);
+}
+
+/**
+ * `(k1, k2, id) > ($1, $2, $3)` is only valid when every column compares in
+ * the same direction and none of them can be NULL. Component JSON keys can
+ * be NULL; timestamptz entity columns cannot.
+ */
+function tryRowValueComparison(args: MultiKeysetCursorArgs): string | null {
+    const idDirection = args.idDirection ?? 'ASC';
+    const dir = args.keys[0]!.direction;
+    if (args.keys.some((key) => key.direction !== dir)) return null;
+    if (dir === 'ASC' ? idDirection !== 'ASC' : idDirection !== 'DESC') return null;
+    if (args.keys.some((key) => key.value === null || key.valueCast !== '::timestamptz')) return null;
+    const op = dir === 'DESC' ? '<' : '>';
+    const valueIdx = args.keys.map((key) => args.addParam(key.value));
+    const idIdx = args.addParam(args.cursorId);
+    const lhs = [...args.keys.map((key) => key.sortExpr), args.entityIdCol].join(', ');
+    const rhs = [
+        ...args.keys.map((key, i) => `$${valueIdx[i]}${key.valueCast}`),
+        `$${idIdx}::uuid`,
+    ].join(', ');
+    return ` ${args.connective} ((${lhs}) ${op} (${rhs}))`;
+}
+
+/**
+ * Lexicographic "strictly after the cursor" for mixed directions and NULLs.
+ * A NULL cursor value ties on `IS NULL` and is strictly-after only when
+ * NULLS FIRST (every non-null sorts later). A non-null cursor is strictly-after
+ * on `>`/`<`, plus `IS NULL` when NULLS LAST.
+ */
+function buildExpandedKeysetOr(args: MultiKeysetCursorArgs): string {
+    const idOp = args.idDirection === 'DESC' ? '<' : '>';
+    const valueIdx = args.keys.map((key) => (key.value === null ? null : args.addParam(key.value)));
+    const idIdx = args.addParam(args.cursorId);
+
+    const tieOf = (i: number): string => {
+        const key = args.keys[i]!;
+        if (key.value === null) return `(${key.sortExpr} IS NULL)`;
+        return `(${key.sortExpr} = $${valueIdx[i]}${key.valueCast})`;
+    };
+    const strictOf = (i: number): string | null => {
+        const key = args.keys[i]!;
+        if (key.value === null) {
+            return key.nullsFirst ? `(${key.sortExpr} IS NOT NULL)` : null;
+        }
+        const op = key.direction === 'DESC' ? '<' : '>';
+        const cmp = `${key.sortExpr} ${op} $${valueIdx[i]}${key.valueCast}`;
+        if (key.nullsFirst) return `(${cmp})`;
+        return `(${cmp} OR ${key.sortExpr} IS NULL)`;
+    };
+
+    const parts: string[] = [];
+    const ties: string[] = [];
+    for (let i = 0; i < args.keys.length; i++) {
+        const strict = strictOf(i);
+        if (strict) {
+            parts.push(ties.length === 0 ? strict : `(${ties.join(' AND ')} AND ${strict})`);
+        }
+        ties.push(tieOf(i));
+    }
+    parts.push(`(${ties.join(' AND ')} AND ${args.entityIdCol} ${idOp} $${idIdx}::uuid)`);
+    return ` ${args.connective} (${parts.join(' OR ')})`;
+}
+
+/**
+ * Throw when a token's sort-value count does not match the query's sort keys.
+ * Legacy `{v, id}` tokens count as one value.
+ */
+export function assertSortedCursorWidth(
+    cursor: { v: string | null; id: string; vs?: (string | null)[] },
+    expected: number,
+    what: string,
+): (string | null)[] {
+    const values = sortedCursorValues(cursor);
+    if (values.length !== expected) {
+        throw new Error(
+            `sortedCursor() token encodes ${values.length} sort value(s) but the query has ${expected} ${what}. ` +
+            'Encode every sort key in order: Query.encodeSortedCursor([k1, k2, ...], entityId).'
+        );
+    }
+    return values;
+}
+
+export function componentSortValueExpr(
+    alias: string,
+    component: string,
+    property: string,
+): { expr: string; valueCast: '::text' | '::numeric' } {
+    const safeProperty = assertIdentifier(property, 'sortOrder.property');
+    if (isNumericProperty(component, property)) {
+        return { expr: `(${alias}.data->>'${safeProperty}')::numeric`, valueCast: '::numeric' };
+    }
+    return { expr: `${alias}.data->>'${safeProperty}'`, valueCast: '::text' };
+}
+
 /** Flip sort + tiebreak when fetching a 'before' page so Query can reverse rows. */
-function cursorSortPresentation(
+export function cursorSortPresentation(
     direction: 'ASC' | 'DESC',
     nullsFirst: boolean,
     isBefore: boolean,
@@ -131,19 +278,22 @@ export class ComponentInclusionNode extends QueryNode {
      * (no param side effects) — QueryDAG consults it to skip CTE planning
      * and execute() consults it before building any SQL.
      *
-     * Eligible shape: exactly one sort order on a required component
-     * (one or more required components — single-component needs no dummy
-     * filters), no findById, no plain entity-id cursor. Filters on any
-     * component are supported (applied inline / via EXISTS).
+     * Eligible shape: one or more sort orders, each on a required component,
+     * no findById, no plain entity-id cursor, no OR. Filters on any component
+     * are supported (applied inline on the driving/joined sort tables, or via
+     * EXISTS). Multi-key emits `ORDER BY expr1, expr2, …, entity_id LIMIT n`
+     * from the first sort component's table.
      */
     public static canUseSortDrivenScan(context: QueryContext): boolean {
-        if (context.sortOrders.length !== 1) return false;
+        if (context.sortOrders.length < 1) return false;
         if (context.componentIds.size < 1) return false;
         if (context.withId) return false;
         if (context.cursorId !== null) return false;
         if (context.hasOrQuery) return false;
-        const sortTypeId = ComponentRegistry.getComponentId(context.sortOrders[0]!.component);
-        if (!sortTypeId || !context.componentIds.has(sortTypeId)) return false;
+        for (const sort of context.sortOrders) {
+            const sortTypeId = ComponentRegistry.getComponentId(sort.component);
+            if (!sortTypeId || !context.componentIds.has(sortTypeId)) return false;
+        }
         return true;
     }
 
@@ -270,8 +420,167 @@ export class ComponentInclusionNode extends QueryNode {
 
     }
 
+    /**
+     * Multi-key sort-driven scan. Drives from the first sort component and
+     * joins any later sort components so ORDER BY can be
+     * `expr1, expr2, …, entity_id` with LIMIT pushed to the scan.
+     */
+    private applySortDrivenScanMulti(context: QueryContext): string {
+        const drive = context.sortOrders[0]!;
+        const driveTypeId = ComponentRegistry.getComponentId(drive.component)!;
+        const aliasByType = new Map<string, string>();
+        aliasByType.set(driveTypeId, 's');
+
+        const joins: string[] = [];
+        let extra = 0;
+        const legacy = getMembershipSource().isLegacy;
+        for (let i = 1; i < context.sortOrders.length; i++) {
+            const sort = context.sortOrders[i]!;
+            const typeId = ComponentRegistry.getComponentId(sort.component)!;
+            if (aliasByType.has(typeId)) continue;
+            extra += 1;
+            const alias = `sk${extra}`;
+            aliasByType.set(typeId, alias);
+            const table = this.getComponentTableName(typeId);
+            const direct = shouldUseDirectPartition() && table !== 'components';
+            const typePh = `$${context.addParam(typeId)}::text`;
+            if (direct || !legacy) {
+                joins.push(
+                    `JOIN ${table} ${alias} ON ${alias}.entity_id = s.entity_id AND ${alias}.type_id = ${typePh} AND ${alias}.deleted_at IS NULL`
+                );
+            } else {
+                joins.push(
+                    `JOIN entity_components ec_${alias} ON ec_${alias}.entity_id = s.entity_id AND ec_${alias}.type_id = ${typePh} AND ec_${alias}.deleted_at IS NULL ` +
+                    `JOIN ${table} ${alias} ON ${alias}.id = ec_${alias}.component_id AND ${alias}.deleted_at IS NULL`
+                );
+            }
+        }
+
+        const keyMeta = context.sortOrders.map((sort) => {
+            const typeId = ComponentRegistry.getComponentId(sort.component)!;
+            const alias = aliasByType.get(typeId)!;
+            const built = componentSortValueExpr(alias, sort.component, sort.property);
+            return { sort, expr: built.expr, valueCast: built.valueCast };
+        });
+
+        const conditions: string[] = [];
+        for (const [typeId, alias] of aliasByType) {
+            const filters = context.componentFilters.get(typeId) ?? [];
+            const group = buildComponentFilterGroup(filters, alias, context);
+            if (group) conditions.push(group);
+        }
+
+        for (const compId of context.componentIds) {
+            if (aliasByType.has(compId)) continue;
+            const filters = context.componentFilters.get(compId) ?? [];
+            const filterGroup = buildComponentFilterGroup(filters, 'cf', context);
+            if (filterGroup) {
+                const compTable = this.getComponentTableName(compId);
+                const filterDirect = shouldUseDirectPartition() && compTable !== 'components';
+                if (filterDirect || !legacy) {
+                    conditions.push(`EXISTS (
+                        SELECT 1 FROM ${compTable} cf
+                        WHERE cf.entity_id = s.entity_id
+                        AND cf.type_id = $${context.addParam(compId)}::text
+                        AND ${filterGroup}
+                        AND cf.deleted_at IS NULL
+                    )`);
+                } else {
+                    conditions.push(`EXISTS (
+                        SELECT 1 FROM entity_components ec_f
+                        JOIN ${compTable} cf ON ec_f.component_id = cf.id
+                        WHERE ec_f.entity_id = s.entity_id
+                        AND ec_f.type_id = $${context.addParam(compId)}::text
+                        AND ${filterGroup}
+                        AND ec_f.deleted_at IS NULL
+                        AND cf.deleted_at IS NULL
+                    )`);
+                }
+            } else {
+                conditions.push(`EXISTS (
+                    SELECT 1 FROM ${getMembershipTable()} ec_r
+                    WHERE ec_r.entity_id = s.entity_id
+                    AND ec_r.type_id = $${context.addParam(compId)}::text
+                    AND ec_r.deleted_at IS NULL
+                )`);
+            }
+        }
+
+        if (context.excludedComponentIds.size > 0) {
+            const excludedPlaceholders = Array.from(context.excludedComponentIds)
+                .map((id) => `$${context.addParam(id)}`).join(', ');
+            conditions.push(`NOT EXISTS (
+                SELECT 1 FROM ${getMembershipTable()} ec_ex
+                WHERE ec_ex.entity_id = s.entity_id
+                AND ec_ex.type_id IN (${excludedPlaceholders})
+                AND ec_ex.deleted_at IS NULL
+            )`);
+        }
+        if (context.excludedEntityIds.size > 0) {
+            const entityPlaceholders = Array.from(context.excludedEntityIds)
+                .map((id) => `$${context.addParam(id)}`).join(', ');
+            conditions.push(`s.entity_id NOT IN (${entityPlaceholders})`);
+        }
+
+        const isBefore = context.compositeCursor !== null && context.cursorDirection === 'before';
+        let cursorWhere = '';
+        if (context.compositeCursor) {
+            const values = assertSortedCursorWidth(context.compositeCursor, context.sortOrders.length, 'sortBy() key(s)');
+            cursorWhere = buildKeysetCursorWhere({
+                keys: keyMeta.map((meta, i) => {
+                    const presented = cursorSortPresentation(meta.sort.direction, !!meta.sort.nullsFirst, isBefore);
+                    return {
+                        sortExpr: meta.expr,
+                        direction: presented.direction,
+                        nullsFirst: presented.nullsFirst,
+                        valueCast: meta.valueCast,
+                        value: values[i]!,
+                    };
+                }),
+                entityIdCol: 's.entity_id',
+                connective: 'AND',
+                cursorId: context.compositeCursor.id,
+                idDirection: isBefore ? 'DESC' : 'ASC',
+                addParam: (value) => context.addParam(value),
+            });
+        }
+
+        const orderParts = keyMeta.map((meta) => {
+            const presented = cursorSortPresentation(meta.sort.direction, !!meta.sort.nullsFirst, isBefore);
+            return `${meta.expr} ${normalizeSortDirection(presented.direction)} ${presented.nullsClause}`;
+        });
+        const idDir = isBefore ? 'DESC' : 'ASC';
+        const extraConditions = conditions.length > 0 ? `\n                AND ${conditions.join('\n                AND ')}` : '';
+        const joinSql = joins.length > 0 ? `\n                ${joins.join('\n                ')}` : '';
+
+        const sortTable = this.getComponentTableName(driveTypeId);
+        const driveDirect = shouldUseDirectPartition() && sortTable !== 'components';
+        let sql: string;
+        if (driveDirect || !legacy) {
+            sql = `SELECT s.entity_id as id FROM ${sortTable} s${joinSql}
+                WHERE s.type_id = $${context.addParam(driveTypeId)}::text
+                AND s.deleted_at IS NULL${extraConditions}${cursorWhere}
+                ORDER BY ${orderParts.join(', ')}, s.entity_id ${idDir}`;
+        } else {
+            sql = `SELECT s.entity_id as id FROM entity_components ec
+                JOIN ${sortTable} s ON s.id = ec.component_id AND s.deleted_at IS NULL${joinSql}
+                WHERE ec.type_id = $${context.addParam(driveTypeId)}::text
+                AND ec.deleted_at IS NULL${extraConditions}${cursorWhere}
+                ORDER BY ${orderParts.join(', ')}, s.entity_id ${idDir}`;
+        }
+
+        if (context.limit !== null) {
+            sql += ` LIMIT $${context.addParam(context.limit)}`;
+        }
+        if (!context.compositeCursor && context.offsetValue > 0) {
+            sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
+        }
+        return sql;
+    }
+
     private applySortDrivenScan(context: QueryContext): string | null {
         if (!ComponentInclusionNode.canUseSortDrivenScan(context)) return null;
+        if (context.sortOrders.length > 1) return this.applySortDrivenScanMulti(context);
 
         const sortOrder = context.sortOrders[0]!;
         const sortTypeId = ComponentRegistry.getComponentId(sortOrder.component)!;
@@ -655,12 +964,6 @@ export class ComponentInclusionNode extends QueryNode {
      * This ensures that sorting and pagination work together correctly
      */
     private applySortingWithComponentJoins(baseQuery: string, context: QueryContext): string {
-        if (context.compositeCursor && context.sortOrders.length !== 1) {
-            throw new Error(
-                'sortedCursor() requires exactly one sort key. ' +
-                'Multi-key component sort cursors are not supported.'
-            );
-        }
 
         // Check if we can use the optimized direct partition sort
         if (shouldUseDirectPartition() && context.sortOrders.length === 1) {
@@ -679,6 +982,8 @@ export class ComponentInclusionNode extends QueryNode {
         // rather than joining all component rows first and filtering later.
         // This is dramatically faster when base_entities is a small subset of total entities.
         const orderByClauses: string[] = [];
+        const sortValueExprs: string[] = [];
+        const sortValueCasts: Array<'::text' | '::numeric'> = [];
 
         for (let i = 0; i < context.sortOrders.length; i++) {
             const sortOrder = context.sortOrders[i]!;
@@ -723,6 +1028,8 @@ export class ComponentInclusionNode extends QueryNode {
                 LIMIT 1
             )`;
 
+            sortValueExprs.push(subquery);
+            sortValueCasts.push(isNumeric ? '::numeric' : '::text');
             orderByClauses.push(`${subquery} ${normalizeSortDirection(sortOrder.direction)} ${nullsClause}`);
         }
 
@@ -758,6 +1065,45 @@ export class ComponentInclusionNode extends QueryNode {
             ORDER BY _sorted._sv ${normalizeSortDirection(presented.direction)} ${presented.nullsClause}, _sorted.id ${presented.idDirection}`;
 
 
+            if (!context.paginationAppliedInCTE && context.limit !== null) {
+                sql += ` LIMIT $${context.addParam(context.limit)}`;
+            }
+            return sql;
+        }
+
+        if (context.compositeCursor && context.sortOrders.length > 1) {
+            if (sortValueExprs.length !== context.sortOrders.length) {
+                throw new Error('sortedCursor() could not resolve every sortBy() key.');
+            }
+            const values = assertSortedCursorWidth(context.compositeCursor, context.sortOrders.length, 'sortBy() key(s)');
+            const isBefore = context.cursorDirection === 'before';
+            const presented = context.sortOrders.map((sortOrder) =>
+                cursorSortPresentation(sortOrder.direction, !!sortOrder.nullsFirst, isBefore)
+            );
+            const selects = sortValueExprs.map((expr, i) => `${expr} AS _sv${i}`).join(', ');
+            const cursorWhere = buildKeysetCursorWhere({
+                keys: sortValueExprs.map((_, i) => ({
+                    sortExpr: `_sorted._sv${i}`,
+                    direction: presented[i]!.direction,
+                    nullsFirst: presented[i]!.nullsFirst,
+                    valueCast: sortValueCasts[i]!,
+                    value: values[i]!,
+                })),
+                entityIdCol: '_sorted.id',
+                connective: 'WHERE',
+                cursorId: context.compositeCursor.id,
+                idDirection: presented[0]!.idDirection,
+                addParam: (value) => context.addParam(value),
+            });
+            const order = presented.map((p, i) =>
+                `_sorted._sv${i} ${normalizeSortDirection(p.direction)} ${p.nullsClause}`
+            ).join(', ');
+            let sql = `WITH _sorted AS (
+                SELECT base_entities.id, ${selects}
+                FROM (${baseQuery}) AS base_entities
+            )
+            SELECT _sorted.id FROM _sorted${cursorWhere}
+            ORDER BY ${order}, _sorted.id ${presented[0]!.idDirection}`;
             if (!context.paginationAppliedInCTE && context.limit !== null) {
                 sql += ` LIMIT $${context.addParam(context.limit)}`;
             }

@@ -95,16 +95,16 @@ See [Liveness & the write probe](#liveness--the-write-probe).
 | `NODE_ENV` | unset | `development` \| `production` \| `test`. Unset is fail-closed: error details are masked, HSTS stays off, and `/metrics`, `/health/remote`, `/docs`, and `/openapi.json` answer 404 unless a token or explicit public opt-in is set. `development` enables verbose errors and, unless overridden, GraphQL introspection and GraphiQL. `production` alone does **not** send HSTS. A boot warning names the affected behaviours; `BUNSANE_STRICT_ENV` promotes it to a startup failure. |
 | `SHUTDOWN_GRACE_PERIOD_MS` | framework default | Max time to drain in-flight requests on SIGTERM/SIGINT before forced shutdown. Also `app.setShutdownGracePeriod(ms)`. |
 | `REQUEST_TIMEOUT_MS` | `30000` | Wall-clock request timeout in milliseconds. `0` disables. Also `app.setRequestTimeout(ms)` or `AppConfig.requestTimeoutMs`. `/health` and `/health/ready` never use this timer and are not cloned for it. |
-| `JSON_BODY_LIMIT` | `1048576` (1MB) | Max `Content-Length` for non-multipart bodies. Oversize returns 413 before the body is read. Also `app.setJsonBodyLimit(bytes)` or `AppConfig.bodyLimits.json`. |
-| `MULTIPART_BODY_LIMIT` | `MAX_REQUEST_BODY_SIZE` (50MB) | Multipart `Content-Length` cap. Also `app.setMultipartBodyLimit(bytes)` or `AppConfig.bodyLimits.multipart`. |
-| `MAX_REQUEST_BODY_SIZE` | `52428800` (50MB) | Absolute `Bun.serve` cap and the default multipart cap. Does **not** raise the JSON limit. Also `app.setMaxRequestBodySize(bytes)` or `AppConfig.bodyLimits.max`. Chunked multipart with no `Content-Length` is still bounded only by this Bun cap. |
+| `JSON_BODY_LIMIT` | `1048576` (1MB) | Max `Content-Length` for non-multipart bodies. Oversize returns 413 before the body is read. A missing `Content-Length` on non-multipart bodies is not rejected here; chunked JSON stays capped by `MAX_REQUEST_BODY_SIZE`. Also `app.setJsonBodyLimit(bytes)` or `AppConfig.bodyLimits.json`. |
+| `MULTIPART_BODY_LIMIT` | `MAX_REQUEST_BODY_SIZE` (50MB) | Multipart `Content-Length` cap; over it returns 413. A `multipart/form-data` request with **no** `Content-Length` returns 411 `{ "error": "Length Required", "code": "LENGTH_REQUIRED", "limit" }` before the body is read (REST and `/graphql`). Browsers and `fetch` with a `FormData` body send the header; in-process `new Request(url, { body: formData })` does not — set it in tests. Also `app.setMultipartBodyLimit(bytes)` or `AppConfig.bodyLimits.multipart`. |
+| `MAX_REQUEST_BODY_SIZE` | `52428800` (50MB) | Absolute `Bun.serve` cap and the default multipart cap. Does **not** raise the JSON limit. Bounds chunked non-multipart bodies. Also `app.setMaxRequestBodySize(bytes)` or `AppConfig.bodyLimits.max`. |
 | `BUNSANE_METRICS_TOKEN` | unset | Bearer token, or `x-metrics-token`, for `/metrics` and `/health/remote`. Minimum 16 characters. Unset, and not public, answers 404. Also `app.setMetricsAccess({ token })`. |
 | `BUNSANE_METRICS` | unset | `public` serves `/metrics` and `/health/remote` without a token. `off` is accepted by validation and does not open the endpoints. |
 | `BUNSANE_DOCS_TOKEN` | unset | Bearer token, or `x-docs-token`, for `/docs`, `/docs/swagger-init.js`, and `/openapi.json`. Minimum 16 characters. Also `app.setDocsAccess({ token })`. |
 | `BUNSANE_DOCS` | unset | `public` serves those docs routes without a token. `off` does not open them. |
 | `BUNSANE_HSTS` | `off` | `on` sends `Strict-Transport-Security`. `NODE_ENV=production` alone does not. |
 | `BUNSANE_TLS` | `off` | `on` also enables HSTS. This declares that the deployment is behind TLS; it does not terminate TLS. |
-| `BUNSANE_STRICT_ENV` | `off` | `on` or `true` promotes boot warnings to a startup failure: unset `NODE_ENV`, production Redis without a password on a non-loopback host, and `REDIS_TLS=true` (validated but not applied by the client). |
+| `BUNSANE_STRICT_ENV` | `off` | `on` or `true` promotes boot warnings to a startup failure: unset `NODE_ENV`, production Redis without a password on a non-loopback host, and production Redis on a non-loopback host with `REDIS_TLS` unset or `false`. |
 
 `securityHeaders` and `requestId` are registered in `start()` unless opted out with `setSecurityHeaders(false)` / `setRequestId(false)`, or the matching `AppConfig` fields, before start. `app.use()` after `start()` throws. A second `start()` is a no-op (warning).
 
@@ -206,11 +206,16 @@ The framework `PreparedStatementCache`, `Query.getCacheStats()`, and `BUNSANE_QU
 | `REDIS_HOST` | `localhost` | Redis host. |
 | `REDIS_PORT` | `6379` | Redis port. |
 | `REDIS_PASSWORD` | — | Redis password. |
+| `REDIS_USERNAME` | — | Redis ACL username (ioredis `username`). Omit for password-only AUTH. |
 | `REDIS_DB` | `0` | Redis DB index. |
-| `REDIS_KEY_PREFIX` | `bunsane:` | Key prefix. |
+| `REDIS_KEY_PREFIX` | `bunsane:` | Cache key prefix, applied by `RedisCache` itself (not as an ioredis `keyPrefix`, so remote stream names are unchanged). |
 | `REDIS_MAX_RECONNECT_ATTEMPTS` | `20` | Capped reconnect attempts (prevents infinite spin, C03). |
 | `REDIS_ENABLE_OFFLINE_QUEUE` | `false` | Offline command queue. Off by default to bound heap (C02). |
-| `REDIS_TLS` | unset | Validated as `true` or `false`. **Not applied by the Redis client** — do not treat it as transport security. `true` logs a boot warning, and fails startup under `BUNSANE_STRICT_ENV`. Isolate Redis on the network and set `REDIS_PASSWORD`. |
+| `REDIS_TLS` | unset | `true` connects the cache and remote ioredis clients with `tls: {}` (certificate verification on). Unset or `false` is plaintext. Production + non-loopback `REDIS_HOST` without TLS logs a boot warning and fails startup under `BUNSANE_STRICT_ENV`. |
+| `REDIS_TLS_SERVERNAME` | unset | TLS SNI `servername`. Applied only when `REDIS_TLS=true`. |
+| `REDIS_TLS_REJECT_UNAUTHORIZED` | `true` | `false` disables certificate verification. Applied only when `REDIS_TLS=true`. |
+
+Explicit `RedisCache` config (`username`, `tls: false` or `tls: { ... }`, host/port/password/db) overrides env defaults. `RemoteManager` `redisFactory` replaces client construction entirely and does not receive env TLS. There is no `REDIS_URL`; `rediss://` is not parsed.
 
 ## Remote RPC trust model
 

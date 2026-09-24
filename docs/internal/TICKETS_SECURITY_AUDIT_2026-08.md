@@ -1,6 +1,6 @@
 # Tickets: Security Audit Hardening
 
-**Status:** SEC-01…SEC-08 shipped on `fix/security-audit-2026-08`; SEC-09…SEC-13 and SEC-15 done in the 2026-09-24 overhaul; SEC-14, SEC-16, and SEC-17 partial.
+**Status:** SEC-01…SEC-08 shipped on `fix/security-audit-2026-08`; SEC-09…SEC-13, SEC-15 done in the 2026-09-24 overhaul (v0.7.0); SEC-14, SEC-16, SEC-17 completed in the follow-up after v0.7.0.
 **Date:** 2026-08-23 (status refreshed 2026-09-24)
 **Basis:** Full-repo security audit; every finding verified directly against source (see audit session notes). No live exploitation was performed.  
 **Scope:** Framework surfaces: endpoints/, core/app/, core/middleware/, gql/, query/, storage/, upload/, core/cache/, core/remote/. App-authored resolvers out of scope except where the framework provides no guardrail.  
@@ -22,10 +22,10 @@
 | 11 | **SEC-11** Pub/sub invalidation authenticity (HMAC) | S | Medium-High (cluster cache wipe) | — | **Done** | 2026-09-24 overhaul |
 | 12 | **SEC-12** RPC/outbox trust boundary documentation + signing | M | Medium-High (impersonation/replay) | — | **Done** | 2026-09-24 overhaul |
 | 13 | **SEC-13** Cache pattern-invalidation DoS bounds | S | Medium | — | **Done** | 2026-09-24 overhaul |
-| 14 | **SEC-14** Request body limits + REST upload streaming | S | Medium (memory DoS) | — | **Partial** | JSON/Content-Length caps; chunked multipart still Bun cap |
+| 14 | **SEC-14** Request body limits + REST upload streaming | S | Medium (memory DoS) | — | **Done** | 0.7.0 Content-Length caps + follow-up: multipart without Content-Length → 411 |
 | 15 | **SEC-15** Security headers default-on | S | Medium | — | **Done** | 2026-09-24 overhaul |
-| 16 | **SEC-16** Env validation hardening | S | Medium (config footguns) | — | **Partial** | validation shipped; `REDIS_TLS` not applied by the client |
-| 17 | **SEC-17** Low-severity hardening sweep | S | Low | — | **Partial** | items 2, 3, 4, 7 landed; 1, 5, 6, 8 not done |
+| 16 | **SEC-16** Env validation hardening | S | Medium (config footguns) | — | **Done** | 0.7.0 validation + follow-up: `REDIS_TLS` applied to ioredis clients |
+| 17 | **SEC-17** Low-severity hardening sweep | S | Low | — | **Done** | 2, 3, 4, 7 in 0.7.0; 1, 5, 6, 8 in the follow-up |
 
 Each ticket ships alone. Tests run under `bun tests/pglite-setup.ts tests/unit/...` and, where SQL behaviour matters, `bun run test:pg`.
 
@@ -405,7 +405,7 @@ Make the required Redis posture explicit and raise the bar for multi-tenant Redi
 
 ## SEC-14 — Right-size body limits; stream REST uploads
 
-**Status: Partial (2026-09-24).** Non-multipart bodies default to 1MB (`JSON_BODY_LIMIT`); an oversize `Content-Length` returns 413 before the body is read. Multipart `Content-Length` is capped by `MULTIPART_BODY_LIMIT` (default `MAX_REQUEST_BODY_SIZE`, 50MB). Chunked multipart without `Content-Length` still relies on the Bun.serve `maxRequestBodySize` cap — there is no mid-stream parser abort.
+**Status: Done (post-0.7.0).** Non-multipart bodies default to 1MB (`JSON_BODY_LIMIT`); an oversize `Content-Length` returns 413 before the body is read. Multipart `Content-Length` is capped by `MULTIPART_BODY_LIMIT` (default `MAX_REQUEST_BODY_SIZE`, 50MB). Multipart without `Content-Length` returns 411 before any body read (REST and `/graphql`). Chunked non-multipart bodies remain bounded by the Bun.serve `maxRequestBodySize` cap.
 
 ### Problem
 - `core/App.ts:114` — 50MB default body limit applies to ALL routes (GraphQL JSON, studio query, REST JSON). Combined with Yoga multipart enabled, unauthenticated requests pin large buffers before validation.
@@ -448,7 +448,7 @@ Make the required Redis posture explicit and raise the bar for multi-tenant Redi
 
 ## SEC-16 — Environment validation hardening
 
-**Status: Partial (2026-09-24).** `validateEnv` declares the SEC-10/11/12/14 variables, warns once when `NODE_ENV` is unset, warns on production Redis without a password on a non-loopback host, and `BUNSANE_STRICT_ENV=on` promotes those warnings to a boot failure. `REDIS_TLS` is validated (`true`|`false`) and warned as unused — the Redis client does not apply it. Do not treat it as transport security.
+**Status: Done (post-0.7.0).** `validateEnv` declares the SEC-10/11/12/14 variables, warns once when `NODE_ENV` is unset, warns on production Redis without a password or without TLS on a non-loopback host, and `BUNSANE_STRICT_ENV=on` promotes those warnings to a boot failure. `REDIS_TLS=true` is applied to both ioredis clients (`tls: {}`, plus `REDIS_TLS_SERVERNAME` / `REDIS_TLS_REJECT_UNAUTHORIZED`).
 
 ### Problem
 `core/validateEnv.ts:25` — `NODE_ENV` optional, yet it gates error masking, the ad-hoc SQL console, HSTS, and verbose CORS warnings. `GRAPHQL_MAX_COMPLEXITY` undeclared. Redis variables (`REDIS_HOST/PASSWORD/TLS`) unchecked — a prod deploy missing REDIS_PASSWORD fails silently into an unauthenticated socket assumption.
@@ -468,7 +468,7 @@ Make the required Redis posture explicit and raise the bar for multi-tenant Redi
 
 ## SEC-17 — Low-severity hardening sweep
 
-**Status: Partial (2026-09-24).** Landed: (2) inbound `X-Request-Id` must match `[A-Za-z0-9-]{1,64}` or a new id is generated; (3) Swagger attaches `BearerAuth` when an operation registered auth metadata; (4) `originalMessage` is emitted only when verbose errors are on; (7) Yoga is created with `cors: false` and the framework CORS wrapper covers GraphQL responses. Not done: (1) `withIndexHint` still interpolates `indexHint` into a SQL comment with no allow-list; (5) SDL names in `gql/schema` are not passed through `assertIdentifier`; (6) advisory lock handle tokens are still the deterministic bigint key, not `randomBytes` per acquisition; (8) `sqlTimeBucketFromTs` does not assert `tsExpr` / `tzParam`.
+**Status: Done (post-0.7.0).** 0.7.0: (2) `X-Request-Id` allow-list, (3) Swagger `BearerAuth` wiring, (4) `originalMessage` only in verbose mode, (7) single CORS implementation. Follow-up: (1) `withIndexHint` allow-list `^[A-Za-z0-9_]+$`; (5) schema DSL and operation-input names asserted as GraphQL identifiers before SDL interpolation; (6) advisory lock tokens from `crypto.randomBytes` per acquisition; (8) `sqlTimeBucketFromTs` shape guards.
 
 Batch the small items; ship as one PR with individual commits.
 

@@ -1,4 +1,27 @@
+import { assertIdentifier } from "../../query/SqlIdentifier";
+
 import { z, type ZodType } from "zod";
+
+/**
+ * GraphQL names are `[_A-Za-z][_0-9A-Za-z]*`, the same shape as
+ * {@link assertIdentifier}. Unwrap `!` and `[]` so a type reference such as
+ * `[String!]!` is checked at the name, not rejected for the wrappers.
+ */
+function assertGraphqlTypeRef(ref: string, context: string): string {
+    let inner = ref;
+    for (;;) {
+        if (inner.endsWith("!")) {
+            inner = inner.slice(0, -1);
+            continue;
+        }
+        if (inner.startsWith("[") && inner.endsWith("]")) {
+            inner = inner.slice(1, -1);
+            continue;
+        }
+        break;
+    }
+    return assertIdentifier(inner, context);
+}
 
 // ─── Marker ────────────────────────────────────────────────────────────────────
 
@@ -76,6 +99,7 @@ export abstract class BaseSchemaType<T = unknown> implements SchemaType<T> {
     }
 
     toGraphQL(): string {
+        assertGraphqlTypeRef(this._graphqlType, "GraphQL type");
         return this._required ? `${this._graphqlType}!` : this._graphqlType;
     }
 
@@ -237,7 +261,7 @@ export class RefType<T = unknown> extends BaseSchemaType<T> {
 
     constructor(graphqlTypeName: string, zodSchema?: ZodType) {
         super();
-        this._internalGraphqlType = graphqlTypeName;
+        this._internalGraphqlType = assertIdentifier(graphqlTypeName, "GraphQL type name");
         this._zodSchema = zodSchema ?? z.any();
     }
 
@@ -255,7 +279,7 @@ export class ObjectType<T extends Record<string, SchemaType> = Record<string, Sc
     constructor(shape: T, typeName: string) {
         super();
         this.shape = shape;
-        this._typeName = typeName;
+        this._typeName = assertIdentifier(typeName, "GraphQL type name");
     }
 
     override get _graphqlType(): string {
@@ -267,10 +291,15 @@ export class ObjectType<T extends Record<string, SchemaType> = Record<string, Sc
     }
 
     toGraphQLTypeDef(): string {
+        const typeName = assertIdentifier(this._typeName, "GraphQL type name");
         const fields = Object.entries(this.shape)
-            .map(([name, field]) => `    ${name}: ${field.toGraphQL()}`)
+            .map(([name, field]) => {
+                const fieldName = assertIdentifier(name, "GraphQL field name");
+                const fieldType = field.toGraphQL();
+                return `    ${fieldName}: ${fieldType}`;
+            })
             .join("\n");
-        return `input ${this._typeName} {\n${fields}\n}`;
+        return `input ${typeName} {\n${fields}\n}`;
     }
 
     toZod(): ZodType {
@@ -331,7 +360,10 @@ export class EnumType<T extends readonly string[] = readonly string[]> extends B
     constructor(values: T, enumName: string) {
         super();
         this.values = values;
-        this._enumName = enumName;
+        this._enumName = assertIdentifier(enumName, "GraphQL enum name");
+        for (const value of values) {
+            assertIdentifier(value, "GraphQL enum value");
+        }
     }
 
     override get _graphqlType(): string {
@@ -343,8 +375,11 @@ export class EnumType<T extends readonly string[] = readonly string[]> extends B
     }
 
     toGraphQLTypeDef(): string {
-        const entries = this.values.join("\n    ");
-        return `enum ${this._enumName} {\n    ${entries}\n}`;
+        const enumName = assertIdentifier(this._enumName, "GraphQL enum name");
+        const entries = this.values
+            .map((value) => assertIdentifier(value, "GraphQL enum value"))
+            .join("\n    ");
+        return `enum ${enumName} {\n    ${entries}\n}`;
     }
 
     toZod(): ZodType {

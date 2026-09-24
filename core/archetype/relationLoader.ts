@@ -3,8 +3,8 @@ import { Entity } from "../Entity";
 import { getMetadataStorage } from "../metadata";
 import { Query } from "../../query";
 import { getRequestScope } from "../requestScope";
-import { resolveRelationTarget, type RelationTarget } from "./relationTarget";
-import { resolveFkOnMap } from "./fkResolve";
+import { archetypeGraphqlName, resolveRelationTarget, type RelationTarget } from "./relationTarget";
+import { requireImplicitFk, resolveFkOnMap } from "./fkResolve";
 /**
  * Populate relation fields on an entity according to the archetype's relationMap.
  * Extracted from BaseArcheType.populateRelations().
@@ -26,7 +26,7 @@ export async function populateRelations(archetype: any, entity: Entity): Promise
         if (relationType === "belongsTo") {
             fieldPromises.push(populateBelongsTo(archetype, entity, fieldName, relatedArchetype, relationOptions, storage));
         } else if (relationType === "hasMany") {
-            fieldPromises.push(populateHasMany(entity, fieldName, relatedArchetype, relationOptions, storage));
+            fieldPromises.push(populateHasMany(archetype, entity, fieldName, relatedArchetype, relationOptions, storage));
         }
     }
     await Promise.all(fieldPromises);
@@ -48,8 +48,14 @@ async function populateBelongsTo(
     relationOptions: any,
     storage: any,
 ): Promise<void> {
-    const foreignKey = relationOptions?.foreignKey;
-    if (!foreignKey) return;
+    let foreignKey: string | undefined = relationOptions?.foreignKey;
+    if (!foreignKey) {
+        foreignKey = requireImplicitFk(
+            archetypeGraphqlName(archetype),
+            fieldName,
+            archetype.componentMap ?? {},
+        ).foreignKeyField;
+    }
 
     let foreignId: string | undefined;
 
@@ -100,17 +106,24 @@ async function populateBelongsTo(
 }
 
 async function populateHasMany(
+    archetype: { constructor: { name: string } },
     entity: Entity,
     fieldName: string,
     relatedArchetype: any,
     relationOptions: any,
     storage: any,
 ): Promise<void> {
-    const foreignKey = relationOptions?.foreignKey;
-    if (!foreignKey) return;
-
     const relatedArchetypeInstance = resolveRelatedArchetypeInstance(relatedArchetype);
     if (!relatedArchetypeInstance) return;
+
+    let foreignKey: string | undefined = relationOptions?.foreignKey;
+    if (!foreignKey) {
+        foreignKey = requireImplicitFk(
+            archetypeGraphqlName(archetype),
+            fieldName,
+            relatedArchetypeInstance.componentMap,
+        ).foreignKeyField;
+    }
 
     const fk = resolveFkOnMap(relatedArchetypeInstance.componentMap, foreignKey);
     if (!fk) return;

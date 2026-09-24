@@ -35,7 +35,7 @@ export async function parseFormData(
     maxBodyBytes: number = DEFAULT_BODY_LIMITS.multipart,
 ): Promise<{ files: ParsedUpload[]; fields: Record<string, string> }> {
     assertBodyWithinLimit(req, { json: maxBodyBytes, multipart: maxBodyBytes });
-    const contentType = req.headers.get("content-type") ?? "";
+    const contentType = (req.headers.get("content-type") ?? "").toLowerCase();
     if (!contentType.includes("multipart/form-data")) {
         throw new Error(
             "Invalid Content-Type: expected multipart/form-data",

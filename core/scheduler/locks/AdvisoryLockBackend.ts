@@ -19,7 +19,7 @@
  * @see https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS
  */
 
-import { randomUUID } from "crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "crypto";
 import type { ReservedSQL, SQL } from "bun";
 import db from "../../../database";
 import { logger } from "../../Logger";
@@ -59,6 +59,18 @@ interface AdvisoryInternal {
     bigintKey: bigint;
 }
 
+interface HeldAdvisory {
+    token: string;
+    bigintKey: bigint;
+}
+
+function tokensEqual(stored: string, presented: string): boolean {
+    const a = Buffer.from(stored, "utf8");
+    const b = Buffer.from(presented, "utf8");
+    if (a.length !== b.length || a.length === 0) return false;
+    return timingSafeEqual(a, b);
+}
+
 export class AdvisoryLockBackend implements LockBackend {
     readonly name = "advisory";
     private config: AdvisoryBackendConfig;
@@ -68,6 +80,10 @@ export class AdvisoryLockBackend implements LockBackend {
     private reservePromise: Promise<ReservedSQL> | null = null;
     /** Outstanding handles; the reserved session is freed when this hits 0. */
     private outstanding = 0;
+    /** Per-key ownership token. taskId/key is only the advisory lock key. */
+    private readonly held = new Map<string, HeldAdvisory>();
+    /** Keys with an acquire in flight, so a second caller cannot bump the PG refcount. */
+    private readonly inflight = new Set<string>();
     /** Session-affinity probe runs once per reserved session. */
     private safetyChecked = false;
 
@@ -179,50 +195,66 @@ export class AdvisoryLockBackend implements LockBackend {
     }
 
     async acquire(key: string, _opts?: AcquireOptions): Promise<LockHandle | null> {
-        const bigintKey = this.generateLockKey(key);
-
-        // Reserve the session (transient failures → null, retried next call).
-        let conn: ReservedSQL;
-        try {
-            conn = await this.ensureReserved();
-        } catch (error) {
-            loggerInstance.error(
-                `Error reserving connection for advisory lock ${key}: ${error instanceof Error ? error.message : String(error)}`
-            );
+        if (this.held.has(key) || this.inflight.has(key)) {
             return null;
         }
-
-        // Fail LOUD on an unsafe pooling config (throws past the catch below).
-        await this.checkSessionAffinity(conn);
-
+        this.inflight.add(key);
         try {
-            const result = await conn`
-                SELECT pg_try_advisory_lock(${bigintKey}::bigint) as locked
-            `;
-            const acquired = result[0]?.locked ?? false;
-            if (!acquired) {
+            const bigintKey = this.generateLockKey(key);
+
+            // Reserve the session (transient failures → null, retried next call).
+            let conn: ReservedSQL;
+            try {
+                conn = await this.ensureReserved();
+            } catch (error) {
+                loggerInstance.error(
+                    `Error reserving connection for advisory lock ${key}: ${error instanceof Error ? error.message : String(error)}`
+                );
+                return null;
+            }
+
+            // Fail LOUD on an unsafe pooling config (throws past the catch below).
+            await this.checkSessionAffinity(conn);
+
+            try {
+                const result = await conn`
+                    SELECT pg_try_advisory_lock(${bigintKey}::bigint) as locked
+                `;
+                const acquired = result[0]?.locked ?? false;
+                if (!acquired) {
+                    this.releaseReservationIfIdle();
+                    return null;
+                }
+                const token = randomBytes(16).toString("hex");
+                this.held.set(key, { token, bigintKey });
+                this.outstanding++;
+                if (this.config.enableLogging) {
+                    loggerInstance.debug(`Acquired advisory lock ${key} (${bigintKey})`);
+                }
+                const internal: AdvisoryInternal = { bigintKey };
+                return { key, token, expiresAt: null, _internal: internal };
+            } catch (error) {
+                loggerInstance.error(
+                    `Error acquiring advisory lock ${key}: ${error instanceof Error ? error.message : String(error)}`
+                );
                 this.releaseReservationIfIdle();
                 return null;
             }
-            this.outstanding++;
-            if (this.config.enableLogging) {
-                loggerInstance.debug(`Acquired advisory lock ${key} (${bigintKey})`);
-            }
-            const internal: AdvisoryInternal = { bigintKey };
-            return { key, token: bigintKey.toString(), expiresAt: null, _internal: internal };
-        } catch (error) {
-            loggerInstance.error(
-                `Error acquiring advisory lock ${key}: ${error instanceof Error ? error.message : String(error)}`
-            );
-            this.releaseReservationIfIdle();
-            return null;
+        } finally {
+            this.inflight.delete(key);
         }
     }
 
     async release(handle: LockHandle): Promise<boolean> {
-        const { bigintKey } = (handle._internal as AdvisoryInternal) ?? {
-            bigintKey: this.generateLockKey(handle.key),
-        };
+        const owned = this.held.get(handle.key);
+        if (!owned || !tokensEqual(owned.token, handle.token)) {
+            return false;
+        }
+        // Forget ownership before touching PG: if the unlock throws or the
+        // session is gone, the PG lock goes with the session anyway, and a
+        // lingering entry would make every later acquire(key) return null.
+        this.held.delete(handle.key);
+        const { bigintKey } = owned;
         if (!this.reservedConn) {
             loggerInstance.warn(
                 `No reserved connection to release advisory lock ${handle.key}`
@@ -257,8 +289,15 @@ export class AdvisoryLockBackend implements LockBackend {
         }
     }
 
+    async renew(handle: LockHandle, _ttlMs: number): Promise<boolean> {
+        const owned = this.held.get(handle.key);
+        return !!owned && tokensEqual(owned.token, handle.token);
+    }
+
     async dispose(): Promise<void> {
         this.outstanding = 0;
+        this.held.clear();
+        this.inflight.clear();
         this.safetyChecked = false; // new session must re-probe affinity
         if (this.reservedConn) {
             try {

@@ -11,7 +11,8 @@
  * - Graceful shutdown drains pending RPC calls within `shutdownDrainMs`
  */
 
-import Redis, { type RedisOptions } from "ioredis";
+import Redis from "ioredis";
+import { remoteRedisClientOptions } from "../redisOptions";
 import { logger } from "../Logger";
 import { StreamConsumer } from "./StreamConsumer";
 import { RpcCaller } from "./RpcCaller";
@@ -31,18 +32,6 @@ import type {
 } from "./types";
 
 const loggerInstance = logger.child({ scope: "RemoteManager" });
-
-function buildRedisOptions(blocking: boolean): RedisOptions {
-    return {
-        host: process.env.REDIS_HOST || "localhost",
-        port: parseInt(process.env.REDIS_PORT || "6379", 10),
-        password: process.env.REDIS_PASSWORD,
-        db: parseInt(process.env.REDIS_DB || "0", 10),
-        maxRetriesPerRequest: blocking ? null : 3,
-        enableReadyCheck: false,
-        retryStrategy: (times: number) => Math.min(times * 50, 2000),
-    };
-}
 
 export class RemoteManager {
     private publisher: Redis | null = null;
@@ -229,9 +218,10 @@ export class RemoteManager {
     async start(): Promise<void> {
         if (this.started) return;
         warnIfRpcSecretUnset(loggerInstance);
+        // redisFactory replaces env-built options entirely (explicit config wins).
         const factory =
             this.config.redisFactory ??
-            ((blocking: boolean) => new Redis(buildRedisOptions(blocking)));
+            ((blocking: boolean) => new Redis(remoteRedisClientOptions(blocking)));
 
         this.publisher = factory(false) as Redis;
         this.consumerRedis = factory(true) as Redis;

@@ -1,4 +1,5 @@
 import type { ComponentConstructor } from "../components/ComponentRegistry";
+import DataLoader from "dataloader";
 import { Entity } from "../Entity";
 import { getMetadataStorage } from "../metadata";
 import { Query } from "../../query";
@@ -10,9 +11,15 @@ import {
     registeredCustomTypes,
 } from "./customTypes";
 import { ensureEntity } from "./ensureEntity";
-import { memoResolveFk, type FkResolution } from "./fkResolve";
+import { componentMapOf, memoResolveFk, requireImplicitFk, type FkResolution } from "./fkResolve";
 import { archetypeGraphqlName, resolveRelationTarget, type RelationTarget } from "./relationTarget";
-import type { ArchetypeFunctionOptions } from "./functionReturn";
+import {
+    functionOutputAllowsNull,
+    functionOutputZod,
+    rejectBatchMiss,
+    type ArchetypeFunctionOptions,
+} from "./functionReturn";
+import "reflect-metadata";
 
 export interface FieldResolverEntry {
     typeName: string;
@@ -32,14 +39,7 @@ interface ComponentLoaders {
     relationsByComponentFk?: {
         load: (key: { entityId: string; componentTypeId: string; foreignKeyField: string }) => Promise<unknown>;
     };
-    relationsByEntityField?: {
-        load: (key: {
-            entityId: string;
-            relationField: string;
-            relatedType: string;
-            foreignKey?: string;
-        }) => Promise<unknown[]>;
-    };
+    archetypeFunctionBatches?: Map<string, DataLoader<Entity, unknown, string>>;
 }
 
 interface ResolverContext {
@@ -61,12 +61,6 @@ function firstRelation(rows: unknown): unknown {
     return Array.isArray(rows) ? (rows[0] ?? null) : (rows ?? null);
 }
 
-function componentMapOf(instance: object): Record<string, ComponentCtor> {
-    if (!("componentMap" in instance) || !instance.componentMap || typeof instance.componentMap !== "object") {
-        return {};
-    }
-    return instance.componentMap as Record<string, ComponentCtor>;
-}
 
 function loadersOf(context: unknown): ComponentLoaders | undefined {
     if (!context || typeof context !== "object" || !("loaders" in context)) return undefined;
@@ -251,11 +245,18 @@ export function buildFieldResolvers(archetype: ArchetypeForResolvers): FieldReso
         const relationType = archetype.relationTypes[field];
         const relationOptions = archetype.relationOptions[field];
         const isArray = relationType === "hasMany" || relationType === "belongsToMany";
+        const isSingleChild = relationType === "hasOne";
         const resolved = resolveRelationTarget(relatedArcheType);
-        const relatedTypeName = resolved.name;
+        const owning = relationType === "belongsTo"
+            ? archetype.componentMap
+            : componentMapOf(new resolved.ctor());
+        const explicitFk = relationOptions?.foreignKey;
+        // Absent foreignKey is inferred once so LIST partitions can prune.
+        const fk: FkResolution | null = explicitFk
+            ? memoResolveFk(() => owning, explicitFk)()
+            : requireImplicitFk(archetypeName, field, owning);
 
-        if (isArray) {
-            const resolveFk = memoResolveFk(() => componentMapOf(new resolved.ctor()), relationOptions?.foreignKey);
+        if (isArray || isSingleChild) {
             resolvers.push({
                 typeName: archetypeName,
                 fieldName: field,
@@ -263,93 +264,21 @@ export function buildFieldResolvers(archetype: ArchetypeForResolvers): FieldReso
                     const present = presentValue(parent, field);
                     if (present.hit) return present.value;
                     const entityId = entityIdOf(parent);
-                    if (!entityId) return [];
-                    if (!relationOptions?.foreignKey) {
-                        const relationLoader = loadersOf(context)?.relationsByEntityField;
-                        if (relationLoader) {
-                            return relationLoader.load({
-                                entityId,
-                                relationField: field,
-                                relatedType: relatedTypeName,
-                                foreignKey: relationOptions?.foreignKey,
-                            });
-                        }
-                        logger.warn(
-                            { scope: "fieldResolvers", archetype: archetypeName, field },
-                            `No relationsByEntityField loader for array relation ${field}`
-                        );
-                        return [];
-                    }
-                    const fk = resolveFk();
+                    if (!entityId) return isArray ? [] : null;
                     if (!fk) {
                         logger.warn(
-                            { scope: "fieldResolvers", archetype: relatedTypeName, foreignKey: relationOptions.foreignKey },
-                            `No component found with foreign key ${relationOptions.foreignKey}`
+                            { scope: "fieldResolvers", archetype: resolved.name, foreignKey: explicitFk },
+                            `No component found with foreign key ${explicitFk}`
                         );
-                        return [];
+                        return isArray ? [] : null;
                     }
-                    const batched = loadersOf(context)?.relationsByComponentFk;
-                    if (batched) {
-                        return batched.load({
-                            entityId,
-                            componentTypeId: fk.componentTypeId,
-                            foreignKeyField: fk.foreignKeyField,
-                        });
-                    }
-                    const query = new Query() as unknown as {
-                        with(ctor: ComponentCtor, options: { filters: Array<{ field: string; operator: string; value: string }> }): { exec(): Promise<unknown> };
-                    };
-                    return query.with(fk.componentCtor, {
-                        filters: [{ field: fk.foreignKeyField, operator: "=", value: entityId }],
-                    }).exec();
-                },
-            });
-            continue;
-        }
-        if (relationType === "hasOne") {
-            const resolveFk = memoResolveFk(() => componentMapOf(new resolved.ctor()), relationOptions?.foreignKey);
-            resolvers.push({
-                typeName: archetypeName,
-                fieldName: field,
-                resolver: (parent, _args, context) => {
-                    const present = presentValue(parent, field);
-                    if (present.hit) return present.value;
-                    const entityId = entityIdOf(parent);
-                    if (!entityId) return null;
-                    const fk = relationOptions?.foreignKey ? resolveFk() : null;
-                    const foreignKeyField = fk?.foreignKeyField ?? (relationOptions?.foreignKey?.includes(".")
-                        ? relationOptions.foreignKey.slice(relationOptions.foreignKey.indexOf(".") + 1)
-                        : relationOptions?.foreignKey);
-                    const batched = fk ? loadersOf(context)?.relationsByComponentFk : undefined;
-                    if (fk && batched) {
-                        return batched.load({
-                            entityId,
-                            componentTypeId: fk.componentTypeId,
-                            foreignKeyField: fk.foreignKeyField,
-                        }).then((rows) => firstRelation(rows));
-                    }
-                    const relationLoader = loadersOf(context)?.relationsByEntityField;
-                    if (relationLoader) {
-                        return relationLoader.load({
-                            entityId,
-                            relationField: field,
-                            relatedType: relatedTypeName,
-                            foreignKey: foreignKeyField,
-                        }).then((rows) => firstRelation(rows));
-                    }
-                    if (!fk) return null;
-                    const query = new Query() as unknown as {
-                        with(ctor: ComponentCtor, options: { filters: Array<{ field: string; operator: string; value: string }> }): { exec(): Promise<unknown> };
-                    };
-                    return query.with(fk.componentCtor, {
-                        filters: [{ field: fk.foreignKeyField, operator: "=", value: entityId }],
-                    }).exec().then((rows) => firstRelation(rows));
+                    const rows = loadRelatedByFk(context, entityId, fk);
+                    return isArray ? rows : Promise.resolve(rows).then((found) => firstRelation(found));
                 },
             });
             continue;
         }
 
-        const resolveFk = memoResolveFk(() => archetype.componentMap, relationOptions?.foreignKey);
         resolvers.push({
             typeName: archetypeName,
             fieldName: field,
@@ -357,30 +286,21 @@ export function buildFieldResolvers(archetype: ArchetypeForResolvers): FieldReso
                 const present = presentValue(parent, field);
                 if (present.hit) return present.value;
                 const entityId = entityIdOf(parent);
-                if (!relationOptions?.foreignKey) {
-                    if (!entityId) return null;
-                    const relationLoader = loadersOf(context)?.relationsByEntityField;
-                    if (!relationLoader) {
-                        logger.warn(
-                            { scope: "fieldResolvers", archetype: archetypeName, field },
-                            `No relationsByEntityField loader for single relation ${field}`
-                        );
-                        return null;
-                    }
-                    return relationLoader.load({
-                        entityId,
-                        relationField: field,
-                        relatedType: relatedTypeName,
-                        foreignKey: relationOptions?.foreignKey,
-                    }).then((results) => firstRelation(results));
-                }
                 if (!entityId) return null;
+                if (!fk) {
+                    logger.warn(
+                        { scope: "fieldResolvers", archetype: archetypeName, field, foreignKey: explicitFk },
+                        `No component found with foreign key ${explicitFk}`
+                    );
+                    return null;
+                }
+                // belongsTo stores the FK on the parent; the component loader pins type_id.
                 return readSingleForeignId(
                     parent,
                     entityId,
                     context,
-                    resolveFk,
-                    relationType === "belongsTo" && relationOptions.foreignKey === "id"
+                    () => fk,
+                    relationType === "belongsTo" && explicitFk === "id"
                 ).then(async (foreignId) => {
                     if (!foreignId) return null;
                     const byId = loadersOf(context)?.entityById;
@@ -392,6 +312,10 @@ export function buildFieldResolvers(archetype: ArchetypeForResolvers): FieldReso
     }
 
     for (const { propertyKey, options } of archetype.functions) {
+        if (options?.batch === true) {
+            resolvers.push(batchFunctionResolver(archetype, archetypeName, propertyKey, options));
+            continue;
+        }
         resolvers.push({
             typeName: archetypeName,
             fieldName: propertyKey,
@@ -460,6 +384,32 @@ function convertArg(type: unknown, argValue: unknown): unknown {
     }
 }
 
+const archetypeReceivers = new WeakMap<object, object>();
+
+function resolveArchetypeMethod(
+    archetype: ArchetypeForResolvers,
+    archetypeName: string,
+    propertyKey: string,
+): { receiver: object; method: (...args: unknown[]) => unknown } {
+    const ctor = archetype.constructor as { prototype?: object; new (): object };
+    const proto = ctor.prototype;
+    const fromProto = proto && typeof proto === "object"
+        ? (proto as Record<string, unknown>)[propertyKey]
+        : undefined;
+    const fromObject = (archetype as unknown as Record<string, unknown>)[propertyKey];
+    const method = typeof fromProto === "function" ? fromProto : fromObject;
+    if (typeof method !== "function") {
+        throw new Error(`${archetypeName}.${propertyKey} is not a function`);
+    }
+    let receiver = archetypeReceivers.get(archetype);
+    if (!receiver) {
+        // generateFieldResolvers passes a plain view; methods expect the class instance.
+        receiver = typeof ctor === "function" ? new ctor() : archetype;
+        archetypeReceivers.set(archetype, receiver);
+    }
+    return { receiver, method: method as (...args: unknown[]) => unknown };
+}
+
 async function invokeArchetypeFunction(
     archetype: ArchetypeForResolvers,
     archetypeName: string,
@@ -469,41 +419,173 @@ async function invokeArchetypeFunction(
     args: unknown,
     context: unknown
 ): Promise<unknown> {
-    let entity: Entity;
-    if (parent instanceof Entity) {
-        entity = parent;
-    } else if (entityIdOf(parent)) {
-        const loaded = loadersOf(context)?.entityById
-            ? await loadersOf(context)!.entityById!.load(entityIdOf(parent)!)
-            : null;
-        entity = loaded ?? new Entity(entityIdOf(parent)!);
-        if (!loaded) entity.setPersisted(true);
-    } else {
-        throw new Error(`Invalid parent for ${archetypeName}.${propertyKey}: parent must have an 'id' property`);
-    }
-
-    const methods = archetype as unknown as Record<string, unknown>;
-    const method = methods[propertyKey];
-    if (typeof method !== "function") {
-        throw new Error(`${archetypeName}.${propertyKey} is not a function`);
-    }
-
+    const entity = await parentEntity(archetypeName, propertyKey, parent, context);
+    const { receiver, method } = resolveArchetypeMethod(archetype, archetypeName, propertyKey);
     const argDefs = options?.args ?? [];
     if (argDefs.length === 0 || !args || typeof args !== "object") {
-        return method.call(archetype, entity);
+        return method.call(receiver, entity);
     }
-    const argRecord = args as Record<string, unknown>;
-    const functionArgs: unknown[] = [];
+    const argRecord = readArgRecord(archetypeName, propertyKey, options, args);
+    const functionArgs = argDefs.map((argDef) => argRecord?.[argDef.name]);
+    return method.call(receiver, entity, ...functionArgs);
+}
+
+function loadRelatedByFk(context: unknown, entityId: string, fk: FkResolution): Promise<unknown> {
+    const batched = loadersOf(context)?.relationsByComponentFk;
+    if (batched) {
+        return batched.load({
+            entityId,
+            componentTypeId: fk.componentTypeId,
+            foreignKeyField: fk.foreignKeyField,
+        });
+    }
+    // Query's filter tuple is compile-time only; the runtime builder accepts this shape.
+    const query = new Query() as unknown as {
+        with(ctor: ComponentCtor, options: { filters: Array<{ field: string; operator: string; value: string }> }): { exec(): Promise<unknown> };
+    };
+    return query.with(fk.componentCtor, {
+        filters: [{ field: fk.foreignKeyField, operator: "=", value: entityId }],
+    }).exec();
+}
+
+function stableSerialize(value: unknown): string {
+    if (value === undefined) return "undefined";
+    if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "undefined";
+    if (value instanceof Date) return JSON.stringify(value.toISOString());
+    if (Array.isArray(value)) return `[${value.map((item) => stableSerialize(item)).join(",")}]`;
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record).sort();
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${stableSerialize(record[key])}`).join(",")}}`;
+}
+
+function readArgRecord(
+    archetypeName: string,
+    propertyKey: string,
+    options: ArchetypeFunctionOptions | undefined,
+    args: unknown,
+): Record<string, unknown> | undefined {
+    const argDefs = options?.args ?? [];
+    if (argDefs.length === 0) return undefined;
+    const argRecord = args && typeof args === "object" ? args as Record<string, unknown> : {};
+    const out: Record<string, unknown> = {};
     for (const argDef of argDefs) {
         const argValue = argRecord[argDef.name];
         if (argValue === undefined || argValue === null) {
             if (!argDef.nullable) {
                 throw new Error(`Required argument '${argDef.name}' is missing for ${archetypeName}.${propertyKey}`);
             }
-            functionArgs.push(null);
+            out[argDef.name] = null;
             continue;
         }
-        functionArgs.push(convertArg(argDef.type, argValue));
+        out[argDef.name] = convertArg(argDef.type, argValue);
     }
-    return method.call(archetype, entity, ...functionArgs);
+    return out;
+}
+
+async function parentEntity(
+    archetypeName: string,
+    propertyKey: string,
+    parent: unknown,
+    context: unknown,
+): Promise<Entity> {
+    if (parent instanceof Entity) return parent;
+    const id = entityIdOf(parent);
+    if (!id) {
+        throw new Error(`Invalid parent for ${archetypeName}.${propertyKey}: parent must have an 'id' property`);
+    }
+    const loaded = loadersOf(context)?.entityById
+        ? await loadersOf(context)!.entityById!.load(id)
+        : null;
+    if (loaded) return loaded;
+    const entity = new Entity(id);
+    entity.setPersisted(true);
+    return entity;
+}
+
+interface FunctionBatchLoader {
+    load(entity: Entity): Promise<unknown>;
+}
+
+function getFunctionBatchLoader(
+    context: unknown,
+    cacheKey: string,
+    run: (entities: readonly Entity[]) => Promise<unknown[]>,
+): FunctionBatchLoader {
+    const map = loadersOf(context)?.archetypeFunctionBatches;
+    if (!map) {
+        return {
+            load: async (entity) => {
+                const values = await run([entity]);
+                const value = values[0];
+                if (value instanceof Error) throw value;
+                return value;
+            },
+        };
+    }
+    const existing = map.get(cacheKey);
+    if (existing) return existing;
+    const loader = new DataLoader<Entity, unknown, string>(run, {
+        cacheKeyFn: (entity) => entity.id,
+    });
+    map.set(cacheKey, loader);
+    return loader;
+}
+
+async function runFunctionBatch(
+    archetype: ArchetypeForResolvers,
+    archetypeName: string,
+    propertyKey: string,
+    entities: readonly Entity[],
+    context: unknown,
+    argRecord: Record<string, unknown> | undefined,
+    allowsNull: boolean,
+): Promise<unknown[]> {
+    const { receiver, method } = resolveArchetypeMethod(archetype, archetypeName, propertyKey);
+    const result: unknown = await method.call(receiver, entities, context, argRecord);
+    if (!(result instanceof Map)) {
+        throw new Error(
+            `@ArcheTypeFunction ${archetypeName}.${propertyKey} batch: true must return a Map keyed by entity id`
+        );
+    }
+    return entities.map((entity) => {
+        if (!result.has(entity.id)) {
+            return rejectBatchMiss(allowsNull, archetypeName, propertyKey, entity.id);
+        }
+        const value = result.get(entity.id);
+        if (value === undefined) {
+            return rejectBatchMiss(allowsNull, archetypeName, propertyKey, entity.id);
+        }
+        return value;
+    });
+}
+
+function batchFunctionResolver(
+    archetype: ArchetypeForResolvers,
+    archetypeName: string,
+    propertyKey: string,
+    options: ArchetypeFunctionOptions,
+): FieldResolverEntry {
+    const designReturn: unknown = Reflect.getMetadata(
+        "design:returntype",
+        archetype.constructor.prototype,
+        propertyKey,
+    );
+    const allowsNull = functionOutputAllowsNull(
+        functionOutputZod(archetypeName, propertyKey, options, designReturn),
+    );
+    return {
+        typeName: archetypeName,
+        fieldName: propertyKey,
+        resolver: (parent, args, context) => {
+            const present = presentValue(parent, propertyKey);
+            if (present.hit) return present.value;
+            const argRecord = readArgRecord(archetypeName, propertyKey, options, args);
+            const cacheKey = `${archetypeName}\0${propertyKey}\0${argRecord === undefined ? "" : stableSerialize(argRecord)}`;
+            const loader = getFunctionBatchLoader(context, cacheKey, (entities) =>
+                runFunctionBatch(archetype, archetypeName, propertyKey, entities, context, argRecord, allowsNull),
+            );
+            if (parent instanceof Entity) return loader.load(parent);
+            return parentEntity(archetypeName, propertyKey, parent, context).then((entity) => loader.load(entity));
+        },
+    };
 }

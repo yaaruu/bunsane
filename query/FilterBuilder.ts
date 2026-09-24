@@ -281,7 +281,14 @@ export function composeFilters(builders: FilterBuilder[]): FilterBuilder {
  * const hintedBuilder = withIndexHint(spatialBuilder, 'idx_spatial_location');
  * // Generates: /&#42; INDEX: idx_spatial_location &#42;/ (spatial_condition)
  */
+const INDEX_HINT_RE = /^[A-Za-z0-9_]+$/;
+
 export function withIndexHint(builder: FilterBuilder, indexHint: string): FilterBuilder {
+    if (!INDEX_HINT_RE.test(indexHint)) {
+        throw new Error(
+            `Invalid index hint ${JSON.stringify(indexHint)}: must match /^[A-Za-z0-9_]+$/ before it can be embedded in a SQL comment`
+        );
+    }
     return (filter: QueryFilter, alias: string, context: QueryContext): FilterResult => {
         const result = builder(filter, alias, context);
         return {

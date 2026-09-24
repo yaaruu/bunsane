@@ -28,17 +28,7 @@ describe('request loader error and pair semantics', () => {
         })).rejects.toBeDefined();
     });
 
-    test('relationsByEntityField rejects when the query is aborted', async () => {
-        const controller = new AbortController();
-        controller.abort(new Error('relation query aborted'));
-        const loaders = createRequestLoaders(db, undefined, controller.signal);
-        await expect(loaders.relationsByEntityField.load({
-            entityId: '00000000-0000-0000-0000-000000000000',
-            relationField: 'orders',
-            relatedType: 'TestOrder',
-            foreignKey: 'orderNumber',
-        })).rejects.toBeDefined();
-    });
+
 
     test('componentsByEntityType returns only the requested pairs', async () => {
         const a = ctx.tracker.create();

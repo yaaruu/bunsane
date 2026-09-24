@@ -9,6 +9,7 @@ import { asEnumType, asUnionType, asObjectType } from "@gqloom/zod";
 import type { FilterSchema } from "../query";
 import { compNameToFieldName } from "./archetype/helpers";
 import { archetypeFunctionsSymbol } from "./archetype/decorators";
+import type { ArchetypeFunctionOptions } from "./archetype/functionReturn";
 import { buildFieldResolvers } from "./archetype/fieldResolvers";
 import { buildZodObjectSchema } from "./archetype/zodSchemaBuilder";
 import { populateRelations as loadRelations } from "./archetype/relationLoader";
@@ -41,7 +42,6 @@ export interface RelationOptions {
     cascade?: boolean;
 }
 
-export { asEnumType, asUnionType, asObjectType };
 export {
     ArcheTypeFunction,
     ArcheType,
@@ -53,6 +53,7 @@ export {
     BelongsToMany,
     ArcheTypeRelation,
 } from "./archetype/decorators";
+export type { BatchArchetypeMethod } from "./archetype/decorators";
 export { compNameToFieldName, shouldUnwrapComponent } from "./archetype/helpers";
 export {
     registerCustomZodType,
@@ -102,7 +103,7 @@ export class BaseArcheType {
     protected relationTypes: Record<string, "hasMany" | "belongsTo" | "hasOne" | "belongsToMany"> = {};
     public unionMap: Record<string, (new (...args: never[]) => BaseComponent)[]> = {};
     protected unionOptions: Record<string, ArcheTypeFieldOptions> = {};
-    public functions: Array<{ propertyKey: string; options?: { returnType?: string; args?: Array<{ name: string; type: unknown; nullable?: boolean }> } }> = [];
+    public functions: Array<{ propertyKey: string; options?: ArchetypeFunctionOptions }> = [];
 
     public resolver?: {
         fields: Record<string, ArcheTypeResolver>;
@@ -288,6 +289,8 @@ export class BaseArcheType {
             unionMap: this.unionMap,
             unionOptions: this.unionOptions,
             relationMap: this.relationMap,
+            relationTypes: this.relationTypes,
+            relationOptions: this.relationOptions,
             functions: this.functions,
         }, options);
     }

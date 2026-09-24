@@ -5,7 +5,7 @@ import db, { QUERY_TIMEOUT_MS } from "../database";
 import { timed } from "../core/Decorators";
 import { inList } from "../database/sqlHelpers";
 import { QueryContext, QueryDAG, ComponentInclusionNode } from "./index";
-import { buildKeysetCursorWhere } from "./ComponentInclusionNode";
+import { assertSortedCursorWidth, buildKeysetCursorWhere, cursorSortPresentation } from "./ComponentInclusionNode";
 import { buildComponentFilterGroup } from "./FilterBuilder";
 import { hydrateComponentRow } from "../core/entity/hydrateComponentRow";
 import { OrQuery } from "./OrQuery";
@@ -597,20 +597,22 @@ class Query<
      * Use composite keyset pagination for a SORTED query.
      *
      * Pass the opaque token returned by `Query.encodeSortedCursor(sortValue, entityId)`
-     * where `sortValue` is the sort column's raw value from the last row of the
-     * previous page, and `entityId` is that row's entity id. The query must have
-     * exactly one active sort key (sortByCreatedAt / sortByUpdatedAt / sortBy).
-     * Multi-key sort cursors are not supported — the method will throw at exec time.
+     * (one sort key) or `Query.encodeSortedCursor([k1, k2, ...], entityId)` (every
+     * sort key, in `sortBy` / `sortByCreatedAt` / `sortByUpdatedAt` order). Single-key
+     * tokens already issued stay valid. `sortBy()` cannot be combined with
+     * `sortByCreatedAt()` / `sortByUpdatedAt()`.
      *
      * @example
      * // Page 1
-     * const page1 = await new Query().with(MyComp).sortBy(MyComp, 'score', 'ASC').take(10).exec();
+     * const page1 = await new Query().with(MyComp).sortBy(MyComp, 'score', 'ASC').sortBy(MyComp, 'name', 'DESC').take(10).exec();
      * const last = page1[page1.length - 1]!;
-     * // Build cursor from the last row's sort value.
-     * const token = Query.encodeSortedCursor(last.componentData['MyComp'].score, last.id);
+     * const token = Query.encodeSortedCursor(
+     *   [last.componentData['MyComp'].score, last.componentData['MyComp'].name],
+     *   last.id,
+     * );
      *
      * // Page 2
-     * const page2 = await new Query().with(MyComp).sortBy(MyComp, 'score', 'ASC').take(10).sortedCursor(token).exec();
+     * const page2 = await new Query().with(MyComp).sortBy(MyComp, 'score', 'ASC').sortBy(MyComp, 'name', 'DESC').take(10).sortedCursor(token).exec();
      */
     public sortedCursor(token: string, direction: 'after' | 'before' = 'after'): this {
         this.context.compositeCursor = Query.decodeSortedCursor(token);
@@ -622,30 +624,58 @@ class Query<
     }
 
     /**
-     * Encode a composite sort cursor from the last row's sort value and entity id.
-     * The sort value is stored as a string; pass the raw JS value (string, number,
-     * Date, or null). Dates are converted to ISO strings for timestamptz comparison.
+     * Encode a composite sort cursor from the last row's sort value(s) and entity id.
+     * A single value keeps the legacy `{v, id}` token. An array encodes every key
+     * (`{v, vs, id}`); a one-element array is stored in the legacy shape so old
+     * decoders still accept it. Dates become ISO strings. `null` is a NULL sort key.
      */
-    public static encodeSortedCursor(sortValue: string | number | Date | null, entityId: string): string {
-        let v: string | null;
-        if (sortValue === null || sortValue === undefined) {
-            v = null;
-        } else if (sortValue instanceof Date) {
-            v = sortValue.toISOString();
-        } else {
-            v = String(sortValue);
+    public static encodeSortedCursor(
+        sortValue: string | number | Date | null | ReadonlyArray<string | number | Date | null>,
+        entityId: string,
+    ): string {
+        const encodeOne = (value: string | number | Date | null): string | null => {
+            if (value === null) return null;
+            if (value instanceof Date) return value.toISOString();
+            return String(value);
+        };
+        // Array.isArray does not narrow ReadonlyArray out of this union.
+        const values: ReadonlyArray<string | number | Date | null> = Array.isArray(sortValue)
+            ? sortValue
+            : [sortValue as string | number | Date | null];
+        if (values.length === 0) {
+            throw new Error('encodeSortedCursor() requires at least one sort value.');
         }
-        return Buffer.from(JSON.stringify({ v, id: entityId })).toString('base64');
+        const vs = values.map((value) => encodeOne(value));
+        if (vs.length === 1) {
+            return Buffer.from(JSON.stringify({ v: vs[0], id: entityId })).toString('base64');
+        }
+        return Buffer.from(JSON.stringify({ v: vs[0], vs, id: entityId })).toString('base64');
     }
 
-    /** Decode a composite sort cursor token. Returns `{v, id}`. */
-    public static decodeSortedCursor(token: string): { v: string | null; id: string } {
+    /**
+     * Decode a composite sort cursor token.
+     * Legacy `{v, id}` tokens return `vs: [v]`. Multi-key tokens return every key in `vs`.
+     */
+    public static decodeSortedCursor(token: string): { v: string | null; vs: (string | null)[]; id: string } {
         try {
             const parsed = JSON.parse(Buffer.from(token, 'base64').toString('utf8'));
             if (typeof parsed !== 'object' || parsed === null || typeof parsed.id !== 'string') {
                 throw new Error('malformed cursor');
             }
-            return { v: parsed.v ?? null, id: parsed.id };
+            let vs: (string | null)[];
+            if (Array.isArray(parsed.vs)) {
+                if (parsed.vs.length === 0) throw new Error('malformed cursor');
+                vs = parsed.vs.map((item: unknown) => {
+                    if (item === null || item === undefined) return null;
+                    if (typeof item !== 'string') throw new Error('malformed cursor');
+                    return item;
+                });
+            } else if (parsed.v === null || parsed.v === undefined || typeof parsed.v === 'string') {
+                vs = [parsed.v ?? null];
+            } else {
+                throw new Error('malformed cursor');
+            }
+            return { v: vs[0] ?? null, vs, id: parsed.id };
         } catch {
             throw new Error(`Invalid sorted cursor token: "${token}"`);
         }
@@ -1069,12 +1099,6 @@ class Query<
     private buildEntityDrivenSortSql(): { sql: string; params: unknown[] } {
         const sorts = this.context.entitySortOrders;
         const cursor = this.context.compositeCursor;
-        if (cursor && sorts.length > 1) {
-            throw new Error(
-                "sortedCursor() does not support multi-key entity sorts. " +
-                "Only a single sortByCreatedAt() or sortByUpdatedAt() is supported with composite keyset pagination."
-            );
-        }
 
         const clauses: string[] = [];
         const hasMembership =
@@ -1119,7 +1143,7 @@ class Query<
         const isBefore = cursor !== null && this.context.cursorDirection === "before";
         if (isBefore) this.reverseSortedPage = true;
 
-        if (cursor) {
+        if (cursor && sorts.length === 1) {
             const sort = sorts[0]!;
             const rawCol = sort.field === "updated_at" ? "e.updated_at" : "e.created_at";
             const truncCol = `date_trunc('milliseconds', ${rawCol})`;
@@ -1143,6 +1167,27 @@ class Query<
                 });
                 clauses.push(fragment.replace(/^\s*(WHERE|AND)\s+/i, ""));
             }
+        } else if (cursor) {
+            const values = assertSortedCursorWidth(cursor, sorts.length, "entity sort key(s)");
+            const fragment = buildKeysetCursorWhere({
+                keys: sorts.map((sort, i) => {
+                    const rawCol = sort.field === "updated_at" ? "e.updated_at" : "e.created_at";
+                    const presented = cursorSortPresentation(sort.direction, !!sort.nullsFirst, isBefore);
+                    return {
+                        sortExpr: `date_trunc('milliseconds', ${rawCol})`,
+                        direction: presented.direction,
+                        nullsFirst: presented.nullsFirst,
+                        valueCast: "::timestamptz" as const,
+                        value: values[i]!,
+                    };
+                }),
+                entityIdCol: "e.id",
+                connective: "AND",
+                cursorId: cursor.id,
+                idDirection: isBefore ? "DESC" : "ASC",
+                addParam: (value) => this.context.addParam(value),
+            });
+            clauses.push(fragment.replace(/^\s*(WHERE|AND)\s+/i, ""));
         }
 
         const orderParts = sorts.map((s) => {
@@ -1203,18 +1248,12 @@ class Query<
             this.context.sortOrders = savedSorts;
         }
 
-        if (savedComposite && componentSorts.length > 1) {
-            throw new Error(
-                "sortedCursor() does not support multi-key sorts. " +
-                "Only a single sortBy() key is supported with composite keyset pagination on OR queries."
-            );
-        }
-
         const joins: string[] = [];
         const orderClauses: string[] = [];
         const isBefore = savedComposite !== null && this.context.cursorDirection === "before";
         if (isBefore) this.reverseSortedPage = true;
 
+        const sortExprs: Array<{ expr: string; valueCast: "::text" | "::numeric" }> = [];
         componentSorts.forEach((s, i) => {
             const sortTypeId = ComponentRegistry.getComponentId(s.component);
             if (!sortTypeId) {
@@ -1235,18 +1274,13 @@ class Query<
             const expr = numeric
                 ? `(${alias}.data->>'${safeProp}')::numeric`
                 : `${alias}.data->>'${safeProp}'`;
-            let dir: SortDirection = s.direction;
-            let nullsFirst = !!s.nullsFirst;
-            if (isBefore && i === 0) {
-                dir = dir === "DESC" ? "ASC" : "DESC";
-                nullsFirst = !nullsFirst;
-            }
-            const nulls = nullsFirst ? "NULLS FIRST" : "NULLS LAST";
-            orderClauses.push(`${expr} ${dir} ${nulls}`);
+            sortExprs.push({ expr, valueCast: numeric ? "::numeric" : "::text" });
+            const presented = cursorSortPresentation(s.direction, !!s.nullsFirst, isBefore);
+            orderClauses.push(`${expr} ${presented.direction} ${presented.nullsClause}`);
         });
 
         let whereClause = "";
-        if (savedComposite) {
+        if (savedComposite && componentSorts.length === 1) {
             const s = componentSorts[0]!;
             if (s.nullsFirst && !isBefore) {
                 throw new Error(
@@ -1254,25 +1288,36 @@ class Query<
                     "Use the default (NULLS LAST) or OFFSET pagination."
                 );
             }
-            const safeProp = assertIdentifier(s.property, "sortOrder.property");
-            const numeric = isNumericProperty(s.component, s.property);
-            const expr = numeric
-                ? `(s0.data->>'${safeProp}')::numeric`
-                : `s0.data->>'${safeProp}'`;
-            const direction: SortDirection = isBefore
-                ? (s.direction === "DESC" ? "ASC" : "DESC")
-                : s.direction;
-            const nullsFirst = isBefore ? !s.nullsFirst : !!s.nullsFirst;
+            const presented = cursorSortPresentation(s.direction, !!s.nullsFirst, isBefore);
             whereClause = buildKeysetCursorWhere({
-                sortExpr: expr,
+                sortExpr: sortExprs[0]!.expr,
                 entityIdCol: "base.id",
                 connective: "WHERE",
-                direction,
-                nullsFirst,
-                valueCast: numeric ? "::numeric" : "::text",
+                direction: presented.direction,
+                nullsFirst: presented.nullsFirst,
+                valueCast: sortExprs[0]!.valueCast,
                 cursor: savedComposite,
                 addParam: (value) => this.context.addParam(value),
+                idDirection: presented.idDirection,
+            });
+        } else if (savedComposite) {
+            const values = assertSortedCursorWidth(savedComposite, componentSorts.length, "sortBy() key(s)");
+            whereClause = buildKeysetCursorWhere({
+                keys: componentSorts.map((s, i) => {
+                    const presented = cursorSortPresentation(s.direction, !!s.nullsFirst, isBefore);
+                    return {
+                        sortExpr: sortExprs[i]!.expr,
+                        direction: presented.direction,
+                        nullsFirst: presented.nullsFirst,
+                        valueCast: sortExprs[i]!.valueCast,
+                        value: values[i]!,
+                    };
+                }),
+                entityIdCol: "base.id",
+                connective: "WHERE",
+                cursorId: savedComposite.id,
                 idDirection: isBefore ? "DESC" : "ASC",
+                addParam: (value) => this.context.addParam(value),
             });
         }
 
@@ -1838,6 +1883,22 @@ AND c.deleted_at IS NULL`;
         return entityIds.map(id => entityMap.get(id)!);
     }
 
+    /** Reject a keyset token whose value count does not match the sort keys, before QSP can route on `v` alone. */
+    private guardSortedCursor(): void {
+        const cursor = this.context.compositeCursor;
+        if (!cursor) return;
+        if (this.context.sortOrders.length > 0 && this.context.entitySortOrders.length > 0) return;
+        const expected = this.context.sortOrders.length + this.context.entitySortOrders.length;
+        if (expected === 0) {
+            throw new Error('sortedCursor() requires sortBy(), sortByCreatedAt(), or sortByUpdatedAt().');
+        }
+        assertSortedCursorWidth(
+            cursor,
+            expected,
+            this.context.entitySortOrders.length > 0 ? 'entity sort key(s)' : 'sortBy() key(s)',
+        );
+    }
+
     private async doExec(): Promise<Entity[]> {
         // Reset context for fresh execution
         this.context.reset();
@@ -1862,6 +1923,7 @@ AND c.deleted_at IS NULL`;
             );
         }
 
+        this.guardSortedCursor();
         // QSP: resolve coverage once (before pagination is neutralized below). Route only when
         // READY; shadow-compare in SHADOW. On any route error fall through to the legacy body unchanged.
         // QSP does its own LIMIT n+1 inside doExecRouted — do not bump limit here first.
@@ -1903,13 +1965,13 @@ AND c.deleted_at IS NULL`;
                 : this.buildIdSelect();
         // Non-OR component sortBy('before') fetches reversed inside
         // ComponentInclusionNode. Reuse the same post-trim row flip as
-        // entity-sort / OR-sort. Multi-key keyset still throws in the node.
+        // entity-sort / OR-sort.
         if (
             this.context.entitySortOrders.length === 0 &&
             !(this.orQuery && this.context.sortOrders.length > 0) &&
             this.context.compositeCursor !== null &&
             this.context.cursorDirection === 'before' &&
-            this.context.sortOrders.length === 1
+            this.context.sortOrders.length >= 1
         ) {
             this.reverseSortedPage = true;
         }
@@ -2166,7 +2228,13 @@ AND c.deleted_at IS NULL`;
         // Reset context for fresh execution
         this.context.reset();
 
-        // Same API guards as doExec (RP-06b).
+        // Same API guards as doExec (RP-06b + keyset width).
+        if (this.context.entitySortOrders.length > 0 && this.context.sortOrders.length > 0) {
+            throw new Error(
+                'sortByCreatedAt()/sortByUpdatedAt() cannot be combined with sortBy() in the same query. ' +
+                'Use one or the other.'
+            );
+        }
         if (this.context.cursorId !== null && this.context.sortOrders.length > 0) {
             throw new Error(
                 'cursor(entityId) cannot be combined with sortBy(). ' +
@@ -2174,6 +2242,7 @@ AND c.deleted_at IS NULL`;
                 'or remove sortBy() to page by entity_id.'
             );
         }
+        this.guardSortedCursor();
 
         const result = this.context.entitySortOrders.length > 0
             ? this.buildEntityDrivenSortSql()

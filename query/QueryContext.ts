@@ -28,6 +28,23 @@ export interface EntitySortOrder {
     nullsFirst?: boolean;
 }
 
+/**
+ * Opaque keyset payload. Legacy single-key tokens only have `v` + `id`.
+ * Multi-key tokens also carry `vs` (every sort value, in sortBy order).
+ * `v` is always the first key so older readers keep working.
+ */
+export interface SortedCursor {
+    v: string | null;
+    vs?: (string | null)[];
+    id: string;
+}
+
+/** Sort values carried by a cursor. Legacy tokens synthesize `[v]`. */
+export function sortedCursorValues(cursor: SortedCursor): (string | null)[] {
+    if (cursor.vs && cursor.vs.length > 0) return cursor.vs;
+    return [cursor.v];
+}
+
 export class QueryContext {
     public params: any[] = [];
     public paramIndex: number = 1;
@@ -56,7 +73,7 @@ export class QueryContext {
      * predicate can be `(sort_expr, entity_id) > ($v, $id)` (or `<` for DESC).
      * Only set via Query.sortedCursor(); plain .cursor() never sets this.
      */
-    public compositeCursor: { v: string | null; id: string } | null = null;
+    public compositeCursor: SortedCursor | null = null;
     public hasCTE: boolean = false;
     public cteName: string = "";
     public eagerComponents: Set<string> = new Set();

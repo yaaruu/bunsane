@@ -10,6 +10,7 @@ import BaseArcheType from "../../core/ArcheType";
 import { getMetadataStorage } from "../../core/metadata";
 import { getArchetypeSchema } from "../../core/ArcheType";
 import { isSchemaInput, collectNestedTypeDefs, type SchemaType } from "../schema";
+import { assertIdentifier } from "../../query/SqlIdentifier";
 
 const logger = MainLogger.child({ scope: 'SchemaGeneratorVisitor' });
 
@@ -228,7 +229,7 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
 
             if (isSchemaInput(input)) {
                 // Schema DSL path
-                const result = this.generateInputFromSchema(input as Record<string, SchemaType>, inputTypeName);
+                const result = this.generateInputFromSchema(input as Record<string, SchemaType>, inputTypeName, name);
                 if (!this.definedTypes.has(inputTypeName)) {
                     this.typeDefs += result.typeDefs;
                     this.definedTypes.add(inputTypeName);
@@ -377,13 +378,23 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
     private generateInputFromSchema(
         input: Record<string, SchemaType>,
         inputName: string,
+        operationName: string,
     ): { typeDefs: string } {
-        const collected = collectNestedTypeDefs(input);
-
+        const safeInputName = assertIdentifier(
+            inputName,
+            `GraphQL operation ${JSON.stringify(operationName)} input type`,
+        );
         const fields = Object.entries(input)
-            .map(([key, schema]) => `  ${key}: ${schema.toGraphQL()}`)
+            .map(([key, schema]) => {
+                const fieldName = assertIdentifier(
+                    key,
+                    `GraphQL operation ${JSON.stringify(operationName)} input field`,
+                );
+                return `  ${fieldName}: ${schema.toGraphQL()}`;
+            })
             .join("\n");
-        collected.set(inputName, `input ${inputName} {\n${fields}\n}`);
+        const collected = collectNestedTypeDefs(input);
+        collected.set(safeInputName, `input ${safeInputName} {\n${fields}\n}`);
 
         return {
             typeDefs: Array.from(collected.values()).join("\n\n") + "\n",

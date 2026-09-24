@@ -22,7 +22,6 @@ export class UploadManager {
     private constructor() {
         this.fileValidator = new FileValidator();
         this.globalConfig = this.getDefaultConfiguration();
-        this.registerDefaultProviders();
     }
 
     public static getInstance(): UploadManager {
@@ -50,6 +49,7 @@ export class UploadManager {
         file: File,
         config?: Partial<UploadConfiguration>
     ): Promise<ValidationResult> {
+        this.ensureDefaultProviders();
         const mergedConfig = { ...this.globalConfig, ...config };
         return this.fileValidator.validate(file, mergedConfig);
     }
@@ -58,6 +58,7 @@ export class UploadManager {
      * Set the default storage provider
      */
     public setDefaultStorageProvider(name: string): void {
+        this.ensureDefaultProviders();
         if (!this.storageProviders.has(name)) {
             throw new Error(`Storage provider '${name}' not found`);
         }
@@ -69,6 +70,7 @@ export class UploadManager {
      * Get storage provider by name
      */
     public getStorageProvider(name?: string): StorageProvider {
+        this.ensureDefaultProviders();
         const providerName = name || this.defaultStorageProvider;
         const provider = this.storageProviders.get(providerName);
         if (!provider) {
@@ -85,10 +87,9 @@ export class UploadManager {
         config?: Partial<UploadConfiguration>,
         storageProvider?: string
     ): Promise<UploadResult> {
+        this.ensureDefaultProviders();
         const uploadId = uuidv7();
         const mergedConfig = { ...this.globalConfig, ...config };
-        
-        logger.info(`Processing upload ${uploadId} for file: ${file.name}`);
 
         try {
             // Validate file
@@ -200,12 +201,18 @@ export class UploadManager {
         return { ...this.globalConfig };
     }
 
-    private registerDefaultProviders(): void {
-        // Synchronous registration. Must NOT be async/awaited: any await here
-        // would defer registration to a later microtask, after which a caller's
-        // post-construction `registerStorageProvider("local", custom)` would be
-        // silently clobbered by the default. See BUNSANE-007.
-        // LocalStorageProvider creates its base directory on first store, not here.
+    /**
+     * Register the built-in local provider on first real use (validate, store,
+     * getProvider). Importing the package, and UploadManager.getInstance(),
+     * must not log or construct a backend.
+     *
+     * Synchronous, and a no-op when "local" is already registered, so a
+     * caller who did registerStorageProvider("local", custom) immediately
+     * after getInstance() is not clobbered. See BUNSANE-007.
+     * LocalStorageProvider creates its base directory on first store, not here.
+     */
+    private ensureDefaultProviders(): void {
+        if (this.storageProviders.has("local")) return;
         this.registerStorageProvider("local", new LocalStorageProvider());
     }
 

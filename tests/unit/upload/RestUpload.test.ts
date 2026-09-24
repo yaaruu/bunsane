@@ -22,10 +22,15 @@ function createMultipartRequest(
             formData.append(k, v);
         }
     }
-    return new Request("http://localhost/upload", {
+    const req = new Request("http://localhost/upload", {
         method: "POST",
         body: formData,
     });
+    // Bun does not set Content-Length on an in-memory FormData body. The
+    // ingress policy rejects multipart without that header before formData().
+    const headers = new Headers(req.headers);
+    headers.set("content-length", "1024");
+    return new Request(req, { headers });
 }
 
 describe("parseFormData", () => {
@@ -70,10 +75,13 @@ describe("parseFormData", () => {
     it("returns empty files array when no files in form", async () => {
         const formData = new FormData();
         formData.append("name", "test");
-        const req = new Request("http://localhost/upload", {
+        const bare = new Request("http://localhost/upload", {
             method: "POST",
             body: formData,
         });
+        const headers = new Headers(bare.headers);
+        headers.set("content-length", "64");
+        const req = new Request(bare, { headers });
 
         const { files, fields } = await parseFormData(req);
         expect(files).toHaveLength(0);

@@ -1,8 +1,10 @@
 import type { BaseComponent } from "../components";
 import type { ArcheTypeFieldOptions } from "../metadata/definitions/ArcheType";
 import type { BaseArcheType, ArcheTypeOptions, RelationOptions } from "../ArcheType";
+import type { Entity } from "../Entity";
 import { getMetadataStorage } from "../metadata";
 import { invalidateArchetypeWeaveCache } from "./weaver";
+import type { ArchetypeFunctionOptions } from "./functionReturn";
 import type { RelationTarget } from "./relationTarget";
 import "reflect-metadata";
 
@@ -11,19 +13,44 @@ export const archetypeFieldsSymbol = Symbol.for("bunsane:archetypeFields");
 export const archetypeUnionFieldsSymbol = Symbol.for("bunsane:archetypeUnionFields");
 export const archetypeRelationsSymbol = Symbol.for("bunsane:archetypeRelations");
 
-export function ArcheTypeFunction(options?: {
-    returnType?: string;
-    args?: Array<{
-        name: string;
-        type: any;
-        nullable?: boolean;
-    }>;
-}) {
-    return function (target: any, propertyKey: string) {
-        if (!target[archetypeFunctionsSymbol]) {
-            target[archetypeFunctionsSymbol] = [];
+type StoredFunction = { propertyKey: string; options?: ArchetypeFunctionOptions };
+
+/** Map-like return so `Map<string, number>` stays assignable (Map is invariant). */
+interface IdKeyedMap {
+    get(key: string): unknown;
+    has(key: string): boolean;
+}
+
+/**
+ * Batch method. `this` is the archetype instance. `parents` are the Entity
+ * values a non-batch call receives as its first argument. Return a Map keyed
+ * by parent entity id.
+ */
+export interface BatchArchetypeMethod {
+    (
+        parents: readonly Entity[],
+        ctx: unknown,
+        args?: Record<string, unknown>,
+    ): Promise<IdKeyedMap> | IdKeyedMap;
+}
+
+export function ArcheTypeFunction<T extends BatchArchetypeMethod>(
+    options: ArchetypeFunctionOptions & { batch: true },
+): (target: object, propertyKey: string, descriptor: TypedPropertyDescriptor<T>) => void;
+export function ArcheTypeFunction(options?: ArchetypeFunctionOptions): (
+    target: object,
+    propertyKey: string,
+    descriptor?: PropertyDescriptor,
+) => void;
+export function ArcheTypeFunction(options?: ArchetypeFunctionOptions) {
+    return function (target: object, propertyKey: string): void {
+        const host = target as Record<symbol, StoredFunction[] | undefined>;
+        let bucket = host[archetypeFunctionsSymbol];
+        if (!bucket) {
+            bucket = [];
+            host[archetypeFunctionsSymbol] = bucket;
         }
-        target[archetypeFunctionsSymbol].push({ propertyKey, options });
+        bucket.push({ propertyKey, options });
     };
 }
 

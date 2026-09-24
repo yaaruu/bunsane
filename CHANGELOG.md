@@ -4,6 +4,26 @@ All notable changes to bunsane are documented here.
 
 ## Unreleased
 
+### Breaking
+
+- **Multipart requests without `Content-Length` get 411** (`{ error, code: "LENGTH_REQUIRED", limit }`) before the body is read, on REST uploads and `/graphql`. Browsers and `fetch(url, { body: formData })` send the header; in-process tests that build `new Request(url, { body: formData })` must set it. `parseFormData` / `handleUpload` throw `LengthRequiredError` under the same rule.
+- **FK-less relations fail schema build unless unambiguous.** `@HasMany` / `@HasOne` / `@BelongsTo` without `foreignKey` must match exactly one `user_id` or `parent_id` property on the owning archetype; otherwise set `foreignKey: 'component.prop'`. `relationsByEntityField` is removed.
+- **`REDIS_TLS=true` now opens TLS** on cache and remote clients (was a no-op). `REDIS_USERNAME` is sent when set.
+- **`sortedCursor()` token width must match the sort key count**, and `sortedCursor()` without a sort throws.
+- **Identifier guards (SEC-17):** `withIndexHint` names must match `^[A-Za-z0-9_]+$`; schema DSL and operation-input names must be GraphQL identifiers; `sqlTimeBucketFromTs` only accepts identifier / `$n` / known column expressions. Advisory lock tokens are random per acquisition; re-acquiring a key this instance already holds returns `null`.
+- `BUNSANE_STRICT_ENV=on` fails boot for production Redis on a non-loopback host without TLS.
+
+### Added
+
+- **Multi-key keyset pagination.** `sortedCursor` works for several `sortBy` keys (same or different components), `sortByCreatedAt` + `sortByUpdatedAt`, and OR + multi-sort, with mixed ASC/DESC, per-key NULLS placement, and `'before'`. `Query.encodeSortedCursor([k1, k2, …], id)`; existing single-key tokens still decode. Multi-key component sorts keep the leaf-driven `ORDER BY expr1, expr2, …, entity_id LIMIT n` scan.
+- **Batched `@ArcheTypeFunction({ batch: true })`.** Parents are collected per request (one batch per distinct args) and the method is called once with `(parents: Entity[], ctx, args?)`, returning a `Map` keyed by entity id. Non-batch methods unchanged.
+- `REDIS_TLS_SERVERNAME`, `REDIS_TLS_REJECT_UNAUTHORIZED`; shared ioredis options builder (`buildRedisConnectionOptions`); explicit `RedisCache` config and `redisFactory` still win over env.
+
+### Fixed
+
+- FK-less relations query with `type_id` pinned (one partition) instead of scanning every component partition.
+- Importing `bunsane` no longer registers the local storage provider or logs; registration happens on first upload use.
+
 ## 0.7.0 — 2026-09-24
 
 Includes the previously unreleased 0.6.2-era work below the overhaul section.

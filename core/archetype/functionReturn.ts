@@ -1,12 +1,16 @@
 import { z, type ZodType } from "zod";
 
+export interface ArchetypeFunctionArg {
+    name: string;
+    type: unknown;
+    nullable?: boolean;
+}
+
 export interface ArchetypeFunctionOptions {
     returnType?: string;
-    args?: Array<{
-        name: string;
-        type: unknown;
-        nullable?: boolean;
-    }>;
+    args?: ArchetypeFunctionArg[];
+    /** Collect parents in the request and call the method once. */
+    batch?: boolean;
 }
 
 const SCALAR_RETURN: Record<string, () => ZodType> = {
@@ -55,5 +59,26 @@ export function functionOutputZod(
         `@ArcheTypeFunction ${archetypeName}.${propertyKey} is missing returnType ` +
         `(design:returntype is ${designName(designReturn)}). ` +
         `Pass { returnType } instead of emitting an untyped field.`
+    );
+}
+
+/** True when a missing batch value may be null instead of a field error. */
+export function functionOutputAllowsNull(schema: ZodType): boolean {
+    return schema.safeParse(null).success || schema.safeParse(undefined).success;
+}
+
+/**
+ * Missing Map key. Nullable function fields (sdlEmit / functionOutputZod are
+ * nullish) resolve null; a non-null field fails that parent.
+ */
+export function rejectBatchMiss(
+    allowsNull: boolean,
+    archetypeName: string,
+    propertyKey: string,
+    entityId: string,
+): null | Error {
+    if (allowsNull) return null;
+    return new Error(
+        `@ArcheTypeFunction ${archetypeName}.${propertyKey} is non-null but the batch result has no value for ${entityId}`
     );
 }

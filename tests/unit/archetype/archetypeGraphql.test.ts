@@ -60,7 +60,7 @@ class GqlArchRoster extends BaseArcheType {
     @ArcheTypeField(GqlArchInfo)
     info!: GqlArchInfo;
 
-    @HasMany(GqlArchPlayer)
+    @HasMany(GqlArchPlayer, { foreignKey: "info.teamId" })
     roster!: GqlArchPlayer[];
 }
 
@@ -219,10 +219,11 @@ describe("archetype GraphQL resolvers and schema", () => {
         );
         expect(resolver).toBeDefined();
 
-        const seen: Array<{ entityId: string; foreignKey?: string }> = [];
+        const seen: Array<{ entityId: string; componentTypeId: string; foreignKeyField: string }> = [];
+        const profileTypeId = getMetadataStorage().getComponentId(GqlArchProfileLink.name);
         const loaders = {
-            relationsByEntityField: {
-                load: async (key: { entityId: string; foreignKey?: string }) => {
+            relationsByComponentFk: {
+                load: async (key: { entityId: string; componentTypeId: string; foreignKeyField: string }) => {
                     seen.push(key);
                     if (key.entityId === "user-1") return [{ id: "profile-1" }];
                     return [];
@@ -242,7 +243,8 @@ describe("archetype GraphQL resolvers and schema", () => {
 
         const hit = await resolver!.resolver({ id: "user-1" }, {}, { loaders });
         expect(hit).toEqual({ id: "profile-1" });
-        expect(seen[0]?.foreignKey).toBe("userId");
+        expect(seen[0]?.foreignKeyField).toBe("userId");
+        expect(seen[0]?.componentTypeId).toBe(profileTypeId);
 
         const miss = await resolver!.resolver({ id: "user-missing" }, {}, { loaders });
         expect(miss).toBeNull();

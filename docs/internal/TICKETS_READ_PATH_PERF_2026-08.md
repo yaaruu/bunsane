@@ -1,6 +1,6 @@
 # Tickets: Read-Path Performance (Filter + Sort + Pagination)
 
-**Status:** Wave A+B engine complete; RP-02 ops open (staging soak); RP-08 deferred; F-01 and F-09 partial; F-11 done (2026-09-24)
+**Status:** Wave A+B engine complete; RP-02 ops open (staging soak); RP-08 deferred; F-01, F-09, F-11 done (post-0.7.0)
 **Date:** 2026-08-07 (status refreshed 2026-09-24)
 **Basis:** `docs/READ_PATH_PERFORMANCE.md` + product sample review + Opus ticket review  
 **Scope:** List-read path only (`Query` → SQL → hydrate). Writes out of scope unless a ticket explicitly dual-writes.  
@@ -311,7 +311,7 @@ Filter+sort on single hot component: index-only or index scan on `proj_*`; compa
 
 | ID | Item | Notes |
 |----|------|--------|
-| F-01 | Multi-key keyset + `direction: 'before'` | **Partial (2026-09-24):** single-key `sortedCursor(token, 'before')` works for `sortByCreatedAt` / `sortByUpdatedAt`, OR + one `sortBy`, and a single component `sortBy`. Multi-key still throws. |
+| F-01 | Multi-key keyset + `direction: 'before'` | **Done (post-0.7.0):** N-key `sortedCursor` with mixed directions, per-key NULLS, and `'before'` for component sorts, `sortByCreatedAt` + `sortByUpdatedAt`, and OR + multi-sort. Legacy single-key tokens still decode. QSP still routes multi-sort to legacy. |
 | F-02 | Composite list-shape indexes (equality → range → entity_id) | After RP-03/04 so SQL can use them |
 | F-03 | CTE LIMIT pushdown when filters selective | Harder correctness; after RP-03 |
 | F-04 | OR + component sort uses sort-driven or rm_ | Currently JOIN wrapper full sort |
@@ -319,7 +319,7 @@ Filter+sort on single hot component: index-only or index scan on `proj_*`; compa
 | F-06 | M2/M3 explicit `@ReadModel` for cross-entity reports | **Stage A shipped 2026-08-20** (`m3_*`, write-through, range/`IN`/`count`/`avg`, live GraphQL Query resolvers). Remaining: outbox/multi-instance, daily fact grain, typed join |
 | F-07 | Tag / `.without` membership columns on `rm_*` | Empty tags currently break QSP coverage; product lists often need tags |
 | F-08 | List-archetype subset / explicit `routeAs` | Route when query set matches list surface without hand-dropping tags |
-| F-09 | GraphQL list hydrate / ArcheTypeFunction DataLoaders by default | **Partial (2026-09-24):** relation, component, and `@ArcheTypeFunction` resolvers attach at schema build; populated parent data and in-memory entity hits return synchronously. Computed fields still call the method per parent when the field is absent — no batch author API. |
+| F-09 | GraphQL list hydrate / ArcheTypeFunction DataLoaders by default | **Done (post-0.7.0):** resolvers attach at schema build and short-circuit populated parents (0.7.0); `@ArcheTypeFunction({ batch: true })` runs once per request batch per distinct args. |
 | F-10 | `Query.aggregate` / groupBy helpers | Kill `take(50k)` analytics patterns |
 | F-11 | Wire `startReconcileSweep` from App when QSP ≠ off | **Done (2026-09-24).** `App.init()` starts the sweep when `BUNSANE_QSP` is `shadow` or `route`; shutdown stops it. `docs/QSP_OPERATIONS.md` no longer tells apps to start a second sweep. |
 

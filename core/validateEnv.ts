@@ -70,7 +70,10 @@ const envSchema = z
         REDIS_HOST: z.string().optional(),
         REDIS_PORT: numeric("REDIS_PORT"),
         REDIS_PASSWORD: z.string().optional(),
+        REDIS_USERNAME: z.string().optional(),
         REDIS_TLS: z.enum(["true", "false"]).optional(),
+        REDIS_TLS_SERVERNAME: z.string().optional(),
+        REDIS_TLS_REJECT_UNAUTHORIZED: z.enum(["true", "false"]).optional(),
         BUNSANE_RPC_CONSUMER_CONCURRENCY: numeric("BUNSANE_RPC_CONSUMER_CONCURRENCY"),
     })
     .refine(
@@ -138,20 +141,21 @@ export function envSecurityWarnings(env: NodeJS.ProcessEnv = process.env): strin
     if (nodeEnv) warnings.push(nodeEnv);
 
     const provider = env.CACHE_PROVIDER;
+    const redisHost = env.REDIS_HOST || "localhost";
     if ((provider === "redis" || provider === "multilevel") && env.NODE_ENV === "production") {
-        const host = env.REDIS_HOST || "localhost";
-        if (!env.REDIS_PASSWORD && !isLoopbackOrLinkLocal(host)) {
+        if (!env.REDIS_PASSWORD && !isLoopbackOrLinkLocal(redisHost)) {
             warnings.push(
-                `CACHE_PROVIDER=${provider} in production with empty REDIS_PASSWORD and non-loopback REDIS_HOST=${host}. ` +
-                "Set REDIS_PASSWORD or bind Redis to loopback. " +
-                "REDIS_TLS is not applied by the Redis client — isolate the network.",
+                `CACHE_PROVIDER=${provider} in production with empty REDIS_PASSWORD and non-loopback REDIS_HOST=${redisHost}. ` +
+                "Set REDIS_PASSWORD or bind Redis to loopback.",
             );
         }
     }
-    if (env.REDIS_TLS === "true") {
+    // Same host default as buildRedisConnectionOptions. Unset REDIS_HOST is
+    // localhost, so a deploy that never points at Redis does not warn.
+    if (env.NODE_ENV === "production" && !isLoopbackOrLinkLocal(redisHost) && env.REDIS_TLS !== "true") {
         warnings.push(
-            "REDIS_TLS=true is validated but not applied by the Redis client. " +
-            "Do not treat it as transport security.",
+            `Production non-loopback REDIS_HOST=${redisHost} has REDIS_TLS unset or false. ` +
+            "The Redis client will connect without TLS. Set REDIS_TLS=true, or bind Redis to loopback.",
         );
     }
     return warnings;

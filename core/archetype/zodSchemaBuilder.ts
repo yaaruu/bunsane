@@ -9,6 +9,7 @@ import { compNameToFieldName, shouldUnwrapComponent } from "./helpers";
 import { getOrCreateComponentSchema } from "./schemaBuilder";
 import { archetypeSchemaCache, allArchetypeZodObjects } from "./weaver";
 import { functionOutputZod } from "./functionReturn";
+import { componentMapOf, requireImplicitFk } from "./fkResolve";
 import { archetypeGraphqlName, resolveRelationTarget, type RelationTarget } from "./relationTarget";
 
 interface ArchetypeForZod {
@@ -19,6 +20,8 @@ interface ArchetypeForZod {
     unionMap: Record<string, ComponentConstructor[]>;
     unionOptions: Record<string, { nullable?: boolean } | undefined>;
     relationMap: Record<string, RelationTarget>;
+    relationTypes: Record<string, string>;
+    relationOptions: Record<string, { foreignKey?: string } | undefined>;
     functions: Array<{ propertyKey: string; options?: { returnType?: string; args?: Array<{ name: string; type: unknown; nullable?: boolean }> } }>;
 }
 
@@ -129,7 +132,13 @@ export function buildZodObjectSchema(
     if (!excludeRelations) {
         for (const [field, related] of Object.entries(archetype.relationMap)) {
             // Fail schema build here, not later via a missed regex.
-            resolveRelationTarget(related);
+            const resolved = resolveRelationTarget(related);
+            if (!archetype.relationOptions[field]?.foreignKey) {
+                const owning = archetype.relationTypes[field] === "belongsTo"
+                    ? archetype.componentMap
+                    : componentMapOf(new resolved.ctor());
+                requireImplicitFk(nameFromStorage, field, owning);
+            }
             zodShapes[field] = hiddenField();
         }
     }

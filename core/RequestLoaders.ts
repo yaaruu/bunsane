@@ -23,8 +23,9 @@ export type ComponentData = {
 export type RequestLoaders = {
   entityById: DataLoader<string, Entity | null>;
   componentsByEntityType: DataLoader<{ entityId: string; typeId: string }, ComponentData | null>;
-  relationsByEntityField: DataLoader<{ entityId: string; relationField: string; relatedType: string; foreignKey?: string }, Entity[]>;
   relationsByComponentFk: DataLoader<{ entityId: string; componentTypeId: string; foreignKeyField: string }, Entity[]>;
+  /** Lazily filled by batched @ArcheTypeFunction resolvers. One map per request. */
+  archetypeFunctionBatches: Map<string, DataLoader<Entity, unknown, string>>;
 };
 
 const SQL_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -391,134 +392,6 @@ export function createRequestLoaders(
     return clearAllKeys();
   };
 
-  const relationsByEntityField = new DataLoader<{ entityId: string; relationField: string; relatedType: string; foreignKey?: string }, Entity[], string>(
-    async (keys: readonly { entityId: string; relationField: string; relatedType: string; foreignKey?: string }[]) => {
-      incrementDataLoaderCall('relation', perRequest);
-      const startTime = Date.now();
-      try {
-        const validKeys = keys.filter(k => k.entityId && typeof k.entityId === 'string' && k.entityId.trim() !== '');
-        if (validKeys.length === 0) {
-          return keys.map(() => []);
-        }
-
-        const resultMap = new Map<string, Entity[]>();
-
-        let keysToQuery = validKeys;
-        const relCacheEnabled = !!(cacheManager
-          && cacheManager.getConfig().enabled
-          && cacheManager.getConfig().relation?.negativeCacheEnabled);
-        if (relCacheEnabled) {
-          try {
-            const tombstones = await cacheManager!.getRelationsEmpty(validKeys);
-            const remaining: typeof validKeys = [];
-            tombstones.forEach((isEmpty, i) => {
-              const k = validKeys[i]!;
-              if (isEmpty) {
-                resultMap.set(`${k.entityId}\x00${k.relationField}\x00${k.relatedType}`, []);
-              } else {
-                remaining.push(k);
-              }
-            });
-            keysToQuery = remaining;
-          } catch (error) {
-            logger.warn({ scope: 'cache', component: 'RequestLoaders', msg: 'Cache read failed for relation tombstones', error });
-          }
-        }
-
-        const keysByForeignKey = new Map<string, typeof keysToQuery>();
-        for (const key of keysToQuery) {
-          const fk = key.foreignKey || 'default';
-          const group = keysByForeignKey.get(fk);
-          if (group) group.push(key);
-          else keysByForeignKey.set(fk, [key]);
-        }
-
-        for (const [foreignKey, groupedKeys] of keysByForeignKey) {
-          const entityIds = [...new Set(groupedKeys.map(k => k.entityId))];
-          let foreignKeyField: string;
-          let whereClause: string;
-
-          if (foreignKey !== 'default') {
-            foreignKeyField = assertSqlIdentifier(foreignKey, 'relation foreign key');
-            whereClause = `c.data->>'${foreignKeyField}' = ANY($1)`;
-          } else {
-            foreignKeyField = 'user_id';
-            whereClause = `(c.data->>'user_id' = ANY($1) OR c.data->>'parent_id' = ANY($1))`;
-          }
-
-          logger.trace(`[RelationLoader] Batched query for ${groupedKeys.length} keys with foreign key ${foreignKey}`);
-
-          const rows = await dbExec<Array<{ entity_id: string; fk_value: string | null; fallback_fk_value: string | null }>>(`
-            SELECT DISTINCT
-              c.entity_id,
-              c.data,
-              c.type_id,
-              c.data->>'${foreignKeyField}' as fk_value,
-              COALESCE(c.data->>'user_id', c.data->>'parent_id') as fallback_fk_value
-            FROM components c
-            INNER JOIN entities e ON c.entity_id = e.id
-            WHERE e.deleted_at IS NULL
-              AND c.deleted_at IS NULL
-              AND ${whereClause}
-          `, [entityIds], { lane: 'request', label: 'loader.relation.distinct', signal, perRequest });
-
-          logger.trace(`[RelationLoader] Found ${rows.length} total components for ${entityIds.length} entities`);
-
-          for (const key of groupedKeys) {
-            const relatedEntityIds = rows
-              .filter(row => {
-                const fkValue = foreignKey !== 'default' ? row.fk_value : row.fallback_fk_value;
-                return fkValue === key.entityId;
-              })
-              .map(row => row.entity_id);
-
-            const entities = [...new Set(relatedEntityIds)].map(id => {
-              const entity = new Entity(id);
-              entity.setPersisted(true);
-              return entity;
-            });
-
-            resultMap.set(`${key.entityId}\x00${key.relationField}\x00${key.relatedType}`, entities);
-            logger.trace(`[RelationLoader] Mapped ${entities.length} entities for ${key.relationField} on ${key.entityId}`);
-          }
-        }
-
-        if (relCacheEnabled && keysToQuery.length > 0) {
-          const emptyKeys = keysToQuery.filter(k => {
-            const mapped = resultMap.get(`${k.entityId}\x00${k.relationField}\x00${k.relatedType}`);
-            return !mapped || mapped.length === 0;
-          });
-          if (emptyKeys.length > 0) {
-            trackCacheOp(
-              cacheManager!.setRelationsEmpty(emptyKeys).catch((error) => {
-                logger.warn({ scope: 'cache', component: 'RequestLoaders', msg: 'Cache write failed for relation tombstones', error });
-              })
-            );
-          }
-        }
-
-        const duration = Date.now() - startTime;
-        if (duration > 1000) {
-          logger.warn(`Slow relationsByEntityField query: ${duration}ms for ${keys.length} keys`);
-        } else {
-          logger.trace(`[RelationLoader] Batched query completed in ${duration}ms for ${keys.length} keys`);
-        }
-
-        return keys.map(k => {
-          if (!k.entityId || typeof k.entityId !== 'string' || k.entityId.trim() === '') return [];
-          return resultMap.get(`${k.entityId}\x00${k.relationField}\x00${k.relatedType}`) ?? [];
-        });
-      } catch (error) {
-        logger.error({ error }, 'Error in relationsByEntityField DataLoader');
-        throw error;
-      }
-    },
-    {
-      maxBatchSize: 50,
-      cacheKeyFn: (k: { entityId: string; relationField: string; relatedType: string; foreignKey?: string }) =>
-        `${k.entityId}\x00${k.relationField}\x00${k.relatedType}\x00${k.foreignKey ?? ''}`,
-    }
-  );
 
   const relationsByComponentFk = new DataLoader<{ entityId: string; componentTypeId: string; foreignKeyField: string }, Entity[], string>(
     async (keys: readonly { entityId: string; componentTypeId: string; foreignKeyField: string }[]) => {
@@ -589,5 +462,6 @@ export function createRequestLoaders(
     }
   );
 
-  return { entityById, componentsByEntityType, relationsByEntityField, relationsByComponentFk };
+  const archetypeFunctionBatches = new Map<string, DataLoader<Entity, unknown, string>>();
+  return { entityById, componentsByEntityType, relationsByComponentFk, archetypeFunctionBatches };
 }
