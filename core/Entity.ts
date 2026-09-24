@@ -129,28 +129,47 @@ export class Entity implements IEntity {
      * Removes a component from the entity.
      * Use like: entity.remove(Component)
      * WARNING: This will delete the component from the database upon saving the entity.
+     *
+     * If the component is not loaded, the type id is still enqueued and `save()`
+     * deletes the row. Returns false only when that deletion was already saved.
      */
     public remove<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): boolean {
         return componentAccess.remove(this, ctor, context);
     }
 
     /**
-     * Get component data from entity. Loads from DB if not cached.
+     * Get component data from entity. Loads from DB if not in memory.
+     *
+     * The returned object is a snapshot of `@CompData` fields. Mutating it
+     * does nothing — it does not update the component and does not mark the
+     * entity dirty. Use `set()`.
      */
     public get<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<ComponentDataType<T> | null> {
         return componentAccess.get(this, ctor, context);
     }
 
     /**
-     * Check if entity has a component (type guard).
-     * Uses in-memory check only - does not query database.
+     * In-memory presence only. Does not query the database. A component that
+     * exists in storage but has not been loaded returns false — use
+     * `hasPersisted()` or `get()`.
      */
     public has<T extends BaseComponent>(ctor: new (...args: any[]) => T): boolean {
         return componentAccess.has(this, ctor);
     }
 
     /**
+     * Whether a saved row exists for this component. Consults the loader or
+     * the database when the component is not in memory. A pending `remove()`
+     * returns false and does not rehydrate the row.
+     */
+    public hasPersisted<T extends BaseComponent>(ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<boolean> {
+        return componentAccess.hasPersisted(this, ctor, context);
+    }
+
+    /**
      * Get component data or throw if not found.
+     * A database failure throws `ComponentLoadError`. A confirmed absence
+     * throws `ComponentMissingError`.
      */
     public getOrThrow<T extends BaseComponent>(
         ctor: new (...args: any[]) => T,
@@ -197,6 +216,16 @@ export class Entity implements IEntity {
     @timed("Entity.save")
     public save(trx?: SQL, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<boolean> {
         return saveEntity.saveEntity(this, trx, context);
+    }
+
+    /**
+     * Persist many entities in one admission and one transaction: one
+     * multi-row entity upsert, batched deletes, one batched component insert
+     * and one batched upsert (chunked at 500 rows). Post-commit hooks and
+     * cache invalidation match `save()`.
+     */
+    public static saveMany(entities: Entity[], opts?: { trx?: SQL; signal?: AbortSignal; context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal } }): Promise<boolean> {
+        return saveEntity.saveMany(entities, opts);
     }
 
     public doSave(trx: SQL, signal?: AbortSignal): Promise<boolean> {
@@ -259,5 +288,7 @@ export class Entity implements IEntity {
         return finders.deserialize(data);
     }
 }
+
+export { ComponentLoadError, ComponentMissingError } from "./entity/errors";
 
 export default Entity;

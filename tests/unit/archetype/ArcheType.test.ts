@@ -3,6 +3,7 @@
  * Tests archetype definition and basic functionality
  */
 import { describe, test, expect, beforeAll } from 'bun:test';
+import { z } from 'zod';
 import { BaseArcheType, ArcheType, ArcheTypeField } from '../../../core/ArcheType';
 import { TestUser, TestProduct, TestOrder } from '../../fixtures/components';
 import { TestUserArchetype, TestUserWithOrdersArchetype } from '../../fixtures/archetypes/TestUserArchetype';
@@ -92,16 +93,14 @@ describe('ArcheType', () => {
     });
 
     describe('withValidation()', () => {
-        test('returns a Zod schema with validations applied', () => {
+        test('replaces a field schema so parsing enforces the new rule', () => {
             const archetype = new TestUserArchetype();
             const schema = archetype.withValidation({
-                user: { name: 'Valid', email: 'valid@test.com', age: 25 }
+                user: z.object({ name: z.string().min(3) }),
             });
 
-            expect(schema).toBeDefined();
-            // Should return a Zod schema with a shape property
-            expect(schema.shape).toBeDefined();
-            expect(typeof schema.safeParse).toBe('function');
+            expect(schema.safeParse({ user: { name: 'ab' } }).success).toBe(false);
+            expect(schema.safeParse({ user: { name: 'abc' } }).success).toBe(true);
         });
     });
 });

@@ -35,15 +35,7 @@ export class OpenAPISpecGenerator {
                 version
             },
             paths: {},
-            components: {
-                securitySchemes: {
-                    BearerAuth: {
-                        type: "http",
-                        scheme: "bearer",
-                        bearerFormat: "JWT"
-                    }
-                },
-            }
+            components: {},
         };
     }
 
@@ -54,15 +46,34 @@ export class OpenAPISpecGenerator {
             this.spec.paths[path] = {};
         }
 
+        const published = { ...operation };
+        const authenticated = published.authenticated === true;
+        delete published.authenticated;
+        const declaredSecurity = Array.isArray(published.security) && published.security.length > 0;
+        if (authenticated && !declaredSecurity) {
+            published.security = [{ BearerAuth: [] }];
+        }
+        if (authenticated || declaredSecurity) {
+            this.ensureBearerAuth();
+        }
+
         this.spec.paths[path][method.toLowerCase()] = {
-            ...operation,
-            responses: operation.responses || {
+            ...published,
+            responses: published.responses || {
                 "200": {
                     description: "Success"
                 }
             }
         };
         this._jsonCache = undefined;
+    }
+
+    private ensureBearerAuth() {
+        this.addSecurityScheme("BearerAuth", {
+            type: "http",
+            scheme: "bearer",
+            bearerFormat: "JWT",
+        });
     }
 
     addServer(url: string, description?: string) {

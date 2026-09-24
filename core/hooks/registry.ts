@@ -50,6 +50,23 @@ export interface ComponentTargetConfig {
 }
 
 /**
+ * Type-id sets compiled once at registration. Dispatch must not rebuild these.
+ * `null` archetype entries mean the archetype had no componentMap (never matches).
+ */
+export interface CompiledComponentTarget {
+    includeTypeIds: ReadonlySet<string> | null;
+    excludeTypeIds: ReadonlySet<string> | null;
+    requireAllIncluded: boolean;
+    requireAllExcluded: boolean;
+    /** Present when `archetype` was set. null typeIds = unresolvable → no match. */
+    archetypeTypeIds: ReadonlySet<string> | null;
+    hasArchetype: boolean;
+    /** Present when `archetypes` was non-empty. A null entry never matches. */
+    archetypesTypeIds: Array<ReadonlySet<string> | null> | null;
+    allowExtra: boolean;
+}
+
+/**
  * Hook registration options
  */
 export interface HookOptions {
@@ -57,7 +74,7 @@ export interface HookOptions {
     priority?: number;
     /** Optional name for the hook for debugging */
     name?: string;
-    /** Whether the hook should be executed asynchronously */
+    /** Whether the hook should be executed asynchronously (off the save critical path) */
     async?: boolean;
     /** Filter function to conditionally execute the hook */
     filter?: (event: LifecycleEvent) => boolean;
@@ -74,6 +91,16 @@ export interface RegisteredHook {
     callback: LifecycleHookCallback;
     options: HookOptions;
     id: string;
+    /** Precomputed at registration. Absent when the hook has no component target. */
+    compiledTarget?: CompiledComponentTarget;
+}
+
+/**
+ * Sync/async split, rebuilt at registration (not per event).
+ */
+export interface HookPartition {
+    sync: RegisteredHook[];
+    async: RegisteredHook[];
 }
 
 /**
@@ -92,6 +119,8 @@ export interface HookMetrics {
  */
 export interface RegistryState {
     hooks: Map<string, RegisteredHook[]>;
+    /** Parallel to `hooks`, split by `options.async`. Missing key = no hooks. */
+    partitions: Map<string, HookPartition>;
     hookCounter: number;
 }
 
@@ -101,7 +130,42 @@ export interface RegistryState {
 export function createRegistryState(): RegistryState {
     return {
         hooks: new Map(),
+        partitions: new Map(),
         hookCounter: 0
+    };
+}
+
+function archetypeTypeIds(archetype: ArcheType): ReadonlySet<string> | null {
+    const map = archetype.componentMap;
+    if (!map) return null;
+    const ids = new Set<string>();
+    for (const ctor of Object.values(map)) {
+        ids.add(typeIdOfCtor(ctor as new () => BaseComponent));
+    }
+    return ids;
+}
+
+/**
+ * Compile component-target type ids once. Called only from registration.
+ */
+export function compileComponentTarget(target?: ComponentTargetConfig): CompiledComponentTarget | undefined {
+    if (!target) return undefined;
+    const allowExtra = !!(target.includeComponents?.length || target.excludeComponents?.length);
+    return {
+        includeTypeIds: target.includeComponents?.length
+            ? new Set(target.includeComponents.map(typeIdOfCtor))
+            : null,
+        excludeTypeIds: target.excludeComponents?.length
+            ? new Set(target.excludeComponents.map(typeIdOfCtor))
+            : null,
+        requireAllIncluded: target.requireAllIncluded ?? true,
+        requireAllExcluded: target.requireAllExcluded ?? true,
+        hasArchetype: !!target.archetype,
+        archetypeTypeIds: target.archetype ? archetypeTypeIds(target.archetype) : null,
+        archetypesTypeIds: target.archetypes?.length
+            ? target.archetypes.map(archetypeTypeIds)
+            : null,
+        allowExtra,
     };
 }
 
@@ -113,13 +177,54 @@ export function generateHookId(state: RegistryState): string {
 }
 
 /**
- * Sort hooks by priority (higher priority first)
+ * Sort hooks by priority (higher priority first) and refresh the sync/async partition.
  */
 export function sortHooksByPriority(state: RegistryState, eventType: string): void {
     const hooks = state.hooks.get(eventType);
     if (hooks) {
         hooks.sort((a, b) => (b.options.priority || 0) - (a.options.priority || 0));
     }
+    rebuildPartition(state, eventType);
+}
+
+function rebuildPartition(state: RegistryState, eventType: string): void {
+    const hooks = state.hooks.get(eventType);
+    if (!hooks || hooks.length === 0) {
+        state.hooks.delete(eventType);
+        state.partitions.delete(eventType);
+        return;
+    }
+    const sync: RegisteredHook[] = [];
+    const asyncHooks: RegisteredHook[] = [];
+    for (const hook of hooks) {
+        if (hook.options.async) asyncHooks.push(hook);
+        else sync.push(hook);
+    }
+    state.partitions.set(eventType, { sync, async: asyncHooks });
+}
+
+function makeHook(
+    state: RegistryState,
+    callback: LifecycleHookCallback,
+    options: HookOptions
+): RegisteredHook {
+    const normalized: HookOptions = { priority: 0, ...options };
+    return {
+        callback,
+        options: normalized,
+        id: generateHookId(state),
+        compiledTarget: compileComponentTarget(normalized.componentTarget),
+    };
+}
+
+function pushHook(state: RegistryState, eventType: string, hook: RegisteredHook): void {
+    let hooks = state.hooks.get(eventType);
+    if (!hooks) {
+        hooks = [];
+        state.hooks.set(eventType, hooks);
+    }
+    hooks.push(hook);
+    sortHooksByPriority(state, eventType);
 }
 
 /**
@@ -131,21 +236,9 @@ export function registerEntityHook<T extends EntityEvent>(
     callback: EntityHookCallback<T>,
     options: HookOptions
 ): string {
-    const hookId = generateHookId(state);
-    const hook: RegisteredHook = {
-        callback: callback as LifecycleHookCallback,
-        options: { priority: 0, ...options },
-        id: hookId
-    };
-
-    if (!state.hooks.has(eventType)) {
-        state.hooks.set(eventType, []);
-    }
-
-    state.hooks.get(eventType)!.push(hook);
-    sortHooksByPriority(state, eventType);
-
-    return hookId;
+    const hook = makeHook(state, callback as LifecycleHookCallback, options);
+    pushHook(state, eventType, hook);
+    return hook.id;
 }
 
 /**
@@ -157,21 +250,9 @@ export function registerComponentHook<T extends ComponentEvent>(
     callback: ComponentHookCallback<T>,
     options: HookOptions
 ): string {
-    const hookId = generateHookId(state);
-    const hook: RegisteredHook = {
-        callback: callback as LifecycleHookCallback,
-        options: { priority: 0, ...options },
-        id: hookId
-    };
-
-    if (!state.hooks.has(eventType)) {
-        state.hooks.set(eventType, []);
-    }
-
-    state.hooks.get(eventType)!.push(hook);
-    sortHooksByPriority(state, eventType);
-
-    return hookId;
+    const hook = makeHook(state, callback as LifecycleHookCallback, options);
+    pushHook(state, eventType, hook);
+    return hook.id;
 }
 
 /**
@@ -182,27 +263,20 @@ export function registerLifecycleHook(
     callback: LifecycleHookCallback,
     options: HookOptions
 ): string {
-    const hookId = generateHookId(state);
-    const hook: RegisteredHook = {
-        callback,
-        options: { priority: 0, ...options },
-        id: hookId
-    };
+    const hook = makeHook(state, callback, options);
 
-    // Register for all event types
     const allEventTypes = [
         "entity.created", "entity.updated", "entity.deleted",
         "component.added", "component.updated", "component.removed"
     ];
 
     for (const eventType of allEventTypes) {
-        if (!state.hooks.has(eventType)) {
-            state.hooks.set(eventType, []);
-        }
-        state.hooks.get(eventType)!.push({ ...hook }); // Clone hook for each event type
+        // Clone so a later remove of one slot cannot alias the others, but
+        // share the compiled target (immutable).
+        pushHook(state, eventType, { ...hook });
     }
 
-    return hookId;
+    return hook.id;
 }
 
 /**
@@ -212,11 +286,15 @@ export function removeHook(state: RegistryState, hookId: string): boolean {
     let removed = false;
 
     for (const [eventType, hooks] of state.hooks.entries()) {
-        const initialLength = hooks.length;
-        state.hooks.set(eventType, hooks.filter(hook => hook.id !== hookId));
-
-        if (state.hooks.get(eventType)!.length < initialLength) {
+        const next = hooks.filter(hook => hook.id !== hookId);
+        if (next.length !== hooks.length) {
             removed = true;
+            if (next.length === 0) {
+                state.hooks.delete(eventType);
+            } else {
+                state.hooks.set(eventType, next);
+            }
+            rebuildPartition(state, eventType);
         }
     }
 
@@ -243,5 +321,6 @@ export function getHookCount(state: RegistryState, eventType?: string): number {
  */
 export function clearAllHooks(state: RegistryState): void {
     state.hooks.clear();
+    state.partitions.clear();
     state.hookCounter = 0;
 }

@@ -114,8 +114,8 @@ export function buildJSONBPath(field: string, alias: string): string {
 export function jsonbInListCast(values: any[]): { lhs: (path: string) => string; param: string } {
     const allNumbers = values.length > 0 && values.every(v => typeof v === 'number');
     if (allNumbers) return { lhs: (p) => `(${p})::numeric`, param: '::numeric' };
-    const allBooleans = values.length > 0 && values.every(v => typeof v === 'boolean');
-    if (allBooleans) return { lhs: (p) => `(${p})::boolean`, param: '::boolean' };
+    // Booleans are compared as text ('true'/'false') by buildComponentFilterCondition
+    // so the btree on (data->>'f') applies. Do not cast the column to ::boolean.
     return { lhs: (p) => p, param: '' };
 }
 
@@ -169,6 +169,15 @@ export function buildComponentFilterCondition(
     }
     if (filter.operator === 'IN' || filter.operator === 'NOT IN') {
         if (Array.isArray(filter.value) && filter.value.length > 0) {
+            const allBooleans = filter.value.every((v: unknown) => typeof v === 'boolean');
+            if (allBooleans) {
+                // Bind 'true'/'false' text so (data->>'f') btree matches.
+                // NULL extraction (missing key / JSON null) does not match.
+                const placeholders = filter.value
+                    .map((v: boolean) => `$${context.addParam(v ? 'true' : 'false')}`)
+                    .join(', ');
+                return `${jsonPath} ${filter.operator} (${placeholders})`;
+            }
             const cast = jsonbInListCast(filter.value);
             const placeholders = filter.value
                 .map((v: any) => `$${context.addParam(v)}${cast.param}`)
@@ -192,6 +201,13 @@ export function buildComponentFilterCondition(
             filter.operator,
             `$${context.addParam(filter.value)}::numeric`
         );
+    }
+    if (typeof filter.value === 'boolean' && (filter.operator === '=' || filter.operator === '!=')) {
+        // Text compare so the btree on (data->>'f') applies. Bind the canonical
+        // JSON text form. NULL (missing key / JSON null) stays NULL and does
+        // not match, same as the previous ::boolean cast.
+        const bound = filter.value ? 'true' : 'false';
+        return `${jsonPath} ${filter.operator} $${context.addParam(bound)}`;
     }
     if (typeof filter.value === 'boolean') {
         return `(${jsonPath})::boolean ${filter.operator} $${context.addParam(filter.value)}`;

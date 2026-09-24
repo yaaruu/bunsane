@@ -48,6 +48,7 @@ describe('SEC-03: injection payloads through real Query execution', () => {
     test("filter field injection \"x' OR true --\" is inert (no rows, no error)", async () => {
         const rows = await new Query()
             .with(TestUser, {
+                // @ts-expect-error runtime guard: field is deliberately not a TestUser key
                 filters: [Query.filter("x' OR true --", FilterOp.EQ, 1)],
             })
             .exec();
@@ -59,6 +60,7 @@ describe('SEC-03: injection payloads through real Query execution', () => {
     test('.with() filters accept injected fields without breaking the WHERE', async () => {
         const rows = await new Query()
             .with(TestUser, {
+                // @ts-expect-error runtime guard: field is deliberately not a TestUser key
                 filters: [{ field: "name') OR true--", operator: '=', value: 'x' }],
             })
             .exec();

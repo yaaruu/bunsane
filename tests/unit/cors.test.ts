@@ -77,6 +77,15 @@ describe('validateOrigin defence in depth', () => {
 
     test('no request Origin → no ACAO decision', () => {
         expect(validateOrigin({ origin: '*' }, null)).toBeNull();
+        expect(validateOrigin({ origin: '*' }, null)).toBeNull();
+    });
+
+    test('Origin: null is never reflected when credentials are on', () => {
+        expect(validateOrigin({ origin: '*', credentials: true }, 'null')).toBeNull();
+        expect(validateOrigin(
+            { origin: ['null'], credentials: true },
+            'null',
+        )).toBeNull();
     });
 });
 

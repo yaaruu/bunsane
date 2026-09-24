@@ -203,18 +203,31 @@ describe('Entity Component Management', () => {
             );
         });
 
-        test('serializableData throws on Date type mismatch', () => {
+        test('serializableData coerces a valid ISO date string', () => {
             const entity = new Entity();
             entity.add(TestOrder, {
                 orderNumber: 'ORD-003',
                 total: 50,
                 status: 'pending',
-                createdAt: '2024-01-15' as any
+                createdAt: '2024-01-15T00:00:00.000Z' as unknown as Date
+            });
+
+            const component = entity.getInMemory(TestOrder);
+            expect(component?.serializableData().createdAt).toBe('2024-01-15T00:00:00.000Z');
+        });
+
+        test('serializableData throws on a non-date string in a Date field', () => {
+            const entity = new Entity();
+            entity.add(TestOrder, {
+                orderNumber: 'ORD-003b',
+                total: 50,
+                status: 'pending',
+                createdAt: 'not-a-date' as unknown as Date
             });
 
             const component = entity.getInMemory(TestOrder);
             expect(() => component?.serializableData()).toThrow(
-                /Type mismatch for property 'createdAt' on component 'TestOrder': expected Date, got string/
+                /Invalid Date for property 'createdAt' on component 'TestOrder'/
             );
         });
 

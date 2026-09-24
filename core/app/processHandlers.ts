@@ -7,11 +7,11 @@ export function registerProcessHandlers(app: any): void {
 
     app.sigTermHandler = () => {
         logger.info({ scope: 'app', component: 'App', msg: 'Received SIGTERM' });
-        app.shutdown().finally(() => process.exit(0));
+        app.shutdown().finally(() => process.exit(app.shutdownFailed ? 1 : 0));
     };
     app.sigIntHandler = () => {
         logger.info({ scope: 'app', component: 'App', msg: 'Received SIGINT' });
-        app.shutdown().finally(() => process.exit(0));
+        app.shutdown().finally(() => process.exit(app.shutdownFailed ? 1 : 0));
     };
     process.once('SIGTERM', app.sigTermHandler);
     process.once('SIGINT', app.sigIntHandler);

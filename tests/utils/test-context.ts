@@ -7,7 +7,6 @@ import { CacheManager } from '../../core/cache';
 import EntityManager from '../../core/EntityManager';
 import { ComponentRegistry } from '../../core/components';
 import db from '../../database';
-import { preparedStatementCache } from '../../database/PreparedStatementCache';
 
 export interface TestContext {
     tracker: EntityTracker;
@@ -55,8 +54,6 @@ export function createTestContext(): TestContext {
         // Clear cache before each test
         await cacheManager.getProvider().clear();
 
-        // Clear prepared statement cache to prevent cache pollution between tests
-        preparedStatementCache.clear();
     });
 
     afterEach(async () => {

@@ -2,7 +2,18 @@ import { logger as MainLogger } from './Logger';
 const logger = MainLogger.child({ scope: 'Middleware' });
 
 export type MiddlewareNext = () => Promise<Response>;
-export type Middleware = (req: Request, next: MiddlewareNext) => Promise<Response>;
+
+/** Per-request values the server knows and middleware cannot see on Request alone. */
+export type MiddlewareContext = {
+    /** Socket address from `server.requestIP(req)`, when Bun provided one. */
+    clientIp?: string;
+};
+
+export type Middleware = (
+    req: Request,
+    next: MiddlewareNext,
+    ctx?: MiddlewareContext,
+) => Promise<Response>;
 
 /**
  * Composes an array of middleware into a single handler function.
@@ -10,9 +21,9 @@ export type Middleware = (req: Request, next: MiddlewareNext) => Promise<Respons
  */
 export function composeMiddleware(
     middlewares: Middleware[],
-    finalHandler: (req: Request) => Promise<Response>,
-): (req: Request) => Promise<Response> {
-    return (req: Request) => {
+    finalHandler: (req: Request, ctx: MiddlewareContext) => Promise<Response>,
+): (req: Request, ctx?: MiddlewareContext) => Promise<Response> {
+    return (req: Request, ctx: MiddlewareContext = {}) => {
         let index = -1;
 
         function dispatch(i: number): Promise<Response> {
@@ -22,11 +33,11 @@ export function composeMiddleware(
             index = i;
 
             if (i >= middlewares.length) {
-                return finalHandler(req);
+                return finalHandler(req, ctx);
             }
 
             const middleware = middlewares[i]!;
-            return middleware(req, () => dispatch(i + 1));
+            return middleware(req, () => dispatch(i + 1), ctx);
         }
 
         return dispatch(0);

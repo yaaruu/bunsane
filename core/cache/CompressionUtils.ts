@@ -6,16 +6,18 @@ const gunzipAsync = promisify(gunzip);
 
 /**
  * Compression utilities for cache payloads. Automatically compresses data
- * over 1KB threshold to reduce memory usage and network transfer for Redis.
+ * over an 8KB threshold to reduce memory usage and network transfer for Redis.
+ * Smaller JSON (typical component rows) stays uncompressed so the miss path
+ * does not pay async zlib.
  *
  * Features:
- * - Gzip compression for payloads > 1KB
+ * - Gzip compression for payloads > 8KB
  * - Automatic compression/decompression
  * - Metadata tracking for compressed data
  * - Error handling with fallback to uncompressed data
  */
 export class CompressionUtils {
-  private static readonly COMPRESSION_THRESHOLD = 1024; // 1KB
+  private static readonly COMPRESSION_THRESHOLD = 8192; // 8KB
   private static readonly COMPRESSION_PREFIX = '__COMPRESSED__';
 
   /**

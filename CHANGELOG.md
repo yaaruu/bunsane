@@ -4,6 +4,83 @@ All notable changes to bunsane are documented here.
 
 ## Unreleased
 
+## 0.7.0 — 2026-09-24
+
+Includes the previously unreleased 0.6.2-era work below the overhaul section.
+
+### Framework overhaul (2026-09-24) — correctness, list performance, DX, security
+
+#### Breaking
+
+- **Entity reads throw on failure.** `get()` / `getOrThrow()` throw `ComponentLoadError` on DB errors or aborts instead of returning `null`; confirmed absence still throws `ComponentMissingError` (same message). Relation DataLoaders reject instead of resolving `[]`.
+- **`remove()` of an unloaded component** returns `true` and deletes the row on `save()` (it used to return `false` and leave the row).
+- **`updated_at` moves.** Dirty saves set `entities.updated_at` and `components.updated_at` to `NOW()`; `sortByUpdatedAt` is no longer creation order for component-only edits.
+- **Query typing.** `Query<TComponents, TPopulated>`: `componentData` is typed as loaded only after `.populate()`. `.with(Ctor, { filters })` rejects field names that are not keys of that component. `Query.getCacheStats()` removed.
+- **`NODE_ENV=development`:** an unbounded `exec()` that fills `BUNSANE_DEFAULT_QUERY_LIMIT` throws. Production keeps the one-time warning and sets `getLastRouteInfo().truncatedByDefaultLimit`.
+- **Boolean filters** compare JSON text (`data->>'f' = 'true'`); PG-liberal casts (`'yes'`, `'1'`, `'t'`) stored as strings no longer match.
+- **GraphQL schema build fails loudly** on: unrecognised `@GraphQLOperation` output (was `String` / `[Any]`), unregistered relation targets, `@ArcheTypeFunction` without a usable return type. Date scalar only from `z.date()` / `Date` props (the `*_at` / `date*` name heuristic is gone). `id: ID` only on archetype `id` fields, not every `id: String`.
+- **GraphQL limits:** default max depth 15; `setGraphQLMaxDepth(n < 15)` and `setGraphQLMaxComplexity(n < 1)` throw; 0 no longer disables. Introspection and GraphiQL are off unless `NODE_ENV=development` or `GRAPHQL_INTROSPECTION` / `GRAPHQL_GRAPHIQL=on` (SEC-09).
+- **Deny-by-default info endpoints (SEC-10):** `/metrics`, `/health/remote`, `/docs`, `/openapi.json` return 404 without `BUNSANE_METRICS_TOKEN` / `BUNSANE_DOCS_TOKEN` or `BUNSANE_METRICS=public` / `BUNSANE_DOCS=public`. `/health` drops uptime/latency fields.
+- **Body limits (SEC-14):** non-multipart bodies default to 1 MB (413 by `Content-Length`).
+- **App lifecycle:** `use()` after `start()` throws; second `start()` is a no-op. `securityHeaders` + `requestId` middleware on by default (SEC-15); HSTS requires `BUNSANE_HSTS=on` or `BUNSANE_TLS=on`.
+- **Cross-instance cache invalidation requires `BUNSANE_CACHE_INVALIDATION_SECRET`** on every instance (SEC-11). Unset: pub/sub disabled with a startup warning — multi-instance apps must set it or serve stale L1 entries until TTL. `invalidatePattern` needs a literal prefix and is capped by `BUNSANE_CACHE_INVALIDATE_MAX` (SEC-13).
+- **Hooks:** `async: true` hooks are no longer awaited on the save path (errors logged; shutdown still drains them).
+- **Scheduler:** queries without `maxEntitiesPerExecution` are capped at 1000 entities.
+- **Uploads:** removed never-implemented `generateThumbnails`, `imageProcessing`, `scanForMalware` flags; `UploadManager` defaults now match `DEFAULT_UPLOAD_CONFIG`.
+- **Removed modules/exports:** `BatchLoader`, `PreparedStatementCache`, `core/app/preparedStatementWarmup.ts`, `DatabaseHelper.UpdateComponentIndexes`, `core/decorators/ScheduledTask.ts` (use `scheduler`), `gql/ArchetypeOperations.ts`, `TypeGenerationStrategy`, `InputTypeBuilder`, `TypeDefBuilder`, `GraphQLFieldTypes`, `TypeFromGraphQL`, `ResolverInput`, the import-time `yoga` export, `enableArchetypeOperations`, `rest/Generator.ts`, `types/app.types.ts`. Downgrade tools moved to `database/maintenance.ts`.
+- **Default `db` export is a lazy proxy** (not `=== getDb()`, not `instanceof SQL`). Use `getDb()` when you need the instance.
+- **`@HasOne` is nullable in SDL** unless `nullable: false`; the child is resolved on the related archetype's foreign key (batched), and a missing child returns `null`.
+
+#### Fixed
+
+- **A rolled-back `Entity.save()` looked persisted** — flags and removal sets now change only after the transaction (incl. QSP/read-model sync) commits, so a retry reissues every write.
+- `LoadComponents` / `LoadMultiple` / eager load revive `@CompData` `Date` fields; `serializableData()` accepts valid ISO strings.
+- `or()` on partitions built its own predicates: booleans were cast `::numeric` and numeric filters skipped the RP-04 index predicate. OR branches now use `FilterBuilder`.
+- Archetype field / relation / `@ArcheTypeFunction` resolvers are attached at schema build (no `registerFieldResolvers` call needed; it stays idempotent). Resolvers return already-populated parent data synchronously instead of re-fetching.
+- `@GraphQLOperation` accepts archetype classes as `output`.
+- `getEntityWithID` `includeComponents` / `excludeComponents` match archetype property keys.
+- `sortedCursor(token, 'before')` works for single-key component sort, `sortByCreatedAt` / `sortByUpdatedAt`, and OR + sort.
+- `LoadComponents(skipCache)` is honored and writes absence tombstones.
+- Scheduler locks renew while a task runs (TTL ≥ timeout + 5 s) and are not released on wrapper timeout until the task settles.
+- Bare `get()` / `reload()` go through the DB gateway (admission, timeout, metrics).
+- Shutdown exits non-zero when a drain step fails, releases the DB singleton (`closeDatabase()`) so a later use opens a fresh pool, and clears the server handle so `start()` can run again.
+- Studio: missing `studio/dist` is detected (was always "present"); `index.html` is cached.
+- `LOG_PRETTY=true` without `pino-pretty` installed falls back to JSON with a warning.
+
+#### Performance
+
+- Single-component `.with(A).sortBy(A, f).take(n)` with no filters uses a leaf-driven `ORDER BY expr, entity_id LIMIT n` scan (was a correlated sort of the whole set).
+- `sortByCreatedAt` / `sortByUpdatedAt` walk `entities` in order with `EXISTS` membership probes + `LIMIT` instead of materializing the id set.
+- CTE multi-filter path no longer re-probes membership or `DISTINCT`s after `INTERSECT`; unique membership scans drop `DISTINCT`; `OFFSET` omitted when 0.
+- Indexed boolean filters use the existing `(data->>'f')` btree.
+- Multi-type `.populate()` reads partition leaves (`UNION ALL`) instead of the parent table.
+- Component DataLoader fetches exact `(entity_id, type_id)` pairs; cache fill no longer blocks the response; misses are single-flighted; L2→L1 promotion is one batched write; gzip threshold 1 KB → 8 KB.
+- `Entity.saveMany()` — one transaction, batched inserts/upserts (500-row chunks); `EntityManager` pending saves use it.
+- Hook dispatch fast-paths events with no hooks; component-target sets precompiled.
+- Schema build weaves archetypes once (memoized) instead of twice per rebuild, with no per-archetype `printSchema`.
+- Resolver path: static upload-guard import, sweep skipped when args contain no `File`/`Blob`, `@Middleware` chain composed once.
+- Boot: sequential partition attach, one partition-strategy lookup, one `pg_indexes` query, `ANALYZE` only when something was created; partition DDL failure fails boot.
+- Request timeout configurable (`REQUEST_TIMEOUT_MS`, 0 = off); `/health` skips the timer and Request clone. Health write probe cached (5 s) and rate-limited.
+- Remote stream consumer runs with bounded concurrency (default 8); outbox claims, commits, then `XADD`s outside the PG transaction.
+
+#### Added
+
+- Root barrel: `import { App, Entity, BaseComponent, Component, CompData, BaseArcheType, Query, FilterOp, BaseService, GraphQLOperation, t, logger, withLock, ScheduledTask, … } from "bunsane"`; `package.json` `exports` (deep paths still resolve), `types`, `engines.bun`.
+- Typed `@GraphQLOperation` / `@GraphQLSubscription`: method checked as `(input: InferInput<I>, ctx, info) => Out`; `t` / `InferInput` exported from `gql`.
+- `HasMany` / `BelongsTo` / `HasOne` / `BelongsToMany` accept a class or `() => Class`.
+- `entity.hasPersisted(Ctor)`; `AppConfig` object for `new App({...})` merged over env; `setRequestTimeout`, `setJsonBodyLimit`, `setMultipartBodyLimit`; `closeDatabase()`, `isDatabaseInitialized()`.
+- Rate limiter keys by socket IP (`server.requestIP`) by default.
+- Optional HMAC signing for RPC envelopes (`BUNSANE_RPC_SECRET`, SEC-12); `replyTo` restricted to `rpc:responses:*`.
+- QSP reconcile sweep starts automatically when `BUNSANE_QSP` is `shadow` / `route` (F-11).
+- `validateEnv` covers SEC-16 variables; `BUNSANE_STRICT_ENV=on` turns boot warnings into failures.
+- README hello world + consumer tsconfig; `docs/README.md` index (internal RFCs/tickets moved to `docs/internal/`, not published).
+
+#### Changed
+
+- String-map and Zod `@GraphQLOperation` inputs log a deprecation warning (use `t.*`).
+- Single CORS implementation in the framework wrapper (Yoga CORS disabled).
+- `pino-pretty` is an optional dependency. `test:all` excludes stress/benchmark.
+
 ### Fixed (2026-09-05, read-path N+1 quick wins)
 
 - **Archetype component-field resolvers re-queried absent optional components.** When the request DataLoader answered null for a `nullable: true` component, the resolver fell through to a bare `entity.get()` — one un-batched `SELECT` per parent per absent field on every list request (measured 40 of 51 statements on a 20-row order list). The loader's null is now authoritative. Same fix applied to the `belongsTo` foreign-key fallback and the related-entity fallback.

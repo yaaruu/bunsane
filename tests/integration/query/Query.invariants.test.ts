@@ -19,7 +19,7 @@
  * so they are a durable regression net for future query-engine changes.
  */
 import { describe, test, expect, beforeAll, beforeEach } from 'bun:test';
-import { Query, FilterOp, or } from '../../../query/Query';
+import { Query, FilterOp, or, type ComponentFieldFilter } from '../../../query/Query';
 import { BaseComponent } from '../../../core/components/BaseComponent';
 import { Component, CompData } from '../../../core/components/Decorators';
 import { createTestContext, ensureComponentsRegistered } from '../../utils';
@@ -76,7 +76,7 @@ describe('Query invariants (dynamic component combinations)', () => {
     // Every query is scoped to this run via the label filter on InvData, so
     // leftover rows from other tests/files can never affect the invariants.
     type QF = () => Query<any>;
-    const base = (extra: ReturnType<typeof Query.filter>[] = []): Query<any> =>
+    const base = (extra: ComponentFieldFilter<InvData>[] = []): Query<any> =>
         new Query().with(InvData, { filters: [Query.filter('label', FilterOp.EQ, prefix), ...extra] });
 
     // ---- invariant helpers -------------------------------------------------

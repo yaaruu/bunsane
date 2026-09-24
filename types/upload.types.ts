@@ -21,54 +21,25 @@ export interface UploadConfiguration {
     
     /** Preserve original file name */
     preserveOriginalName: boolean;
-    
-    /** Generate thumbnails for images */
-    generateThumbnails: boolean;
-    
+
     /** Upload path relative to storage root */
     uploadPath: string;
-    
+
     /** File naming strategy */
     namingStrategy: "uuid" | "timestamp" | "original";
-    
+
     /** Storage provider to use */
     storageProvider?: string;
-    
-    /** Image processing options */
-    imageProcessing?: ImageProcessingOptions;
-    
-    /** Validation options */
+
+    /** Validation options. `customValidators` runs; there is no malware scanner. */
     validation?: ValidationOptions;
 }
 
-export interface ImageProcessingOptions {
-    /** Generate thumbnails */
-    generateThumbnails: boolean;
-    
-    /** Thumbnail sizes */
-    thumbnailSizes: Array<{ width: number; height: number; suffix: string }>;
-    
-    /** Compress images */
-    compress: boolean;
-    
-    /** Compression quality (0-100) */
-    quality: number;
-    
-    /** Convert to specific format */
-    convertTo?: "jpeg" | "png" | "webp";
-    
-    /** Maximum dimensions */
-    maxDimensions?: { width: number; height: number };
-}
-
 export interface ValidationOptions {
-    /** Check for malicious files */
-    scanForMalware: boolean;
-    
     /** Custom validation functions */
     customValidators?: Array<(file: File) => Promise<ValidationResult>>;
-    
-    /** Strict MIME type checking */
+
+    /** Strict MIME type checking (reserved; FileValidator uses allowedMimeTypes). */
     strictMimeType: boolean;
 }
 

@@ -1,6 +1,6 @@
 import "reflect-metadata";
 import type { UploadDecoratorConfig } from "../../types/upload.types";
-import { UploadManager } from "../../upload";
+import { UploadManager } from "../../upload/UploadManager";
 import { logger as MainLogger } from "../../core/Logger";
 import { UPLOAD_CONFIG_KEY, wrapUploadValidation } from "../uploadGuard";
 
@@ -89,7 +89,6 @@ export class UploadDecorators {
             maxFileSize: 5 * 1024 * 1024, // 5MB
             allowedMimeTypes: ["image/jpeg", "image/png", "image/gif", "image/webp"],
             allowedExtensions: [".jpg", ".jpeg", ".png", ".gif", ".webp"],
-            generateThumbnails: true
         });
     }
 
@@ -103,7 +102,6 @@ export class UploadDecorators {
             maxFileSize: 2 * 1024 * 1024, // 2MB
             allowedMimeTypes: ["image/jpeg", "image/png", "image/webp"],
             allowedExtensions: [".jpg", ".jpeg", ".png", ".webp"],
-            generateThumbnails: true,
             namingStrategy: "uuid"
         });
     }
@@ -138,7 +136,6 @@ export class UploadDecorators {
             validateFileSignature: true,
             sanitizeFileName: true,
             validation: {
-                scanForMalware: true,
                 strictMimeType: true
             }
         });

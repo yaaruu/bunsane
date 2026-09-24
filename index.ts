@@ -1,101 +1,73 @@
-// import App from "./core/App";
-// import ServiceRegistry from "./service/ServiceRegistry";
-// import BaseService from "./service/Service";
-// import { Component, CompData, BaseComponent } from "./core/Components";
-// import { Entity } from "./core/Entity";
-// import type { IEntity } from "./core/EntityInterface";
-// import BaseArcheType, { ArcheType} from "./core/ArcheType";
-// import Query from "./core/Query";
-// import {logger} from "./core/Logger";
-// import { handleGraphQLError, responseError } from "./core/ErrorHandler";
-// import { type Plugin } from "graphql-yoga";
-// import { BatchLoader } from "./core/BatchLoader";
-// import { createRequestContextPlugin } from "./core/RequestContext";
-// import type { RequestLoaders } from "./core/RequestLoaders";
-// import BasePlugin from "./plugins";
-// // Hook system exports
-// import EntityHookManager from "./core/EntityHookManager";
-// import {
-//     EntityHook,
-//     ComponentHook,
-//     LifecycleHook,
-//     ComponentTargetHook,
-//     registerDecoratedHooks
-// } from "./core/decorators/EntityHooks";
-// import type {
-//     EntityHookCallback,
-//     ComponentHookCallback,
-//     LifecycleHookCallback,
-//     HookOptions,
-//     ComponentTargetConfig
-// } from "./core/EntityHookManager";
-// import type {
-//     EntityLifecycleEvent,
-//     EntityCreatedEvent,
-//     EntityUpdatedEvent,
-//     EntityDeletedEvent,
-//     ComponentLifecycleEvent,
-//     ComponentAddedEvent,
-//     ComponentUpdatedEvent,
-//     ComponentRemovedEvent
-// } from "./core/events/EntityLifecycleEvents";
-// import { ScheduledTask } from "./core/decorators/ScheduledTask";
-// import { ScheduleInterval } from "./types/scheduler.types";
-// // Swagger exports
-// import { ApiDocs, ApiTags } from "./swagger";
+/**
+ * BunSane authoring surface.
+ *
+ * Importing this module does not open a database connection and does not
+ * construct a GraphQL Yoga instance. The pool is created on first use of the
+ * `bunsane/database` client. Yoga is created when `App.init()` builds the server.
+ *
+ * Deep paths (`bunsane/database`, `bunsane/core/components`, …) remain
+ * importable. Prefer this barrel for application code.
+ */
 
-// export { 
-//     App, 
-//     BaseArcheType,
-//     ArcheType,
-//     ServiceRegistry,
-//     BaseService,
-//     BaseComponent,
-//     Component,
-//     CompData,
-//     Entity,
-//     type IEntity,
-//     BatchLoader,
+export { default as App } from "./core/App";
+export type { AppConfig, CorsConfig } from "./core/App";
 
-//     Query,
+export { Entity } from "./core/Entity";
 
-//     // Scheduler exports
-//     ScheduleInterval,
-//     ScheduledTask,
+export { BaseComponent } from "./core/components/BaseComponent";
+export { Component, CompData } from "./core/components/Decorators";
 
-//     // Swagger exports
-//     ApiDocs,
-//     ApiTags,
+export { default as BaseArcheType } from "./core/ArcheType";
+export {
+    ArcheType,
+    ArcheTypeField,
+    ArcheTypeFunction,
+    ArcheTypeUnionField,
+    HasMany,
+    BelongsTo,
+    HasOne,
+    BelongsToMany,
+} from "./core/ArcheType";
 
-//     logger,
+export { Query, or, FilterOp } from "./query/Query";
 
-//     BasePlugin,
-//     type Plugin,
+export { default as BaseService } from "./service/Service";
+export { default as ServiceRegistry } from "./service/ServiceRegistry";
 
-//     responseError,
-//     handleGraphQLError,
+export { GraphQLOperation, GraphQLSubscription } from "./gql/Generator";
+export { t, type InferInput } from "./gql/schema";
 
-//     createRequestContextPlugin,
-//     type RequestLoaders,
+export { logger } from "./core/Logger";
 
-//     // Hook system exports
-//     EntityHookManager,
-//     EntityHook,
-//     ComponentHook,
-//     LifecycleHook,
-//     ComponentTargetHook,
-//     registerDecoratedHooks,
-//     type EntityHookCallback,
-//     type ComponentHookCallback,
-//     type LifecycleHookCallback,
-//     type HookOptions,
-//     type ComponentTargetConfig,
-//     type EntityLifecycleEvent,
-//     type EntityCreatedEvent,
-//     type EntityUpdatedEvent,
-//     type EntityDeletedEvent,
-//     type ComponentLifecycleEvent,
-//     type ComponentAddedEvent,
-//     type ComponentUpdatedEvent,
-//     type ComponentRemovedEvent
-// };
+export {
+    withLock,
+    LockUnavailableError,
+} from "./core/scheduler/withLock";
+export type { WithLockOptions, LockOutcome } from "./core/scheduler/withLock";
+
+export {
+    ScheduledTask,
+    registerScheduledTasks,
+    ScheduleInterval,
+} from "./scheduler";
+
+export { accessLog, type AccessLogOptions } from "./core/middleware/AccessLog";
+export { requestId, getRequestId } from "./core/middleware/RequestId";
+export { securityHeaders, type SecurityHeadersOptions } from "./core/middleware/SecurityHeaders";
+export { rateLimit, type RateLimitOptions } from "./core/middleware/RateLimit";
+
+export {
+    handleUpload,
+    parseFormData,
+    uploadResponse,
+    uploadErrorResponse,
+} from "./upload/RestUpload";
+export type {
+    ParsedUpload,
+    RestUploadOptions,
+    RestUploadResult,
+} from "./upload/RestUpload";
+export { UploadManager } from "./upload/UploadManager";
+export { UploadHelper } from "./utils/UploadHelper";
+
+export { CacheManager } from "./core/cache/CacheManager";

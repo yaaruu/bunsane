@@ -1,11 +1,10 @@
 // Component access + mutation for Entity (add/set/remove/get/has/reload
 // and the in-memory helpers). Extracted from Entity.ts
 // (RFC_REFACTOR_TARGETS §3.2). Pure functions take the entity instance as
-// the first parameter; hook phases/order are byte-identical to the
-// original inline implementation.
+// the first parameter; hook phases/order match the original inline implementation.
 import type { ComponentDataType, ComponentGetter, BaseComponent } from "../components";
 import { logger } from "../Logger";
-import db from "../../database";
+import { dbRun } from "../../database/gateway";
 import { runWithSignal } from "../../database/cancellable";
 import ComponentRegistry from "../components/ComponentRegistry";
 import { SQL } from "bun";
@@ -17,6 +16,34 @@ import { trackCacheOp } from "./pendingOps";
 import { getCacheManager } from "./getCacheManager";
 import { COMPONENT_TOMBSTONE } from "../cache/CacheManager";
 import type { Entity } from "../Entity";
+import { hydrateComponentRow } from "./hydrateComponentRow";
+import { ComponentLoadError, ComponentMissingError } from "./errors";
+
+export { ComponentLoadError, ComponentMissingError };
+
+export type ComponentAccessContext = {
+    loaders?: { componentsByEntityType?: ComponentsByEntityTypeLoader };
+    trx?: SQL;
+    signal?: AbortSignal;
+};
+
+type ComponentsByEntityTypeLoader = {
+    load(key: { entityId: string; typeId: string }): Promise<unknown>;
+    clear(key: { entityId: string; typeId: string }): void;
+};
+
+type PersistenceFlags = { _dirty: boolean; _persisted: boolean };
+
+function flagsOf(target: object): PersistenceFlags {
+    return target as unknown as PersistenceFlags;
+}
+
+function readLoaderRow(value: unknown): { id: string | null; data: unknown } | null {
+    if (value == null || typeof value !== "object") return null;
+    const rec = value as unknown as Record<string, unknown>;
+    const id = rec.id;
+    return { id: typeof id === "string" ? id : null, data: rec.data };
+}
 
 export function addComponent(entity: Entity, component: BaseComponent): Entity {
     const typeId = component.getTypeID();
@@ -78,10 +105,10 @@ export function add<T extends BaseComponent>(entity: Entity, ctor: new (...args:
     return entity;
 }
 
-export async function set<T extends BaseComponent>(entity: Entity, ctor: new (...args: any[]) => T, data: Partial<ComponentDataType<T>>, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<Entity> {
+export async function set<T extends BaseComponent>(entity: Entity, ctor: new (...args: any[]) => T, data: Partial<ComponentDataType<T>>, context?: ComponentAccessContext): Promise<Entity> {
     await get(entity, ctor, context);
 
-    const component = entity.components.get(typeIdOf(ctor)) as T;
+    const component = entity.components.get(typeIdOf(ctor)) as T | undefined;
     if (component) {
         // Store old data for the update event
         const oldData = { ...component };
@@ -101,33 +128,16 @@ export async function set<T extends BaseComponent>(entity: Entity, ctor: new (..
             // Don't fail the set operation if hooks fail
         }
 
-        // Invalidate DataLoader cache if context is provided
+        // Invalidate DataLoader cache if context is provided. Shared cache
+        // I/O waits until save() commits — publishing here would let a
+        // concurrent miss refill L2 with the pre-commit row (or with data
+        // that never landed). save() invalidates / write-throughs after commit.
         if (context?.loaders?.componentsByEntityType) {
             context.loaders.componentsByEntityType.clear({
                 entityId: entity.id,
                 typeId: component.getTypeID()
             });
         }
-
-        // Fire-and-forget cache update, tracked via drainable set so
-        // App.shutdown can await it (H-CACHE-1).
-        trackCacheOp((async () => {
-            try {
-                const CacheManager = getCacheManager();
-                const cacheManager = CacheManager.getInstance();
-                const config = cacheManager.getConfig();
-
-                if (config.enabled && config.component?.enabled) {
-                    if (config.strategy === 'write-through') {
-                        await cacheManager.setComponentWriteThrough(entity.id, [component], component.getTypeID(), config.component.ttl);
-                    } else {
-                        await cacheManager.invalidateComponent(entity.id, component.getTypeID());
-                    }
-                }
-            } catch (error) {
-                logger.warn({ scope: 'cache', component: 'Entity', msg: 'Cache operation failed after set', err: error });
-            }
-        })());
     } else {
         // Add new component
         add(entity, ctor, data);
@@ -137,12 +147,17 @@ export async function set<T extends BaseComponent>(entity: Entity, ctor: new (..
     return entity;
 }
 
-export function remove<T extends BaseComponent>(entity: Entity, ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): boolean {
-    const component = entity.components.get(typeIdOf(ctor)) as T;
+/**
+ * Remove a component. If it is not loaded, the type id is still enqueued so
+ * `save()` deletes the row. Returns false only when this session already
+ * saved that deletion. `has()` stays an in-memory check — use `hasPersisted`
+ * to ask the loader.
+ */
+export function remove<T extends BaseComponent>(entity: Entity, ctor: new (...args: any[]) => T, context?: ComponentAccessContext): boolean {
+    const typeId = typeIdOf(ctor);
+    const component = entity.components.get(typeId) as T | undefined;
 
     if (component) {
-        const typeId = component.getTypeID();
-
         // Track the component type for database deletion
         entity.removedComponents.add(typeId);
 
@@ -159,7 +174,9 @@ export function remove<T extends BaseComponent>(entity: Entity, ctor: new (...ar
                 logger.error(`Error firing component removed hook for ${typeId}: ${error}`);
             });
 
-        // Invalidate DataLoader cache if context is provided
+        // Invalidate DataLoader cache if context is provided. Shared cache
+        // invalidation runs post-commit from save(), which already covers
+        // removed type ids.
         if (context?.loaders?.componentsByEntityType) {
             context.loaders.componentsByEntityType.clear({
                 entityId: entity.id,
@@ -167,45 +184,80 @@ export function remove<T extends BaseComponent>(entity: Entity, ctor: new (...ar
             });
         }
 
-        // Fire-and-forget cache invalidation, tracked for shutdown drain
-        // (H-CACHE-1).
-        trackCacheOp((async () => {
-            try {
-                const CacheManager = getCacheManager();
-                const cacheManager = CacheManager.getInstance();
-                const config = cacheManager.getConfig();
-
-                if (config.enabled && config.component?.enabled) {
-                    await cacheManager.invalidateComponent(entity.id, typeId);
-                }
-            } catch (error) {
-                logger.warn({ scope: 'cache', component: 'Entity', msg: 'Cache invalidation failed after remove', err: error });
-            }
-        })());
-
         return true;
     }
 
-    return false;
+    if (entity.savedRemovedComponents.has(typeId)) {
+        return false;
+    }
+    if (entity.removedComponents.has(typeId)) {
+        return true;
+    }
+
+    // Not in memory. Still record the deletion so save() issues the DELETE
+    // even when the caller never hydrated the component (loaded-by-id).
+    entity.removedComponents.add(typeId);
+    entity._missingComponents.delete(typeId);
+    entity.setDirty(true);
+    if (context?.loaders?.componentsByEntityType) {
+        context.loaders.componentsByEntityType.clear({
+            entityId: entity.id,
+            typeId
+        });
+    }
+    return true;
 }
 
-export async function get<T extends BaseComponent>(entity: Entity, ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<ComponentDataType<T> | null> {
+/**
+ * Get component data. Loads from the DB when not in memory.
+ *
+ * The returned object is a snapshot of `@CompData` fields. Mutating it does
+ * not change the component and does not mark the entity dirty — use `set()`.
+ */
+export async function get<T extends BaseComponent>(entity: Entity, ctor: new (...args: any[]) => T, context?: ComponentAccessContext): Promise<ComponentDataType<T> | null> {
     const comp = await loadComponent(entity, ctor, context);
     return comp ? (comp as ComponentGetter<T>).data() : null;
 }
 
+/**
+ * In-memory presence only. A component that exists in the database but has
+ * not been loaded returns false. Use `hasPersisted()` for a loader/DB check,
+ * or `get()` to load it.
+ */
 export function has<T extends BaseComponent>(entity: Entity, ctor: new (...args: any[]) => T): boolean {
     return hasInMemory(entity, ctor);
 }
 
+/**
+ * True when a saved row exists (or the in-memory instance is already marked
+ * persisted). Consults the loader / database when the component is not in
+ * memory. A pending or completed `remove()` returns false and does not
+ * rehydrate the row.
+ */
+export async function hasPersisted<T extends BaseComponent>(entity: Entity, ctor: new (...args: any[]) => T, context?: ComponentAccessContext): Promise<boolean> {
+    const typeId = typeIdOf(ctor);
+    const inMem = entity.components.get(typeId);
+    if (inMem) return flagsOf(inMem)._persisted;
+    if (entity.removedComponents.has(typeId) || entity.savedRemovedComponents.has(typeId)) {
+        return false;
+    }
+    const loaded = await loadComponent(entity, ctor, context);
+    return loaded !== null;
+}
+
+/**
+ * Get component data or throw if not found.
+ * A database failure throws `ComponentLoadError`. A confirmed absence throws
+ * `ComponentMissingError`.
+ */
 export async function getOrThrow<T extends BaseComponent>(
     entity: Entity,
     ctor: new (...args: any[]) => T,
-    context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }
+    context?: ComponentAccessContext
 ): Promise<ComponentDataType<T>> {
     const data = await get(entity, ctor, context);
     if (data === null) {
-        throw new Error(`Entity ${entity.id} is missing required component ${ctor.name}`);
+        throw new ComponentMissingError(entity.id, ctor.name);
     }
     return data;
 }
@@ -215,7 +267,7 @@ export function getCached<T extends BaseComponent>(entity: Entity, ctor: new (..
     return comp ? (comp as ComponentGetter<T>).data() : undefined;
 }
 
-export async function getInstanceOf<T extends BaseComponent>(entity: Entity, ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<T | null> {
+export async function getInstanceOf<T extends BaseComponent>(entity: Entity, ctor: new (...args: any[]) => T, context?: ComponentAccessContext): Promise<T | null> {
     return loadComponent(entity, ctor, context);
 }
 
@@ -228,35 +280,31 @@ export async function reload(entity: Entity, opts?: { trx?: SQL; signal?: AbortS
     entity.savedRemovedComponents.clear();
     entity._missingComponents.clear();
 
-    const dbConn = opts?.trx ?? db;
-    const rows = await runWithSignal<any[]>(
-        dbConn`
-        SELECT c.id, c.type_id, c.data
-        FROM components c
-        WHERE c.entity_id = ${entity.id} AND c.deleted_at IS NULL
-    `,
-        opts?.signal
-    );
+    // Caller-supplied trx stays a raw template: the enclosing transaction
+    // already holds the admission permit. Bare reads go through the gateway.
+    const rows = opts?.trx
+        ? await runWithSignal<ComponentSelectRow[]>(
+            opts.trx`
+            SELECT c.id, c.type_id, c.data
+            FROM components c
+            WHERE c.entity_id = ${entity.id} AND c.deleted_at IS NULL
+        `,
+            opts.signal
+        )
+        : await dbRun<ComponentSelectRow[]>(
+            (conn) => conn`
+            SELECT c.id, c.type_id, c.data
+            FROM components c
+            WHERE c.entity_id = ${entity.id} AND c.deleted_at IS NULL
+        `,
+            "entity.reload",
+            { lane: "request", label: "entity.reload", signal: opts?.signal },
+        );
 
-    const storage = getMetadataStorage();
     for (const row of rows) {
         const ctor = ComponentRegistry.getConstructor(row.type_id);
         if (!ctor) continue;
-        const comp: any = new ctor();
-        const parsed = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
-        Object.assign(comp, parsed);
-        comp.id = row.id;
-        const props = storage.componentProperties.get(row.type_id);
-        if (props) {
-            for (const prop of props) {
-                if (prop.propertyType === Date && typeof comp[prop.propertyKey] === 'string') {
-                    comp[prop.propertyKey] = new Date(comp[prop.propertyKey]);
-                }
-            }
-        }
-        comp.setPersisted(true);
-        comp.setDirty(false);
-        addComponent(entity, comp);
+        addComponent(entity, hydrateComponentRow(ctor, { id: row.id, data: row.data, typeId: row.type_id }));
     }
 
     entity.setPersisted(true);
@@ -280,8 +328,19 @@ export async function requireComponents(entity: Entity, ctors: Array<new (...arg
     await Entity.LoadComponents([entity], missing);
 }
 
-async function loadComponent<T extends BaseComponent>(entity: Entity, ctor: new (...args: any[]) => T, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<T | null> {
-    const comp = entity.components.get(typeIdOf(ctor)) as T | undefined;
+type ComponentSelectRow = {
+    id: string;
+    entity_id?: string;
+    type_id: string;
+    data: unknown;
+    created_at?: Date;
+    updated_at?: Date;
+    deleted_at?: Date | null;
+};
+
+async function loadComponent<T extends BaseComponent>(entity: Entity, ctor: new (...args: any[]) => T, context?: ComponentAccessContext): Promise<T | null> {
+    const typeId = typeIdOf(ctor);
+    const comp = entity.components.get(typeId) as T | undefined;
     if (typeof comp !== "undefined") {
         return comp;
     }
@@ -292,9 +351,10 @@ async function loadComponent<T extends BaseComponent>(entity: Entity, ctor: new 
         return null;
     }
 
-    // Memoized metadata lookup — no throwaway component instantiation
-    // just to read the type id.
-    const typeId = typeIdOf(ctor);
+    // A removal recorded this session must not be resurrected by get().
+    if (entity.removedComponents.has(typeId) || entity.savedRemovedComponents.has(typeId)) {
+        return null;
+    }
 
     // Negative-cache short-circuit: if we previously confirmed this component
     // is absent from the DB (and no explicit transaction is in scope that
@@ -304,9 +364,6 @@ async function loadComponent<T extends BaseComponent>(entity: Entity, ctor: new 
     if (!context?.trx && entity._missingComponents.has(typeId)) {
         return null;
     }
-
-    // Use transaction if provided, otherwise use default db
-    const dbConn = context?.trx ?? db;
 
     // Ambient request scope fallback: bare entity.get() calls (e.g.
     // inside @ArcheTypeFunction bodies or Unwrap()) batch through the
@@ -318,14 +375,14 @@ async function loadComponent<T extends BaseComponent>(entity: Entity, ctor: new 
     const signal = context?.signal ?? scope?.signal;
 
     try {
-        let componentData: any = null;
+        let componentData: unknown = null;
         let componentId: string | null = null;
 
         if (loaders?.componentsByEntityType) {
-            const loaderResult = await loaders.componentsByEntityType.load({
+            const loaderResult = readLoaderRow(await loaders.componentsByEntityType.load({
                 entityId: entity.id,
                 typeId: typeId
-            });
+            }));
             if (loaderResult) {
                 componentData = loaderResult.data;
                 componentId = loaderResult.id;
@@ -337,11 +394,11 @@ async function loadComponent<T extends BaseComponent>(entity: Entity, ctor: new 
             // A tombstone hit is a confirmed absence.
             const cacheManager = context?.trx ? null : getCacheManager().getInstance();
             const cacheConfig = cacheManager?.getConfig();
-            const cacheOn = !!cacheConfig?.enabled && !!cacheConfig?.component?.enabled;
+            const cacheOn = Boolean(cacheConfig?.enabled && cacheConfig.component?.enabled);
             let cacheDecided = false;
-            if (cacheOn) {
+            if (cacheOn && cacheManager) {
                 try {
-                    const [cached] = await cacheManager!.getComponents([{ entityId: entity.id, typeId }]);
+                    const [cached] = await cacheManager.getComponents([{ entityId: entity.id, typeId }]);
                     if (cached === COMPONENT_TOMBSTONE) {
                         cacheDecided = true;
                     } else if (cached) {
@@ -355,34 +412,46 @@ async function loadComponent<T extends BaseComponent>(entity: Entity, ctor: new 
             }
 
             if (!cacheDecided) {
-                // Route through runWithSignal so a request/wall-clock abort can
-                // cancel this in-flight read. When dbConn is context.trx, an
-                // uncancelled read leaks the backend into `idle in transaction`
-                // on timeout (matches the d1dde84 save/delete fix, which missed
-                // the read path).
-                const rows = await runWithSignal<any[]>(
-                    dbConn`SELECT id, entity_id, type_id, data, created_at, updated_at, deleted_at FROM components WHERE entity_id = ${entity.id} AND type_id = ${typeId} AND deleted_at IS NULL`,
-                    signal
-                );
+                // Bare reads take a gateway permit (lane request, statement
+                // timeout). A caller-supplied trx is already admitted — keep
+                // the raw template so we do not wait for a second permit
+                // while holding the connection.
+                const rows = context?.trx
+                    ? await runWithSignal<ComponentSelectRow[]>(
+                        context.trx`SELECT id, entity_id, type_id, data, created_at, updated_at, deleted_at FROM components WHERE entity_id = ${entity.id} AND type_id = ${typeId} AND deleted_at IS NULL`,
+                        signal
+                    )
+                    : await dbRun<ComponentSelectRow[]>(
+                        (conn) => conn`SELECT id, entity_id, type_id, data, created_at, updated_at, deleted_at FROM components WHERE entity_id = ${entity.id} AND type_id = ${typeId} AND deleted_at IS NULL`,
+                        "entity.component.get",
+                        { lane: "request", label: "entity.component.get", signal },
+                    );
                 if (rows.length > 0) {
-                    componentData = rows[0].data;
-                    componentId = rows[0].id;
+                    componentData = rows[0]!.data;
+                    componentId = rows[0]!.id;
                 }
-                if (cacheOn) {
+                if (cacheOn && cacheManager) {
                     // Write-through (or tombstone the absence). Fire-and-forget
                     // like the other cache writes in this module.
                     const requested = [{ entityId: entity.id, typeId }];
-                    const found = rows.length > 0 ? [{
-                        id: rows[0].id,
-                        entityId: rows[0].entity_id,
-                        typeId: rows[0].type_id,
-                        data: rows[0].data,
-                        createdAt: rows[0].created_at,
-                        updatedAt: rows[0].updated_at,
-                        deletedAt: rows[0].deleted_at,
-                    }] : [];
+                    const found = [];
+                    if (rows.length > 0) {
+                        const row = rows[0]!;
+                        const createdAt = row.created_at instanceof Date ? row.created_at : new Date();
+                        const updatedAt = row.updated_at instanceof Date ? row.updated_at : createdAt;
+                        found.push({
+                            id: row.id,
+                            entityId: row.entity_id ?? entity.id,
+                            typeId: row.type_id,
+                            data: row.data,
+                            createdAt,
+                            updatedAt,
+                            deletedAt: row.deleted_at ?? null,
+                        });
+                    }
+                    const ttl = cacheConfig?.component?.ttl;
                     trackCacheOp(
-                        cacheManager!.setComponentsWriteThrough(found, requested, cacheConfig!.component!.ttl)
+                        cacheManager.setComponentsWriteThrough(found, requested, ttl)
                             .catch((error) => logger.warn({ scope: 'cache', component: 'componentAccess', msg: 'Cache write failed after component fetch', error }))
                     );
                 }
@@ -390,37 +459,27 @@ async function loadComponent<T extends BaseComponent>(entity: Entity, ctor: new 
         }
 
         if (componentData !== null) {
-            const comp: any = new ctor();
-            if (componentId) {
-                comp.id = componentId;
-            }
-            const parsedData = typeof componentData === 'string' ? JSON.parse(componentData) : componentData;
-            Object.assign(comp, parsedData);
-            const storage = getMetadataStorage();
-            const props = storage.componentProperties.get(typeId);
-            if (props) {
-                for (const prop of props) {
-                    if (prop.propertyType === Date && typeof comp[prop.propertyKey] === 'string') {
-                        comp[prop.propertyKey] = new Date(comp[prop.propertyKey]);
-                    }
-                }
-            }
-            comp.setPersisted(true);
-            comp.setDirty(false);
-            addComponent(entity, comp);
-            return comp as T;
-        } else {
-            // Record the confirmed absence so repeated probes skip the DB.
-            // Only when no explicit trx — within a transaction the caller
-            // may insert the component and probe again in the same scope.
-            if (!context?.trx) {
-                entity._missingComponents.add(typeId);
-            }
-            return null;
+            const hydrated = hydrateComponentRow(ctor, {
+                id: componentId,
+                data: componentData,
+                typeId,
+            });
+            addComponent(entity, hydrated);
+            return hydrated;
         }
-    } catch (error) {
-        logger.error(`Failed to fetch component ${ctor.name}: ${error}`);
+
+        // Record the confirmed absence so repeated probes skip the DB.
+        // Only when no explicit trx — within a transaction the caller
+        // may insert the component and probe again in the same scope.
+        // A thrown read must NOT land here: absence is a zero-row result.
+        if (!context?.trx) {
+            entity._missingComponents.add(typeId);
+        }
         return null;
+    } catch (error) {
+        if (error instanceof ComponentLoadError) throw error;
+        logger.error(`Failed to fetch component ${ctor.name}: ${error}`);
+        throw new ComponentLoadError(entity.id, ctor.name, error);
     }
 }
 

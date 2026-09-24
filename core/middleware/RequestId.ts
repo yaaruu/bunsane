@@ -21,7 +21,11 @@ export { requestStore };
  */
 export function requestId(): Middleware {
     return async (req, next) => {
-        const id = req.headers.get('X-Request-Id') || crypto.randomUUID();
+        // SEC-17: reject header injection and oversized ids. Generate instead.
+        const inbound = req.headers.get('X-Request-Id');
+        const id = inbound && /^[A-Za-z0-9-]{1,64}$/.test(inbound)
+            ? inbound
+            : crypto.randomUUID();
 
         return requestStore.run({ requestId: id }, async () => {
             const response = await next();

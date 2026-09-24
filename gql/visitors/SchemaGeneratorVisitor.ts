@@ -1,5 +1,3 @@
-import type { TypeGenerationStrategy } from "../strategies/TypeGenerationStrategy";
-import { ZodTypeStrategy } from "../strategies/TypeGenerationStrategy";
 import { GraphVisitor } from "./GraphVisitor";
 import type { TypeNode, OperationNode, FieldNode, InputNode, ScalarNode } from "../graph/GraphNode";
 import { logger as MainLogger } from "../../core/Logger";
@@ -255,7 +253,7 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
 
                 fieldDef += `(input: ${inputTypeName}${inputNullability})`;
             } else if (typeof input === 'object') {
-                // Fallback: Record<string, GraphQLType> format
+                logger.warn(`Operation "${name}" uses a string-map input ({ field: "Type" }). This dialect is deprecated. Use the Schema DSL (t.string(), t.id(), etc.) instead.`);
                 const inputTypeDef = `input ${inputTypeName} {\n${Object.entries(input).map(([k, v]) => `  ${k}: ${v}`).join('\n')}\n}\n`;
                 if (!this.definedTypes.has(inputTypeName)) {
                     this.typeDefs += inputTypeDef;
@@ -273,113 +271,122 @@ export class SchemaGeneratorVisitor extends GraphVisitor {
     }
 
     /**
-     * Extract output type from operation metadata
+     * Extract output type from operation metadata.
+     * Accepts a GraphQL type-name string, an archetype instance or constructor
+     * (or an array of either), or a plain field map. Anything else throws.
      */
-    private extractOutputType(output: any, operationName: string): string {
-        if (typeof output === 'string') {
+    private extractOutputType(output: unknown, operationName: string): string {
+        if (typeof output === "string") {
+            if (output.trim() === "") {
+                throw this.unrecognisedOutput(operationName, output);
+            }
             return output;
-        } else if (Array.isArray(output)) {
-            const archetypeInstance = output[0];
-            const typeName = this.getArchetypeTypeName(archetypeInstance);
-            if (typeName) {
-                return `[${typeName}]`;
-            } else {
-                logger.warn(`Invalid array output type, expected archetype instance`);
-                return '[Any]';
+        }
+
+        if (Array.isArray(output)) {
+            if (output.length === 0) {
+                throw this.unrecognisedOutput(operationName, output);
             }
-        } else if (output instanceof BaseArcheType) {
-            const typeName = this.getArchetypeTypeName(output);
-            if (typeName) {
-                return typeName;
-            } else {
-                logger.warn(`Could not determine type name for archetype`);
-                return 'Any';
-            }
-        } else if (typeof output === 'object' && output !== null) {
-            // Inline object output — generate a named GraphQL output type
+            return `[${this.resolveArchetypeTypeName(output[0], operationName)}]`;
+        }
+
+        if (this.isArchetypeValue(output)) {
+            return this.resolveArchetypeTypeName(output, operationName);
+        }
+
+        if (this.isFieldMap(output)) {
             const capitalizedName = operationName.charAt(0).toUpperCase() + operationName.slice(1);
             const outputTypeName = `${capitalizedName}Output`;
             if (!this.definedTypes.has(outputTypeName)) {
-                const outputTypeDef = `type ${outputTypeName} {\n${Object.entries(output).map(([k, v]) => `  ${k}: ${v}`).join('\n')}\n}\n`;
-                this.typeDefs += outputTypeDef;
+                const fields = Object.entries(output).map(([key, value]) => `  ${key}: ${value}`).join("\n");
+                this.typeDefs += `type ${outputTypeName} {\n${fields}\n}\n`;
                 this.definedTypes.add(outputTypeName);
             }
             return outputTypeName;
-        } else {
-            return 'String';
         }
+
+        throw this.unrecognisedOutput(operationName, output);
     }
-    
-    /**
-     * Get archetype type name exactly like V1's getArchetypeTypeName
-     */
-    private getArchetypeTypeName(archetypeInstance: any): string | null {
-        if (!archetypeInstance || !(archetypeInstance instanceof BaseArcheType)) {
-            return null;
+
+    private unrecognisedOutput(operationName: string, output: unknown): Error {
+        let hint: string = typeof output;
+        if (typeof output === "function") {
+            hint = `function ${output.name || "(anonymous)"}`;
+        } else if (Array.isArray(output)) {
+            hint = "array";
+        } else if (output === null) {
+            hint = "null";
         }
-        
+        return new Error(
+            `Operation "${operationName}" has an unrecognised output type (${hint}). ` +
+            `Pass an archetype class or instance (or an array of them), a GraphQL type name string, or a field map. ` +
+            `Refusing to default to String.`,
+        );
+    }
+
+    private isFieldMap(output: unknown): output is Record<string, string> {
+        if (!output || typeof output !== "object" || Array.isArray(output)) return false;
+        if (output instanceof BaseArcheType) return false;
+        if ("_def" in output) return false;
+        const entries = Object.entries(output);
+        return entries.length > 0 && entries.every(([, value]) => typeof value === "string");
+    }
+
+    private isArchetypeConstructor(value: unknown): value is new (...args: readonly unknown[]) => BaseArcheType {
+        return typeof value === "function" && value.prototype instanceof BaseArcheType;
+    }
+
+    private isArchetypeValue(value: unknown): value is BaseArcheType | (new (...args: readonly unknown[]) => BaseArcheType) {
+        return value instanceof BaseArcheType || this.isArchetypeConstructor(value);
+    }
+
+    private resolveArchetypeTypeName(value: unknown, operationName: string): string {
+        const ctor = value instanceof BaseArcheType
+            ? (value.constructor as new (...args: readonly unknown[]) => BaseArcheType)
+            : this.isArchetypeConstructor(value)
+                ? value
+                : null;
+        if (!ctor) {
+            throw this.unrecognisedOutput(operationName, value);
+        }
+
         const storage = getMetadataStorage();
-        const className = archetypeInstance.constructor.name;
-        
-        // Look up the archetype metadata by class name to get the custom name
-        const archetypeMetadata = storage.archetypes.find(a => a.target?.name === className);
-        
-        if (archetypeMetadata?.name) {
-            // Use the custom name from @ArcheType("CustomName") decorator
-            logger.trace(`Found custom archetype name: ${archetypeMetadata.name} for class ${className}`);
-            
-            // Ensure schema is generated and cached
-            try {
-                if (!getArchetypeSchema(archetypeMetadata.name)) {
-                    archetypeInstance.getZodObjectSchema();
-                }
-            } catch (error) {
-                logger.warn(`Failed to generate schema for archetype ${archetypeMetadata.name}: ${error}`);
-            }
-            
-            return archetypeMetadata.name;
-        }
-        
-        // Fallback: infer from class name
-        const inferredName = className.replace(/ArcheType$/, '');
-        logger.trace(`Using inferred archetype name: ${inferredName} for class ${className}`);
-        
+        const className = ctor.name;
+        const archetypeMetadata = storage.archetypes.find(
+            (entry) => entry.target === ctor || entry.target?.name === className,
+        );
+        const typeName = archetypeMetadata?.name || className.replace(/ArcheType$/, "");
+
         try {
-            if (!getArchetypeSchema(inferredName)) {
-                archetypeInstance.getZodObjectSchema();
+            if (!getArchetypeSchema(typeName)) {
+                const subject = value instanceof BaseArcheType ? value : new ctor();
+                subject.getZodObjectSchema();
             }
         } catch (error) {
-            logger.warn(`Failed to generate schema for archetype ${inferredName}: ${error}`);
+            logger.warn(`Failed to generate schema for archetype ${typeName}: ${error}`);
         }
-        
-        return inferredName;
+        return typeName;
     }
     
     /**
-     * Generate input type from Schema DSL definitions.
-     * Collects nested type definitions (depth-first) and builds a Zod schema for validation.
+     * Generate input type SDL from Schema DSL definitions.
+     * Nested type definitions are collected depth-first. Runtime Zod validation
+     * is built later by ResolverGeneratorVisitor — do not construct a throwaway
+     * object schema here.
      */
     private generateInputFromSchema(
         input: Record<string, SchemaType>,
         inputName: string,
-    ): { typeDefs: string; zodSchema: ZodType } {
+    ): { typeDefs: string } {
         const collected = collectNestedTypeDefs(input);
 
-        // Build the top-level input type
         const fields = Object.entries(input)
             .map(([key, schema]) => `  ${key}: ${schema.toGraphQL()}`)
             .join("\n");
         collected.set(inputName, `input ${inputName} {\n${fields}\n}`);
 
-        // Build Zod schema for runtime validation
-        const zodShape: Record<string, ZodType> = {};
-        for (const [key, schema] of Object.entries(input)) {
-            zodShape[key] = schema.toZod();
-        }
-
         return {
             typeDefs: Array.from(collected.values()).join("\n\n") + "\n",
-            zodSchema: z.object(zodShape),
         };
     }
 

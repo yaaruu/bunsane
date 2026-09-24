@@ -106,9 +106,10 @@ if (!isPGlite) {
                 allEntities.push(e);
             }
 
-            // Update a subset — exercises updated_at parity. entities.updated_at is never bumped
-            // on component updates, so rm_.updated_at must mirror the entities row (NOT save-time
-            // NOW()). The buggy P2 code would diverge here.
+            // Update a subset — component saves bump entities.updated_at in the
+            // same transaction, and upsertProjection copies that column (not a
+            // separate clock). Parity still requires rm_.updated_at to mirror
+            // entities.updated_at after the bump.
             for (let i = 0; i < 150; i++) {
                 const e = allEntities[(i * 10) % allEntities.length]!;
                 await e.set(QspShadowOrder, { status: 'closed', total: Math.floor(rnd(seed) * 1000) });

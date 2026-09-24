@@ -21,6 +21,7 @@ import { CircuitBreaker } from "./CircuitBreaker";
 import { RemoteMetrics, type RemoteMetricsSnapshot } from "./metrics";
 import { collectRemoteHealth, type RemoteHealthCheck } from "./health";
 import db from "../../database";
+import { encodeEnvelope, warnIfRpcSecretUnset } from "./envelopeSign";
 import type {
     CallOptions,
     EmitOptions,
@@ -156,7 +157,8 @@ export class RemoteManager {
         }
 
         const stream = `${this.streamPrefix}${target}`;
-        const envelope = JSON.stringify({
+        // sourceApp is this process's config, never a field of `data`.
+        const envelope = encodeEnvelope({
             kind: "event",
             sourceApp: this.config.appName,
             event,
@@ -226,7 +228,7 @@ export class RemoteManager {
 
     async start(): Promise<void> {
         if (this.started) return;
-
+        warnIfRpcSecretUnset(loggerInstance);
         const factory =
             this.config.redisFactory ??
             ((blocking: boolean) => new Redis(buildRedisOptions(blocking)));

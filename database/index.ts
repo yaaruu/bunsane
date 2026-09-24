@@ -208,9 +208,66 @@ export function resetDatabase(): void {
     _db = createDatabase();
 }
 
-// For backward compatibility, initialize eagerly on import
-// This ensures existing code using `import db from './database'` continues to work
-// Note: For benchmarks that need delayed initialization, use getDb() or resetDatabase()
-const db = getDb();
+/**
+ * Close the current pool and drop the singleton, so the next use lazily opens
+ * a fresh pool instead of hitting a closed one (tests, scripts, re-init).
+ */
+export async function closeDatabase(): Promise<void> {
+    const current = _db;
+    _db = null;
+    if (current) await current.close();
+}
+
+/**
+ * Default client. Forwards tagged templates, calls (`db(rows)`), and property
+ * access (`db.unsafe`, `db.begin`, `db.transaction`, `db.close`, …) to the
+ * instance from {@link getDb}, so the pool is not created until something
+ * actually uses it. Follows {@link resetDatabase} — the previous eager
+ * `const db = getDb()` pinned importers to the pool that existed at import.
+ *
+ * `then` / `catch` / `finally` do not initialize the pool. Awaiting a
+ * non-thenable checks `.then`; that must not open a connection.
+ */
+const methodCache = new WeakMap<object, Map<PropertyKey, { fn: Function; bound: Function }>>();
+
+// Target must be callable so tagged-template / helper calls hit the apply trap.
+const lazyTarget = function lazyDatabase(): void {
+    // Unreachable: apply forwards to getDb().
+};
+
+const db = new Proxy(lazyTarget, {
+    apply(_target, _thisArg, argArray) {
+        const real = getDb() as unknown as (...args: unknown[]) => unknown;
+        return real(...argArray);
+    },
+    get(_target, prop) {
+        if ((prop === "then" || prop === "catch" || prop === "finally") && _db === null) {
+            return undefined;
+        }
+        const real = getDb();
+        const value = Reflect.get(real as object, prop, real);
+        if (typeof value !== "function") return value;
+        let cache = methodCache.get(real);
+        const cached = cache?.get(prop);
+        // Re-bind when the instance method was replaced (tests/instrumentation patch it).
+        if (cached && cached.fn === value) return cached.bound;
+        const bound = value.bind(real);
+        if (!cache) {
+            cache = new Map();
+            methodCache.set(real, cache);
+        }
+        cache.set(prop, { fn: value, bound });
+        return bound;
+    },
+    // Writes land on the live instance, as they did when `db` was the instance.
+    set(_target, prop, value) {
+        return Reflect.set(getDb() as object, prop, value);
+    },
+}) as unknown as SQL;
+
+/** True after the pool has been created. Importing this module leaves it false. */
+export function isDatabaseInitialized(): boolean {
+    return _db !== null;
+}
 
 export default db;

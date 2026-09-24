@@ -48,17 +48,6 @@ describe('GraphQL Schema Generation', () => {
             expect(inputSchema).toBeDefined();
             expect(typeof inputSchema).toBe('object');
         });
-
-        test('input schema validates valid data', () => {
-            const archetype = new TestUserArchetype();
-            const schema = archetype.withValidation({
-                user: { name: 'Valid', email: 'valid@example.com', age: 25 }
-            });
-
-            expect(schema).toBeDefined();
-            expect(schema.shape).toBeDefined();
-            expect(typeof schema.safeParse).toBe('function');
-        });
     });
 
     describe('schema consistency', () => {

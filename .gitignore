@@ -40,9 +40,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 tests/benchmark/databases/
 # Postgres dumps (may contain PII) — never commit
 *.sql.gz
-# Claude Code runtime artifacts
-.claude/scheduled_tasks.lock
-.claude/worktrees/
+# Local agent state — not part of the framework
+.serena/
+.claude/
 
 # LocalStorageProvider default base ("./public") — runtime upload artifacts
 /public/

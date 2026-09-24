@@ -1,6 +1,17 @@
 import pino from "pino";
 
-const usePretty = process.env.LOG_PRETTY === 'true';
+// pino-pretty is an optional dependency: fall back to JSON output when it is
+// not installed instead of crashing the transport worker at startup.
+function prettyAvailable(): boolean {
+    try {
+        Bun.resolveSync('pino-pretty', import.meta.dir);
+        return true;
+    } catch {
+        return false;
+    }
+}
+const prettyRequested = process.env.LOG_PRETTY === 'true';
+const usePretty = prettyRequested && prettyAvailable();
 export const logger = pino({
     level: process.env.LOG_LEVEL || 'info',
     // Error objects have non-enumerable message/stack, so without a
@@ -43,4 +54,8 @@ if (usePretty && process.env.NODE_ENV === 'production') {
         'LOG_PRETTY=true is set in a production environment. ' +
         'pino-pretty is 5-10x slower than JSON output and should not run in production.'
     );
+}
+
+if (prettyRequested && !usePretty) {
+    logger.warn('LOG_PRETTY=true but pino-pretty is not installed; using JSON output. Install pino-pretty to enable pretty logs.');
 }

@@ -8,6 +8,12 @@ import { type CacheProvider, type CacheStats } from './CacheProvider';
 import { type CacheConfig } from '../../config/cache.config';
 import { logger } from '../Logger';
 import { CompressionUtils } from './CompressionUtils';
+import {
+    assertScopedInvalidatePattern,
+    cacheInvalidateMax,
+    collectScanKeys,
+    yieldEventLoop,
+} from './invalidateBounds';
 
 export interface HealthStatus {
     connected: boolean;
@@ -305,26 +311,30 @@ export class RedisCache implements CacheProvider {
     }
 
     /**
-     * Invalidate keys matching a pattern using SCAN to avoid blocking
+     * Invalidate keys matching a pattern using SCAN.
+     * Requires a literal prefix (after keyPrefix), caps the match set
+     * (BUNSANE_CACHE_INVALIDATE_MAX, default 10k), and yields between pages.
+     * Exceeding the cap throws without deleting any key.
      */
     async invalidatePattern(pattern: string): Promise<void> {
-        try {
-            const prefixedPattern = this.prefixKey(pattern);
-            let cursor = '0';
-            const keysToDelete: string[] = [];
+        const prefixedPattern = this.prefixKey(pattern);
+        assertScopedInvalidatePattern(prefixedPattern);
+        const max = cacheInvalidateMax();
+        const keysToDelete = await collectScanKeys(async (cursor) => {
+            const [next, keys] = await this.client.scan(cursor, 'MATCH', prefixedPattern, 'COUNT', 100);
+            return { cursor: next, keys };
+        }, max, pattern);
 
-            do {
-                const [newCursor, keys] = await this.client.scan(cursor, 'MATCH', prefixedPattern, 'COUNT', 100);
-                cursor = newCursor;
-                keysToDelete.push(...keys);
-            } while (cursor !== '0');
-
-            if (keysToDelete.length > 0) {
-                await this.client.del(...keysToDelete);
-                logger.debug({ pattern, count: keysToDelete.length, msg: `Invalidated ${keysToDelete.length} keys matching pattern` });
+        const batchSize = 500;
+        for (let i = 0; i < keysToDelete.length; i += batchSize) {
+            const batch = keysToDelete.slice(i, i + batchSize);
+            if (batch.length > 0) {
+                await this.client.del(...batch);
             }
-        } catch (error) {
-            logger.error({ error, msg: 'Redis invalidatePattern error' });
+            await yieldEventLoop();
+        }
+        if (keysToDelete.length > 0) {
+            logger.debug({ pattern, count: keysToDelete.length, msg: `Invalidated ${keysToDelete.length} keys matching pattern` });
         }
     }
 
@@ -368,10 +378,12 @@ export class RedisCache implements CacheProvider {
      */
     async getStats(): Promise<CacheStats> {
         try {
-            // Get approximate key count using DBSIZE
-            const size = await this.client.dbsize();
+            // Own-prefix count when a key prefix is configured. DBSIZE leaks
+            // occupancy of a shared Redis instance (SEC-13).
+            const size = this.keyPrefix
+                ? await this.countPrefixedKeys()
+                : await this.client.dbsize();
 
-            // Get memory usage
             const info = await this.client.info('memory');
             const memoryMatch = info.match(/used_memory:(\d+)/);
             const memoryUsage = memoryMatch && memoryMatch[1] ? parseInt(memoryMatch[1], 10) : undefined;
@@ -393,6 +405,20 @@ export class RedisCache implements CacheProvider {
                 size: 0
             };
         }
+    }
+
+    /** SCAN MATCH prefix* — never DBSIZE. Yields between pages. */
+    private async countPrefixedKeys(): Promise<number> {
+        const match = this.prefixKey('*');
+        let cursor = '0';
+        let count = 0;
+        do {
+            const [next, keys] = await this.client.scan(cursor, 'MATCH', match, 'COUNT', 100);
+            cursor = next;
+            count += keys.length;
+            await yieldEventLoop();
+        } while (cursor !== '0');
+        return count;
     }
 
     /**

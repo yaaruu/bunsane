@@ -24,8 +24,8 @@ export interface SchemaType<T = unknown> {
     readonly _required: boolean;
     readonly _nullable: boolean;
     readonly _graphqlType: string;
-    required(): this;
-    optional(): this;
+    required(): this & { readonly _required: true };
+    optional(): this & { readonly _required: false };
     nullable(): this;
     toGraphQL(): string;
     toZod(): ZodType;
@@ -60,14 +60,14 @@ export abstract class BaseSchemaType<T = unknown> implements SchemaType<T> {
         this._internalGraphqlType = value;
     }
 
-    required(): this {
+    required(): this & { readonly _required: true } {
         this._required = true;
-        return this;
+        return this as this & { readonly _required: true };
     }
 
-    optional(): this {
+    optional(): this & { readonly _required: false } {
         this._required = false;
-        return this;
+        return this as this & { readonly _required: false };
     }
 
     nullable(): this {

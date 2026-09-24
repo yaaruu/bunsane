@@ -1,5 +1,6 @@
 import { type CacheProvider, type CacheStats } from './CacheProvider';
 import { logger } from '../Logger';
+import { cacheInvalidateMax, CacheInvalidateCapExceededError, matchGlob } from './invalidateBounds';
 
 function formatBytes(bytes: number): string {
     if (bytes === 0) return '0 B';
@@ -75,6 +76,11 @@ export class MemoryCache implements CacheProvider {
     }
 
     async set<T>(key: string, value: T, ttl?: number): Promise<void> {
+        this.writeEntry(key, value, ttl);
+        await this.evictIfNeeded();
+    }
+
+    private writeEntry<T>(key: string, value: T, ttl?: number): void {
         const expiresAt = ttl ? Date.now() + ttl : (this.config.defaultTTL ? Date.now() + this.config.defaultTTL : undefined);
 
         const size = this.entrySize(key, value);
@@ -85,10 +91,6 @@ export class MemoryCache implements CacheProvider {
             size
         };
 
-        // Incremental memory accounting: adjust by the delta instead of
-        // re-walking the entire cache on every write.
-        // Delete before set so the key moves to the end of Map iteration
-        // order (most recently used position for LRU eviction).
         const existing = this.cache.get(key);
         if (existing) {
             this.stats.memoryUsage = Math.max(0, this.stats.memoryUsage - existing.size);
@@ -98,9 +100,6 @@ export class MemoryCache implements CacheProvider {
         }
         this.cache.set(key, entry);
         this.stats.memoryUsage += size;
-
-        // Evict if necessary
-        await this.evictIfNeeded();
     }
 
     async delete(key: string | string[]): Promise<void> {
@@ -137,8 +136,9 @@ export class MemoryCache implements CacheProvider {
 
     async setMany<T>(entries: Array<{key: string, value: T, ttl?: number}>): Promise<void> {
         for (const entry of entries) {
-            await this.set(entry.key, entry.value, entry.ttl);
+            this.writeEntry(entry.key, entry.value, entry.ttl);
         }
+        await this.evictIfNeeded();
     }
 
     async deleteMany(keys: string[]): Promise<void> {
@@ -146,13 +146,13 @@ export class MemoryCache implements CacheProvider {
     }
 
     async invalidatePattern(pattern: string): Promise<void> {
-        // Simple pattern matching - convert glob to regex
-        const regex = new RegExp(pattern.replace(/\*/g, '.*').replace(/\?/g, '.'));
-
+        const max = cacheInvalidateMax();
         const keysToDelete: string[] = [];
         for (const key of this.cache.keys()) {
-            if (regex.test(key)) {
-                keysToDelete.push(key);
+            if (!matchGlob(pattern, key)) continue;
+            keysToDelete.push(key);
+            if (keysToDelete.length > max) {
+                throw new CacheInvalidateCapExceededError(pattern, max);
             }
         }
 
@@ -201,14 +201,12 @@ export class MemoryCache implements CacheProvider {
     }
 
     private async evictIfNeeded(): Promise<void> {
-        // Check size limit
-        if (this.stats.size > this.config.maxSize) {
-            await this.evictLRU(Math.ceil(this.config.maxSize * 0.1)); // Evict 10% of max size
-        }
-
-        // Check memory limit
-        if (this.stats.memoryUsage > this.config.maxMemory) {
-            await this.evictLRU(Math.ceil(this.config.maxSize * 0.1)); // Evict 10% of max size
+        // setMany can cross the cap by many entries in one call. Keep evicting
+        // until both limits hold, matching the per-write behavior of set().
+        while (this.stats.size > this.config.maxSize || this.stats.memoryUsage > this.config.maxMemory) {
+            const before = this.stats.size;
+            await this.evictLRU(Math.max(1, Math.ceil(this.config.maxSize * 0.1)));
+            if (this.stats.size >= before) break;
         }
     }
 

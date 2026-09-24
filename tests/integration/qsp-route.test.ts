@@ -175,7 +175,8 @@ if (!isPGlite) {
             let total = 0;
             (db as any).unsafe = (sql: string, ...rest: any[]) => {
                 total++;
-                if (/\bFROM\s+components\b/i.test(sql)) components++;
+                // Parent table or a partition leaf (`components_<type>`): populate() reads leaves.
+                if (/\bFROM\s+components(?:_\w+)?\b/i.test(sql)) components++;
                 return realUnsafe(sql, ...rest);
             };
             try {

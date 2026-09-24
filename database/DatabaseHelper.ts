@@ -2,8 +2,7 @@ import db, { DDL_TIMEOUT_MS, QUERY_TIMEOUT_MS } from "./index";
 import { dbExec } from "./gateway";
 import { logger as MainLogger } from "../core/Logger";
 import { getMetadataStorage } from "../core/metadata";
-import { ensureMultipleJSONBPathIndexes } from "./IndexingStrategy";
-import { getMembershipTable } from "../query/membershipSource";
+import { ensureMultipleJSONBPathIndexes, type IndexBootContext, indexCatalogKey } from "./IndexingStrategy";
 import { ProjectionManager, qspActive } from "./projection";
 const logger = MainLogger.child({ scope: "DatabaseHelper" });
 
@@ -75,7 +74,28 @@ const validateIdentifier = (str: string, maxLength: number = 64): string => {
         throw new Error(`Invalid identifier format: ${str}`);
     }
     return str;
-};
+}
+
+/** Set after the components table is created or first successfully read. */
+let partitionStrategyMemo: 'list' | 'hash' | null | undefined;
+
+export function rememberPartitionStrategy(strategy: 'list' | 'hash' | null): void {
+    partitionStrategyMemo = strategy;
+}
+
+async function readPartitionStrategyFromCatalog(): Promise<'list' | 'hash' | null> {
+    const result = await schemaQuery<Array<{ strategy: 'list' | 'hash' | null }>>('schema.GetPartitionStrategy.select', `
+        SELECT
+            CASE
+                WHEN partstrat = 'l' THEN 'list'
+                WHEN partstrat = 'h' THEN 'hash'
+                ELSE NULL
+            END as strategy
+        FROM pg_partitioned_table
+        WHERE partrelid = (SELECT oid FROM pg_class WHERE relname = 'components' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public'))
+    `);
+    return result.length > 0 ? result[0]!.strategy : null;
+}
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -242,7 +262,7 @@ export const CreateComponentTable = async () => {
     const partitionStrategy = process.env.BUNSANE_PARTITION_STRATEGY === 'hash' ? 'hash' : 'list'; // Default to list (LIST+Direct is the recommended strategy)
 
     // Check if the table already exists and what partitioning strategy it uses
-    const existingStrategy = await GetPartitionStrategy();
+    const existingStrategy = await readPartitionStrategyFromCatalog();
     const tableExists = await schemaQuery('schema.CreateComponentTable.select', `
         SELECT 1 FROM information_schema.tables
         WHERE table_name = 'components'
@@ -286,6 +306,7 @@ export const CreateComponentTable = async () => {
         await db`CREATE INDEX IF NOT EXISTS idx_components_entity_created_desc ON components (entity_id, created_at DESC)`;
         await db`CREATE INDEX IF NOT EXISTS idx_components_type_entity_created ON components (type_id, entity_id, created_at DESC)`;
     }
+    rememberPartitionStrategy(partitionStrategy);
 }
 
 /**
@@ -403,164 +424,54 @@ export const CreateHashPartitionedComponentTable = async (partitionCount: number
     await db`CREATE INDEX IF NOT EXISTS idx_components_entity_created_desc ON components (entity_id, created_at DESC)`;
     await db`CREATE INDEX IF NOT EXISTS idx_components_type_entity_created ON components (type_id, entity_id, created_at DESC)`;
 }
-export const UpdateComponentIndexes = async (table_name: string, indexedProperties: string[]) => {
-    try {
-        table_name = validateIdentifier(table_name);
-        indexedProperties = indexedProperties.map(prop => validateIdentifier(prop));
-        logger.trace(`Updating indexes for component table: ${table_name}`);
+export const CreateComponentPartitionTable = async (
+    comp_name: string,
+    type_id: string,
+    opts?: { strategy?: 'list' | 'hash' | null; boot?: IndexBootContext },
+): Promise<boolean> => {
+    comp_name = validateIdentifier(comp_name);
+    logger.trace(`Attempt adding partition table for component: ${comp_name}`);
 
-        // Check if this is a hash partitioned table
-        const partitionStrategy = await GetPartitionStrategy();
-        if (partitionStrategy === 'hash' && table_name !== 'components') {
-            // For hash partitioning, indexes should be on the parent table
-            logger.trace(`Redirecting index update to parent table 'components' for hash partitioning`);
-            table_name = 'components';
-        }
+    const partitionStrategy = opts && opts.strategy !== undefined
+        ? opts.strategy
+        : await GetPartitionStrategy();
+    logger.trace(`Current partition strategy: ${partitionStrategy}`);
 
-        // Check if table is partitioned
-        const partitionCheck = await schemaQuery('schema.UpdateComponentIndexes.select', `
-            SELECT relkind
-            FROM pg_class
-            WHERE relname = '${table_name}' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
-        `);
-        const isPartitioned = partitionCheck.length > 0 && partitionCheck[0].relkind === 'p';
-        const useConcurrently = !isPartitioned && !process.env.USE_PGLITE; // Cannot use CONCURRENTLY on partitioned tables or PGlite
-
-        const indexes_list = await schemaQuery('schema.UpdateComponentIndexes.select', `
-            SELECT indexname 
-            FROM pg_indexes 
-            WHERE tablename = '${table_name}'
-        `);
-        const existingIndexes = indexes_list.map((row: any) => row.indexname);
-        const addedIndexes = new Set<string>();
-
-        // Check and create indexes for any new indexed properties
-        if (indexedProperties && indexedProperties.length > 0) {
-            for (const prop of indexedProperties) {
-                const indexName = `idx_${table_name}_${prop}_gin`;
-                if (!existingIndexes.includes(indexName)) {
-                    logger.trace(`Creating missing index ${indexName} for property ${prop}`);
-                    await retryWithBackoff(async () => {
-                        try {
-                            await schemaDdl('schema.UpdateComponentIndexes.create', `CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} IF NOT EXISTS ${indexName} ON ${table_name} USING GIN ((data->'${prop}'))`);
-                        } catch (error: any) {
-                            // Check if the error is about duplicate key (index already exists)
-                            if (error.message && error.message.includes('duplicate key value violates unique constraint "pg_class_relname_nsp_index"')) {
-                                logger.trace(`Index ${indexName} already exists (confirmed by error), skipping creation`);
-                                return;
-                            }
-                            throw error;
-                        }
-                    });
-                    addedIndexes.add(indexName);
-                } else {
-                    logger.trace(`Index ${indexName} for property ${prop} already exists`);
-                }
-            }
-        }
-
-        // Remove indexes for properties that are no longer indexed
-        for (const index of existingIndexes) {
-            const match = index.match(new RegExp(`^idx_${table_name}_(.*)_gin$`));
-            if (match) {
-                const prop = match[1];
-                if (!indexedProperties.includes(prop) && !addedIndexes.has(index)) {
-                    await retryWithBackoff(async () => {
-                        try {
-                            await schemaDdl('schema.UpdateComponentIndexes.drop', `DROP INDEX${useConcurrently ? ' CONCURRENTLY' : ''} IF EXISTS ${index}`);
-                        } catch (error: any) {
-                            // Check if the error is about relation does not exist
-                            if (error.message && (error.message.includes('does not exist') || error.message.includes('not found'))) {
-                                logger.trace(`Index ${index} does not exist, skipping drop`);
-                                return;
-                            }
-                            throw error;
-                        }
-                    });
-                    logger.info(`Dropped obsolete index ${index} for property ${prop}`);
-                }
-            }
-        }
-    } catch (error) {
-        logger.error(`Failed to update component indexes for ${table_name}: ${error}`);
-        throw error;
+    if (partitionStrategy === 'hash') {
+        logger.info(`Component ${comp_name} will use existing hash partitions`);
+        return false;
     }
-}
 
-//TODO: Cleanup and optimize
-export const CreateComponentPartitionTable = async (comp_name: string, type_id: string) => {
-    try {
-        comp_name = validateIdentifier(comp_name);
-        logger.trace(`Attempt adding partition table for component: ${comp_name}`);
-
-        // Check partitioning strategy
-        const partitionStrategy = await GetPartitionStrategy();
-        logger.trace(`Current partition strategy: ${partitionStrategy}`);
-
-        if (partitionStrategy === 'hash') {
-            // For HASH partitioning, partitions are pre-created and data is automatically distributed
-            // We just need to ensure indexes are created for this component type
-            logger.info(`Component ${comp_name} will use existing hash partitions`);
-            
-            // For hash partitioning, indexes are created at the parent table level
-            // But we can still create component-specific indexes if needed
-            const storage = getMetadataStorage();
-            const componentId = storage.getComponentId(comp_name);
-            const indexedFields = storage.getIndexedFields(componentId);
-            
-            if (indexedFields.length > 0) {
-                logger.trace(`Ensuring specialized indexes for ${comp_name} on hash partitions`);
-                // For hash partitioning, indexes on parent table should suffice
-                // But we can add component-specific logic here if needed
-                logger.trace(`Hash partitioning handles indexes at parent table level`);
-            }
-            
-            return;
-        }
-
-        // Original LIST partitioning logic
-        const table_name = GenerateTableName(comp_name);
-        logger.trace(`Checking for existing partition table: ${table_name}`);
-        const existingPartition = await schemaQuery('schema.CreateComponentPartitionTable.select', `SELECT 1 FROM information_schema.tables 
-            WHERE table_name = '${table_name}' 
-            AND table_schema = 'public'`);
-        logger.trace(`Existing partition check result: ${existingPartition.length > 0 ? 'found' : 'not found'}`);
-
-        if (existingPartition.length > 0) {
-            logger.info(`Partition table ${table_name} already exists`);
-            return;
-        }
-        logger.trace(`Creating partition table: ${table_name}`);
-
-        await retryWithBackoff(async () => {
-            await schemaDdl('schema.CreateComponentPartitionTable.create', `CREATE TABLE IF NOT EXISTS ${table_name}
-                PARTITION OF components
-                FOR VALUES IN ('${type_id}')`);
-        });
-        logger.trace(`Successfully created partition table: ${table_name}`);
-
-        // Automatically create indexes based on component metadata
-        const storage = getMetadataStorage();
-        const componentId = storage.getComponentId(comp_name);
-        const indexedFields = storage.getIndexedFields(componentId);
-        
-        if (indexedFields.length > 0) {
-            logger.trace(`Creating ${indexedFields.length} specialized indexes for ${comp_name}`);
-            const indexDefinitions = indexedFields.map(field => ({
-                tableName: table_name,
-                field: field.propertyKey,
-                indexType: field.indexType,
-                isDateField: field.isDateField
-            }));
-            await ensureMultipleJSONBPathIndexes(table_name, indexDefinitions);
-            logger.trace(`Created specialized indexes for ${comp_name}`);
-        }
-        
-    } catch (error) {
-        logger.error(`Failed to create component partition table for ${comp_name}: ${error}`);
-        // Graceful degradation: log error without crashing
+    const table_name = GenerateTableName(comp_name);
+    const existingPartition = await schemaQuery('schema.CreateComponentPartitionTable.select', `SELECT 1 FROM information_schema.tables
+        WHERE table_name = '${table_name}'
+        AND table_schema = 'public'`);
+    if (existingPartition.length > 0) {
+        logger.info(`Partition table ${table_name} already exists`);
+        return false;
     }
-}
+
+    await retryWithBackoff(async () => {
+        await schemaDdl('schema.CreateComponentPartitionTable.create', `CREATE TABLE IF NOT EXISTS ${table_name}
+            PARTITION OF components
+            FOR VALUES IN ('${type_id}')`);
+    });
+    logger.trace(`Successfully created partition table: ${table_name}`);
+
+    const storage = getMetadataStorage();
+    const componentId = storage.getComponentId(comp_name);
+    const indexedFields = storage.getIndexedFields(componentId);
+    if (indexedFields.length > 0) {
+        const indexDefinitions = indexedFields.map(field => ({
+            tableName: table_name,
+            field: field.propertyKey,
+            indexType: field.indexType,
+            isDateField: field.isDateField
+        }));
+        await ensureMultipleJSONBPathIndexes(table_name, indexDefinitions, opts?.boot);
+    }
+    return true;
+};
 
 export const DeleteComponentPartitionTable = async (comp_name: string) => {
     try {
@@ -601,80 +512,6 @@ export const DeleteComponentPartitionTable = async (comp_name: string) => {
     }
 }
 
-export const CreateEntityComponentTable = async () => {
-    await db`CREATE TABLE IF NOT EXISTS entity_components (
-        entity_id UUID REFERENCES entities(id) ON DELETE CASCADE,
-        type_id VARCHAR(64) NOT NULL,
-        component_id UUID,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW(),
-        deleted_at TIMESTAMPTZ,
-        UNIQUE(entity_id, type_id)
-    );`;
-    const concurrently = process.env.USE_PGLITE ? '' : ' CONCURRENTLY';
-    await schemaDdl('schema.CreateEntityComponentTable.create', `CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_entity_id ON entity_components (entity_id)`);
-    await schemaDdl('schema.CreateEntityComponentTable.create', `CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_type_id ON entity_components (type_id)`);
-    await schemaDdl('schema.CreateEntityComponentTable.create', `CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_type_entity ON entity_components (type_id, entity_id)`);
-    await schemaDdl('schema.CreateEntityComponentTable.create', `CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_type_entity_deleted ON entity_components (type_id, entity_id, deleted_at)`);
-    await schemaDdl('schema.CreateEntityComponentTable.create', `CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_deleted_type ON entity_components (deleted_at, type_id) WHERE deleted_at IS NULL`);
-    await schemaDdl('schema.CreateEntityComponentTable.create', `CREATE INDEX${concurrently} IF NOT EXISTS idx_entity_components_component_id ON entity_components (component_id)`);
-    
-    // Add component_id column if it doesn't exist (for backward compatibility)
-    try {
-        await db`ALTER TABLE entity_components ADD COLUMN IF NOT EXISTS component_id UUID`;
-        logger.info(`Added component_id column to entity_components table`);
-    } catch (error) {
-        logger.warn(`Could not add component_id column to entity_components table: ${error}`);
-    }
-}
-
-/**
- * Rollback/repair tool. Backfills the legacy `entity_components` mirror from
- * `components` (the single source of truth as of Phase 3). Only needed if you
- * intend to downgrade to a build that still reads `entity_components`
- * (BUNSANE_MEMBERSHIP_SOURCE=legacy).
- *
- * The framework no longer creates `entity_components` on boot. If the table is
- * absent this throws a clear error: create it first via
- * `CreateEntityComponentTable()`, then re-run this.
- *
- * Intended for a freshly-created/empty table: ON CONFLICT DO NOTHING skips
- * pre-existing rows, so `deleted_at` drift on them is not reconciled.
- */
-export const PopulateComponentIds = async () => {
-    const tableExists = await schemaQuery('schema.PopulateComponentIds.select', `
-        SELECT 1 FROM information_schema.tables
-        WHERE table_name = 'entity_components'
-        AND table_schema = 'public'
-    `);
-    if (tableExists.length === 0) {
-        throw new Error(
-            `Cannot populate entity_components: the table does not exist. ` +
-            `It is no longer created since Phase 3 of the entity_components removal. ` +
-            `If you need the legacy mirror (e.g. for a downgrade), run ` +
-            `CreateEntityComponentTable() first, then re-run PopulateComponentIds().`
-        );
-    }
-    try {
-        // Backfill membership rows from components, then set component_id for
-        // any rows still missing it.
-        await db`INSERT INTO entity_components (entity_id, type_id, component_id, deleted_at)
-                 SELECT c.entity_id, c.type_id, c.id, c.deleted_at
-                 FROM components c
-                 ON CONFLICT (entity_id, type_id) DO NOTHING`;
-        await db`UPDATE entity_components
-                 SET component_id = c.id
-                 FROM components c
-                 WHERE entity_components.entity_id = c.entity_id
-                 AND entity_components.type_id = c.type_id
-                 AND entity_components.component_id IS NULL`;
-
-        logger.info(`Backfilled entity_components from components`);
-    } catch (error) {
-        logger.warn(`Could not backfill entity_components: ${error}`);
-        throw error;
-    }
-}
 
 export const EnsureDatabaseMigrations = async () => {
     logger.trace(`Checking for database migrations...`);
@@ -682,9 +519,9 @@ export const EnsureDatabaseMigrations = async () => {
     // `entity_components` is no longer created, migrated, or written (Phase 3
     // of docs/ENTITY_COMPONENTS_REMOVAL_PLAN.md). Any pre-existing table is
     // left in place, untouched — never auto-dropped. Membership now lives
-    // solely in `components` (UNIQUE(entity_id, type_id)). Run
-    // `PopulateComponentIds()` manually to backfill the legacy table if a
-    // downgrade is ever required.
+    // solely in `components` (UNIQUE(entity_id, type_id)). To backfill the
+    // legacy table for a downgrade, import `PopulateComponentIds` from
+    // `database/maintenance.ts` (after `CreateEntityComponentTable()`).
     const orphanCheck = await schemaQuery('schema.EnsureDatabaseMigrations.select', `
         SELECT 1 FROM information_schema.tables
         WHERE table_name = 'entity_components'
@@ -737,88 +574,17 @@ export const AnalyzeAllComponentTables = async (): Promise<void> => {
 }
 
 export const GetPartitionStrategy = async (): Promise<'list' | 'hash' | null> => {
+    if (partitionStrategyMemo !== undefined) return partitionStrategyMemo;
     try {
-        const result = await schemaQuery('schema.GetPartitionStrategy.select', `
-            SELECT 
-                CASE 
-                    WHEN partstrat = 'l' THEN 'list'
-                    WHEN partstrat = 'h' THEN 'hash'
-                    ELSE NULL
-                END as strategy
-            FROM pg_partitioned_table 
-            WHERE partrelid = (SELECT oid FROM pg_class WHERE relname = 'components' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public'))
-        `);
-        return result.length > 0 ? result[0].strategy : null;
+        const strategy = await readPartitionStrategyFromCatalog();
+        if (strategy) partitionStrategyMemo = strategy;
+        return strategy;
     } catch (error) {
         logger.warn(`Could not determine partition strategy: ${error}`);
         return null;
     }
 }
 
-export const BenchmarkPartitionCounts = async (partitionCounts: number[] = [8, 16, 32]) => {
-    const results: Array<{partitionCount: number, planningTime: number, executionTime: number}> = [];
-    
-    for (const count of partitionCounts) {
-        logger.info(`Benchmarking with ${count} partitions`);
-        
-        // Create temporary hash partitioned table
-        const tempTableName = `components_benchmark_${count}`;
-        await schemaDdl('schema.BenchmarkPartitionCounts.create', `CREATE TABLE ${tempTableName} (
-            id UUID,
-            entity_id UUID,
-            type_id varchar(64) NOT NULL,
-            name varchar(128),
-            data jsonb,
-            created_at TIMESTAMPTZ DEFAULT NOW(),
-            updated_at TIMESTAMPTZ DEFAULT NOW(),
-            deleted_at TIMESTAMPTZ,
-            PRIMARY KEY (id, type_id),
-            UNIQUE(entity_id, type_id)
-        ) PARTITION BY HASH (type_id);`);
-        
-        // Create partitions
-        for (let i = 0; i < count; i++) {
-            await schemaDdl('schema.BenchmarkPartitionCounts.create', `CREATE TABLE ${tempTableName}_p${i}
-                PARTITION OF ${tempTableName}
-                FOR VALUES WITH (MODULUS ${count}, REMAINDER ${i});`);
-        }
-        
-        // Copy sample data (limit to avoid long benchmark)
-        await schemaDdl('schema.BenchmarkPartitionCounts.insert', `INSERT INTO ${tempTableName} (id, entity_id, type_id, name, data, created_at, updated_at, deleted_at)
-            SELECT id, entity_id, type_id, name, data, created_at, updated_at, deleted_at
-            FROM components 
-            TABLESAMPLE BERNOULLI(10) -- Sample 10% of data
-            LIMIT 10000;`);
-        
-        // Create indexes
-        await schemaDdl('schema.BenchmarkPartitionCounts.create', `CREATE INDEX idx_${tempTableName}_type_id ON ${tempTableName} (type_id)`);
-        await schemaDdl('schema.BenchmarkPartitionCounts.analyze', `ANALYZE ${tempTableName}`);
-        
-        // Run benchmark query
-        const explainResult = await schemaDdl('schema.BenchmarkPartitionCounts.explain', `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
-            SELECT DISTINCT ec.entity_id as id
-            FROM ${getMembershipTable()} ec
-            WHERE ec.type_id = (SELECT type_id FROM ${tempTableName} LIMIT 1)
-            AND ec.deleted_at IS NULL`);
-        
-        const plan = explainResult[0]['QUERY PLAN'] ? JSON.parse(explainResult[0]['QUERY PLAN']) : explainResult[0];
-        const planningTime = plan.Planning ? plan.Planning.Time : 0;
-        const executionTime = plan.Execution ? plan.Execution.Time : 0;
-        
-        results.push({
-            partitionCount: count,
-            planningTime,
-            executionTime
-        });
-        
-        // Clean up
-        await schemaDdl('schema.BenchmarkPartitionCounts.drop', `DROP TABLE ${tempTableName} CASCADE;`);
-        
-        logger.info(`Partition count ${count}: planning=${planningTime}ms, execution=${executionTime}ms`);
-    }
-    
-    return results;
-}
 
 export const GenerateTableName = (name: string) => `components_${name.toLowerCase().replace(/\s+/g, '_')}`;
 
@@ -834,41 +600,53 @@ export const GenerateTableName = (name: string) => `components_${name.toLowerCas
  * // Create index for user_id foreign key
  * await CreateForeignKeyIndex('components_userprofile', 'user_id');
  */
-export const CreateForeignKeyIndex = async (tableName: string, foreignKeyField: string): Promise<boolean> => {
+export const CreateForeignKeyIndex = async (
+    tableName: string,
+    foreignKeyField: string,
+    boot?: IndexBootContext,
+): Promise<boolean> => {
     tableName = validateIdentifier(tableName);
     foreignKeyField = validateIdentifier(foreignKeyField);
 
     const indexName = `idx_${tableName}_fk_${foreignKeyField}`;
-
-    // Check if index already exists
-    const existingIndex = await schemaQuery('schema.CreateForeignKeyIndex.select', `
-        SELECT 1 FROM pg_indexes
-        WHERE tablename = '${tableName}' AND indexname = '${indexName}'
-    `);
-
-    if (existingIndex.length > 0) {
+    const catalogKey = indexCatalogKey(tableName, indexName);
+    if (boot?.existing.has(catalogKey)) {
         logger.trace(`Foreign key index ${indexName} already exists`);
         return false;
     }
 
-    // Check partition strategy
-    const partitionStrategy = await GetPartitionStrategy();
+    if (!boot) {
+        const existingIndex = await schemaQuery('schema.CreateForeignKeyIndex.select', `
+            SELECT 1 FROM pg_indexes
+            WHERE tablename = '${tableName}' AND indexname = '${indexName}'
+        `);
+        if (existingIndex.length > 0) {
+            logger.trace(`Foreign key index ${indexName} already exists`);
+            return false;
+        }
+    }
+
+    const partitionStrategy = boot?.partitionStrategy ?? await GetPartitionStrategy();
     const useConcurrently = partitionStrategy !== 'hash' && !process.env.USE_PGLITE;
 
     try {
         await retryWithBackoff(async () => {
-            // Use btree index on the extracted text value for equality lookups (faster than GIN for FK)
             await schemaDdl('schema.CreateForeignKeyIndex.create', `
                 CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} IF NOT EXISTS ${indexName}
                 ON ${tableName} ((data->>'${foreignKeyField}'))
                 WHERE deleted_at IS NULL
             `);
         });
+        if (boot) {
+            boot.existing.add(catalogKey);
+            boot.indexCreated = true;
+        }
         logger.info(`Created foreign key index ${indexName} on ${tableName}.data->>'${foreignKeyField}'`);
         return true;
     } catch (error: any) {
         if (error.message?.includes('duplicate key value violates unique constraint')) {
             logger.trace(`Foreign key index ${indexName} already exists (concurrent creation)`);
+            if (boot) boot.existing.add(catalogKey);
             return false;
         }
         throw error;
@@ -879,7 +657,7 @@ export const CreateForeignKeyIndex = async (tableName: string, foreignKeyField: 
  * Creates foreign key indexes for all relation fields defined in archetypes.
  * Should be called during database initialization for optimal relation query performance.
  */
-export const CreateRelationIndexes = async (): Promise<void> => {
+export const CreateRelationIndexes = async (boot?: IndexBootContext): Promise<boolean> => {
     const storage = getMetadataStorage();
     const createdIndexes: string[] = [];
 
@@ -888,17 +666,14 @@ export const CreateRelationIndexes = async (): Promise<void> => {
             if (!relation.options?.foreignKey) continue;
 
             const foreignKey = relation.options.foreignKey;
-            // Skip nested foreign keys (handled differently)
             if (foreignKey.includes('.')) continue;
 
-            // Find the component that has this foreign key
             const archetypeMetadata = storage.archetypes.find(a =>
                 storage.getComponentId(a.name) === archetypeId || a.typeId === archetypeId
             );
 
             if (!archetypeMetadata) continue;
 
-            // Get the component fields for this archetype
             const archetypeFields = storage.archetypes_field_map.get(archetypeId) || [];
 
             for (const field of archetypeFields) {
@@ -909,7 +684,7 @@ export const CreateRelationIndexes = async (): Promise<void> => {
                 if (hasForeignKey) {
                     const tableName = GenerateTableName(field.component.name);
                     try {
-                        const created = await CreateForeignKeyIndex(tableName, foreignKey);
+                        const created = await CreateForeignKeyIndex(tableName, foreignKey, boot);
                         if (created) {
                             createdIndexes.push(`${tableName}.${foreignKey}`);
                         }
@@ -924,4 +699,5 @@ export const CreateRelationIndexes = async (): Promise<void> => {
     if (createdIndexes.length > 0) {
         logger.info(`Created ${createdIndexes.length} relation foreign key indexes`);
     }
+    return createdIndexes.length > 0;
 };

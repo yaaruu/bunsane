@@ -1,9 +1,10 @@
 import ApplicationLifecycle, { ApplicationPhase, type PhaseChangeEvent } from "./ApplicationLifecycle";
+import { Entity } from "./Entity";
 import type { IEntity } from "./EntityInterface";
 
 class EntityManager {
     static #instance: EntityManager;
-    private entityQueue: IEntity[] = [];
+    private entityQueue: Entity[] = [];
     private phaseListener: ((event: PhaseChangeEvent) => void) | null = null;
 
     constructor() {
@@ -43,11 +44,13 @@ class EntityManager {
     }
 
     private async savePendingEntities() {
-        const promiseWait = [];
-        for(const entity of this.entityQueue) {
-           promiseWait.push(entity.save()); 
+        if (this.entityQueue.length === 0) return;
+        const pending = this.entityQueue.slice();
+        await Entity.saveMany(pending);
+        for (const entity of pending) {
+            const idx = this.entityQueue.indexOf(entity);
+            if (idx >= 0) this.entityQueue.splice(idx, 1);
         }
-        return await Promise.all(promiseWait);
     }
 
     public static get instance(): EntityManager {

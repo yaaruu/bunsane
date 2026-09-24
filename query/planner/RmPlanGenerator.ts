@@ -152,7 +152,7 @@ export function buildRmQuery(
     }
 
     let offsetClause = '';
-    if (!hasKeyset && (req.offset > 0 || req.limit !== null)) {
+    if (!hasKeyset && req.offset > 0) {
         offsetClause = ` OFFSET ${p(req.offset)}`;
     }
 

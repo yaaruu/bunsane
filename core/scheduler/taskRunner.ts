@@ -3,10 +3,21 @@ import { Query } from "../../query/Query";
 import ArcheType from "../ArcheType";
 import { BaseComponent } from "../components";
 import type { ScheduledTaskInfo, SchedulerMetrics, TaskMetrics } from "../../types/scheduler.types";
+import { DEFAULT_MAX_ENTITIES_PER_EXECUTION } from "../../types/scheduler.types";
 import type { ComponentTargetConfig } from "../EntityHookManager";
 import type { SchedulerManager } from "../SchedulerManager";
+import { startLeaseHeartbeat } from "./withLock";
 
 const loggerInstance = logger.child({ scope: "SchedulerManager" });
+
+/** Lease must strictly outlive the wrapper timeout so a peer cannot acquire during overrun. */
+export const SCHEDULER_LEASE_MARGIN_MS = 5_000;
+
+const entityCapWarned = new Set<string>();
+
+export function leaseTtlForTask(timeoutMs: number, configuredTtlMs: number): number {
+    return Math.max(configuredTtlMs, timeoutMs + SCHEDULER_LEASE_MARGIN_MS);
+}
 
 export function updateTaskMetrics(manager: SchedulerManager, taskId: string, updates: Partial<TaskMetrics>): void {
     if (!manager.metrics.taskMetrics[taskId]) {
@@ -267,9 +278,14 @@ export async function doExecuteTask(manager: SchedulerManager, taskId: string): 
         return;
     }
 
+    const timeout = taskInfo.options?.timeout || manager.config.defaultTimeout;
+    // Lease must outlive the wrapper timeout. Heartbeat extends it if the
+    // task overruns the wrapper (the promise cannot be cancelled).
+    const leaseTtlMs = leaseTtlForTask(timeout, manager.distributedLock.getLeaseTtlMs());
+
     // Try to acquire distributed lock before executing
     manager.metrics.lockAttempts++;
-    const lockResult = await manager.distributedLock.tryAcquire(taskId);
+    const lockResult = await manager.distributedLock.tryAcquire(taskId, leaseTtlMs);
 
     if (!lockResult.acquired) {
         // Another instance is executing this task
@@ -299,12 +315,52 @@ export async function doExecuteTask(manager: SchedulerManager, taskId: string): 
         data: { lockKey: lockResult.lockKey.toString() }
     });
 
+    const stopHeartbeat = manager.distributedLock.getConfig().enabled
+        ? startLeaseHeartbeat(manager.distributedLock, taskId, leaseTtlMs)
+        : () => undefined;
+
+    let releasePromise: Promise<void> | null = null;
+    const releaseLock = (): Promise<void> => {
+        if (releasePromise) return releasePromise;
+        stopHeartbeat();
+        releasePromise = manager.distributedLock.release(taskId).then(() => {
+            manager.emitEvent({
+                type: 'task.lock.released',
+                taskId: taskInfo.id,
+                timestamp: new Date(),
+                data: { lockKey: lockResult.lockKey.toString() }
+            });
+        });
+        return releasePromise;
+    };
+
+    const clearRunning = () => {
+        taskInfo.isRunning = false;
+        manager.metrics.runningTasks--;
+    };
+
     taskInfo.isRunning = true;
     taskInfo.lastExecution = new Date();
     manager.metrics.runningTasks++;
 
     const startTime = Date.now();
-    const timeout = taskInfo.options?.timeout || manager.config.defaultTimeout;
+    // True until a live task promise is created. Setup failures release immediately.
+    let workDone = true;
+    let settleRelease: Promise<unknown> | null = null;
+    // Wrapper timeout must not arm the retry while isRunning is still true,
+    // or the retry hits the overlap guard and the budget is consumed.
+    let deferredRetry: { error: Error; duration: number } | null = null;
+    const armDeferredRetry = (): void => {
+        const pending = deferredRetry;
+        if (!pending) return;
+        deferredRetry = null;
+        void handleTaskFailure(manager, taskInfo, pending.error, pending.duration).catch((err) => {
+            loggerInstance.error(
+                { taskId: taskInfo.id, err },
+                'Failed to schedule retry after scheduled-task timeout'
+            );
+        });
+    };
 
     try {
         // Create query based on targeting configuration
@@ -325,12 +381,35 @@ export async function doExecuteTask(manager: SchedulerManager, taskId: string): 
         // else: time-based task — no entity selection. Handler invoked
         // with no arguments on each tick.
 
-        // Apply entity limit if specified (can be used with query function)
-        if (query && taskInfo.options?.maxEntitiesPerExecution) {
-            query.take(taskInfo.options.maxEntitiesPerExecution);
+        let usedDefaultCap = false;
+        let appliedCap = 0;
+        if (query) {
+            const explicitCap = taskInfo.options?.maxEntitiesPerExecution;
+            if (explicitCap != null && explicitCap > 0) {
+                query.take(explicitCap);
+                appliedCap = explicitCap;
+            } else {
+                // Query.context is not on the public type. Do not raise a
+                // .take() the author already set; only cap missing/larger limits.
+                const carrier = query as unknown as { context?: { limit?: number | null } };
+                const existing = carrier.context?.limit;
+                appliedCap = DEFAULT_MAX_ENTITIES_PER_EXECUTION;
+                if (typeof existing !== "number" || existing > appliedCap) {
+                    query.take(appliedCap);
+                    usedDefaultCap = true;
+                } else {
+                    appliedCap = existing;
+                }
+            }
         }
 
         const entities = query ? await query.exec() : [];
+        if (usedDefaultCap && entities.length >= appliedCap && !entityCapWarned.has(taskInfo.id)) {
+            entityCapWarned.add(taskInfo.id);
+            loggerInstance.warn(
+                `Task ${taskInfo.name} hit the default entity cap of ${appliedCap}. Set maxEntitiesPerExecution (or a smaller query.take()) to confirm the limit.`
+            );
+        }
 
         // Execute the scheduled method with the entities array
         const method = taskInfo.service[taskInfo.methodName];
@@ -338,15 +417,25 @@ export async function doExecuteTask(manager: SchedulerManager, taskId: string): 
             throw new Error(`Method ${taskInfo.methodName} not found on service`);
         }
 
-        // Execute with timeout. Time-based tasks receive no entity arg.
-        const result = await executeWithTimeout(
-            manager,
-            query
+        let invocation: unknown;
+        try {
+            invocation = query
                 ? method.call(taskInfo.service, entities)
-                : method.call(taskInfo.service),
-            timeout,
-            taskInfo
-        );
+                : method.call(taskInfo.service);
+        } catch (err) {
+            invocation = Promise.reject(err);
+        }
+        const taskPromise = Promise.resolve(invocation);
+        workDone = false;
+        settleRelease = taskPromise.finally(() => {
+            workDone = true;
+            return releaseLock();
+        });
+
+        // Execute with timeout. Time-based tasks receive no entity arg.
+        // On timeout the wrapper rejects but taskPromise keeps running;
+        // the lock is released only from taskPromise.finally above.
+        await executeWithTimeout(manager, taskPromise, timeout, taskInfo);
 
         const duration = Date.now() - startTime;
         taskInfo.executionCount++;
@@ -354,7 +443,6 @@ export async function doExecuteTask(manager: SchedulerManager, taskId: string): 
         manager.metrics.totalExecutionTime += duration;
         manager.metrics.averageExecutionTime = manager.metrics.totalExecutionTime / manager.metrics.completedExecutions;
 
-        // Update task-specific metrics
         updateTaskMetrics(manager, taskInfo.id, {
             totalExecutions: taskInfo.executionCount,
             successfulExecutions: (manager.metrics.taskMetrics[taskInfo.id]?.successfulExecutions || 0) + 1,
@@ -376,35 +464,50 @@ export async function doExecuteTask(manager: SchedulerManager, taskId: string): 
 
     } catch (error) {
         const duration = Date.now() - startTime;
+        const err = error instanceof Error ? error : new Error(String(error));
         manager.metrics.failedExecutions++;
 
-        // Handle retry logic
-        await handleTaskFailure(manager, taskInfo, error instanceof Error ? error : new Error(String(error)), duration);
+        if (!workDone) {
+            deferredRetry = { error: err, duration };
+        } else {
+            await handleTaskFailure(manager, taskInfo, err, duration);
+        }
 
         if (manager.config.enableLogging) {
-            loggerInstance.error(`Task ${taskInfo.name} failed after ${duration}ms: ${error instanceof Error ? error.message : String(error)}`);
+            loggerInstance.error(`Task ${taskInfo.name} failed after ${duration}ms: ${err.message}`);
         }
 
         manager.emitEvent({
             type: 'task.failed',
             taskId: taskInfo.id,
             timestamp: new Date(),
-            data: { duration, error: error instanceof Error ? error.message : String(error) }
+            data: { duration, error: err.message }
         });
 
     } finally {
-        taskInfo.isRunning = false;
-        manager.metrics.runningTasks--;
-
-        // Release the distributed lock
-        await manager.distributedLock.release(taskId);
-
-        manager.emitEvent({
-            type: 'task.lock.released',
-            taskId: taskInfo.id,
-            timestamp: new Date(),
-            data: { lockKey: lockResult.lockKey.toString() }
-        });
+        const afterSettled = (): void => {
+            clearRunning();
+            armDeferredRetry();
+        };
+        if (workDone) {
+            if (settleRelease) await Promise.allSettled([settleRelease]);
+            else await releaseLock();
+            afterSettled();
+        } else if (settleRelease) {
+            // Wrapper timed out; the task promise is still running. Do not
+            // release the lock or clear isRunning until it actually settles.
+            // .then(onOk, onErr) swallows the late rejection — .finally()
+            // would rethrow it as an unhandled rejection.
+            void settleRelease.then(afterSettled, (err) => {
+                loggerInstance.warn(
+                    { taskId: taskInfo.id, err },
+                    'Scheduled task rejected after wrapper timeout'
+                );
+                afterSettled();
+            });
+        } else {
+            afterSettled();
+        }
     }
 }
 

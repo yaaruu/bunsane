@@ -1,4 +1,5 @@
 import { UploadManager } from "./UploadManager";
+import { assertBodyWithinLimit, DEFAULT_BODY_LIMITS } from "../core/app/bodyLimit";
 import type {
     UploadConfiguration,
     UploadResult,
@@ -31,7 +32,9 @@ export interface RestUploadResult {
 
 export async function parseFormData(
     req: Request,
+    maxBodyBytes: number = DEFAULT_BODY_LIMITS.multipart,
 ): Promise<{ files: ParsedUpload[]; fields: Record<string, string> }> {
+    assertBodyWithinLimit(req, { json: maxBodyBytes, multipart: maxBodyBytes });
     const contentType = req.headers.get("content-type") ?? "";
     if (!contentType.includes("multipart/form-data")) {
         throw new Error(

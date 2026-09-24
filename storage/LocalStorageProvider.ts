@@ -24,9 +24,8 @@ export class LocalStorageProvider extends StorageProvider {
         this.basePath = config.basePath || "./public";
         this.baseUrl = config.baseUrl || "";
         this.validateConfig();
-        // Synchronous, idempotent dir creation. Done in the constructor so that
-        // registration is never deferred to a microtask — see BUNSANE-007.
-        this.ensureBaseDir();
+        // Directory creation is lazy (first store / explicit initialize) so
+        // UploadManager.getInstance() does not mkdir ./public.
     }
 
     public async initialize(): Promise<void> {
@@ -71,6 +70,7 @@ export class LocalStorageProvider extends StorageProvider {
         logger.info(`Storing file: ${metadata.fileName} to ${fullPath}`);
 
         try {
+            this.ensureBaseDir();
             // Ensure upload directory exists
             if (!fs.existsSync(uploadDir)) {
                 fs.mkdirSync(uploadDir, { recursive: true });

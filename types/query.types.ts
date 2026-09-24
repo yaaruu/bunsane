@@ -42,13 +42,33 @@ export type ComponentRecord<T extends readonly ComponentConstructor[]> = {
 export type ComponentUnion<T extends readonly ComponentConstructor[]> = T[number];
 
 /**
- * Entity with typed component access based on components included in query.
- * Provides both async getTyped() and synchronous componentData access.
+ * Component rows are loaded only when the query called `.populate()`.
+ * Without it, each `.with()` component is optional — `exec()` returns ids
+ * and does not issue the component SELECT.
  */
-export type TypedEntity<TComponents extends readonly ComponentConstructor[]> = Entity & {
+export type LoadedComponentData<
+    TComponents extends readonly ComponentConstructor[],
+    TPopulated extends boolean,
+> = TPopulated extends true
+    ? ComponentRecord<TComponents>
+    : Partial<ComponentRecord<TComponents>>;
+
+/**
+ * Entity with typed component access based on components included in query.
+ *
+ * `TPopulated` is true only after `Query.populate()`. `componentData` is then
+ * the loaded record. Otherwise each component property is optional / possibly
+ * undefined — reading it without `.populate()` is a type error under strict
+ * null checks, matching the runtime (no component SELECT was issued).
+ */
+export type TypedEntity<
+    TComponents extends readonly ComponentConstructor[] = [],
+    TPopulated extends boolean = false,
+> = Entity & {
     /**
      * Type-safe async component getter - only available for components in the query.
      * Unlike regular get(), this returns non-null since query guarantees component exists.
+     * This still hits the component cache / DB when `.populate()` was not called.
      */
     getTyped<T extends ComponentUnion<TComponents>>(
         ctor: T
@@ -57,10 +77,13 @@ export type TypedEntity<TComponents extends readonly ComponentConstructor[]> = E
         : never>;
 
     /**
-     * Synchronous access to already-loaded component data.
-     * Available immediately after query execution without additional DB calls.
+     * Synchronous component data for the `.with()` set.
+     *
+     * Fully typed only after `.populate()` — that is the call that loads rows.
+     * Without it, each component is optional and may be undefined. Do not treat
+     * this as "available immediately after query execution".
      */
-    componentData: ComponentRecord<TComponents>;
+    componentData: LoadedComponentData<TComponents, TPopulated>;
 
     /**
      * The component constructors that were included in this query.

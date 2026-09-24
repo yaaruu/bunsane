@@ -8,15 +8,17 @@ before exiting.
 ## Bootstrap
 
 ```ts
-import 'reflect-metadata';
-import db from 'bunsane/database';                     // or: import { getDb } from 'bunsane/database'
-import { Entity } from 'bunsane';
-import { ComponentRegistry } from 'bunsane/core/components';   // singleton instance
-import './components';                                 // import the @Component classes you touch
+import "reflect-metadata";
+import db from "bunsane/database"; // or: import { getDb } from "bunsane/database"
+import { Entity } from "bunsane";
+import { ComponentRegistry } from "bunsane/core/components"; // singleton instance
+import "./components"; // import the @Component classes you touch
 
 // Registers type ids and (with the default `list` strategy) component partitions.
 await ComponentRegistry.registerAllComponents();
 ```
+
+`bunsane` is the authoring barrel (`App`, `Entity`, `Query`, `t`, `logger`, …). See the [docs index](README.md). `bunsane/database` and `bunsane/core/components` are published subpaths. Importing either does not open a pool; the connection is created on first use.
 
 There is no lifecycle phase to emit and no `App.init()` to run. The DB
 connection is created lazily on first use.

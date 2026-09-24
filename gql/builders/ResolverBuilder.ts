@@ -3,251 +3,211 @@ import { logger } from "../../core/Logger";
 import { type ZodType } from "zod";
 import * as z from "zod";
 import { isVerboseErrors } from "../../core/envMode";
+import { handleGraphQLError } from "../../core/ErrorHandler";
+import {
+  containsFileOrBlob,
+  isUploadWrapped,
+  sweepValidateArgs,
+} from "../uploadGuard";
 
-/** Check if error is a GraphQLError (handles cross-package version mismatches) */
 function isGraphQLError(error: unknown): error is GraphQLError {
   return error instanceof GraphQLError ||
-    (error !== null && typeof error === 'object' && 'extensions' in error &&
-     'message' in error && typeof (error as any).message === 'string');
+    (error !== null && typeof error === "object" && "extensions" in error &&
+     "message" in error && typeof error.message === "string");
+}
+
+function inputFromArgs(args: unknown): unknown {
+  if (args && typeof args === "object" && "input" in args) {
+    return args.input;
+  }
+  return args;
+}
+
+async function callService(service: Record<string, unknown>, propertyKey: string, ...methodArgs: unknown[]): Promise<unknown> {
+  const method = service[propertyKey];
+  if (typeof method !== "function") {
+    throw new Error(`Resolver method ${propertyKey} is not a function`);
+  }
+  return Reflect.apply(method, service, methodArgs);
 }
 
 export interface ResolverDefinition {
   name: string;
   type: "Query" | "Mutation" | "Subscription";
-  service: any;
+  service: Record<string, unknown>;
   propertyKey: string;
   zodSchema?: ZodType;
   hasInput?: boolean;
 }
 
+type ResolverFn = Function;
+
 export class ResolverBuilder {
-  private resolvers: Record<string, Record<string, Function>> = {
+  private resolvers: Record<string, Record<string, ResolverFn>> = {
     Query: {},
     Mutation: {},
-    Subscription: {}
+    Subscription: {},
   };
 
-  /**
-   * Add a resolver definition
-   */
   addResolver(definition: ResolverDefinition): void {
     const { name, type, service, propertyKey, zodSchema, hasInput } = definition;
 
-    let resolver: any;
-
-    if (type === "Subscription") {
-      // Subscriptions need special handling with subscribe/resolve pattern
-      resolver = hasInput
+    const resolver = type === "Subscription"
+      ? hasInput
         ? this.createSubscriptionResolverWithInput(service, propertyKey, zodSchema)
-        : this.createSubscriptionResolverWithoutInput(service, propertyKey);
-    } else {
-      // Queries and Mutations use regular resolver pattern
-      resolver = hasInput
+        : this.createSubscriptionResolverWithoutInput(service, propertyKey)
+      : hasInput
         ? this.createResolverWithInput(service, propertyKey, zodSchema)
         : this.createResolverWithoutInput(service, propertyKey);
-    }
 
-    // Ensure the resolver category exists (should always exist due to initialization)
-    if (!this.resolvers[type]) {
-      this.resolvers[type] = {};
-    }
-    this.resolvers[type][name] = resolver;
+    const bucket = this.resolvers[type] ?? {};
+    bucket[name] = resolver;
+    this.resolvers[type] = bucket;
     logger.trace(`Added ${type} resolver: ${name}`);
   }
 
   /**
-   * Create a resolver that expects input arguments
+   * Skip the upload sweep when the method is already wrapped or a cheap scan
+   * finds no File/Blob. Undecorated methods that receive files are still
+   * swept (SEC-06 safety net).
    */
-  private createResolverWithInput(service: any, propertyKey: string, zodSchema?: ZodType): Function {
-    return async (_: any, args: any, context: any, info: any) => {
+  private async guardUploads(service: Record<string, unknown>, propertyKey: string, args: unknown): Promise<void> {
+    if (isUploadWrapped(service[propertyKey])) return;
+    if (!containsFileOrBlob(args)) return;
+    await sweepValidateArgs([args]);
+  }
+
+  private createResolverWithInput(service: Record<string, unknown>, propertyKey: string, zodSchema?: ZodType): ResolverFn {
+    return async (_parent: unknown, args: unknown, context: unknown, info: unknown) => {
       try {
-        const inputArgs = args.input || args;
+        const inputArgs = inputFromArgs(args);
+        await this.guardUploads(service, propertyKey, inputArgs);
 
-        // SEC-06: validate-only sweep for files arriving through ANY argument
-        // shape (nested inputs, undecorated methods). Skip it when the method is
-        // already @Upload/@UploadField-wrapped — that wrapper does a complete,
-        // config-aware sweep of its own, and running this global-config net on
-        // top would falsely reject a file the method's own permissive config
-        // allows.
-        const { sweepValidateArgs, isUploadWrapped } = await import("../uploadGuard");
-        if (!isUploadWrapped(service[propertyKey])) {
-          await sweepValidateArgs([inputArgs]);
-        }
-
-        // Automatically validate with Zod schema if provided
         if (zodSchema) {
           try {
             const validated = zodSchema.parse(inputArgs);
-            return await service[propertyKey](validated, context, info);
+            return await callService(service, propertyKey, validated, context, info);
           } catch (error) {
             if (error instanceof z.ZodError) {
-              // Let handleGraphQLError convert Zod errors to user-friendly messages
-              const { handleGraphQLError } = await import("../../core/ErrorHandler");
               handleGraphQLError(error);
             }
             throw error;
           }
-        } else {
-          return await service[propertyKey](inputArgs, context, info);
         }
+        return await callService(service, propertyKey, inputArgs, context, info);
       } catch (error) {
         logger.error(`Error in resolver with input:`);
         logger.error(error);
-        if (isGraphQLError(error)) {
-          throw error;
-        }
+        if (isGraphQLError(error)) throw error;
         throw new GraphQLError(`Internal error`, {
           extensions: {
             code: "INTERNAL_ERROR",
-            originalError: isVerboseErrors() ? error : undefined
-          }
+            originalError: isVerboseErrors() ? error : undefined,
+          },
         });
       }
     };
   }
 
-  /**
-   * Create a resolver that doesn't expect input arguments
-   */
-  private createResolverWithoutInput(service: any, propertyKey: string): Function {
-    return async (_: any, args: any, context: any, info: any) => {
+  private createResolverWithoutInput(service: Record<string, unknown>, propertyKey: string): ResolverFn {
+    return async (_parent: unknown, args: unknown, context: unknown, info: unknown) => {
       try {
-        // SEC-06: same safety net for no-input resolvers (bare File scalars),
-        // skipped when the method's own upload wrapper already covers it.
-        const { sweepValidateArgs, isUploadWrapped } = await import("../uploadGuard");
-        if (!isUploadWrapped(service[propertyKey])) {
-          await sweepValidateArgs([args]);
-        }
-
-        const result = await service[propertyKey]({}, context, info);
-        return result;
+        await this.guardUploads(service, propertyKey, args);
+        return await callService(service, propertyKey, {}, context, info);
       } catch (error) {
         logger.error(`Error in resolver without input:`);
         logger.error(error);
-        if (isGraphQLError(error)) {
-          throw error;
-        }
+        if (isGraphQLError(error)) throw error;
         throw new GraphQLError(`Internal error`, {
           extensions: {
             code: "INTERNAL_ERROR",
-            originalError: isVerboseErrors() ? error : undefined
-          }
+            originalError: isVerboseErrors() ? error : undefined,
+          },
         });
       }
     };
   }
 
-  /**
-   * Create a subscription resolver with input (returns { subscribe, resolve })
-   */
-  private createSubscriptionResolverWithInput(service: any, propertyKey: string, zodSchema?: ZodType): any {
+  private createSubscriptionResolverWithInput(service: Record<string, unknown>, propertyKey: string, zodSchema?: ZodType): ResolverFn {
     return {
-      subscribe: async (_: any, args: any, context: any, info: any) => {
+      subscribe: async (_parent: unknown, args: unknown, context: unknown, info: unknown) => {
         try {
-          const inputArgs = args.input || args;
-
-          // Automatically validate with Zod schema if provided
+          const inputArgs = inputFromArgs(args);
           if (zodSchema) {
             try {
               const validated = zodSchema.parse(inputArgs);
-              return await service[propertyKey](validated, context, info);
+              return await callService(service, propertyKey, validated, context, info);
             } catch (error) {
               if (error instanceof z.ZodError) {
-                const { handleGraphQLError } = await import("../../core/ErrorHandler");
                 handleGraphQLError(error);
               }
               throw error;
             }
-          } else {
-            return await service[propertyKey](inputArgs, context, info);
           }
+          return await callService(service, propertyKey, inputArgs, context, info);
         } catch (error) {
           logger.error(`Error in subscription with input:`);
           logger.error(error);
-          if (isGraphQLError(error)) {
-            throw error;
-          }
+          if (isGraphQLError(error)) throw error;
           throw new GraphQLError(`Internal error in subscription`, {
             extensions: {
               code: "INTERNAL_ERROR",
-              originalError: isVerboseErrors() ? error : undefined
-            }
+              originalError: isVerboseErrors() ? error : undefined,
+            },
           });
         }
       },
-      resolve: (payload: any) => payload
-    };
+      resolve: (payload: unknown) => payload,
+    } as unknown as ResolverFn;
   }
 
-  /**
-   * Create a subscription resolver without input (returns { subscribe, resolve })
-   */
-  private createSubscriptionResolverWithoutInput(service: any, propertyKey: string): any {
+  private createSubscriptionResolverWithoutInput(service: Record<string, unknown>, propertyKey: string): ResolverFn {
     return {
-      subscribe: async (_: any, args: any, context: any, info: any) => {
+      subscribe: async (_parent: unknown, _args: unknown, context: unknown, info: unknown) => {
         try {
-          return await service[propertyKey]({}, context, info);
+          return await callService(service, propertyKey, {}, context, info);
         } catch (error) {
           logger.error(`Error in subscription without input:`);
           logger.error(error);
-          if (isGraphQLError(error)) {
-            throw error;
-          }
+          if (isGraphQLError(error)) throw error;
           throw new GraphQLError(`Internal error in subscription`, {
             extensions: {
               code: "INTERNAL_ERROR",
-              originalError: isVerboseErrors() ? error : undefined
-            }
+              originalError: isVerboseErrors() ? error : undefined,
+            },
           });
         }
       },
-      resolve: (payload: any) => payload
-    };
+      resolve: (payload: unknown) => payload,
+    } as unknown as ResolverFn;
   }
 
-  /**
-   * Get all built resolvers
-   */
-  getResolvers(): Record<string, Record<string, Function>> {
+  getResolvers(): Record<string, Record<string, ResolverFn>> {
     return { ...this.resolvers };
   }
 
-  /**
-   * Get resolvers for a specific type
-   */
-  getResolversForType(type: "Query" | "Mutation" | "Subscription"): Record<string, Function> {
-    return { ...this.resolvers[type] };
+  getResolversForType(type: "Query" | "Mutation" | "Subscription"): Record<string, ResolverFn> {
+    return { ...(this.resolvers[type] ?? {}) };
   }
 
-  /**
-   * Clear all resolvers (for reuse)
-   */
   clear(): void {
     this.resolvers = {
       Query: {},
       Mutation: {},
-      Subscription: {}
+      Subscription: {},
     };
   }
 
-  /**
-   * Add a scalar resolver
-   */
-  addScalarResolver(name: string, resolver: any): void {
-    if (!this.resolvers[name]) {
-      this.resolvers[name] = resolver;
-      logger.trace(`Added scalar resolver: ${name}`);
-    }
+  addScalarResolver(name: string, resolver: object): void {
+    this.resolvers[name] = resolver as unknown as Record<string, ResolverFn>;
+    logger.trace(`Added scalar resolver: ${name}`);
   }
 
-  /**
-   * Get statistics
-   */
   getStats(): { queries: number; mutations: number; subscriptions: number } {
     return {
       queries: Object.keys(this.resolvers.Query ?? {}).length,
       mutations: Object.keys(this.resolvers.Mutation ?? {}).length,
-      subscriptions: Object.keys(this.resolvers.Subscription ?? {}).length
+      subscriptions: Object.keys(this.resolvers.Subscription ?? {}).length,
     };
   }
 }

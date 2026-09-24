@@ -4,6 +4,7 @@ import type { StorageProvider } from "../storage/StorageProvider";
 import { LocalStorageProvider } from "../storage/LocalStorageProvider";
 import type { UploadConfiguration, UploadResult, UploadError, FileMetadata, ValidationResult } from "../types/upload.types";
 import { FileValidator } from "./FileValidator";
+import { DEFAULT_UPLOAD_CONFIG } from "../config/upload.config";
 
 const logger = MainLogger.child({ scope: "UploadManager" });
 
@@ -204,26 +205,20 @@ export class UploadManager {
         // would defer registration to a later microtask, after which a caller's
         // post-construction `registerStorageProvider("local", custom)` would be
         // silently clobbered by the default. See BUNSANE-007.
-        // LocalStorageProvider creates its base directory in its constructor.
+        // LocalStorageProvider creates its base directory on first store, not here.
         this.registerStorageProvider("local", new LocalStorageProvider());
     }
 
     private getDefaultConfiguration(): UploadConfiguration {
+        const validation = DEFAULT_UPLOAD_CONFIG.validation;
         return {
-            maxFileSize: 10 * 1024 * 1024, // 10MB
-            allowedMimeTypes: [
-                "image/jpeg",
-                "image/png",
-                "image/gif",
-                "image/webp"
-            ],
-            allowedExtensions: [".jpg", ".jpeg", ".png", ".gif", ".webp"],
-            validateFileSignature: true,
-            sanitizeFileName: true,
-            preserveOriginalName: false,
-            generateThumbnails: false,
-            uploadPath: "uploads",
-            namingStrategy: "uuid"
+            ...DEFAULT_UPLOAD_CONFIG,
+            validation: validation
+                ? {
+                    strictMimeType: validation.strictMimeType,
+                    customValidators: validation.customValidators ? [...validation.customValidators] : undefined,
+                }
+                : undefined,
         };
     }
 

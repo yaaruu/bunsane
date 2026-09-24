@@ -14,6 +14,7 @@
  */
 import { describe, test, expect, beforeAll } from 'bun:test';
 import { Entity } from '../../../core/Entity';
+import { ComponentLoadError } from '../../../core/entity/errors';
 import { TestUser } from '../../fixtures/components';
 import { createTestContextWithoutCache, ensureComponentsRegistered } from '../../utils';
 
@@ -24,20 +25,18 @@ describe('Entity read-path AbortSignal', () => {
         await ensureComponentsRegistered(TestUser);
     });
 
-    test('get() with an already-aborted signal cancels the read (returns null, no query)', async () => {
+    test('get() with an already-aborted signal rejects instead of looking like a miss', async () => {
         const entity = ctx.tracker.create();
         entity.add(TestUser, { name: 'abort-read', email: 'ar@example.com', age: 7 });
         await entity.save();
 
-        // Fresh instance with no in-memory components forces the DB read path.
         const fresh = Entity.CreateWithId(entity.id);
         const controller = new AbortController();
         controller.abort(new Error('simulated request timeout'));
 
-        const data = await fresh.get(TestUser, { signal: controller.signal });
-        // runWithSignal short-circuits before awaiting the query; _loadComponent
-        // swallows the abort and returns null rather than hanging on the read.
-        expect(data).toBeNull();
+        await expect(fresh.get(TestUser, { signal: controller.signal })).rejects.toBeInstanceOf(ComponentLoadError);
+        const typeId = fresh.getInMemory(TestUser)?.getTypeID();
+        expect(typeId).toBeUndefined();
     });
 
     test('get() with no signal still loads from DB (backwards compatible)', async () => {

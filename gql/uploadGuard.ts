@@ -15,7 +15,7 @@
  */
 import "reflect-metadata";
 import { logger as MainLogger } from "../core/Logger";
-import { UploadManager } from "../upload";
+import { UploadManager } from "../upload/UploadManager";
 import type { UploadDecoratorConfig } from "../types/upload.types";
 
 const logger = MainLogger.child({ scope: "UploadGuard" });
@@ -66,6 +66,27 @@ export function collectFiles(value: unknown, depth: number = 0): File[] {
         return out;
     }
     return [];
+}
+
+/** True when a File or Blob is reachable without collecting every match. */
+export function containsFileOrBlob(value: unknown, depth: number = 0): boolean {
+    if (depth > MAX_SWEEP_DEPTH) return false;
+    if (typeof Blob !== "undefined" && value instanceof Blob) return true;
+    if (looksLikeFile(value)) return true;
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            if (containsFileOrBlob(item, depth + 1)) return true;
+        }
+        return false;
+    }
+    if (typeof value === "object" && value !== null) {
+        const proto = Object.getPrototypeOf(value);
+        if (proto !== Object.prototype && proto !== null) return false;
+        for (const [, child] of Object.entries(value)) {
+            if (containsFileOrBlob(child, depth + 1)) return true;
+        }
+    }
+    return false;
 }
 
 async function validateOnly(file: File, config?: Partial<UploadDecoratorConfig>): Promise<void> {

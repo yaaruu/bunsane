@@ -1,13 +1,17 @@
-// Persistence path for Entity (save / doSave / doDelete) and post-commit
-// side effects. Extracted from Entity.ts (RFC_REFACTOR_TARGETS §3.2). This
-// is the framework's hottest path — behavior is byte-identical to the
-// original inline implementation. Pure functions take the entity instance
-// as the first parameter.
+// Persistence path for Entity (save / doSave / doDelete / saveMany) and
+// post-commit side effects. Extracted from Entity.ts (RFC_REFACTOR_TARGETS
+// §3.2). Pure functions take the entity instance as the first parameter.
+//
+// Persisted/dirty flags and the removal sets are mutated only after every
+// statement in the transaction succeeds (entity upsert, deletes, inserts,
+// component upserts, QSP projection, read-model sync). A rolled-back save
+// must leave the instance dirty so the next save() reissues every statement.
 import { logger } from "../Logger";
-import db, { QUERY_TIMEOUT_MS } from "../../database";
+import { QUERY_TIMEOUT_MS } from "../../database";
 import { dbTransaction } from "../../database/gateway";
 import { runWithSignal } from "../../database/cancellable";
 import ComponentRegistry from "../components/ComponentRegistry";
+import type { BaseComponent } from "../components";
 import { uuidv7 } from "../../utils/uuid";
 import { sql, SQL } from "bun";
 import EntityHookManager from "../EntityHookManager";
@@ -35,93 +39,179 @@ import type { Entity } from "../Entity";
  */
 export const SAVE_CLIENT_BACKSTOP_MS = 2_000;
 
-export async function saveEntity(entity: Entity, trx?: SQL, context?: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal }): Promise<boolean> {
-    // Capture pre-save state BEFORE doSave mutates persisted/dirty flags.
-    const wasNew = !entity._persisted;
-    const changedComponentTypeIds = getDirtyComponents(entity);
-    const removedComponentTypeIds = Array.from(entity.removedComponents);
+/** Rows per multi-row INSERT / upsert / delete chunk. */
+const SAVE_ROW_CHUNK = 500;
 
-    // Pre-flight: await ComponentRegistry readiness for every component on
-    // this entity BEFORE opening the transaction. Previously doSave awaited
-    // ComponentRegistry.getReadyPromise inside the executeSave loop, so a
-    // slow DDL (partition creation) would keep the PG transaction open and
-    // idle-in-transaction waiting on registry state. (H-DB-4).
-    for (const comp of entity.components.values()) {
-        const compName = comp.constructor.name;
-        if (!ComponentRegistry.isComponentReady(compName)) {
-            await ComponentRegistry.getReadyPromise(compName);
+export type SaveContext = {
+    loaders?: { componentsByEntityType?: { clear(key: { entityId: string; typeId: string }): void } };
+    trx?: SQL;
+    signal?: AbortSignal;
+};
+
+export type SaveManyOptions = {
+    trx?: SQL;
+    signal?: AbortSignal;
+    context?: SaveContext;
+};
+
+/** Protected persistence bits. This module is their writer. */
+type PersistenceFlags = { _dirty: boolean; _persisted: boolean };
+
+function flagsOf(target: object): PersistenceFlags {
+    return target as unknown as PersistenceFlags;
+}
+
+function entityIsDirty(entity: Entity): boolean {
+    return flagsOf(entity)._dirty;
+}
+
+type ComponentWriteRow = {
+    id: string;
+    entity_id: string;
+    name: string;
+    type_id: string;
+    data: Record<string, unknown>;
+};
+
+type EntitySavePlan = {
+    entity: Entity;
+    removedTypeIds: string[];
+    toInsert: ComponentWriteRow[];
+    toUpdate: ComponentWriteRow[];
+    insertedComps: BaseComponent[];
+    updatedComps: BaseComponent[];
+};
+
+type CapturedSave = {
+    entity: Entity;
+    wasNew: boolean;
+    changedComponentTypeIds: string[];
+    removedComponentTypeIds: string[];
+};
+
+export async function saveEntity(entity: Entity, trx?: SQL, context?: SaveContext): Promise<boolean> {
+    return saveMany([entity], { trx, context });
+}
+
+/**
+ * Persist many entities in one admission and one transaction.
+ *
+ * One multi-row entity upsert (insert new ids, bump `updated_at` on conflict),
+ * one batched delete, one batched component insert, and one batched upsert,
+ * each chunked at 500 rows. Hooks and cache invalidation run post-commit,
+ * per entity, the same way `save()` does.
+ */
+export async function saveMany(entities: Entity[], opts?: SaveManyOptions): Promise<boolean> {
+    if (entities.length === 0) return true;
+
+    const unique: Entity[] = [];
+    const seen = new Set<string>();
+    for (const entity of entities) {
+        if (seen.has(entity.id)) continue;
+        seen.add(entity.id);
+        unique.push(entity);
+    }
+
+    // Capture pre-save state BEFORE executeBatch mutates persisted/dirty flags.
+    const captured: CapturedSave[] = unique.map((entity) => ({
+        entity,
+        wasNew: !entity._persisted,
+        changedComponentTypeIds: getDirtyComponents(entity),
+        removedComponentTypeIds: Array.from(entity.removedComponents),
+    }));
+
+    // Await registry readiness BEFORE opening the transaction so a slow
+    // partition DDL cannot hold a pg session idle in transaction (H-DB-4).
+    for (const entity of unique) {
+        if (!entityIsDirty(entity)) continue;
+        for (const comp of entity.components.values()) {
+            const compName = comp.constructor.name;
+            if (!ComponentRegistry.isComponentReady(compName)) {
+                await ComponentRegistry.getReadyPromise(compName);
+            }
         }
     }
 
-    const profile = process.env.DB_SAVE_PROFILE === 'true';
+    const profile = process.env.DB_SAVE_PROFILE === "true";
     const phaseStart = profile ? performance.now() : 0;
     const phases: Record<string, number> = {};
+    const anyDirty = unique.some(entityIsDirty);
+    const context = opts?.context;
+    const callerTrx = opts?.trx ?? context?.trx;
 
-    // AbortController cancels in-flight queries and propagates ROLLBACK
-    // when the wall-clock timer fires. Throwing from inside the transaction
-    // callback triggers Bun SQL's auto-ROLLBACK, releasing the pooled connection.
-    const controller = new AbortController();
-    const timeoutMs = QUERY_TIMEOUT_MS;
-    // One deadline shared with the gateway below, rather than a second clock
-    // starting when admission does. The save's budget must cover WAITING for a
-    // connection as well as using one: two independent 30s timers is how a
-    // request stalls for a minute before failing.
-    const deadline = Date.now() + timeoutMs;
-    const timeoutHandle = setTimeout(() => {
-        const err = new Error(`Entity save timeout for entity ${entity.id} after ${timeoutMs}ms`);
-        logger.error({ scope: 'Entity.save', entityId: entity.id, timeoutMs }, err.message);
-        controller.abort(err);
-    }, timeoutMs + SAVE_CLIENT_BACKSTOP_MS);
-
-    try {
-        const dbStart = profile ? performance.now() : 0;
-        if (trx) {
-            // Caller-supplied transaction: it already holds the connection, so
-            // no admission is taken here (and none is available to take —
-            // waiting for a permit while holding a connection deadlocks).
-            await doSave(entity, trx, controller.signal);
-        } else {
-            await dbTransaction(
-                async (newTrx) => {
-                    await doSave(entity, newTrx, controller.signal);
-                },
-                { lane: 'request', label: 'entity.save', deadline, signal: controller.signal },
+    if (anyDirty) {
+        const controller = new AbortController();
+        const timeoutMs = QUERY_TIMEOUT_MS;
+        const deadline = Date.now() + timeoutMs;
+        const timeoutLabel = unique.length === 1
+            ? `entity ${unique[0]!.id}`
+            : `${unique.length} entities`;
+        const timeoutHandle = setTimeout(() => {
+            const err = new Error(`Entity save timeout for ${timeoutLabel} after ${timeoutMs}ms`);
+            logger.error(
+                { scope: "Entity.save", entityId: unique.length === 1 ? unique[0]!.id : undefined, count: unique.length, timeoutMs },
+                err.message,
             );
+            controller.abort(err);
+        }, timeoutMs + SAVE_CLIENT_BACKSTOP_MS);
+
+        const callerSignal = opts?.signal;
+        const onCallerAbort = () => controller.abort(callerSignal?.reason);
+        if (callerSignal) {
+            if (callerSignal.aborted) controller.abort(callerSignal.reason);
+            else callerSignal.addEventListener("abort", onCallerAbort, { once: true });
         }
-        if (profile) phases.db = performance.now() - dbStart;
 
-        clearTimeout(timeoutHandle);
+        try {
+            const dbStart = profile ? performance.now() : 0;
+            if (callerTrx) {
+                await executeBatch(unique, callerTrx, controller.signal);
+            } else {
+                await dbTransaction(
+                    async (newTrx) => {
+                        await executeBatch(unique, newTrx, controller.signal);
+                    },
+                    {
+                        lane: "request",
+                        label: unique.length === 1 ? "entity.save" : "entity.saveMany",
+                        deadline,
+                        signal: controller.signal,
+                    },
+                );
+            }
+            if (profile) phases.db = performance.now() - dbStart;
+            clearTimeout(timeoutHandle);
+        } catch (error) {
+            clearTimeout(timeoutHandle);
+            if (controller.signal.aborted) {
+                throw controller.signal.reason ?? error;
+            }
+            throw error;
+        } finally {
+            if (callerSignal) callerSignal.removeEventListener("abort", onCallerAbort);
+            if (!controller.signal.aborted) controller.abort();
+        }
+    }
 
-        // Post-commit side effects are fire-and-forget so Redis / hook
-        // latency cannot consume the save budget or block the caller.
-        // Tracked in pendingSideEffects so tests/shutdown can drain
-        // background work before asserting or tearing down.
+    const profileForPost = profile && unique.length === 1;
+    for (const cap of captured) {
         const sideEffectPromise = new Promise<void>((resolve) => {
             queueMicrotask(() => {
                 runPostCommitSideEffects(
-                    entity,
-                    wasNew,
-                    changedComponentTypeIds,
-                    removedComponentTypeIds,
+                    cap.entity,
+                    cap.wasNew,
+                    cap.changedComponentTypeIds,
+                    cap.removedComponentTypeIds,
                     context,
-                    profile ? phases : undefined,
-                    profile ? phaseStart : undefined,
+                    profileForPost ? phases : undefined,
+                    profileForPost ? phaseStart : undefined,
                 ).finally(() => resolve());
             });
         });
         trackSideEffect(sideEffectPromise);
-
-        return true;
-    } catch (error) {
-        clearTimeout(timeoutHandle);
-        if (controller.signal.aborted) {
-            throw controller.signal.reason ?? error;
-        }
-        throw error;
-    } finally {
-        // Ensure AbortController listeners are released even on success.
-        if (!controller.signal.aborted) controller.abort();
     }
+
+    return true;
 }
 
 /**
@@ -134,7 +224,7 @@ async function runPostCommitSideEffects(
     wasNew: boolean,
     changedComponentTypeIds: string[],
     removedComponentTypeIds: string[],
-    context: { loaders?: { componentsByEntityType?: any }; trx?: SQL; signal?: AbortSignal } | undefined,
+    context: SaveContext | undefined,
     phases: Record<string, number> | undefined,
     phaseStart: number | undefined,
 ): Promise<void> {
@@ -144,7 +234,7 @@ async function runPostCommitSideEffects(
     try {
         await handleCacheAfterSave(entity, changedComponentTypeIds, removedComponentTypeIds, context);
     } catch (err) {
-        logger.warn({ scope: 'cache', entityId: entity.id, err }, 'post-commit cache invalidation failed');
+        logger.warn({ scope: "cache", entityId: entity.id, err }, "post-commit cache invalidation failed");
     }
     if (profile) phases!.cache = performance.now() - cacheStart;
 
@@ -156,196 +246,269 @@ async function runPostCommitSideEffects(
             await EntityHookManager.executeHooks(new EntityUpdatedEvent(entity, changedComponentTypeIds));
         }
     } catch (err) {
-        logger.error({ scope: 'hooks', entityId: entity.id, err }, 'post-commit lifecycle hooks failed');
+        logger.error({ scope: "hooks", entityId: entity.id, err }, "post-commit lifecycle hooks failed");
     }
     if (profile) phases!.hooks = performance.now() - hookStart;
 
     if (profile) {
         phases!.total = performance.now() - phaseStart!;
-        logger.info({ scope: 'Entity.save.profile', entityId: entity.id, phases }, 'Entity.save phase timings');
+        logger.info({ scope: "Entity.save.profile", entityId: entity.id, phases }, "Entity.save phase timings");
     }
 }
 
-export async function doSave(entity: Entity, trx: SQL, signal?: AbortSignal): Promise<boolean> {
-    // Validate entity ID to prevent PostgreSQL UUID parsing errors
-    if (!entity.id || entity.id.trim() === '') {
-        logger.error(`Cannot save entity: id is empty or invalid`);
-        throw new Error(`Cannot save entity: id is empty or invalid`);
+function logSkipNotDirty(entity: Entity): void {
+    if (!logger.isLevelEnabled?.("trace")) return;
+    let dirtyComponents: string[] = [];
+    try {
+        dirtyComponents = getDirtyComponents(entity);
+    } catch {
+        // best-effort diagnostics only
+    }
+    const removedTypeIds = Array.from(entity.removedComponents);
+    const entityType = entity.constructor?.name ?? "Entity";
+    logger.trace(
+        {
+            component: "Entity",
+            entity: {
+                type: entityType,
+                id: entity.id,
+                persisted: entity._persisted,
+                dirty: flagsOf(entity)._dirty,
+            },
+            components: {
+                total: entity.components.size,
+                dirtyCount: dirtyComponents.length,
+                dirtyPreview: dirtyComponents.slice(0, 10),
+            },
+            removedComponents: {
+                count: removedTypeIds.length,
+                typeIdsPreview: removedTypeIds.slice(0, 10),
+            },
+        },
+        "[Entity.doSave] Skipping save because entity is not dirty",
+    );
+}
+
+function planEntity(entity: Entity): EntitySavePlan {
+    const removedTypeIds = Array.from(entity.removedComponents);
+    const toInsert: ComponentWriteRow[] = [];
+    const toUpdate: ComponentWriteRow[] = [];
+    const insertedComps: BaseComponent[] = [];
+    const updatedComps: BaseComponent[] = [];
+
+    if (entity.components.size === 0) {
+        logger.trace(`No components to save for entity ${entity.id}`);
     }
 
-    if (!(entity as any)._dirty) {
-        // Diagnostics object is non-trivial to build (component walk +
-        // preview mapping) — gate on the active level so the not-dirty
-        // fast path stays allocation-free in production.
-        if (logger.isLevelEnabled?.('trace')) {
-            let dirtyComponents: string[] = [];
-            try {
-                dirtyComponents = getDirtyComponents(entity);
-            } catch {
-                // best-effort diagnostics only
-            }
+    const traceEnabled = logger.isLevelEnabled?.("trace") === true;
 
-            const removedTypeIds = Array.from(entity.removedComponents);
-            const entityType = (entity as any)?.constructor?.name ?? "Entity";
-            const dirtyComponentPreview = dirtyComponents.slice(0, 10).map((component) => {
-                const anyComponent = component as any;
-                return {
-                    type: anyComponent?.constructor?.name ?? "Component",
-                    typeId: typeof anyComponent?.getTypeID === "function" ? anyComponent.getTypeID() : undefined,
-                    id: anyComponent?.id,
-                    persisted: anyComponent?._persisted,
-                    dirty: anyComponent?._dirty,
-                };
+    for (const comp of entity.components.values()) {
+        const compName = comp.constructor.name;
+        if (!ComponentRegistry.isComponentReady(compName)) {
+            throw new Error(`Component ${compName} not ready; call save() (not doSave) or await registry readiness before the transaction.`);
+        }
+        const compFlags = flagsOf(comp);
+        if (!compFlags._persisted) {
+            if (comp.id === "") {
+                comp.id = uuidv7();
+            }
+            toInsert.push({
+                id: comp.id,
+                entity_id: entity.id,
+                name: compName,
+                type_id: comp.getTypeID(),
+                data: comp.serializableData(),
             });
-
-            logger.trace(
-                {
-                    component: "Entity",
-                    entity: {
-                        type: entityType,
-                        id: entity.id,
-                        persisted: entity._persisted,
-                        dirty: (entity as any)._dirty,
-                    },
-                    components: {
-                        total: entity.components.size,
-                        dirtyCount: dirtyComponents.length,
-                        dirtyPreview: dirtyComponentPreview,
-                    },
-                    removedComponents: {
-                        count: removedTypeIds.length,
-                        typeIdsPreview: removedTypeIds.slice(0, 10),
-                    },
-                },
-                "[Entity.doSave] Skipping save because entity is not dirty"
-            );
+            insertedComps.push(comp);
+        } else if (compFlags._dirty) {
+            if (!comp.id || comp.id.trim() === "") {
+                logger.error(`Cannot update component: id is empty or invalid. Component data: ${JSON.stringify(comp.serializableData()).substring(0, 200)}`);
+                throw new Error("Cannot update component: component id is empty or invalid");
+            }
+            const data = comp.serializableData();
+            if (traceEnabled) {
+                logger.trace({ componentId: comp.id, data }, "[Entity.doSave] Updating component");
+            }
+            toUpdate.push({
+                id: comp.id,
+                entity_id: entity.id,
+                name: compName,
+                type_id: comp.getTypeID(),
+                data,
+            });
+            updatedComps.push(comp);
         }
-        return true;
     }
 
-    const qspTouched = ProjectionManager.enabled
-        ? [...getDirtyComponents(entity), ...entity.removedComponents]
-        : undefined;
+    return { entity, removedTypeIds, toInsert, toUpdate, insertedComps, updatedComps };
+}
 
-    // Cancellation goes through the shared `runWithSignal` helper so
-    // every db.unsafe / trx`...` callsite in the framework uses the same
-    // pattern: on abort the in-flight Bun SQL Query is cancelled, the
-    // transaction callback throws, Bun emits ROLLBACK, and the pooled
-    // backend connection is released. Without this a wall-clock timeout
-    // leaks the backend into `idle in transaction` under pgbouncer
-    // transaction-mode pooling.
-    const run = <T>(q: any): Promise<T> => runWithSignal<T>(q, signal);
-
-    const executeSave = async (saveTrx: SQL) => {
-        if (!entity._persisted) {
-            await run(saveTrx`INSERT INTO entities (id) VALUES (${entity.id}) ON CONFLICT DO NOTHING`);
-            entity._persisted = true;
+function applySaveFlags(plans: EntitySavePlan[]): void {
+    for (const plan of plans) {
+        const entity = plan.entity;
+        for (const typeId of plan.removedTypeIds) {
+            entity.savedRemovedComponents.add(typeId);
         }
-
-        // Delete removed components from database. `components` is the
-        // single source of membership truth — one DELETE per removal batch.
-        if (entity.removedComponents.size > 0) {
-            const typeIds = Array.from(entity.removedComponents);
-            await run(saveTrx`DELETE FROM components WHERE entity_id = ${entity.id} AND type_id IN ${sql(typeIds)}`);
-            // Move to savedRemovedComponents so resolvers can still detect removed components
-            // This is needed because DataLoader may have stale cached data for this request
-            for (const typeId of typeIds) {
-                entity.savedRemovedComponents.add(typeId);
-            }
+        if (plan.removedTypeIds.length > 0) {
             entity.removedComponents.clear();
         }
-
-        if (entity.components.size === 0) {
-            logger.trace(`No components to save for entity ${entity.id}`);
-            return;
+        for (const comp of plan.insertedComps) {
+            comp.setPersisted(true);
+            comp.setDirty(false);
         }
-
-        // Batch inserts and updates for better performance
-        const componentsToInsert: Array<{ id: string; entity_id: string; name: string; type_id: string; data: Record<string, any> }> = [];
-        const componentsToUpdate: Array<{ id: string; entity_id: string; name: string; type_id: string; data: Record<string, any> }> = [];
-
-        for (const comp of entity.components.values()) {
-            const compName = comp.constructor.name;
-            // Registry readiness is pre-flighted in save() before the
-            // transaction starts (H-DB-4). This assert catches a
-            // theoretical race if a caller skipped save() and jumped
-            // straight to doSave — we refuse to await inside the txn so
-            // a slow DDL cannot hold a pg session idle in transaction.
-            if (!ComponentRegistry.isComponentReady(compName)) {
-                throw new Error(`Component ${compName} not ready; call save() (not doSave) or await registry readiness before the transaction.`);
-            }
-
-            if (!(comp as any)._persisted) {
-                if (comp.id === "") {
-                    comp.id = uuidv7();
-                }
-                componentsToInsert.push({
-                    id: comp.id,
-                    entity_id: entity.id,
-                    name: compName,
-                    type_id: comp.getTypeID(),
-                    data: comp.serializableData()
-                });
-                (comp as any).setPersisted(true);
-                (comp as any).setDirty(false);
-            } else if ((comp as any)._dirty) {
-                // Full columns so the batched upsert below can encode every row
-                // through the same sql(arr, cols) path as the INSERT batch.
-                componentsToUpdate.push({
-                    id: comp.id,
-                    entity_id: entity.id,
-                    name: compName,
-                    type_id: comp.getTypeID(),
-                    data: comp.serializableData()
-                });
-                (comp as any).setDirty(false);
-            }
+        for (const comp of plan.updatedComps) {
+            comp.setDirty(false);
         }
+        entity.setPersisted(true);
+        entity.setDirty(false);
+    }
+}
 
-        // Perform batch inserts
-        if (componentsToInsert.length > 0) {
-            await run(saveTrx`INSERT INTO components ${sql(componentsToInsert, 'id', 'entity_id', 'name', 'type_id', 'data')}`);
+async function forChunks<T>(rows: T[], run: (chunk: T[]) => Promise<void>): Promise<void> {
+    if (rows.length === 0) return;
+    if (rows.length <= SAVE_ROW_CHUNK) {
+        await run(rows);
+        return;
+    }
+    for (let i = 0; i < rows.length; i += SAVE_ROW_CHUNK) {
+        await run(rows.slice(i, i + SAVE_ROW_CHUNK));
+    }
+}
+
+async function upsertEntityRows(
+    trx: SQL,
+    entities: Entity[],
+    run: <T>(q: Promise<T> | T) => Promise<T>,
+): Promise<void> {
+    // One statement for new ids and for the updated_at bump on rows that
+    // already exist. NOW() is transaction_timestamp(), so the component
+    // upsert in this same transaction stamps the same instant. QSP reads
+    // entities.updated_at after this statement and therefore mirrors it.
+    if (entities.length === 1) {
+        const id = entities[0]!.id;
+        await run(trx`INSERT INTO entities (id) VALUES (${id}) ON CONFLICT (id) DO UPDATE SET updated_at = NOW()`);
+        return;
+    }
+    const rows = entities.map((entity) => ({ id: entity.id }));
+    await forChunks(rows, async (chunk) => {
+        await run(trx`INSERT INTO entities ${sql(chunk, "id")} ON CONFLICT (id) DO UPDATE SET updated_at = NOW()`);
+    });
+}
+
+async function deleteRemoved(
+    trx: SQL,
+    plans: EntitySavePlan[],
+    run: <T>(q: Promise<T> | T) => Promise<T>,
+): Promise<void> {
+    const pairs: Array<{ entity_id: string; type_id: string }> = [];
+    for (const plan of plans) {
+        for (const typeId of plan.removedTypeIds) {
+            pairs.push({ entity_id: plan.entity.id, type_id: typeId });
         }
+    }
+    if (pairs.length === 0) return;
 
-        // Perform updates as a SINGLE batched upsert. Dirty components already
-        // exist (persisted, live), so the ON CONFLICT path always fires and
-        // updates `data` for every row in one round-trip — replacing the
-        // previous N sequential UPDATEs (N wire round-trips inside the txn).
-        // Conflict target is the (id, type_id) PRIMARY KEY, which contains the
-        // partition key `type_id` — required for ON CONFLICT on the partitioned
-        // `components` table. Reuses the same sql(arr, cols) encoder as the
-        // INSERT batch, so jsonb encoding is identical across PostgreSQL and
-        // PGlite. `created_at` is preserved (DO UPDATE only touches `data`).
-        if (componentsToUpdate.length > 0) {
-            const traceEnabled = logger.isLevelEnabled?.('trace') === true;
-            for (const comp of componentsToUpdate) {
-                // Validate component ID to prevent PostgreSQL UUID parsing errors
-                if (!comp.id || comp.id.trim() === '') {
-                    logger.error(`Cannot update component: id is empty or invalid. Component data: ${JSON.stringify(comp.data).substring(0, 200)}`);
-                    throw new Error(`Cannot update component: component id is empty or invalid`);
-                }
-                // Level-gated: per-component log-object allocation in the
-                // write hot path is pure waste when trace is off.
-                if (traceEnabled) {
-                    logger.trace({ componentId: comp.id, data: comp.data }, `[Entity.doSave] Updating component`);
-                }
-            }
-            await run(saveTrx`INSERT INTO components ${sql(componentsToUpdate, 'id', 'entity_id', 'name', 'type_id', 'data')} ON CONFLICT (id, type_id) DO UPDATE SET data = EXCLUDED.data`);
-        }
-    };
-
-    await executeSave(trx);
-
-    if (ProjectionManager.enabled && qspTouched) {
-        await ProjectionManager.instance.upsertProjection(entity, qspTouched, trx);
+    const firstEntityId = pairs[0]!.entity_id;
+    const singleEntity = pairs.every((pair) => pair.entity_id === firstEntityId);
+    if (singleEntity) {
+        const typeIds = pairs.map((pair) => pair.type_id);
+        await run(trx`DELETE FROM components WHERE entity_id = ${firstEntityId} AND type_id IN ${sql(typeIds)}`);
+        return;
     }
 
-    // M3 derived tables: same transaction as the ECS write (no second write API).
-    await ReadModelManager.instance.syncOnSave(entity, trx);
+    const byType = new Map<string, string[]>();
+    for (const pair of pairs) {
+        const list = byType.get(pair.type_id);
+        if (list) list.push(pair.entity_id);
+        else byType.set(pair.type_id, [pair.entity_id]);
+    }
+    for (const [typeId, entityIds] of byType) {
+        await forChunks(entityIds, async (chunk) => {
+            await run(trx`DELETE FROM components WHERE type_id = ${typeId} AND entity_id IN ${sql(chunk)}`);
+        });
+    }
+}
 
-    entity.setDirty(false);
+async function insertComponents(
+    trx: SQL,
+    rows: ComponentWriteRow[],
+    run: <T>(q: Promise<T> | T) => Promise<T>,
+): Promise<void> {
+    await forChunks(rows, async (chunk) => {
+        await run(trx`INSERT INTO components ${sql(chunk, "id", "entity_id", "name", "type_id", "data")}`);
+    });
+}
 
+async function upsertComponents(
+    trx: SQL,
+    rows: ComponentWriteRow[],
+    run: <T>(q: Promise<T> | T) => Promise<T>,
+): Promise<void> {
+    // Conflict target is the (id, type_id) PRIMARY KEY, which contains the
+    // partition key type_id — required for ON CONFLICT on the partitioned
+    // components table. created_at is preserved; updated_at moves.
+    await forChunks(rows, async (chunk) => {
+        await run(trx`INSERT INTO components ${sql(chunk, "id", "entity_id", "name", "type_id", "data")} ON CONFLICT (id, type_id) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`);
+    });
+}
+
+async function executeBatch(entities: Entity[], trx: SQL, signal?: AbortSignal): Promise<boolean> {
+    for (const entity of entities) {
+        if (!entity.id || entity.id.trim() === "") {
+            logger.error("Cannot save entity: id is empty or invalid");
+            throw new Error("Cannot save entity: id is empty or invalid");
+        }
+    }
+
+    const dirty = entities.filter(entityIsDirty);
+    if (dirty.length === 0) {
+        for (const entity of entities) logSkipNotDirty(entity);
+        return true;
+    }
+    for (const entity of entities) {
+        if (!entityIsDirty(entity)) logSkipNotDirty(entity);
+    }
+
+    // Plans are built before any SQL so a serializableData throw cannot leave
+    // a prefix of the batch flagged clean. Id minting is the only mutation
+    // here; it is idempotent across a retry.
+    const plans = dirty.map(planEntity);
+    const run = <T>(q: Promise<T> | T): Promise<T> => runWithSignal<T>(q, signal);
+
+    await upsertEntityRows(trx, dirty, run);
+    await deleteRemoved(trx, plans, run);
+
+    const toInsert: ComponentWriteRow[] = [];
+    const toUpdate: ComponentWriteRow[] = [];
+    for (const plan of plans) {
+        for (const row of plan.toInsert) toInsert.push(row);
+        for (const row of plan.toUpdate) toUpdate.push(row);
+    }
+    await insertComponents(trx, toInsert, run);
+    await upsertComponents(trx, toUpdate, run);
+
+    if (ProjectionManager.enabled) {
+        for (const plan of plans) {
+            const touched = [
+                ...plan.insertedComps.map((comp) => comp.getTypeID()),
+                ...plan.updatedComps.map((comp) => comp.getTypeID()),
+                ...plan.removedTypeIds,
+            ];
+            if (touched.length === 0) continue;
+            await ProjectionManager.instance.upsertProjection(plan.entity, touched, trx);
+        }
+    }
+
+    for (const entity of dirty) {
+        await ReadModelManager.instance.syncOnSave(entity, trx);
+    }
+
+    applySaveFlags(plans);
     return true;
+}
+
+export async function doSave(entity: Entity, trx: SQL, signal?: AbortSignal): Promise<boolean> {
+    return executeBatch([entity], trx, signal);
 }
 
 export async function doDelete(entity: Entity, force: boolean = false): Promise<boolean> {
@@ -364,13 +527,13 @@ export async function doDelete(entity: Entity, force: boolean = false): Promise<
     const deadline = Date.now() + timeoutMs;
     const timeoutHandle = setTimeout(() => {
         const err = new Error(`Entity delete timeout for entity ${entity.id} after ${timeoutMs}ms`);
-        logger.error({ scope: 'Entity.doDelete', entityId: entity.id, timeoutMs }, err.message);
+        logger.error({ scope: "Entity.doDelete", entityId: entity.id, timeoutMs }, err.message);
         // Backstop, same as save: let the server bound produce the legible error.
         controller.abort(err);
     }, timeoutMs + SAVE_CLIENT_BACKSTOP_MS);
 
     const signal = controller.signal;
-    const run = <T>(q: any): Promise<T> => runWithSignal<T>(q, signal);
+    const run = <T>(q: Promise<T> | T): Promise<T> => runWithSignal<T>(q, signal);
 
     try {
         await dbTransaction(async (trx) => {
@@ -390,7 +553,7 @@ export async function doDelete(entity: Entity, force: boolean = false): Promise<
                 await ProjectionManager.instance.deleteProjection(entity.id, force, trx);
             }
             await ReadModelManager.instance.syncOnDelete(entity.id, force, trx);
-        }, { lane: 'request', label: 'entity.delete', deadline, signal: controller.signal });
+        }, { lane: "request", label: "entity.delete", deadline, signal: controller.signal });
         clearTimeout(timeoutHandle);
 
         // Fire-and-forget post-commit side effects: lifecycle hooks + cache
@@ -409,9 +572,9 @@ export async function doDelete(entity: Entity, force: boolean = false): Promise<
     } catch (error) {
         clearTimeout(timeoutHandle);
         if (signal.aborted) {
-            logger.error({ scope: 'Entity.doDelete', entityId: entity.id }, `Entity delete aborted: ${signal.reason ?? error}`);
+            logger.error({ scope: "Entity.doDelete", entityId: entity.id }, `Entity delete aborted: ${signal.reason ?? error}`);
         } else {
-            logger.error({ scope: 'Entity.doDelete', entityId: entity.id, err: error }, 'Failed to delete entity');
+            logger.error({ scope: "Entity.doDelete", entityId: entity.id, err: error }, "Failed to delete entity");
         }
         // Re-throw so callers can distinguish DB failures (pool exhausted,
         // lock timeout, etc.) from "entity not found" / not persisted,
@@ -431,7 +594,8 @@ export function getDirtyComponents(entity: Entity): string[] {
     for (const component of entity.components.values()) {
         // Include both dirty (modified) components AND new (not persisted) components
         // New components need to be cached after save, not just modified ones
-        if ((component as any)._dirty || !(component as any)._persisted) {
+        const compFlags = flagsOf(component);
+        if (compFlags._dirty || !compFlags._persisted) {
             dirtyComponents.push(component.getTypeID());
         }
     }

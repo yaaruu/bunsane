@@ -158,10 +158,12 @@ describe('Entity', () => {
             expect(entity.hasInMemory(TestUser)).toBe(false);
         });
 
-        test('returns false if component was not present', () => {
+        test('records a deletion when the component is not in memory', () => {
             const entity = new Entity();
             const removed = entity.remove(TestUser);
-            expect(removed).toBe(false);
+            expect(removed).toBe(true);
+            expect(entity.wasRemoved(TestUser)).toBe(true);
+            expect(entity.hasInMemory(TestUser)).toBe(false);
         });
 
         test('marks entity as dirty after removing component', () => {

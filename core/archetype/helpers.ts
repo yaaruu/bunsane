@@ -2,11 +2,9 @@ import type { ComponentPropertyMetadata } from "../metadata/definitions/Componen
 
 export const primitiveTypes = [String, Number, Boolean, Date];
 
+/** GraphQL nested component type name. Keeps the class name (including a Component suffix) so emitted type names do not change. */
 export function compNameToFieldName(compName: string): string {
-    return (
-        compName.charAt(0).toLowerCase() +
-        compName.slice(1).replace(/Component$/, "Component")
-    );
+    return compName.charAt(0).toLowerCase() + compName.slice(1);
 }
 
 /**

@@ -81,6 +81,39 @@ export type LockOutcome<T> =
 /** In-process holders, keyed by lock key (see "Within a process" above). */
 const localHeld = new Set<string>();
 
+/** Heartbeat cadence shared by withLock and the scheduler task runner. */
+export function leaseHeartbeatIntervalMs(ttlMs: number): number {
+    return Math.max(1000, Math.floor(ttlMs / 3));
+}
+
+/**
+ * Renew `key` every ~ttl/3 while work runs. Returns a stop function.
+ * A failed renew is logged and the interval is cleared — the lease was stolen.
+ */
+export function startLeaseHeartbeat(
+    lock: { renew: (key: string) => Promise<boolean> },
+    key: string,
+    ttlMs: number,
+): () => void {
+    const heartbeat = setInterval(() => {
+        lock.renew(key).then(
+            (ok) => {
+                if (!ok) {
+                    clearInterval(heartbeat);
+                    loggerInstance.error(
+                        `Lost lease for "${key}" mid-execution — critical section no longer protected`
+                    );
+                }
+            },
+            () => {
+                /* transient renew error already logged; retry next tick */
+            }
+        );
+    }, leaseHeartbeatIntervalMs(ttlMs));
+    (heartbeat as { unref?: () => void }).unref?.();
+    return () => clearInterval(heartbeat);
+}
+
 const sleep = (ms: number): Promise<void> =>
     new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -127,30 +160,12 @@ export async function withLock<T>(
         // Heartbeat: keep the lease alive for the duration of fn. Interval is
         // ttl/3 (≥1s) so a renewal lands well before expiry. unref so a stray
         // timer never keeps the process alive during shutdown.
-        const heartbeatMs = Math.max(1000, Math.floor(ttlMs / 3));
-        const heartbeat = setInterval(() => {
-            lock.renew(key).then(
-                (ok) => {
-                    if (!ok) {
-                        // DistributedLock.renew already logged ERROR + counted;
-                        // stop pinging a lease we no longer own.
-                        clearInterval(heartbeat);
-                        loggerInstance.error(
-                            `Lost lease for "${key}" mid-execution — critical section no longer protected`
-                        );
-                    }
-                },
-                () => {
-                    /* transient renew error already logged; retry next tick */
-                }
-            );
-        }, heartbeatMs);
-        (heartbeat as { unref?: () => void }).unref?.();
+        const stopHeartbeat = startLeaseHeartbeat(lock, key, ttlMs);
 
         try {
             return { acquired: true, result: await fn() };
         } finally {
-            clearInterval(heartbeat);
+            stopHeartbeat();
             await lock.release(key);
         }
     } finally {

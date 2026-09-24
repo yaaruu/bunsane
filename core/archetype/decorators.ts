@@ -2,6 +2,8 @@ import type { BaseComponent } from "../components";
 import type { ArcheTypeFieldOptions } from "../metadata/definitions/ArcheType";
 import type { BaseArcheType, ArcheTypeOptions, RelationOptions } from "../ArcheType";
 import { getMetadataStorage } from "../metadata";
+import { invalidateArchetypeWeaveCache } from "./weaver";
+import type { RelationTarget } from "./relationTarget";
 import "reflect-metadata";
 
 export const archetypeFunctionsSymbol = Symbol.for("bunsane:archetypeFunctions");
@@ -119,6 +121,7 @@ export function ArcheType<T extends new () => BaseArcheType>(
             ) as string[];
             storage.setArchetypeComponentNames(typeId, componentNames);
         }
+        invalidateArchetypeWeaveCache();
         return target;
     };
 }
@@ -154,7 +157,7 @@ export function ArcheTypeUnionField(
 function createRelationDecorator(
     relationType: "hasMany" | "belongsTo" | "hasOne" | "belongsToMany"
 ) {
-    return function (relatedArcheType: string, options?: RelationOptions) {
+    return function (relatedArcheType: RelationTarget, options?: RelationOptions) {
         return function (target: any, propertyKey: string) {
             if (!target[archetypeRelationsSymbol]) {
                 target[archetypeRelationsSymbol] = [];

@@ -1,72 +1,39 @@
-import { GraphQLFieldTypes } from './types';
-import { z } from 'zod';
-
 export type GraphQLType =
-  | GraphQLFieldTypes  // e.g., "ID!", "String"
-  | string             // For custom types like "User", "[User]", "[User]!"
-  | `${string}!`       // For required custom types
-  | `[${string}]`      // For list types
-  | `[${string}]!`;    // For required list types
+  | string
+  | `${string}!`
+  | `[${string}]`
+  | `[${string}]!`;
 
 export function isValidGraphQLType(type: string): type is GraphQLType {
-  const enumValues = Object.values(GraphQLFieldTypes);
-  return enumValues.includes(type as GraphQLFieldTypes) ||
-         /^(\w+|\[\w+\])(!)?$/.test(type);  // Simple regex for custom types/lists
-}
-/** @deprecated */
-export type TypeFromGraphQL<T extends GraphQLType> =
-  T extends GraphQLFieldTypes.ID_REQUIRED | GraphQLFieldTypes.ID ? string :
-  T extends GraphQLFieldTypes.STRING_REQUIRED ? string :
-  T extends GraphQLFieldTypes.STRING ? string | null :
-  T extends GraphQLFieldTypes.INT_REQUIRED ? number :
-  T extends GraphQLFieldTypes.INT ? number | null :
-  T extends GraphQLFieldTypes.BOOLEAN_REQUIRED ? boolean :
-  T extends GraphQLFieldTypes.BOOLEAN ? boolean | null :
-  T extends GraphQLFieldTypes.FLOAT_REQUIRED ? number :
-  T extends GraphQLFieldTypes.FLOAT ? number | null :
-  T extends `[${string}]` | `[${string}]!` ? any[] :  
-  any;  
-
-/**
- * 
- * @deprecated
- * @reason Use `ArcheType.getInputSchema()` instead.
- */
-export type ResolverInput<T extends Record<string, GraphQLType>> = {
-  [K in keyof T]: TypeFromGraphQL<T[K]>;
-};
-
-export function isFieldRequested(info: any, fieldName: string): boolean {
-    return info.fieldNodes[0].selectionSet.selections.some((selection: any) => 
-        selection.name.value === fieldName
-    );
+  return /^(\w+|\[\w+\])(!)?$/.test(type);
 }
 
-export function isFieldRequestedSafe(info: any, ...path: string[]): boolean {
-    if (!info || !info.fieldNodes || info.fieldNodes.length === 0) return false;
-    const fieldNode = info.fieldNodes[0];
-    if (!fieldNode.selectionSet) return false;
+export function isFieldRequested(info: { fieldNodes?: Array<{ selectionSet?: { selections: Array<{ name?: { value?: string } }> } }> }, fieldName: string): boolean {
+    const selections = info.fieldNodes?.[0]?.selectionSet?.selections;
+    if (!selections) return false;
+    return selections.some((selection) => selection.name?.value === fieldName);
+}
+
+export function isFieldRequestedSafe(info: { fieldNodes?: Array<{ selectionSet?: { selections: readonly unknown[] } }> } | null | undefined, ...path: string[]): boolean {
+    const fieldNode = info?.fieldNodes?.[0];
+    if (!fieldNode?.selectionSet) return false;
     return isPathSelected(fieldNode.selectionSet, path);
 }
 
-function isPathSelected(selectionSet: any, path: string[]): boolean {
+function isPathSelected(selectionSet: { selections: readonly unknown[] }, path: string[]): boolean {
     if (path.length === 0) return true;
     const [current, ...rest] = path;
     for (const selection of selectionSet.selections) {
-        if (selection.kind === 'Field') {
-            if (selection.name.value === current) {
-                if (rest.length === 0) return true;
-                if (selection.selectionSet) {
-                    return isPathSelected(selection.selectionSet, rest);
-                }
-                return false;
+        if (!selection || typeof selection !== "object" || !("kind" in selection)) continue;
+        if (selection.kind === "Field" && "name" in selection && selection.name && typeof selection.name === "object" && "value" in selection.name && selection.name.value === current) {
+            if (rest.length === 0) return true;
+            if ("selectionSet" in selection && selection.selectionSet && typeof selection.selectionSet === "object" && "selections" in selection.selectionSet) {
+                return isPathSelected(selection.selectionSet as { selections: readonly unknown[] }, rest);
             }
-        } else if (selection.kind === 'InlineFragment' || selection.kind === 'FragmentSpread') {
-            // For simplicity, assume fragments are expanded; in practice, they should be resolved
-            // Here, we can check if the fragment has the field
-            if (selection.selectionSet) {
-                if (isPathSelected(selection.selectionSet, path)) return true;
-            }
+            return false;
+        }
+        if ((selection.kind === "InlineFragment" || selection.kind === "FragmentSpread") && "selectionSet" in selection && selection.selectionSet && typeof selection.selectionSet === "object" && "selections" in selection.selectionSet) {
+            if (isPathSelected(selection.selectionSet as { selections: readonly unknown[] }, path)) return true;
         }
     }
     return false;

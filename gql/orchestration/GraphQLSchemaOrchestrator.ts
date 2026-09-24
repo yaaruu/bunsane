@@ -1,6 +1,7 @@
 import { GraphQLSchema } from "graphql";
 import { createSchema } from "graphql-yoga";
 import { logger } from "../../core/Logger";
+import { getMetadataStorage } from "../../core/metadata";
 import { ServiceScanner } from "../scanner/ServiceScanner";
 import { SchemaGraph } from "../graph/SchemaGraph";
 import { VisitorComposer } from "../visitors/VisitorComposer";
@@ -8,7 +9,6 @@ import { ArchetypePreprocessorVisitor } from "../visitors/ArchetypePreprocessorV
 import { DeduplicationVisitor } from "../visitors/DeduplicationVisitor";
 import { SchemaGeneratorVisitor } from "../visitors/SchemaGeneratorVisitor";
 import { ResolverGeneratorVisitor } from "../visitors/ResolverGeneratorVisitor";
-
 /**
  * Orchestrates the complete GraphQL schema generation process using the graph-based architecture.
  * Coordinates service scanning, visitor execution, and final schema assembly.
@@ -31,7 +31,7 @@ export class GraphQLSchemaOrchestrator {
      */
     generateSchema(services: any[]): GraphQLSchema | null {
         try {
-            logger.info("Starting GraphQL schema generation with orchestrator");
+            logger.debug("Starting GraphQL schema generation with orchestrator");
 
             // Store services for use in visitors
             this.services = services;
@@ -51,12 +51,13 @@ export class GraphQLSchemaOrchestrator {
             // Phase 5: Create final GraphQL schema
             const schema = this.createGraphQLSchema(generationResults);
 
-            logger.info("GraphQL schema generation completed successfully");
+            logger.debug("GraphQL schema generation completed successfully");
             return schema;
 
         } catch (error) {
-            logger.error(`Failed to generate GraphQL schema: ${error instanceof Error ? error.message : String(error)}`);
-            throw new Error(`Schema generation failed: ${error instanceof Error ? error.message : String(error)}`);
+            const message = error instanceof Error ? error.message : String(error);
+            logger.error(`Failed to generate GraphQL schema: ${message}`);
+            throw new Error(`Schema generation failed: ${message}`, { cause: error });
         }
     }
 
@@ -118,8 +119,8 @@ export class GraphQLSchemaOrchestrator {
         const schemaResults = results["visitor-0"];
         const resolverResults = results["visitor-1"];
 
-        // Add field resolvers from services (for archetype field resolvers)
         this.addFieldResolvers(resolverResults);
+        this.attachArchetypeFieldResolvers(resolverResults);
 
         // Filter out empty resolver types to avoid schema validation errors
         const filteredResolvers: Record<string, any> = {};
@@ -147,14 +148,12 @@ export class GraphQLSchemaOrchestrator {
 
             for (const fieldMeta of fields) {
                 const { type, field, propertyKey } = fieldMeta;
-                
-                // Ensure the type exists in resolvers
                 if (!resolvers[type]) {
                     resolvers[type] = {};
                 }
+                if (resolvers[type][field]) continue;
 
-                // Add field resolver
-                resolvers[type][field] = async (parent: any, args: any, context: any, info: any) => {
+                resolvers[type][field] = async (parent: unknown, args: unknown, context: unknown, info: unknown) => {
                     try {
                         return await service[propertyKey](parent, args, context, info);
                     } catch (error) {
@@ -162,6 +161,30 @@ export class GraphQLSchemaOrchestrator {
                         throw error;
                     }
                 };
+            }
+        }
+    }
+
+    /**
+     * Install archetype component, relation, and @ArcheTypeFunction resolvers.
+     * Skips fields already registered (registerFieldResolvers or @GraphQLField)
+     * so a service constructor call cannot double-register them.
+     */
+    private attachArchetypeFieldResolvers(resolvers: Record<string, unknown>): void {
+        const storage = getMetadataStorage();
+        for (const meta of storage.archetypes) {
+            if (typeof meta.target !== "function") continue;
+            const instance = new (meta.target as new () => object)();
+            if (!("generateFieldResolvers" in instance) || typeof instance.generateFieldResolvers !== "function") continue;
+            const entries = instance.generateFieldResolvers() as Array<{ typeName: string; fieldName: string; resolver: unknown }>;
+            for (const { typeName, fieldName, resolver } of entries) {
+                const typeResolvers = resolvers[typeName];
+                const bucket = typeResolvers && typeof typeResolvers === "object"
+                    ? typeResolvers as Record<string, unknown>
+                    : {};
+                if (!typeResolvers) resolvers[typeName] = bucket;
+                if (bucket[fieldName]) continue;
+                bucket[fieldName] = resolver;
             }
         }
     }
@@ -220,8 +243,9 @@ export class GraphQLSchemaOrchestrator {
             return schema;
 
         } catch (error) {
-            logger.error({error},"Failed to create GraphQL schema");
-            throw new Error(`Schema creation failed: ${error instanceof Error ? error.message : String(error)}`);
+            logger.error({ error }, "Failed to create GraphQL schema");
+            const message = error instanceof Error ? error.message : String(error);
+            throw new Error(`Schema creation failed: ${message}`, { cause: error });
         }
     }
 

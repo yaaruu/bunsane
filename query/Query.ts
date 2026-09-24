@@ -5,9 +5,11 @@ import db, { QUERY_TIMEOUT_MS } from "../database";
 import { timed } from "../core/Decorators";
 import { inList } from "../database/sqlHelpers";
 import { QueryContext, QueryDAG, ComponentInclusionNode } from "./index";
+import { buildKeysetCursorWhere } from "./ComponentInclusionNode";
+import { buildComponentFilterGroup } from "./FilterBuilder";
+import { hydrateComponentRow } from "../core/entity/hydrateComponentRow";
 import { OrQuery } from "./OrQuery";
 import { OrNode } from "./OrNode";
-import { preparedStatementCache } from "../database/PreparedStatementCache";
 import { type PerRequestCounters } from "../database/instrumentedDb";
 import { dbExec } from "../database/gateway";
 import { linkAbortSignals } from "../database/cancellable";
@@ -38,14 +40,29 @@ import { ProjectionManager } from "../database/projection/ProjectionManager";
 import { sqlTimeBucketFromTs, type TimeTrunc } from "./timeBucket";
 import { isVerboseErrors } from "../core/envMode";
 
-// Parsed once at module load instead of on every exec() (process.env read +
-// parseInt was on the query hot path). 0 disables the default limit.
-const DEFAULT_QUERY_LIMIT = parseInt(process.env.BUNSANE_DEFAULT_QUERY_LIMIT ?? '10000', 10);
+// Parsed once, re-read only if the env string changes so tests can lower the
+// cap without a process.env read on the steady-state hot path.
+let defaultLimitRaw = process.env.BUNSANE_DEFAULT_QUERY_LIMIT;
+let defaultQueryLimit = parseDefaultQueryLimit(defaultLimitRaw);
+
+function parseDefaultQueryLimit(raw: string | undefined): number {
+    const n = parseInt(raw ?? "10000", 10);
+    return Number.isFinite(n) ? n : 10000;
+}
+
+function currentDefaultQueryLimit(): number {
+    const raw = process.env.BUNSANE_DEFAULT_QUERY_LIMIT;
+    if (raw !== defaultLimitRaw) {
+        defaultLimitRaw = raw;
+        defaultQueryLimit = parseDefaultQueryLimit(raw);
+    }
+    return defaultQueryLimit;
+}
+
 let warnedDefaultLimit = false;
 
 // Gated once through the single SEC-08 verbosity gate: only NODE_ENV=development
-// logs params. Fail-closed — unset/staging/typo'd NODE_ENV masks, matching every
-// other verbose-error decision (was `!== 'production'`, which leaked when unset).
+// logs params. Fail-closed — unset/staging/typo'd NODE_ENV masks.
 const DEBUG_PARAMS = isVerboseErrors();
 
 // QSP gates read env at call time via qspConfig.
@@ -135,12 +152,30 @@ export const FilterOp = {
 export interface QueryFilter {
     field: string;
     operator: FilterOperator;
-    value: any;
+    value: unknown;
 }
 
-export interface QueryFilterOptions {
-    filters: QueryFilter[];
+/** Filter whose `field` is a key of the component the ctor belongs to. */
+export type ComponentFieldFilter<T extends BaseComponent> = {
+    field: keyof ComponentDataType<T> & string;
+    operator: FilterOperator;
+    value: unknown;
+};
+
+export interface QueryFilterOptions<T extends BaseComponent = BaseComponent> {
+    filters: ReadonlyArray<ComponentFieldFilter<T>>;
 }
+
+type WithItem = {
+    component: ComponentConstructor;
+    filters?: ReadonlyArray<{ field: string; operator: FilterOperator; value: unknown }>;
+};
+
+type CtorOfItem<T> = T extends { component: infer C extends ComponentConstructor } ? C : never;
+
+type CtorsOf<T extends readonly { component: ComponentConstructor }[]> = {
+    [K in keyof T]: CtorOfItem<T[K]>;
+};
 
 export type SortDirection = "ASC" | "DESC";
 
@@ -151,12 +186,13 @@ export interface SortOrder {
     nullsFirst?: boolean;
 }
 
-export interface ComponentWithFilters {
-    component: new (...args: any[]) => BaseComponent;
-    filters?: QueryFilter[];
+export interface ComponentWithFilters<T extends BaseComponent = BaseComponent> {
+    component: new (...args: never[]) => T;
+    filters?: ReadonlyArray<ComponentFieldFilter<T>>;
 }
 
 export interface QueryCacheOptions {
+    /** Ignored. Bun SQL prepares statements; there is no framework statement cache. */
     preparedStatement?: boolean;
     component?: boolean;
 }
@@ -176,38 +212,50 @@ export interface QueryExecOptions {
     perRequest?: PerRequestCounters;
 }
 
+export interface QueryRouteInfo {
+    routed: boolean;
+    surface: 'rm' | 'legacy';
+    archetype?: string;
+    hasNextPage?: boolean;
+    /**
+     * True when an unbounded `exec()` filled `BUNSANE_DEFAULT_QUERY_LIMIT`
+     * (default 10000). The page may be truncated. Call `.take(n)`.
+     */
+    truncatedByDefaultLimit?: boolean;
+}
+
 /**
- * New Query class that uses DAG internally for better modularity and extensibility.
- *
- * Generic type parameter `TComponents` tracks component types added via `.with()`,
- * enabling type-safe access to component data after query execution.
+ * Query builder. `TComponents` accumulates `.with()` ctors. `TPopulated` is
+ * true only after `.populate()` — `exec()` then types `componentData` as loaded.
  *
  * @example
  * ```typescript
  * const entities = await new Query()
  *   .with(Position)
  *   .with(Velocity)
+ *   .populate()
  *   .exec();
- * // entities is TypedEntity<[typeof Position, typeof Velocity]>[]
+ * // entities is TypedEntity<[typeof Position, typeof Velocity], true>[]
  * ```
  */
-class Query<TComponents extends readonly ComponentConstructor[] = []> {
+class Query<
+    TComponents extends readonly ComponentConstructor[] = [],
+    TPopulated extends boolean = false,
+> {
     private context: QueryContext;
     private debug: boolean = false;
     private orQuery: OrQuery | null = null;
     private shouldPopulate: boolean = false;
     private trx: SQL | undefined;
-    private skipPreparedCache: boolean = false;
     private skipComponentCache: boolean = false;
     private execSignal?: AbortSignal;
     private execPerRequest?: PerRequestCounters;
     /** Last QSP route decision for this Query instance (additive; not GraphQL-exposed). */
-    private _lastRouteInfo: {
-        routed: boolean;
-        surface: 'rm' | 'legacy';
-        archetype?: string;
-        hasNextPage?: boolean;
-    } = { routed: false, surface: 'legacy' };
+    private _lastRouteInfo: QueryRouteInfo = { routed: false, surface: 'legacy' };
+    /** Unbounded exec() applied BUNSANE_DEFAULT_QUERY_LIMIT. */
+    private appliedDefaultLimit = false;
+    /** 'before' keyset fetched in reverse order; flip rows after the n+1 trim. */
+    private reverseSortedPage = false;
 
     /**
      * True only when the caller invoked `.take(N)`. Framework default LIMIT
@@ -240,12 +288,7 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
      * Additive QSP diagnostic: whether the last exec/count served via rm_ (route mode)
      * and optional hasNextPage from N+1 fetch. Not part of GraphQL schema.
      */
-    public getLastRouteInfo(): {
-        routed: boolean;
-        surface: 'rm' | 'legacy';
-        archetype?: string;
-        hasNextPage?: boolean;
-    } {
+    public getLastRouteInfo(): QueryRouteInfo {
         return this._lastRouteInfo;
     }
 
@@ -297,7 +340,7 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         return this;
     }
 
-    public async findOneById(id: string, opts?: QueryExecOptions): Promise<TypedEntity<TComponents> | null> {
+    public async findOneById(id: string, opts?: QueryExecOptions): Promise<TypedEntity<TComponents, TPopulated> | null> {
         // Validate ID to prevent PostgreSQL UUID parsing errors
         if (!id || typeof id !== 'string' || id.trim() === '') {
             return null;
@@ -311,27 +354,26 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
      * The returned Query tracks all component types for type-safe access after exec().
      */
     public with<T extends BaseComponent>(
-        componentCtor: new (...args: any[]) => T,
-        options?: QueryFilterOptions
-    ): Query<readonly [...TComponents, new (...args: any[]) => T]>;
-    public with(components: ComponentWithFilters[]): this;
+        componentCtor: ComponentConstructor<T>,
+        options?: QueryFilterOptions<T>
+    ): Query<readonly [...TComponents, ComponentConstructor<T>], TPopulated>;
+    public with<const TItems extends readonly WithItem[]>(
+        components: TItems
+    ): Query<readonly [...TComponents, ...CtorsOf<TItems>], TPopulated>;
     public with(orQuery: OrQuery): this;
-    public with<T extends BaseComponent>(
-        componentCtorOrComponentsOrOrQuery: (new (...args: any[]) => T) | ComponentWithFilters[] | OrQuery,
-        options?: QueryFilterOptions
-    ): Query<readonly [...TComponents, new (...args: any[]) => T]> | this {
+    public with(
+        componentCtorOrComponentsOrOrQuery: ComponentConstructor | readonly WithItem[] | OrQuery,
+        options?: { filters?: ReadonlyArray<{ field: string; operator: FilterOperator; value: unknown }> }
+    ): unknown {
         if (componentCtorOrComponentsOrOrQuery instanceof OrQuery) {
-            // Handle OR query
             this.orQuery = componentCtorOrComponentsOrOrQuery;
-            // Suppress base-level scan optimizations that bake ORDER/LIMIT
-            // into the SQL OrNode later embeds as its base set.
             this.context.hasOrQuery = true;
             return this;
         }
 
         if (Array.isArray(componentCtorOrComponentsOrOrQuery)) {
-            // Handle array of components with filters
-            for (const item of componentCtorOrComponentsOrOrQuery) {
+            const items: readonly WithItem[] = componentCtorOrComponentsOrOrQuery;
+            for (const item of items) {
                 const typeId = this.context.getComponentId(item.component);
                 if (!typeId) {
                     throw new Error(`Component ${item.component.name} is not registered.`);
@@ -340,24 +382,25 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
                 this._componentCtors.push(item.component);
 
                 if (item.filters && item.filters.length > 0) {
-                    this.context.componentFilters.set(typeId, item.filters);
+                    this.context.componentFilters.set(typeId, [...item.filters]);
                 }
             }
-        } else {
-            // Handle single component
-            const typeId = this.context.getComponentId(componentCtorOrComponentsOrOrQuery);
-            if (!typeId) {
-                throw new Error(`Component ${componentCtorOrComponentsOrOrQuery.name} is not registered.`);
-            }
-            this.context.componentIds.add(typeId);
-            this._componentCtors.push(componentCtorOrComponentsOrOrQuery);
-
-            if (options?.filters && options.filters.length > 0) {
-                this.context.componentFilters.set(typeId, options.filters);
-            }
+            return this;
         }
 
-        return this as unknown as Query<readonly [...TComponents, new (...args: any[]) => T]>;
+        // Array.isArray does not exclude a readonly array from the false branch.
+        const ctor = componentCtorOrComponentsOrOrQuery as ComponentConstructor;
+        const typeId = this.context.getComponentId(ctor);
+        if (!typeId) {
+            throw new Error(`Component ${ctor.name} is not registered.`);
+        }
+        this.context.componentIds.add(typeId);
+        this._componentCtors.push(ctor);
+
+        if (options?.filters && options.filters.length > 0) {
+            this.context.componentFilters.set(typeId, [...options.filters]);
+        }
+        return this;
     }
 
     public without<T extends BaseComponent>(ctor: new (...args: any[]) => T) {
@@ -374,9 +417,11 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         return this;
     }
 
-    public populate(): this {
+    public populate(): Query<TComponents, true> {
         this.shouldPopulate = true;
-        return this;
+        // Type-state: the same instance is now a populated query. Callers must
+        // use the return value (chaining) for componentData to be typed loaded.
+        return this as unknown as Query<TComponents, true>;
     }
 
     /**
@@ -681,16 +726,10 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
     public noCache(): this;
     public noCache(options: QueryCacheOptions): this;
     public noCache(options?: QueryCacheOptions): this {
-        if (!options) {
-            // Default behavior: bypass prepared statement cache
-            this.skipPreparedCache = true;
-        } else {
-            if (options.preparedStatement === true) {
-                this.skipPreparedCache = true;
-            }
-            if (options.component === true) {
-                this.skipComponentCache = true;
-            }
+        // preparedStatement is ignored: Bun SQL prepares per connection.
+        // The component option still bypasses the component cache.
+        if (options?.component === true) {
+            this.skipComponentCache = true;
         }
         return this;
     }
@@ -877,40 +916,7 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         }
         this._lastRouteInfo = { routed: false, surface: 'legacy' };
 
-        // Build the DAG
-        const dag = new QueryDAG();
-
-        // Check if we have an OR query
-        if (this.orQuery) {
-            // For OR queries, we need to ensure entities have all required components first
-            if (this.context.componentIds.size > 0) {
-                // ComponentInclusionNode is the root, OrNode is the leaf
-                const componentNode = new ComponentInclusionNode();
-                dag.setRootNode(componentNode);
-
-                // OrNode filters on top of the base requirements
-                const orNode = new OrNode(this.orQuery);
-                orNode.addDependency(componentNode);
-                dag.addNode(orNode);
-            } else {
-                // No base requirements, OrNode is both root and leaf
-                const orNode = new OrNode(this.orQuery);
-                dag.setRootNode(orNode);
-            }
-        } else {
-            // Use buildBasicQuery for regular AND logic (includes CTE optimization)
-            const optimizedDag = QueryDAG.buildBasicQuery(this.context);
-            // Copy nodes from optimized DAG to our DAG
-            for (const node of optimizedDag.getNodes()) {
-                dag.addNode(node);
-            }
-            if (optimizedDag.getRootNode()) {
-                dag.setRootNode(optimizedDag.getRootNode()!);
-            }
-        }
-
-        // Execute the DAG
-        const result = dag.execute(this.context);
+        const result = this.buildIdSelect();
 
         // Modify SQL for count
         const countSql = `SELECT COUNT(*) as count FROM (${result.sql}) AS subquery`;
@@ -929,7 +935,6 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
             console.log('🔍 Query Count Debug:');
             console.log('SQL:', countSql);
             console.log('Params:', result.params);
-            console.log('Prepared Cache Bypass:', this.skipPreparedCache);
             console.log('Component Cache Bypass:', this.skipComponentCache);
             console.log('Using Transaction:', !!this.trx);
             console.log('---');
@@ -990,22 +995,298 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         return this.runWithTimeout('Query average execution', () => this.doAggregate('AVG', componentCtor, field as string));
     }
 
-    private compileMembershipSql(): { sql: string; params: any[] } {
-        this.context.reset();
+    /**
+     * One id-select assembly for count, group-by, aggregate, exec, and explain.
+     * Does not reset the context — callers own param lifetime.
+     */
+    private buildIdSelect(): { sql: string; params: unknown[] } {
         const dag = new QueryDAG();
         if (this.orQuery) {
-            throw new Error("Query.groupBy cannot be combined with OR queries");
-        }
-        const optimizedDag = QueryDAG.buildBasicQuery(this.context);
-        for (const node of optimizedDag.getNodes()) {
-            dag.addNode(node);
-        }
-        if (optimizedDag.getRootNode()) {
-            dag.setRootNode(optimizedDag.getRootNode()!);
+            if (this.context.componentIds.size > 0) {
+                const componentNode = new ComponentInclusionNode();
+                dag.setRootNode(componentNode);
+                const orNode = new OrNode(this.orQuery);
+                orNode.addDependency(componentNode);
+                dag.addNode(orNode);
+            } else {
+                const orNode = new OrNode(this.orQuery);
+                dag.setRootNode(orNode);
+            }
+        } else {
+            const optimizedDag = QueryDAG.buildBasicQuery(this.context);
+            for (const node of optimizedDag.getNodes()) {
+                dag.addNode(node);
+            }
+            const root = optimizedDag.getRootNode();
+            if (root) dag.setRootNode(root);
         }
         const result = dag.execute(this.context);
         return { sql: result.sql, params: result.params };
     }
+
+    private compileMembershipSql(): { sql: string; params: unknown[] } {
+        this.context.reset();
+        if (this.orQuery) {
+            throw new Error("Query.groupBy cannot be combined with OR queries");
+        }
+        return this.buildIdSelect();
+    }
+
+    private membershipExists(
+        entityIdSql: string,
+        typeId: string,
+        filters: ReadonlyArray<{ field: string; operator: string; value: unknown }> | undefined,
+    ): string {
+        const legacy = getMembershipSource().isLegacy;
+        const typeIdx = this.context.addParam(typeId);
+        if (legacy) {
+            let sql = `EXISTS (SELECT 1 FROM entity_components p WHERE p.entity_id = ${entityIdSql} AND p.type_id = $${typeIdx}::text AND p.deleted_at IS NULL)`;
+            if (filters && filters.length > 0) {
+                const raw = shouldUseDirectPartition()
+                    ? (ComponentRegistry.getPartitionTableName(typeId) || "components")
+                    : "components";
+                const dataTable = assertComponentTableName(raw, "entitySort.dataTable");
+                const dataTypeIdx = this.context.addParam(typeId);
+                const group = buildComponentFilterGroup([...filters], "d", this.context);
+                sql += ` AND EXISTS (SELECT 1 FROM ${dataTable} d WHERE d.entity_id = ${entityIdSql} AND d.type_id = $${dataTypeIdx}::text AND d.deleted_at IS NULL${group ? ` AND ${group}` : ""})`;
+            }
+            return sql;
+        }
+        const raw = shouldUseDirectPartition()
+            ? (ComponentRegistry.getPartitionTableName(typeId) || "components")
+            : "components";
+        const table = assertComponentTableName(raw, "entitySort.table");
+        const group = filters && filters.length > 0
+            ? buildComponentFilterGroup([...filters], "p", this.context)
+            : null;
+        return `EXISTS (SELECT 1 FROM ${table} p WHERE p.entity_id = ${entityIdSql} AND p.type_id = $${typeIdx}::text AND p.deleted_at IS NULL${group ? ` AND ${group}` : ""})`;
+    }
+
+    /**
+     * Entity-column sort driven by `entities` (index scan) with correlated
+     * membership probes. Does not materialize the unbounded id set.
+     */
+    private buildEntityDrivenSortSql(): { sql: string; params: unknown[] } {
+        const sorts = this.context.entitySortOrders;
+        const cursor = this.context.compositeCursor;
+        if (cursor && sorts.length > 1) {
+            throw new Error(
+                "sortedCursor() does not support multi-key entity sorts. " +
+                "Only a single sortByCreatedAt() or sortByUpdatedAt() is supported with composite keyset pagination."
+            );
+        }
+
+        const clauses: string[] = [];
+        const hasMembership =
+            this.context.componentIds.size > 0 ||
+            this.orQuery !== null ||
+            this.context.excludedComponentIds.size > 0;
+        if (!hasMembership) {
+            clauses.push("e.deleted_at IS NULL");
+        }
+
+        for (const typeId of this.context.componentIds) {
+            clauses.push(this.membershipExists("e.id", typeId, this.context.componentFilters.get(typeId)));
+        }
+        if (this.orQuery) {
+            const ors: string[] = [];
+            for (const branch of this.orQuery.branches) {
+                const typeId = this.context.getComponentId(branch.component);
+                if (!typeId) {
+                    throw new Error(`Component ${branch.component.name} is not registered.`);
+                }
+                ors.push(this.membershipExists("e.id", typeId, branch.filters));
+            }
+            clauses.push(`(${ors.join(" OR ")})`);
+        }
+        if (this.context.excludedComponentIds.size > 0) {
+            const ids = Array.from(this.context.excludedComponentIds);
+            const placeholders = ids.map((id) => `$${this.context.addParam(id)}`).join(", ");
+            const table = getMembershipSource().isLegacy ? "entity_components" : "components";
+            clauses.push(
+                `NOT EXISTS (SELECT 1 FROM ${table} ex WHERE ex.entity_id = e.id AND ex.type_id IN (${placeholders}) AND ex.deleted_at IS NULL)`
+            );
+        }
+        if (this.context.withId) {
+            clauses.push(`e.id = $${this.context.addParam(this.context.withId)}`);
+        }
+        if (this.context.excludedEntityIds.size > 0) {
+            const ids = Array.from(this.context.excludedEntityIds);
+            const placeholders = ids.map((id) => `$${this.context.addParam(id)}`).join(", ");
+            clauses.push(`e.id NOT IN (${placeholders})`);
+        }
+
+        const isBefore = cursor !== null && this.context.cursorDirection === "before";
+        if (isBefore) this.reverseSortedPage = true;
+
+        if (cursor) {
+            const sort = sorts[0]!;
+            const rawCol = sort.field === "updated_at" ? "e.updated_at" : "e.created_at";
+            const truncCol = `date_trunc('milliseconds', ${rawCol})`;
+            const direction: SortDirection = isBefore
+                ? (sort.direction === "DESC" ? "ASC" : "DESC")
+                : sort.direction;
+            const nullsFirst = isBefore ? !sort.nullsFirst : !!sort.nullsFirst;
+            if (cursor.v === null && !isBefore) {
+                clauses.push("FALSE");
+            } else {
+                const fragment = buildKeysetCursorWhere({
+                    sortExpr: truncCol,
+                    entityIdCol: "e.id",
+                    connective: "AND",
+                    direction,
+                    nullsFirst,
+                    valueCast: "::timestamptz",
+                    cursor,
+                    addParam: (value) => this.context.addParam(value),
+                    idDirection: isBefore ? "DESC" : "ASC",
+                });
+                clauses.push(fragment.replace(/^\s*(WHERE|AND)\s+/i, ""));
+            }
+        }
+
+        const orderParts = sorts.map((s) => {
+            const rawCol = s.field === "updated_at" ? "e.updated_at" : "e.created_at";
+            const col = cursor ? `date_trunc('milliseconds', ${rawCol})` : rawCol;
+            let dir: SortDirection = s.direction;
+            let nullsFirst = !!s.nullsFirst;
+            if (isBefore) {
+                dir = dir === "DESC" ? "ASC" : "DESC";
+                nullsFirst = !nullsFirst;
+            }
+            const nulls = nullsFirst ? "NULLS FIRST" : "NULLS LAST";
+            return `${col} ${dir} ${nulls}`;
+        });
+        const idDir: SortDirection = isBefore ? "DESC" : "ASC";
+
+        let sql = "SELECT e.id FROM entities e";
+        if (clauses.length > 0) {
+            sql += ` WHERE ${clauses.join(" AND ")}`;
+        }
+        sql += ` ORDER BY ${orderParts.join(", ")}, e.id ${idDir}`;
+        if (this.context.limit !== null) {
+            sql += ` LIMIT $${this.context.addParam(this.context.limit)}`;
+        }
+        if (!cursor && this.context.offsetValue > 0) {
+            sql += ` OFFSET $${this.context.addParam(this.context.offsetValue)}`;
+        }
+        return { sql, params: this.context.params };
+    }
+
+    /**
+     * OR + component sortBy: inner id-set, then JOIN the sort component.
+     * Non-OR component sort stays in ComponentInclusionNode (leaf scan).
+     */
+    private buildOrComponentSortSql(): { sql: string; params: unknown[] } {
+        const componentSorts = this.context.sortOrders;
+        const savedLimit = this.context.limit;
+        const savedOffset = this.context.offsetValue;
+        const savedCursorId = this.context.cursorId;
+        const savedComposite = this.context.compositeCursor;
+        const savedSuppress = this.context.suppressNodeOrdering;
+        const savedSorts = this.context.sortOrders;
+        this.context.limit = null;
+        this.context.offsetValue = 0;
+        this.context.cursorId = null;
+        this.context.compositeCursor = null;
+        this.context.suppressNodeOrdering = true;
+        this.context.sortOrders = [];
+        let result: { sql: string; params: unknown[] };
+        try {
+            result = this.buildIdSelect();
+        } finally {
+            this.context.limit = savedLimit;
+            this.context.offsetValue = savedOffset;
+            this.context.cursorId = savedCursorId;
+            this.context.compositeCursor = savedComposite;
+            this.context.suppressNodeOrdering = savedSuppress;
+            this.context.sortOrders = savedSorts;
+        }
+
+        if (savedComposite && componentSorts.length > 1) {
+            throw new Error(
+                "sortedCursor() does not support multi-key sorts. " +
+                "Only a single sortBy() key is supported with composite keyset pagination on OR queries."
+            );
+        }
+
+        const joins: string[] = [];
+        const orderClauses: string[] = [];
+        const isBefore = savedComposite !== null && this.context.cursorDirection === "before";
+        if (isBefore) this.reverseSortedPage = true;
+
+        componentSorts.forEach((s, i) => {
+            const sortTypeId = ComponentRegistry.getComponentId(s.component);
+            if (!sortTypeId) {
+                throw new Error(`Component ${s.component} is not registered.`);
+            }
+            const table = shouldUseDirectPartition()
+                ? (ComponentRegistry.getPartitionTableName(sortTypeId) || "components")
+                : "components";
+            const safeTable = assertComponentTableName(table, "orSort.componentTable");
+            const alias = `s${i}`;
+            const typeParamIdx = this.context.addParam(sortTypeId);
+            joins.push(
+                `JOIN ${safeTable} ${alias} ON ${alias}.entity_id = base.id ` +
+                `AND ${alias}.type_id = $${typeParamIdx} AND ${alias}.deleted_at IS NULL`
+            );
+            const safeProp = assertIdentifier(s.property, "sortOrder.property");
+            const numeric = isNumericProperty(s.component, s.property);
+            const expr = numeric
+                ? `(${alias}.data->>'${safeProp}')::numeric`
+                : `${alias}.data->>'${safeProp}'`;
+            let dir: SortDirection = s.direction;
+            let nullsFirst = !!s.nullsFirst;
+            if (isBefore && i === 0) {
+                dir = dir === "DESC" ? "ASC" : "DESC";
+                nullsFirst = !nullsFirst;
+            }
+            const nulls = nullsFirst ? "NULLS FIRST" : "NULLS LAST";
+            orderClauses.push(`${expr} ${dir} ${nulls}`);
+        });
+
+        let whereClause = "";
+        if (savedComposite) {
+            const s = componentSorts[0]!;
+            if (s.nullsFirst && !isBefore) {
+                throw new Error(
+                    "sortedCursor() does not support NULLS FIRST sorts. " +
+                    "Use the default (NULLS LAST) or OFFSET pagination."
+                );
+            }
+            const safeProp = assertIdentifier(s.property, "sortOrder.property");
+            const numeric = isNumericProperty(s.component, s.property);
+            const expr = numeric
+                ? `(s0.data->>'${safeProp}')::numeric`
+                : `s0.data->>'${safeProp}'`;
+            const direction: SortDirection = isBefore
+                ? (s.direction === "DESC" ? "ASC" : "DESC")
+                : s.direction;
+            const nullsFirst = isBefore ? !s.nullsFirst : !!s.nullsFirst;
+            whereClause = buildKeysetCursorWhere({
+                sortExpr: expr,
+                entityIdCol: "base.id",
+                connective: "WHERE",
+                direction,
+                nullsFirst,
+                valueCast: numeric ? "::numeric" : "::text",
+                cursor: savedComposite,
+                addParam: (value) => this.context.addParam(value),
+                idDirection: isBefore ? "DESC" : "ASC",
+            });
+        }
+
+        const idDir: SortDirection = isBefore ? "DESC" : "ASC";
+        let wrapped = `SELECT base.id FROM (${result.sql}) AS base ${joins.join(" ")}${whereClause} ORDER BY ${orderClauses.join(", ")}, base.id ${idDir}`;
+        if (savedLimit !== null) {
+            wrapped += ` LIMIT $${this.context.addParam(savedLimit)}`;
+        }
+        if (!savedComposite && savedOffset > 0) {
+            wrapped += ` OFFSET $${this.context.addParam(savedOffset)}`;
+        }
+        return { sql: wrapped, params: this.context.params };
+    }
+
 
     private partitionTable(typeId: string, ctx: string): string {
         const raw = shouldUseDirectPartition()
@@ -1250,34 +1531,7 @@ class Query<TComponents extends readonly ComponentConstructor[] = []> {
         // Reset context for fresh execution
         this.context.reset();
 
-        // Build the DAG
-        const dag = new QueryDAG();
-
-        // Check if we have an OR query
-        if (this.orQuery) {
-            if (this.context.componentIds.size > 0) {
-                const componentNode = new ComponentInclusionNode();
-                dag.setRootNode(componentNode);
-
-                const orNode = new OrNode(this.orQuery);
-                orNode.addDependency(componentNode);
-                dag.addNode(orNode);
-            } else {
-                const orNode = new OrNode(this.orQuery);
-                dag.setRootNode(orNode);
-            }
-        } else {
-            const optimizedDag = QueryDAG.buildBasicQuery(this.context);
-            for (const node of optimizedDag.getNodes()) {
-                dag.addNode(node);
-            }
-            if (optimizedDag.getRootNode()) {
-                dag.setRootNode(optimizedDag.getRootNode()!);
-            }
-        }
-
-        // Execute the DAG to get the base query
-        const result = dag.execute(this.context);
+        const result = this.buildIdSelect();
 
         // Determine the component table name. Validate against allow-list so
         // a poisoned registry cannot inject SQL through the embedded name.
@@ -1350,67 +1604,65 @@ AND c.deleted_at IS NULL`;
     /**
      * Execute the query and return typed entities.
      *
-     * When components are added via `.with()`, the returned entities have:
-     * - `getTyped(Ctor)`: Type-safe async getter (returns non-null since query guarantees existence)
-     * - `componentData`: Synchronous access to already-loaded component data
-     *
-     * @returns Promise resolving to array of TypedEntity with accumulated component types
+     * `componentData` is fully loaded only when `.populate()` was called.
+     * Otherwise each component property is optional.
      */
     @timed("Query.exec")
-    public async exec(opts?: QueryExecOptions): Promise<TypedEntity<TComponents>[]> {
+    public async exec(opts?: QueryExecOptions): Promise<TypedEntity<TComponents, TPopulated>[]> {
         this.applyExecOptions(opts);
-        // Apply default LIMIT so unbounded queries cannot load entire tables
-        // into memory. Configurable via BUNSANE_DEFAULT_QUERY_LIMIT, 0 to
-        // disable. When the default is applied without an explicit .take(),
-        // warn once at execution so developers notice runaway queries
-        // (H-QUERY-1).
+        // Apply default LIMIT so unbounded queries cannot load entire tables.
+        // Configurable via BUNSANE_DEFAULT_QUERY_LIMIT, 0 to disable.
+        // Production warns once. Development throws after the fetch if the
+        // cap actually binds (returned row count equals the cap).
+        this.appliedDefaultLimit = false;
         if (this.context.limit === null || this.context.limit === undefined) {
-            if (DEFAULT_QUERY_LIMIT > 0) {
-                this.context.limit = DEFAULT_QUERY_LIMIT;
-                // Warn once per process — this fires on every unbounded query,
-                // so logging per-call floods logs and allocates on the hot path.
+            const cap = currentDefaultQueryLimit();
+            if (cap > 0) {
+                this.context.limit = cap;
+                this.appliedDefaultLimit = true;
                 if (!warnedDefaultLimit) {
                     warnedDefaultLimit = true;
-                    logger.warn({ scope: 'Query.exec', defaultLimit: DEFAULT_QUERY_LIMIT }, 'Query executed without explicit .take() — applying framework default LIMIT. Call .take(N) to suppress this warning.');
+                    logger.warn({ scope: 'Query.exec', defaultLimit: cap }, 'Query executed without explicit .take() — applying framework default LIMIT. Call .take(N) to suppress this warning.');
                 }
             }
         }
 
         return this.runWithTimeout('Query execution', async () => {
             const result = await this.doExec();
-            // Wrap entities with typed accessors
+            if (this._lastRouteInfo.truncatedByDefaultLimit && isVerboseErrors()) {
+                const cap = currentDefaultQueryLimit();
+                throw new Error(
+                    `Query.exec() filled the framework default cap of ${cap} rows (BUNSANE_DEFAULT_QUERY_LIMIT) without .take(). ` +
+                    `The result is truncated. Call .take(n) to page. ` +
+                    `In production this is a one-time warning and getLastRouteInfo().truncatedByDefaultLimit is true.`
+                );
+            }
             return result.map(e => this.wrapTypedEntity(e));
         });
     }
 
     /**
      * Wrap an entity with typed accessors for components in this query.
-     * Provides both async getTyped() and synchronous componentData access.
+     * `componentData` only contains rows `.populate()` (or a prior in-memory add) loaded.
      */
-    private wrapTypedEntity(entity: Entity): TypedEntity<TComponents> {
+    private wrapTypedEntity(entity: Entity): TypedEntity<TComponents, TPopulated> {
         const componentCtors = this._componentCtors;
 
-        // Build synchronous component data record from already-loaded components
-        const componentData: Record<string, any> = {};
+        const componentData: Record<string, unknown> = {};
         for (const ctor of componentCtors) {
             const comp = entity.getInMemory(ctor);
             if (comp) {
-                componentData[ctor.name] = (comp as any).data();
+                componentData[ctor.name] = comp.data();
             }
         }
 
-        // Create typed entity wrapper
-        const typedEntity = entity as TypedEntity<TComponents>;
+        const typedEntity = entity as TypedEntity<TComponents, TPopulated>;
+        Object.assign(typedEntity, { componentData });
 
-        // Plain assignment — enumerable: true matches prior behavior; no defineProperty overhead.
-        (typedEntity as any).componentData = componentData as ComponentRecord<TComponents>;
-
-        // _queriedComponents must stay non-enumerable (hidden from Object.keys / spreads).
         queriedComponentsDescriptor.value = componentCtors as unknown as TComponents;
         Object.defineProperty(typedEntity, '_queriedComponents', queriedComponentsDescriptor);
-        queriedComponentsDescriptor.value = undefined; // don't retain ref
+        queriedComponentsDescriptor.value = undefined;
 
-        // Shared function — one allocation per module, not per row.
         Object.defineProperty(typedEntity, 'getTyped', getTypedDescriptor);
 
         return typedEntity;
@@ -1446,7 +1698,15 @@ AND c.deleted_at IS NULL`;
         }
 
         recordRoute(archetype);
-        this._lastRouteInfo = { routed: true, surface: 'rm', archetype, hasNextPage };
+        this._lastRouteInfo = {
+            routed: true,
+            surface: 'rm',
+            archetype,
+            hasNextPage,
+            ...(this.appliedDefaultLimit && currentDefaultQueryLimit() > 0 && entityIds.length >= currentDefaultQueryLimit()
+                ? { truncatedByDefaultLimit: true }
+                : {}),
+        };
 
         if (entityIds.length === 0) {
             return [];
@@ -1632,311 +1892,28 @@ AND c.deleted_at IS NULL`;
             this.context.limit = this.context.limit + 1;
         }
 
-        // Native entity-column sort (created_at/updated_at) is applied as an
-        // outer ORDER BY over the resolved id-set. The inner nodes must emit
-        // the FULL set with no ordering/pagination of their own, else their
-        // LIMIT would truncate the wrong rows before we re-order. Stash and
-        // neutralize pagination for the inner build; restore + re-apply in the
-        // wrapper below.
-        const entitySorts = this.context.entitySortOrders;
-        const useEntitySort = entitySorts.length > 0;
-        // Component sortBy() on an OR query is also resolved by an outer
-        // wrapper: OrNode produces an unordered id-set, then we JOIN the sort
-        // component's data table and ORDER BY it (mirrors the entity-sort
-        // wrapper). The non-OR component sort path lives inside
-        // ComponentInclusionNode/CTE and is untouched.
-        const componentSorts = this.context.sortOrders;
-        const useOrComponentSort = !!this.orQuery && componentSorts.length > 0;
-        const useOuterSortWrapper = useEntitySort || useOrComponentSort;
-
-        let savedLimit: number | null = null;
-        let savedOffset = 0;
-        let savedCursorId: string | null = null;
-        let savedCompositeCursor: { v: string | null; id: string } | null = null;
-        const savedSuppressNodeOrdering = this.context.suppressNodeOrdering;
-        // Captured by reference before any neutralization below, so the wrapper
-        // still sees the requested sort keys after we clear context.sortOrders.
-        const savedSortOrders = this.context.sortOrders;
-        if (useOuterSortWrapper) {
-            savedLimit = this.context.limit;
-            savedOffset = this.context.offsetValue;
-            savedCursorId = this.context.cursorId;
-            savedCompositeCursor = this.context.compositeCursor;
-            this.context.limit = null;
-            this.context.offsetValue = 0;
-            this.context.cursorId = null;
-            this.context.compositeCursor = null;
-            // Only OrNode honours this; the inner OR id-set need not self-sort
-            // because the wrapper re-orders the full set. Non-OR inner nodes
-            // ignore the flag.
-            this.context.suppressNodeOrdering = true;
-            // For OR + component sortBy, clear the component sort keys for the
-            // inner build so the OR base node (ComponentInclusionNode) emits a
-            // plain unordered id-set — the wrapper below owns all ordering and
-            // its keyset/param accounting. (Entity sorts leave sortOrders empty.)
-            if (useOrComponentSort) {
-                this.context.sortOrders = [];
-            }
+        // Entity-column sort drives from entities (EXISTS probes + LIMIT).
+        // OR + component sortBy still wraps the id-set. Non-OR component
+        // sortBy stays inside ComponentInclusionNode's leaf scan.
+        this.reverseSortedPage = false;
+        const result = this.context.entitySortOrders.length > 0
+            ? this.buildEntityDrivenSortSql()
+            : (this.orQuery && this.context.sortOrders.length > 0)
+                ? this.buildOrComponentSortSql()
+                : this.buildIdSelect();
+        // Non-OR component sortBy('before') fetches reversed inside
+        // ComponentInclusionNode. Reuse the same post-trim row flip as
+        // entity-sort / OR-sort. Multi-key keyset still throws in the node.
+        if (
+            this.context.entitySortOrders.length === 0 &&
+            !(this.orQuery && this.context.sortOrders.length > 0) &&
+            this.context.compositeCursor !== null &&
+            this.context.cursorDirection === 'before' &&
+            this.context.sortOrders.length === 1
+        ) {
+            this.reverseSortedPage = true;
         }
 
-        // Inner DAG build + entity-sort wrapper run with pagination
-        // neutralized (above). Restore in `finally` so a throw mid-build —
-        // including the entity-sort guards below — can never leave a reused
-        // Query instance with limit/offset/cursor nulled.
-        let result: { sql: string; params: any[]; context: QueryContext };
-        try {
-            // Build the DAG
-            const dag = new QueryDAG();
-
-            // Check if we have an OR query
-            if (this.orQuery) {
-                // For OR queries, we need to ensure entities have all required components first
-                if (this.context.componentIds.size > 0) {
-                    // ComponentInclusionNode is the root, OrNode is the leaf
-                    const componentNode = new ComponentInclusionNode();
-                    dag.setRootNode(componentNode);
-
-                    // OrNode filters on top of the base requirements
-                    const orNode = new OrNode(this.orQuery);
-                    orNode.addDependency(componentNode);
-                    dag.addNode(orNode);
-                } else {
-                    // No base requirements, OrNode is both root and leaf
-                    const orNode = new OrNode(this.orQuery);
-                    dag.setRootNode(orNode);
-                }
-            } else {
-                // Use buildBasicQuery for regular AND logic (includes CTE optimization)
-                const optimizedDag = QueryDAG.buildBasicQuery(this.context);
-                // Copy nodes from optimized DAG to our DAG
-                for (const node of optimizedDag.getNodes()) {
-                    dag.addNode(node);
-                }
-                if (optimizedDag.getRootNode()) {
-                    dag.setRootNode(optimizedDag.getRootNode()!);
-                }
-            }
-
-            // Execute the DAG
-            result = dag.execute(this.context);
-
-            // Wrap the resolved id-set with an outer ORDER BY on the native
-            // entities column(s). result.params === this.context.params (same
-            // ref), so pushing pagination params keeps placeholders sequential.
-            if (useEntitySort) {
-                if (savedCompositeCursor && entitySorts.length > 1) {
-                    throw new Error(
-                        'sortedCursor() does not support multi-key entity sorts. ' +
-                        'Only a single sortByCreatedAt() or sortByUpdatedAt() is supported with composite keyset pagination.'
-                    );
-                }
-
-                const orderClauses = entitySorts.map(s => {
-                    // Hard-mapped allow-list — never interpolate raw input.
-                    const col = s.field === "updated_at" ? "updated_at" : "created_at";
-                    const nulls = s.nullsFirst ? "NULLS FIRST" : "NULLS LAST";
-                    const dir = s.direction === "DESC" ? "DESC" : "ASC";
-                    return `e.${col} ${dir} ${nulls}`;
-                }).join(", ");
-
-                let whereClause = '';
-                if (savedCompositeCursor) {
-                    const isBefore = this.context.cursorDirection === 'before';
-                    if (isBefore) {
-                        // 'before' for sorted entity-column cursors is not yet implemented:
-                        // it requires reversing ORDER BY and post-reversing rows in JS.
-                        // Throw a clear error rather than returning silently wrong pages.
-                        throw new Error(
-                            "sortedCursor(token, 'before') is not supported for sortByCreatedAt()/sortByUpdatedAt(). " +
-                            'Use OFFSET pagination or walk pages forward only.'
-                        );
-                    }
-
-                    // Composite keyset for native entity-column sort.
-                    // We truncate both sides to milliseconds so the JS Date (ms precision)
-                    // matches the stored TIMESTAMPTZ value. Without truncation, a stored
-                    // microsecond timestamp (e.g. 00:00:01.000123) always compares GREATER
-                    // than the ms-truncated cursor (00:00:01.000), causing already-seen
-                    // rows to re-qualify on every subsequent page.
-                    //
-                    // ORDER BY: date_trunc('milliseconds', col) <dir> NULLS x, base.id ASC
-                    // ASC+after:  (trunc_col, id) > ($v, $id)
-                    // DESC+after: trunc_col < $v OR (trunc_col = $v AND id > $id)
-                    const s = entitySorts[0]!;
-                    const rawCol = s.field === "updated_at" ? "e.updated_at" : "e.created_at";
-                    const col = `date_trunc('milliseconds', ${rawCol})`;
-                    const isDesc = s.direction === "DESC";
-                    const { v, id: cursorId } = savedCompositeCursor;
-
-                    if (v === null) {
-                        // After the last non-null row under NULLS LAST: for ASC the NULL
-                        // region follows all non-null rows — they've all been seen, so
-                        // nothing remains (entities.created_at is NOT NULL in practice,
-                        // but handle generically).
-                        whereClause = ' WHERE FALSE';
-                    } else if (!isDesc) {
-                        // ASC+after: row-comparison on truncated timestamp + id tiebreak.
-                        // Include NULL-timestamped rows too (NULLS LAST → they appear at
-                        // the very end, AFTER all non-null rows, so they have not yet been
-                        // visited when we are past a non-null cursor value).
-                        const vIdx = result.params.push(v);
-                        const idGtIdx = result.params.push(cursorId);
-                        whereClause = ` WHERE ((${col}, base.id) > ($${vIdx}::timestamptz, $${idGtIdx}::uuid) OR ${rawCol} IS NULL)`;
-                    } else {
-                        // DESC+after: values come in decreasing order; "after" the cursor
-                        // means smaller truncated timestamp, or same + larger id.
-                        const vLtIdx = result.params.push(v);
-                        const vEqIdx = result.params.push(v);
-                        const idGtIdx = result.params.push(cursorId);
-                        whereClause = ` WHERE (${col} < $${vLtIdx}::timestamptz OR (${col} = $${vEqIdx}::timestamptz AND base.id > $${idGtIdx}::uuid))`;
-                    }
-                }
-
-                // Mirror the ORDER BY truncation in the sort clause so the cursor
-                // comparison and the ORDER BY operate on the same precision.
-                const truncatedOrderClauses = entitySorts.map(s => {
-                    const rawCol = s.field === "updated_at" ? "e.updated_at" : "e.created_at";
-                    const col = `date_trunc('milliseconds', ${rawCol})`;
-                    const nulls = s.nullsFirst ? "NULLS FIRST" : "NULLS LAST";
-                    const dir = s.direction === "DESC" ? "DESC" : "ASC";
-                    return `${col} ${dir} ${nulls}`;
-                }).join(", ");
-                const effectiveOrderClauses = savedCompositeCursor ? truncatedOrderClauses : orderClauses;
-
-                let wrapped = `SELECT base.id FROM (${result.sql}) AS base
-                    JOIN entities e ON e.id = base.id${whereClause}
-                    ORDER BY ${effectiveOrderClauses}, base.id ASC`;
-
-                if (savedLimit !== null) {
-                    result.params.push(savedLimit);
-                    wrapped += ` LIMIT $${result.params.length}`;
-                }
-                // Only add OFFSET when not using cursor-based pagination
-                if (!savedCompositeCursor && (savedOffset > 0 || savedLimit !== null)) {
-                    result.params.push(savedOffset);
-                    wrapped += ` OFFSET $${result.params.length}`;
-                }
-
-                result.sql = wrapped;
-            } else if (useOrComponentSort) {
-                // OR + component sortBy(): wrap the unordered OR id-set with a
-                // JOIN to each sort component's data table and an outer ORDER
-                // BY. The sort component is always a required `.with()`
-                // component (sortBy validates this), and the OR base node
-                // guarantees every result entity has all required components,
-                // so the INNER JOIN never drops a row. Composite keyset
-                // pagination is supported for a single sort key; OFFSET for
-                // any number of keys.
-                if (savedCompositeCursor && componentSorts.length > 1) {
-                    throw new Error(
-                        'sortedCursor() does not support multi-key sorts. ' +
-                        'Only a single sortBy() key is supported with composite keyset pagination on OR queries.'
-                    );
-                }
-
-                const joins: string[] = [];
-                const orderClauses: string[] = [];
-                componentSorts.forEach((s, i) => {
-                    const sortTypeId = ComponentRegistry.getComponentId(s.component);
-                    if (!sortTypeId) {
-                        throw new Error(`Component ${s.component} is not registered.`);
-                    }
-                    const table = shouldUseDirectPartition()
-                        ? (ComponentRegistry.getPartitionTableName(sortTypeId) || 'components')
-                        : 'components';
-                    const safeTable = assertComponentTableName(table, 'orSort.componentTable');
-                    const alias = `s${i}`;
-                    const typeParamIdx = result.params.push(sortTypeId);
-                    joins.push(
-                        `JOIN ${safeTable} ${alias} ON ${alias}.entity_id = base.id ` +
-                        `AND ${alias}.type_id = $${typeParamIdx} AND ${alias}.deleted_at IS NULL`
-                    );
-                    const safeProp = assertIdentifier(s.property, 'sortOrder.property');
-                    const numeric = isNumericProperty(s.component, s.property);
-                    const expr = numeric
-                        ? `(${alias}.data->>'${safeProp}')::numeric`
-                        : `${alias}.data->>'${safeProp}'`;
-                    const dir = s.direction === "DESC" ? "DESC" : "ASC";
-                    const nulls = s.nullsFirst ? "NULLS FIRST" : "NULLS LAST";
-                    orderClauses.push(`${expr} ${dir} ${nulls}`);
-                });
-
-                let whereClause = '';
-                if (savedCompositeCursor) {
-                    const isBefore = this.context.cursorDirection === 'before';
-                    if (isBefore) {
-                        throw new Error(
-                            "sortedCursor(token, 'before') is not supported for OR + sortBy(). " +
-                            'Use OFFSET pagination or walk pages forward only.'
-                        );
-                    }
-                    // Single-key keyset (guarded above). Re-derive the sort
-                    // expression on alias s0; the keyset shape mirrors
-                    // ComponentInclusionNode.buildCompositeCursorWhere exactly.
-                    const s = componentSorts[0]!;
-                    // NULLS FIRST + keyset cannot advance past the leading
-                    // null-block onto non-null rows (the (expr,id) comparison
-                    // never re-admits the front nulls), silently dropping rows.
-                    // Throw a clear error instead of returning wrong pages.
-                    if (s.nullsFirst) {
-                        throw new Error(
-                            'sortedCursor() does not support NULLS FIRST sorts. ' +
-                            'Use the default (NULLS LAST) or OFFSET pagination.'
-                        );
-                    }
-                    const safeProp = assertIdentifier(s.property, 'sortOrder.property');
-                    const numeric = isNumericProperty(s.component, s.property);
-                    const expr = numeric
-                        ? `(s0.data->>'${safeProp}')::numeric`
-                        : `s0.data->>'${safeProp}'`;
-                    const cast = numeric ? '::numeric' : '::text';
-                    const isDesc = s.direction === "DESC";
-                    const nullsLast = !s.nullsFirst;
-                    const { v, id: cursorId } = savedCompositeCursor;
-
-                    if (v === null) {
-                        const idIdx = result.params.push(cursorId);
-                        whereClause = ` WHERE (${expr} IS NULL AND base.id > $${idIdx}::uuid)`;
-                    } else if (!isDesc) {
-                        const vIdx = result.params.push(v);
-                        const idIdx = result.params.push(cursorId);
-                        const nullInclude = nullsLast ? ` OR ${expr} IS NULL` : '';
-                        whereClause = ` WHERE ((${expr}, base.id) > ($${vIdx}${cast}, $${idIdx}::uuid)${nullInclude})`;
-                    } else {
-                        const vLtIdx = result.params.push(v);
-                        const vEqIdx = result.params.push(v);
-                        const idGtIdx = result.params.push(cursorId);
-                        whereClause = ` WHERE (${expr} < $${vLtIdx}${cast} OR (${expr} = $${vEqIdx}${cast} AND base.id > $${idGtIdx}::uuid))`;
-                    }
-                }
-
-                let wrapped = `SELECT base.id FROM (${result.sql}) AS base
-                    ${joins.join(' ')}${whereClause}
-                    ORDER BY ${orderClauses.join(', ')}, base.id ASC`;
-
-                if (savedLimit !== null) {
-                    result.params.push(savedLimit);
-                    wrapped += ` LIMIT $${result.params.length}`;
-                }
-                if (!savedCompositeCursor && (savedOffset > 0 || savedLimit !== null)) {
-                    result.params.push(savedOffset);
-                    wrapped += ` OFFSET $${result.params.length}`;
-                }
-
-                result.sql = wrapped;
-            }
-        } finally {
-            if (useOuterSortWrapper) {
-                // Restore so the Query instance stays reusable, even if the
-                // DAG build/execute or a sort guard threw above.
-                this.context.limit = savedLimit;
-                this.context.offsetValue = savedOffset;
-                this.context.cursorId = savedCursorId;
-                this.context.compositeCursor = savedCompositeCursor;
-                this.context.suppressNodeOrdering = savedSuppressNodeOrdering;
-                this.context.sortOrders = savedSortOrders;
-            }
-        }
 
         // Get the database connection (transaction or default)
         const dbConn = this.getDb();
@@ -1947,7 +1924,6 @@ AND c.deleted_at IS NULL`;
             console.log('SQL:', result.sql);
             console.log('Params:', result.params);
             console.log('OR Query:', !!this.orQuery);
-            console.log('Prepared Cache Bypass:', this.skipPreparedCache);
             console.log('Component Cache Bypass:', this.skipComponentCache);
             console.log('Using Transaction:', !!this.trx);
             console.log('---');
@@ -1983,20 +1959,28 @@ AND c.deleted_at IS NULL`;
         let entityIds: string[] = entities.map((row: any) => row.id);
 
         // RP-01: trim the extra row and report hasNextPage (legacy path).
+        // 'before' fetches in reverse order; drop the extra row first, then
+        // restore the caller's sort direction.
         let hasNextPage: boolean | undefined;
         if (this.nPlus1PageSize !== null) {
             hasNextPage = entityIds.length > this.nPlus1PageSize;
             if (hasNextPage) {
                 entityIds = entityIds.slice(0, this.nPlus1PageSize);
             }
-            // Restore caller-visible limit (was temporarily N+1 for the build).
             this.context.limit = this.nPlus1PageSize;
             this.nPlus1PageSize = null;
         }
+        if (this.reverseSortedPage) {
+            entityIds.reverse();
+            this.reverseSortedPage = false;
+        }
+        const defaultCap = currentDefaultQueryLimit();
+        const capBound = this.appliedDefaultLimit && defaultCap > 0 && entityIds.length >= defaultCap;
         this._lastRouteInfo = {
             routed: false,
             surface: 'legacy',
             ...(hasNextPage !== undefined ? { hasNextPage } : {}),
+            ...(capBound ? { truncatedByDefaultLimit: true } : {}),
         };
 
         if (qspReq && qspRes) {
@@ -2050,89 +2034,70 @@ AND c.deleted_at IS NULL`;
             return;
         }
 
-        // Bulk fetch all components for all entities and all requested component types
         const entityIdList = inList(entityIds, 1);
-        const typeIdList = inList(componentTypeIds, entityIdList.newParamIndex);
+        const params: unknown[] = [...entityIdList.params];
+        let next = entityIdList.newParamIndex;
+        const selects: string[] = [];
 
-        // Get the database connection (transaction or default)
-        const dbConn = this.getDb();
-
-        // created_at/updated_at included so results can warm the component
-        // cache below with full ComponentData entries.
-        let components: any[];
-        if (shouldUseDirectPartition() && componentTypeIds.length === 1) {
-            // Single component type - use direct partition if available
-            const partitionTableName = ComponentRegistry.getPartitionTableName(componentTypeIds[0]!);
-            if (partitionTableName) {
-                // SEC-03: registry-derived name is asserted before interpolation.
-                assertComponentTableName(partitionTableName, 'Query.populate.partitionTable');
-                components = await this.execSql<any[]>('query.components.partition', dbConn, `
-                    SELECT id, entity_id, type_id, data, created_at, updated_at
-                    FROM ${partitionTableName}
-                    WHERE entity_id IN ${entityIdList.sql}
-                    AND type_id IN ${typeIdList.sql}
-                    AND deleted_at IS NULL
-                `, [...entityIdList.params, ...typeIdList.params], this.execSignal, this.execPerRequest);
-            } else {
-                // Fallback to parent table
-                components = await this.execSql<any[]>('query.components.fallback', dbConn, `
-                    SELECT id, entity_id, type_id, data, created_at, updated_at
-                    FROM components
-                    WHERE entity_id IN ${entityIdList.sql}
-                    AND type_id IN ${typeIdList.sql}
-                    AND deleted_at IS NULL
-                `, [...entityIdList.params, ...typeIdList.params], this.execSignal, this.execPerRequest);
+        if (shouldUseDirectPartition()) {
+            const parentTypeIds: string[] = [];
+            for (const typeId of componentTypeIds) {
+                const raw = ComponentRegistry.getPartitionTableName(typeId);
+                if (!raw) {
+                    parentTypeIds.push(typeId);
+                    continue;
+                }
+                const table = assertComponentTableName(raw, "Query.populate.partitionTable");
+                params.push(typeId);
+                const typeIdx = next;
+                next += 1;
+                selects.push(
+                    `SELECT id, entity_id, type_id, data, created_at, updated_at FROM ${table} WHERE entity_id IN ${entityIdList.sql} AND type_id = $${typeIdx} AND deleted_at IS NULL`
+                );
+            }
+            if (parentTypeIds.length > 0) {
+                const typeIdList = inList(parentTypeIds, next);
+                params.push(...typeIdList.params);
+                selects.push(
+                    `SELECT id, entity_id, type_id, data, created_at, updated_at FROM components WHERE entity_id IN ${entityIdList.sql} AND type_id IN ${typeIdList.sql} AND deleted_at IS NULL`
+                );
             }
         } else {
-            // Multiple types or direct partition disabled - use parent table
-            components = await this.execSql<any[]>('query.components.multi', dbConn, `
-                SELECT id, entity_id, type_id, data, created_at, updated_at
-                FROM components
-                WHERE entity_id IN ${entityIdList.sql}
-                AND type_id IN ${typeIdList.sql}
-                AND deleted_at IS NULL
-            `, [...entityIdList.params, ...typeIdList.params], this.execSignal, this.execPerRequest);
+            const typeIdList = inList(componentTypeIds, next);
+            params.push(...typeIdList.params);
+            selects.push(
+                `SELECT id, entity_id, type_id, data, created_at, updated_at FROM components WHERE entity_id IN ${entityIdList.sql} AND type_id IN ${typeIdList.sql} AND deleted_at IS NULL`
+            );
         }
 
-        // Get metadata storage for Date deserialization
-        const storage = getMetadataStorage();
+        const dbConn = this.getDb();
+        const sql = selects.length === 1 ? selects[0]! : selects.join(" UNION ALL ");
+        const components = await this.execSql<Array<{
+            id: string;
+            entity_id: string;
+            type_id: string;
+            data: unknown;
+            created_at: Date | string;
+            updated_at: Date | string;
+        }>>("query.components", dbConn, sql, params, this.execSignal, this.execPerRequest);
 
-        // Group components by entity_id and attach them to entities
         for (const row of components) {
             const entity = entityMap.get(row.entity_id);
             if (!entity) continue;
 
-            // Get the component constructor from registry
             const ComponentCtor = ComponentRegistry.getConstructor(row.type_id);
             if (!ComponentCtor) {
                 logger.warn(`Component constructor not found for type_id: ${row.type_id}`);
                 continue;
             }
 
-            // Create component instance
-            const component = new ComponentCtor();
-            
-            // Parse and assign component data
-            const componentData = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
-            Object.assign(component, componentData);
-
-            // Deserialize Date properties
-            const props = storage.componentProperties.get(row.type_id);
-            if (props) {
-                for (const prop of props) {
-                    if (prop.propertyType === Date && typeof (component as any)[prop.propertyKey] === 'string') {
-                        (component as any)[prop.propertyKey] = new Date((component as any)[prop.propertyKey]);
-                    }
-                }
-            }
-
-            // Set component metadata
-            component.id = row.id;
-            component.setPersisted(true);
-            component.setDirty(false);
-
-            // Add component to entity (using protected method)
-            (entity as any).addComponent(component);
+            const component = hydrateComponentRow(ComponentCtor, {
+                id: row.id,
+                data: row.data,
+                typeId: row.type_id,
+            });
+            const attach = entity as Entity & { addComponent(component: BaseComponent): void };
+            attach.addComponent(component);
         }
 
         this.warmComponentCache(components, entityIds, componentTypeIds);
@@ -2210,33 +2175,11 @@ AND c.deleted_at IS NULL`;
             );
         }
 
-        // Build the DAG (same as exec)
-        const dag = new QueryDAG();
-
-        if (this.orQuery) {
-            if (this.context.componentIds.size > 0) {
-                const componentNode = new ComponentInclusionNode();
-                dag.setRootNode(componentNode);
-
-                const orNode = new OrNode(this.orQuery);
-                orNode.addDependency(componentNode);
-                dag.addNode(orNode);
-            } else {
-                const orNode = new OrNode(this.orQuery);
-                dag.setRootNode(orNode);
-            }
-        } else {
-            const optimizedDag = QueryDAG.buildBasicQuery(this.context);
-            for (const node of optimizedDag.getNodes()) {
-                dag.addNode(node);
-            }
-            if (optimizedDag.getRootNode()) {
-                dag.setRootNode(optimizedDag.getRootNode()!);
-            }
-        }
-
-        // Execute the DAG
-        const result = dag.execute(this.context);
+        const result = this.context.entitySortOrders.length > 0
+            ? this.buildEntityDrivenSortSql()
+            : (this.orQuery && this.context.sortOrders.length > 0)
+                ? this.buildOrComponentSortSql()
+                : this.buildIdSelect();
 
         // Create EXPLAIN ANALYZE query
         const explainSql = `EXPLAIN (ANALYZE${buffers ? ', BUFFERS' : ''}) ${result.sql}`;
@@ -2260,32 +2203,23 @@ AND c.deleted_at IS NULL`;
         return explainResult.map((row: any) => row['QUERY PLAN']).join('\n');
     }
 
-    /**
-     * Get prepared statement cache statistics.
-     * @deprecated The framework-level prepared statement cache is no longer
-     * used on the query hot path (Bun SQL auto-prepares at the driver
-     * layer). Stats remain for API compatibility and report an idle cache.
-     */
-    public static getCacheStats() {
-        return preparedStatementCache.getStats();
-    }
-
     static filterOp = FilterOp;
 
-    public static filter(field: string, operator: FilterOperator, value: any): QueryFilter {
+    public static filter<F extends string>(field: F, operator: FilterOperator, value: unknown): QueryFilter & { field: F } {
         return { field, operator, value };
     }
 
     public static typedFilter<T extends BaseComponent>(
-        componentCtor: new (...args: any[]) => T,
-        field: keyof ComponentDataType<T>,
+        componentCtor: new (...args: never[]) => T,
+        field: keyof ComponentDataType<T> & string,
         operator: FilterOperator,
-        value: any
-    ): QueryFilter {
-        return { field: field as string, operator, value };
+        value: unknown
+    ): QueryFilter & { field: keyof ComponentDataType<T> & string } {
+        void componentCtor;
+        return { field, operator, value };
     }
 
-    public static filters(...filters: QueryFilter[]): QueryFilterOptions {
+    public static filters<const F extends readonly QueryFilter[]>(...filters: F): { filters: F } {
         return { filters };
     }
 }
@@ -2294,9 +2228,14 @@ AND c.deleted_at IS NULL`;
  * OR function for combining component filters
  * Creates an OrQuery that matches entities satisfying ANY of the branches
  */
-export function or(branches: ComponentWithFilters[]): OrQuery {
-    return new OrQuery(branches);
+export function or(branches: ReadonlyArray<{
+    component: ComponentConstructor;
+    filters?: ReadonlyArray<QueryFilter>;
+}>): OrQuery {
+    return new OrQuery(branches.map((branch) => ({
+        component: branch.component,
+        filters: branch.filters ? [...branch.filters] : undefined,
+    })));
 }
-
 export { Query };
 export type { TimeTrunc } from "./timeBucket";

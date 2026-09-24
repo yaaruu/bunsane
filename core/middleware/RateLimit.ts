@@ -1,4 +1,4 @@
-import type { Middleware } from '../Middleware';
+import type { Middleware, MiddlewareContext } from '../Middleware';
 import { logger as MainLogger } from '../Logger';
 import { setResponseHeaders } from './headers';
 
@@ -11,8 +11,8 @@ export type RateLimitOptions = {
     windowMs?: number;
     /** Only apply to paths matching this prefix list. Default: all */
     pathPrefixes?: string[];
-    /** Extract client key (override default: X-Forwarded-For → remote). */
-    keyExtractor?: (req: Request) => string;
+    /** Extract client key. Default: trusted proxy headers, else socket IP. */
+    keyExtractor?: (req: Request, ctx?: MiddlewareContext) => string;
     /** Response status for rejection. Default: 429 */
     status?: number;
     /** Trust X-Forwarded-For header. Default: false */
@@ -36,38 +36,36 @@ export function rateLimit(options: RateLimitOptions = {}): Middleware {
     const status = options.status ?? 429;
     const trustProxy = options.trustProxy ?? false;
 
-    let warnedSharedBucket = false;
-    function warnSharedBucketOnce() {
-        if (warnedSharedBucket) return;
-        warnedSharedBucket = true;
+    let warnedFailOpen = false;
+    function warnFailOpenOnce() {
+        if (warnedFailOpen) return;
+        warnedFailOpen = true;
         logger.warn(
             { scope: 'RateLimit' },
-            'rate-limit key is shared ("anonymous"): set trustProxy=true behind a proxy you control, or provide keyExtractor, for per-client limiting',
+            'rate-limit key unavailable (no socket IP and trustProxy is off); failing open instead of sharing one bucket',
         );
     }
 
-    const keyExtractor = options.keyExtractor ?? ((req: Request) => {
+    const keyExtractor = options.keyExtractor ?? ((req: Request, ctx?: MiddlewareContext) => {
         // SEC-05: client-supplied IP headers are only honoured when the
-        // deployment explicitly declares a trusted proxy. Reading X-Real-IP
-        // unconditionally let any client rotate its bucket at will.
+        // deployment explicitly declares a trusted proxy.
         if (trustProxy) {
             const xff = req.headers.get('x-forwarded-for');
             if (xff) return xff.split(',')[0]!.trim();
             const realIp = req.headers.get('x-real-ip');
             if (realIp) return realIp;
         }
-        // Without proxy headers there is no per-client identity available to
-        // middleware (Bun only exposes socket IP via the Server handle). All
-        // un-keyed traffic shares one global bucket: a coarse fuse, not a
-        // per-client limit. Warn once so deployments notice.
-        warnSharedBucketOnce();
-        return 'anonymous';
+        // Bun exposes the socket address only via the Server handle. App.start
+        // copies server.requestIP(req) into the middleware context.
+        if (ctx?.clientIp) return ctx.clientIp;
+        warnFailOpenOnce();
+        return '';
     });
 
     const buckets = new Map<string, Bucket>();
     let lastSweep = Date.now();
 
-    return async (req, next) => {
+    return async (req, next, ctx) => {
         if (pathPrefixes && pathPrefixes.length > 0) {
             const url = new URL(req.url);
             const match = pathPrefixes.some((p) => url.pathname.startsWith(p));
@@ -75,7 +73,8 @@ export function rateLimit(options: RateLimitOptions = {}): Middleware {
         }
 
         const now = Date.now();
-        const key = keyExtractor(req);
+        const key = keyExtractor(req, ctx);
+        if (!key) return next();
 
         if (now - lastSweep > windowMs) {
             for (const [k, v] of buckets) {

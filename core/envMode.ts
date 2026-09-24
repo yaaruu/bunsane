@@ -14,21 +14,19 @@ export function isVerboseErrors(): boolean {
     return process.env.NODE_ENV === 'development';
 }
 
-let warnedNodeEnvUnset = false;
 
 /**
- * One-time boot warning when NODE_ENV is unset — it drives error masking,
- * the studio surface and HSTS, so its absence is security-relevant.
- * Called from validateEnv().
+ * Guidance when NODE_ENV is unset. Returns null when it is set.
+ * validateEnv warns, or throws under BUNSANE_STRICT_ENV.
  */
-export function warnIfNodeEnvUnset(): void {
-    if (warnedNodeEnvUnset) return;
-    if (!process.env.NODE_ENV) {
-        warnedNodeEnvUnset = true;
-        console.warn(
-            '[BunSane] NODE_ENV is not set. Defaulting to fail-closed behaviour: ' +
-            'error details are masked and production-only surfaces stay off. ' +
-            'Set NODE_ENV=development for verbose errors.'
-        );
-    }
+export function nodeEnvUnsetWarning(): string | null {
+    if (process.env.NODE_ENV) return null;
+    return (
+        "NODE_ENV is not set. Fail-closed defaults apply: error details are masked, " +
+        "HSTS stays off unless BUNSANE_HSTS=on, and /metrics, /health/remote, /docs, and /openapi.json " +
+        "answer 404 unless a token or explicit public opt-in is configured. " +
+        "Studio still requires enableStudio({ token }). " +
+        "Set NODE_ENV=development for verbose errors, or NODE_ENV=production for a production deploy."
+    );
 }
+

@@ -1,21 +1,25 @@
 /**
  * Remote Communication: OutboxWorker
  *
- * Polls `remote_outbox` for unpublished rows, publishes each to Redis, and
- * marks the row published. Uses `FOR UPDATE SKIP LOCKED` so multiple
- * instances can run workers concurrently without double-publishing:
- * each row is claimed by exactly one worker per batch.
+ * Polls `remote_outbox` for unpublished rows and publishes each to Redis.
  *
- * At-least-once semantics: if the worker crashes after XADD but before the
- * UPDATE commits, the row stays pending and will be republished. Consumers
- * must be idempotent — enforce this at the handler level (e.g., dedup on
- * `ctx.messageId` or domain-level idempotency keys).
+ * Claim, commit, then XADD. Redis I/O never runs inside the PostgreSQL
+ * transaction: a slow Redis must not hold row locks. The claim (`claim_token`
+ * + `claimed_at`) is committed first; XADD happens after; `published_at` is
+ * set in a later statement.
+ *
+ * At-least-once: if the process dies after XADD and before `published_at` is
+ * set, the claim lease expires and another tick republishes the same row
+ * (new Redis id, same `correlationId` = outbox row id). Consumers dedupe on
+ * `(sourceApp, correlationId)` inside the in-memory retention window.
+ * `sourceApp` is stamped from this worker's config, never from the row payload.
  */
 
 import type Redis from "ioredis";
-import { sql as sqlHelper, type SQL } from "bun";
+import type { SQL } from "bun";
 import { logger } from "../Logger";
 import type { RemoteMetrics } from "./metrics";
+import { encodeEnvelope } from "./envelopeSign";
 
 const loggerInstance = logger.child({ scope: "OutboxWorker" });
 
@@ -27,6 +31,8 @@ export interface OutboxWorkerConfig {
     enableLogging: boolean;
     /** Retention window for published rows in ms. 0 disables trimming. Default 24h. */
     retentionMs: number;
+    /** How long a claim blocks other workers before it can be stolen. Default 60s. */
+    claimLeaseMs?: number;
 }
 
 interface OutboxRow {
@@ -82,11 +88,12 @@ export class OutboxWorker {
     }
 
     /**
-     * Force an immediate tick. Used during shutdown to flush any
-     * committed-but-unpublished rows before the process exits.
+     * Force an immediate publish pass. Used during shutdown and tests.
+     * Does not require start() — `running` only gates the poll timer.
      */
     async flush(): Promise<void> {
-        await this.tick();
+        await this.processBatch();
+        await this.maybeTrimPublished();
     }
 
     private scheduleNext(delayMs: number): void {
@@ -101,6 +108,10 @@ export class OutboxWorker {
 
     private async tick(): Promise<void> {
         if (!this.running) return;
+        await this.processOnce();
+    }
+
+    private async processOnce(): Promise<void> {
         try {
             await this.processBatch();
             await this.maybeTrimPublished();
@@ -137,77 +148,107 @@ export class OutboxWorker {
         }
     }
 
-    private async processBatch(): Promise<void> {
-        const db = this.db as any;
-        await db.begin(async (trx: any) => {
-            const rows: OutboxRow[] = await trx`
-                SELECT id, target, event, data, created_at
-                FROM remote_outbox
-                WHERE published_at IS NULL
-                ORDER BY created_at
-                LIMIT ${this.config.batchSize}
-                FOR UPDATE SKIP LOCKED
-            `;
+    private claimLeaseMs(): number {
+        return this.config.claimLeaseMs ?? 60_000;
+    }
 
-            if (rows.length === 0) return;
-
-            this.metrics?.outboxClaimed(rows.length);
-            if (this.config.enableLogging) {
-                loggerInstance.debug(`Claimed ${rows.length} outbox rows`);
-            }
-
-            // Publish concurrently rather than serially. Each xadd is bounded
-            // by the publisher client's `commandTimeout`; with serial awaits a
-            // batch of N slow rows would hold PG row locks for N × timeout.
-            // Parallel keeps worst-case lock hold ≈ single-xadd timeout.
-            // (H-DB-1 partial — full fix requires a claim-via-column design
-            // so Redis latency no longer sits inside a PG transaction at all.)
-            const publishResults = await Promise.allSettled(
-                rows.map((row) => {
-                    const stream = `${this.config.streamPrefix}${row.target}`;
-                    const envelope = JSON.stringify({
-                        kind: "event",
-                        sourceApp: this.config.sourceApp,
-                        event: row.event,
-                        data: row.data,
-                        emittedAt: row.created_at.getTime(),
-                    });
-                    return this.publisher.xadd(stream, "*", "data", envelope);
-                })
+    /**
+     * Claim unpublished rows and commit before returning. Callers must not
+     * touch Redis until this promise resolves.
+     */
+    private async claimRows(): Promise<{ token: string; rows: OutboxRow[] }> {
+        const token = crypto.randomUUID();
+        const leaseSec = Math.max(1, Math.ceil(this.claimLeaseMs() / 1000));
+        // Bun's SQL type doesn't expose begin(); the runtime does.
+        const db = this.db as unknown as {
+            begin(fn: (trx: { unsafe(query: string, params?: unknown[]): Promise<unknown> }) => Promise<void>): Promise<void>;
+        };
+        let rows: OutboxRow[] = [];
+        await db.begin(async (trx) => {
+            // unsafe: tagged templates are prepared, and Bun's truncated
+            // statement names collide (42P05) after a connection recycle.
+            const selected = await trx.unsafe(
+                `SELECT id, target, event, data, created_at
+                 FROM remote_outbox
+                 WHERE published_at IS NULL
+                   AND (claimed_at IS NULL OR claimed_at < NOW() - ($1 * INTERVAL '1 second'))
+                 ORDER BY created_at
+                 LIMIT $2
+                 FOR UPDATE SKIP LOCKED`,
+                [leaseSec, this.config.batchSize]
             );
-
-            const successIds: string[] = [];
-            for (let i = 0; i < publishResults.length; i++) {
-                const r = publishResults[i];
-                const row = rows[i]!;
-                if (r!.status === "fulfilled") {
-                    successIds.push(row.id);
-                } else {
-                    this.metrics?.outboxPublishFailed();
-                    loggerInstance.error({
-                        err: r!.reason,
-                        outboxId: row.id,
-                        target: row.target,
-                        event: row.event,
-                        msg: "Outbox XADD failed — row will retry next tick",
-                    });
-                    // Leave row unpublished; SKIP LOCKED releases on tx end
-                    // so next tick (or another instance) picks it up.
-                }
-            }
-
-            if (successIds.length > 0) {
-                // Single bulk UPDATE instead of N round-trips holding row
-                // locks (H-DB-3). Previously each success fired its own
-                // UPDATE statement serially. Uses Bun SQL's `sql(...)` helper
-                // for the IN-list so ids are parameterised individually.
-                await trx`
-                    UPDATE remote_outbox
-                    SET published_at = NOW()
-                    WHERE id IN ${sqlHelper(successIds)}
-                `;
-                this.metrics?.outboxPublished(successIds.length);
-            }
+            if (!Array.isArray(selected) || selected.length === 0) return;
+            const ids = selected.map((row: OutboxRow) => row.id);
+            const placeholders = ids.map((_, i) => `$${i + 2}`).join(", ");
+            await trx.unsafe(
+                `UPDATE remote_outbox
+                 SET claim_token = $1, claimed_at = NOW()
+                 WHERE id IN (${placeholders})`,
+                [token, ...ids]
+            );
+            rows = selected;
         });
+        return { token, rows };
+    }
+
+    private async publishRow(row: OutboxRow): Promise<void> {
+        const stream = `${this.config.streamPrefix}${row.target}`;
+        const created = row.created_at instanceof Date ? row.created_at : new Date(row.created_at);
+        // sourceApp is server config, never row.data.sourceApp.
+        const payload = encodeEnvelope({
+            kind: "event",
+            sourceApp: this.config.sourceApp,
+            event: row.event,
+            data: row.data,
+            emittedAt: created.getTime(),
+            correlationId: row.id,
+        });
+        await this.publisher.xadd(stream, "*", "data", payload);
+    }
+
+    private async markIds(token: string, ids: string[], published: boolean): Promise<void> {
+        if (ids.length === 0) return;
+        const placeholders = ids.map((_, i) => `$${i + 2}`).join(", ");
+        const sql = published
+            ? `UPDATE remote_outbox SET published_at = NOW(), claim_token = NULL WHERE claim_token = $1 AND id IN (${placeholders})`
+            : `UPDATE remote_outbox SET claim_token = NULL, claimed_at = NULL WHERE claim_token = $1 AND id IN (${placeholders})`;
+        await this.db.unsafe(sql, [token, ...ids]);
+    }
+
+    private async processBatch(): Promise<void> {
+        const { token, rows } = await this.claimRows();
+        if (rows.length === 0) return;
+
+        this.metrics?.outboxClaimed(rows.length);
+        if (this.config.enableLogging) {
+            loggerInstance.debug(`Claimed ${rows.length} outbox rows`);
+        }
+
+        // Redis I/O is outside the claim transaction (H-DB-1).
+        const publishResults = await Promise.allSettled(rows.map((row) => this.publishRow(row)));
+
+        const successIds: string[] = [];
+        const failedIds: string[] = [];
+        for (let i = 0; i < publishResults.length; i++) {
+            const result = publishResults[i];
+            const row = rows[i]!;
+            if (result && result.status === "fulfilled") {
+                successIds.push(row.id);
+            } else {
+                failedIds.push(row.id);
+                this.metrics?.outboxPublishFailed();
+                loggerInstance.error({
+                    err: result && result.status === "rejected" ? result.reason : undefined,
+                    outboxId: row.id,
+                    target: row.target,
+                    event: row.event,
+                    msg: "Outbox XADD failed — claim released, row retries next tick",
+                });
+            }
+        }
+
+        await this.markIds(token, successIds, true);
+        if (successIds.length > 0) this.metrics?.outboxPublished(successIds.length);
+        await this.markIds(token, failedIds, false);
     }
 }

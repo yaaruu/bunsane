@@ -40,12 +40,8 @@ export function createPhaseListener(app: any): (event: PhaseChangeEvent) => Prom
     };
 }
 
-export async function runDatabaseReadyPhase(app: any): Promise<void> {
-    try {
-        await app.warmUpPreparedStatementCache();
-    } catch (error) {
-        logger.warn("Failed to warm up prepared statement cache:", error as any);
-    }
+export async function runDatabaseReadyPhase(_app: unknown): Promise<void> {
+    // Prepared-statement warm-up removed: Bun SQL auto-prepares.
 }
 
 export async function runSystemReadyPhase(app: any): Promise<void> {

@@ -51,7 +51,6 @@ import EntityManager from '../core/EntityManager';
 import { ComponentRegistry } from '../core/components';
 import { CacheManager } from '../core/cache';
 import { logger } from '../core/Logger';
-import { preparedStatementCache } from '../database/PreparedStatementCache';
 
 let isSetupComplete = false;
 let setupError: Error | null = null;
@@ -104,8 +103,6 @@ async function initializeTestEnvironment(): Promise<void> {
         });
         logger.info({ scope: 'test-setup' }, 'CacheManager initialized with memory provider');
 
-        // 6. Clear prepared statement cache to ensure clean slate
-        preparedStatementCache.clear();
 
         isSetupComplete = true;
         logger.info({ scope: 'test-setup' }, 'Test environment initialization complete');
@@ -132,12 +129,7 @@ async function cleanupTestEnvironment(): Promise<void> {
             // Ignore cache cleanup errors
         }
 
-        // Clear prepared statement cache
-        try {
-            preparedStatementCache.clear();
-        } catch {
-            // Ignore errors
-        }
+
 
         // Note: We don't close the database connection pool here because
         // Bun's test runner may still need it for parallel test files.

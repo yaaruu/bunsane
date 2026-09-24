@@ -17,23 +17,41 @@ export type OperationMiddleware = (
 /**
  * Compose an array of OperationMiddleware into a single chain.
  * The final `handler` is the original service method.
+ *
+ * The middleware list is closed over once. Each invocation gets its own
+ * index so concurrent calls do not share mutable chain state.
  */
-export function composeOperationMiddleware(
-    middlewares: OperationMiddleware[],
-    handler: (...args: any[]) => Promise<any>,
-    thisArg: any,
-): (args: any, context: any, info: any) => Promise<any> {
-    return (args: any, context: any, info: any) => {
-        let index = 0;
-        const dispatch = (): Promise<any> => {
-            if (index >= middlewares.length) {
+export function bindOperationMiddleware(
+    middlewares: readonly OperationMiddleware[],
+): (
+    handler: (...args: unknown[]) => Promise<unknown>,
+    thisArg: unknown,
+    args: unknown,
+    context: unknown,
+    info: unknown,
+) => Promise<unknown> {
+    const chain = middlewares;
+    const len = chain.length;
+    return (handler, thisArg, args, context, info) => {
+        const dispatch = (index: number): Promise<unknown> => {
+            if (index >= len) {
                 return handler.call(thisArg, args, context, info);
             }
-            const mw = middlewares[index++]!;
-            return mw(args, context, info, dispatch);
+            const mw = chain[index];
+            if (!mw) return handler.call(thisArg, args, context, info);
+            return mw(args, context, info, () => dispatch(index + 1));
         };
-        return dispatch();
+        return dispatch(0);
     };
+}
+
+export function composeOperationMiddleware(
+    middlewares: OperationMiddleware[],
+    handler: (...args: unknown[]) => Promise<unknown>,
+    thisArg: unknown,
+): (args: unknown, context: unknown, info: unknown) => Promise<unknown> {
+    const run = bindOperationMiddleware(middlewares);
+    return (args, context, info) => run(handler, thisArg, args, context, info);
 }
 
 /**
@@ -69,11 +87,11 @@ export function composeOperationMiddleware(
  * ```
  */
 export function Middleware(middlewares: OperationMiddleware[]) {
-    return function (_target: any, _propertyKey: string, descriptor: PropertyDescriptor) {
+    const run = bindOperationMiddleware(middlewares);
+    return function (_target: unknown, _propertyKey: string, descriptor: PropertyDescriptor) {
         const original = descriptor.value;
-        descriptor.value = function (this: any, args: any, context: any, info: any) {
-            const chain = composeOperationMiddleware(middlewares, original, this);
-            return chain(args, context, info);
+        descriptor.value = function (this: unknown, args: unknown, context: unknown, info: unknown) {
+            return run(original, this, args, context, info);
         };
     };
 }

@@ -160,7 +160,7 @@ describe('ResolverBuilder safety net', () => {
             name: 'up',
             type: 'Mutation',
             service: {
-                up: async (input: any) => { serviceCalled = true; return input; },
+                up: async (input: unknown) => { serviceCalled = true; return input; },
             },
             propertyKey: 'up',
             hasInput: true,
@@ -231,14 +231,14 @@ describe('ResolverBuilder safety net', () => {
         expect(result).toBe('payload.bin');
     });
 
-    test('the same permissive-config file IS rejected by the net when unwrapped', async () => {
-        // Control for the test above: identical file through a method with no
-        // upload decorator, so the net runs and the global defaults apply.
+    test('upload metadata without a wrapper still rejects a file the defaults forbid', async () => {
+        const service = { uploadBlobBare: async (_input: unknown) => 'ran' };
+        Reflect.defineMetadata(UPLOAD_CONFIG_KEY, { 0: { field: 'file' } }, service, 'uploadBlobBare');
         const rb = new ResolverBuilder();
         rb.addResolver({
             name: 'uploadBlobBare',
             type: 'Mutation',
-            service: { uploadBlobBare: async (input: any) => 'ran' },
+            service,
             propertyKey: 'uploadBlobBare',
             hasInput: true,
         });

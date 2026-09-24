@@ -5,7 +5,14 @@ export { ComponentInclusionNode } from "./ComponentInclusionNode";
 export { QueryDAG } from "./QueryDAG";
 export { OrQuery } from "./OrQuery";
 export { OrNode } from "./OrNode";
-export { Query, or } from "./Query";
+export { Query, or, FilterOp } from "./Query";
+export type {
+    FilterOperator,
+    QueryFilter,
+    QueryFilterOptions,
+    ComponentWithFilters,
+    SortDirection,
+} from "./Query";
 
 export type FilterSchema<T = any> = {
     [K in keyof T]?: {

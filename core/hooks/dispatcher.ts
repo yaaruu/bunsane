@@ -1,7 +1,8 @@
 import type { LifecycleEvent } from "../events/EntityLifecycleEvents";
 import { logger as MainLogger } from "../Logger";
 import type { RegisteredHook, HookMetrics, RegistryState } from "./registry";
-import { matchesComponentTarget } from "./guards";
+import { matchesCompiledTarget } from "./guards";
+import { trackSideEffect } from "../entity/pendingOps";
 
 const logger = MainLogger.child({ scope: "EntityHookManager" });
 
@@ -99,341 +100,144 @@ export function resetMetrics(state: DispatcherState, eventType?: string): void {
     logger.trace(`Reset metrics${eventType ? ` for ${eventType}` : ''}`);
 }
 
-/**
- * Execute hooks for a specific event
- */
-export async function executeHooks(registryState: RegistryState, dispatcherState: DispatcherState, event: LifecycleEvent): Promise<void> {
-    const eventType = event.getEventType();
-    const hooks = registryState.hooks.get(eventType) || [];
-    const startTime = performance.now();
-    let hadErrors = false;
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+    return value != null && typeof (value as PromiseLike<unknown>).then === "function";
+}
 
-    if (hooks.length === 0) {
+function hookMatches(hook: RegisteredHook, event: LifecycleEvent): boolean {
+    if (!matchesCompiledTarget(event, hook.compiledTarget)) return false;
+    if (hook.options.filter && !hook.options.filter(event)) return false;
+    return true;
+}
+
+/**
+ * Run a hook. Sync callbacks are invoked inline (no Promise.resolve().then).
+ * A thenable return is awaited so an `async` function registered with
+ * `async: false` cannot escape as an unhandled rejection (C13).
+ */
+async function invokeHook(hook: RegisteredHook, event: LifecycleEvent): Promise<void> {
+    const timeout = hook.options.timeout;
+    if (timeout && timeout > 0) {
+        const result = hook.callback(event);
+        const hookPromise = Promise.resolve(result);
+        // Detach a catch so a rejection that loses the race is not unhandled (H-HOOK-2).
+        hookPromise.catch((err) => {
+            logger.warn({ hookId: hook.id, err }, `Late rejection from hook after timeout`);
+        });
+        let timerHandle: NodeJS.Timeout | number | undefined;
+        const timeoutPromise = new Promise<never>((_, reject) => {
+            timerHandle = setTimeout(
+                () => reject(new Error(`Hook ${hook.id} timed out after ${timeout}ms`)),
+                timeout
+            );
+            // Bun/Node Timeout has unref; DOM lib types the handle as a number.
+            const nodeHandle = timerHandle as unknown as { unref?: () => void };
+            nodeHandle.unref?.();
+        });
+        try {
+            await Promise.race([hookPromise, timeoutPromise]);
+        } finally {
+            clearTimeout(timerHandle);
+        }
         return;
     }
 
-    logger.trace(`Executing ${hooks.length} hooks for event: ${eventType}`);
+    const result = hook.callback(event);
+    if (isThenable(result)) {
+        await result;
+    }
+}
 
-    // Separate sync and async hooks
-    const syncHooks = hooks.filter(hook => !hook.options.async);
-    const asyncHooks = hooks.filter(hook => hook.options.async);
-
-    // Execute sync hooks immediately
-    for (const hook of syncHooks) {
-        // Check component targeting first
-        if (!matchesComponentTarget(event, hook.options.componentTarget)) {
-            continue;
-        }
-
-        // Check filter condition
-        if (hook.options.filter && !hook.options.filter(event)) {
-            continue;
-        }
-
+/**
+ * `async: true` hooks must not sit on the save critical path. Schedule them
+ * like component.added: a microtask, errors logged, tracked for shutdown drain.
+ */
+function enqueueAsyncHook(hook: RegisteredHook, event: LifecycleEvent, eventType: string): void {
+    const tracked = Promise.resolve().then(async () => {
+        if (!hookMatches(hook, event)) return;
         try {
-            if (hook.options.timeout && hook.options.timeout > 0) {
-                // Execute with timeout. Timer handle is stored so the
-                // normal-completion path clears it (no leaked pending
-                // timers per successful hook). The underlying callback
-                // promise is attached with a detached .catch so a late
-                // rejection after timeout does not escape as unhandled
-                // (H-HOOK-2 / H-MEM-2).
-                let timerHandle: ReturnType<typeof setTimeout> | null = null;
-                const timeoutPromise = new Promise<never>((_, reject) => {
-                    timerHandle = setTimeout(
-                        () => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)),
-                        hook.options.timeout
-                    );
-                    (timerHandle as unknown as { unref?: () => void }).unref?.();
-                });
-                const hookPromise = Promise.resolve().then(() => hook.callback(event));
-                hookPromise.catch((err) => {
-                    logger.warn({ hookId: hook.id, err }, `Late rejection from hook after timeout`);
-                });
-                try {
-                    await Promise.race([hookPromise, timeoutPromise]);
-                } finally {
-                    if (timerHandle) clearTimeout(timerHandle);
-                }
-            } else {
-                // Always await — callback may be an async function declared
-                // with async:false by mistake. Without await, a rejection
-                // from such a callback escapes as an unhandled rejection
-                // and crashes the process under strict mode (C13).
-                await hook.callback(event);
-            }
+            await invokeHook(hook, event);
+        } catch (error) {
+            logger.error(`Error executing async hook ${hook.id} for event ${eventType}: ${error}`);
+        }
+    }).catch((err) => {
+        logger.error({ hookId: hook.id, err }, `Detached async hook failed for event ${eventType}`);
+    });
+    trackSideEffect(tracked);
+}
+
+async function runSyncHooks(hooks: RegisteredHook[], event: LifecycleEvent, eventType: string): Promise<boolean> {
+    let hadErrors = false;
+    for (const hook of hooks) {
+        if (!hookMatches(hook, event)) continue;
+        try {
+            await invokeHook(hook, event);
         } catch (error) {
             logger.error(`Error executing sync hook ${hook.id} for event ${eventType}: ${error}`);
             hadErrors = true;
-            // Continue executing other hooks even if one fails
         }
     }
-
-    // Execute async hooks in parallel
-    if (asyncHooks.length > 0) {
-        const asyncPromises = asyncHooks.map(async (hook) => {
-            // Check component targeting first
-            if (!matchesComponentTarget(event, hook.options.componentTarget)) {
-                return;
-            }
-
-            // Check filter condition
-            if (hook.options.filter && !hook.options.filter(event)) {
-                return;
-            }
-
-            try {
-                if (hook.options.timeout && hook.options.timeout > 0) {
-                    // Execute with timeout. See sync path for rationale —
-                    // clear the timer on normal completion and detach a
-                    // .catch on the hook promise so late rejections do
-                    // not escape (H-HOOK-2 / H-MEM-2).
-                    let timerHandle: ReturnType<typeof setTimeout> | null = null;
-                    const hookPromise = Promise.resolve().then(() => hook.callback(event));
-                    hookPromise.catch((err) => {
-                        logger.warn({ hookId: hook.id, err }, `Late rejection from hook after timeout`);
-                    });
-                    const timeoutPromise = new Promise<never>((_, reject) => {
-                        timerHandle = setTimeout(
-                            () => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)),
-                            hook.options.timeout
-                        );
-                        (timerHandle as unknown as { unref?: () => void }).unref?.();
-                    });
-                    try {
-                        await Promise.race([hookPromise, timeoutPromise]);
-                    } finally {
-                        if (timerHandle) clearTimeout(timerHandle);
-                    }
-                } else {
-                    // Execute normally
-                    await hook.callback(event);
-                }
-            } catch (error) {
-                logger.error(`Error executing async hook ${hook.id} for event ${eventType}: ${error}`);
-                hadErrors = true;
-                // Continue executing other hooks even if one fails
-            }
-        });
-
-        await Promise.allSettled(asyncPromises);
-    }
-
-    // Record performance metrics
-    const executionTime = performance.now() - startTime;
-    recordMetrics(dispatcherState, eventType, executionTime, hadErrors);
+    return hadErrors;
 }
 
 /**
- * Execute hooks for multiple events in batch
+ * Execute hooks for a specific event.
+ *
+ * No-hook events return before `performance.now()` and before any array
+ * allocation. Sync hooks run inline. `async: true` hooks are enqueued and
+ * are not awaited — callers on the save path must not wait on them.
  */
-export async function executeHooksBatch(registryState: RegistryState, dispatcherState: DispatcherState, events: LifecycleEvent[]): Promise<void> {
-    if (events.length === 0) {
-        return;
+export async function executeHooks(registryState: RegistryState, dispatcherState: DispatcherState, event: LifecycleEvent): Promise<void> {
+    const eventType = event.getEventType();
+    const partition = registryState.partitions.get(eventType);
+    if (!partition) return;
+
+    const startTime = performance.now();
+    logger.trace(`Executing ${partition.sync.length + partition.async.length} hooks for event: ${eventType}`);
+
+    const hadErrors = await runSyncHooks(partition.sync, event, eventType);
+
+    for (const hook of partition.async) {
+        enqueueAsyncHook(hook, event, eventType);
     }
 
-    logger.trace(`Executing hooks for ${events.length} events in batch`);
+    recordMetrics(dispatcherState, eventType, performance.now() - startTime, hadErrors);
+}
 
-    // Group events by type for efficient processing
+/**
+ * Execute hooks for multiple events in batch.
+ * Async hooks are detached, same as {@link executeHooks}.
+ */
+export async function executeHooksBatch(registryState: RegistryState, dispatcherState: DispatcherState, events: LifecycleEvent[]): Promise<void> {
+    if (events.length === 0) return;
+
     const eventsByType = new Map<string, LifecycleEvent[]>();
     for (const event of events) {
         const eventType = event.getEventType();
-        if (!eventsByType.has(eventType)) {
-            eventsByType.set(eventType, []);
+        const partition = registryState.partitions.get(eventType);
+        if (!partition) continue;
+        let bucket = eventsByType.get(eventType);
+        if (!bucket) {
+            bucket = [];
+            eventsByType.set(eventType, bucket);
         }
-        eventsByType.get(eventType)!.push(event);
+        bucket.push(event);
     }
+    if (eventsByType.size === 0) return;
 
-    // Process each event type
-    const promises: Promise<void>[] = [];
-    for (const [eventType, typeEvents] of eventsByType.entries()) {
-        promises.push(executeHooksForType(registryState, dispatcherState, eventType, typeEvents));
-    }
+    logger.trace(`Executing hooks for ${events.length} events in batch`);
 
-    await Promise.allSettled(promises);
-}
-
-/**
- * Execute hooks for a specific event type with multiple events
- */
-async function executeHooksForType(registryState: RegistryState, dispatcherState: DispatcherState, eventType: string, events: LifecycleEvent[]): Promise<void> {
-    const hooks = registryState.hooks.get(eventType) || [];
-
-    if (hooks.length === 0 || events.length === 0) {
-        return;
-    }
-
-    logger.trace(`Executing ${hooks.length} hooks for ${events.length} ${eventType} events`);
-
-    // Pre-filter hooks by component targeting to avoid repeated checks
-    const preFilteredHooks = preFilterHooksByComponentTargeting(hooks, events);
-
-    if (preFilteredHooks.length === 0) {
-        return;
-    }
-
-    // Separate sync and async hooks
-    const syncHooks = preFilteredHooks.filter(hook => !hook.options.async);
-    const asyncHooks = preFilteredHooks.filter(hook => hook.options.async);
-
-    // Execute sync hooks for all events with batch optimization
-    if (syncHooks.length > 0) {
-        await executeSyncHooksBatch(dispatcherState, syncHooks, events, eventType);
-    }
-
-    // Execute async hooks in parallel for all events with batch optimization
-    if (asyncHooks.length > 0) {
-        await executeAsyncHooksBatch(dispatcherState, asyncHooks, events, eventType);
-    }
-}
-
-/**
- * Pre-filter hooks based on component targeting to optimize batch processing
- */
-function preFilterHooksByComponentTargeting(hooks: RegisteredHook[], events: LifecycleEvent[]): RegisteredHook[] {
-    // If no hooks have component targeting, return all hooks (preserving order)
-    const hasComponentTargeting = hooks.some(hook => hook.options.componentTarget);
-    if (!hasComponentTargeting) {
-        return [...hooks]; // Return a copy to avoid modifying the original
-    }
-
-    // For hooks with component targeting, check if they could match any event
-    // This is a broad pre-filter to avoid checking every hook against every event
-    const filteredHooks = hooks.filter(hook => {
-        if (!hook.options.componentTarget) {
-            return true; // No targeting means it matches all
-        }
-
-        // Check if this hook could potentially match any of the events
-        return events.some(event => matchesComponentTarget(event, hook.options.componentTarget));
-    });
-
-    // Return filtered hooks in their original order (priority should already be sorted)
-    return filteredHooks;
-}
-
-/**
- * Execute sync hooks for multiple events with batch optimizations
- */
-async function executeSyncHooksBatch(dispatcherState: DispatcherState, syncHooks: RegisteredHook[], events: LifecycleEvent[], eventType: string): Promise<void> {
-    const startTime = performance.now();
-    let hadErrors = false;
-
-    // Execute hooks in priority order across all events to maintain deterministic execution
-    for (const hook of syncHooks) {
-        // Process all events for this hook
-        for (const event of events) {
-            // Double-check component targeting (pre-filter may have false positives)
-            if (!matchesComponentTarget(event, hook.options.componentTarget)) {
-                continue;
-            }
-
-            // Check filter condition
-            if (hook.options.filter && !hook.options.filter(event)) {
-                continue;
-            }
-
-            try {
-                if (hook.options.timeout && hook.options.timeout > 0) {
-                    // Same cleanup pattern as single-event path (H-HOOK-2 / H-MEM-2).
-                    let timerHandle: ReturnType<typeof setTimeout> | null = null;
-                    const hookPromise = Promise.resolve().then(() => hook.callback(event));
-                    hookPromise.catch((err) => {
-                        logger.warn({ hookId: hook.id, err }, `Late rejection from hook after timeout`);
-                    });
-                    const timeoutPromise = new Promise<never>((_, reject) => {
-                        timerHandle = setTimeout(
-                            () => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)),
-                            hook.options.timeout
-                        );
-                        (timerHandle as unknown as { unref?: () => void }).unref?.();
-                    });
-                    try {
-                        await Promise.race([hookPromise, timeoutPromise]);
-                    } finally {
-                        if (timerHandle) clearTimeout(timerHandle);
-                    }
-                } else {
-                    // Await so async callbacks do not escape as unhandled
-                    // rejections (C13 parity).
-                    await hook.callback(event);
-                }
-            } catch (error) {
-                logger.error(`Error executing sync hook ${hook.id} for event ${eventType}: ${error}`);
-                hadErrors = true;
+    for (const [eventType, typeEvents] of eventsByType) {
+        const partition = registryState.partitions.get(eventType);
+        if (!partition) continue;
+        const startTime = performance.now();
+        let hadErrors = false;
+        for (const event of typeEvents) {
+            if (await runSyncHooks(partition.sync, event, eventType)) hadErrors = true;
+            for (const hook of partition.async) {
+                enqueueAsyncHook(hook, event, eventType);
             }
         }
+        recordMetrics(dispatcherState, eventType, performance.now() - startTime, hadErrors);
     }
-
-    // Record performance metrics
-    const executionTime = performance.now() - startTime;
-    recordMetrics(dispatcherState, eventType, executionTime, hadErrors);
-}
-
-/**
- * Execute async hooks for multiple events with batch optimizations
- */
-async function executeAsyncHooksBatch(dispatcherState: DispatcherState, asyncHooks: RegisteredHook[], events: LifecycleEvent[], eventType: string): Promise<void> {
-    const startTime = performance.now();
-    let hadErrors = false;
-
-    // Collect all async hook executions
-    const asyncPromises: Promise<void>[] = [];
-
-    // Use a more efficient batching strategy for async hooks
-    for (const event of events) {
-        for (const hook of asyncHooks) {
-            // Double-check component targeting
-            if (!matchesComponentTarget(event, hook.options.componentTarget)) {
-                continue;
-            }
-
-            // Check filter condition
-            if (hook.options.filter && !hook.options.filter(event)) {
-                continue;
-            }
-
-            asyncPromises.push(
-                (async () => {
-                    try {
-                        if (hook.options.timeout && hook.options.timeout > 0) {
-                            // Same cleanup pattern (H-HOOK-2 / H-MEM-2).
-                            let timerHandle: ReturnType<typeof setTimeout> | null = null;
-                            const hookPromise = Promise.resolve().then(() => hook.callback(event));
-                            hookPromise.catch((err) => {
-                                logger.warn({ hookId: hook.id, err }, `Late rejection from hook after timeout`);
-                            });
-                            const timeoutPromise = new Promise<never>((_, reject) => {
-                                timerHandle = setTimeout(
-                                    () => reject(new Error(`Hook ${hook.id} timed out after ${hook.options.timeout}ms`)),
-                                    hook.options.timeout
-                                );
-                                (timerHandle as unknown as { unref?: () => void }).unref?.();
-                            });
-                            try {
-                                await Promise.race([hookPromise, timeoutPromise]);
-                            } finally {
-                                if (timerHandle) clearTimeout(timerHandle);
-                            }
-                        } else {
-                            // Execute normally
-                            await hook.callback(event);
-                        }
-                    } catch (error) {
-                        logger.error(`Error executing async hook ${hook.id} for event ${eventType}: ${error}`);
-                        hadErrors = true;
-                    }
-                })()
-            );
-        }
-    }
-
-    // Execute all async hooks in parallel with controlled concurrency
-    if (asyncPromises.length > 0) {
-        await Promise.allSettled(asyncPromises);
-    }
-
-    // Record performance metrics
-    const executionTime = performance.now() - startTime;
-    recordMetrics(dispatcherState, eventType, executionTime, hadErrors);
 }

@@ -7,6 +7,8 @@
  * - XACK on success; failures skip ACK to allow PEL redelivery
  * - XAUTOCLAIM on startup reclaims PEL entries idle > autoClaimIdleMs
  * - RPC dispatch via `kind: "rpc_request"` envelope — sends response to `replyTo`
+ *   only when replyTo is under `rpc:responses:`
+ * - In-flight handlers are capped (default 8). ACK remains per message id.
  */
 
 import Redis from "ioredis";
@@ -20,8 +22,24 @@ import type {
     RpcResponse,
 } from "./types";
 import type { RemoteMetrics } from "./metrics";
+import { encodeEnvelope, isAllowedReplyTo, readRpcSecret, verifyEnvelopeSignature } from "./envelopeSign";
+import { alreadyProcessed, rememberProcessed } from "./idempotency";
 
 const loggerInstance = logger.child({ scope: "StreamConsumer" });
+
+export const DEFAULT_CONSUMER_CONCURRENCY = 8;
+
+function resolveConsumerConcurrency(config: RemoteManagerConfig): number {
+    if (typeof config.consumerConcurrency === "number" && config.consumerConcurrency > 0) {
+        return Math.floor(config.consumerConcurrency);
+    }
+    const raw = process.env.BUNSANE_RPC_CONSUMER_CONCURRENCY;
+    if (raw) {
+        const parsed = parseInt(raw, 10);
+        if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    return DEFAULT_CONSUMER_CONCURRENCY;
+}
 
 type InternalEventHandler = { id: string; fn: RemoteHandler };
 type InternalRpcHandler = { id: string; fn: RpcHandler };
@@ -48,7 +66,10 @@ export class StreamConsumer {
     private rpcHandlers = new Map<string, InternalRpcHandler>();
     private running = false;
     private loopPromise: Promise<void> | null = null;
-    private currentHandlerPromise: Promise<void> | null = null;
+    private inflight = new Set<Promise<void>>();
+    private active = 0;
+    private slotWaiters: Array<() => void> = [];
+    private concurrency: number;
     private metrics?: RemoteMetrics;
 
     constructor(
@@ -73,6 +94,7 @@ export class StreamConsumer {
             responseStreamMaxLen: config.responseStreamMaxLen ?? 1000,
             dlqMaxDeliveries: config.dlqMaxDeliveries ?? 3,
         };
+        this.concurrency = resolveConsumerConcurrency(config);
     }
 
     get dlqStream(): string {
@@ -145,9 +167,7 @@ export class StreamConsumer {
             await this.loopPromise.catch(() => {});
             this.loopPromise = null;
         }
-        if (this.currentHandlerPromise) {
-            await this.currentHandlerPromise.catch(() => {});
-        }
+        await Promise.allSettled([...this.inflight]);
         loggerInstance.info("Stream consumer stopped");
     }
 
@@ -193,6 +213,30 @@ export class StreamConsumer {
         }
     }
 
+    private acquireSlot(): Promise<void> {
+        if (this.active < this.concurrency) {
+            this.active++;
+            return Promise.resolve();
+        }
+        const { promise, resolve } = Promise.withResolvers<void>();
+        this.slotWaiters.push(resolve);
+        return promise;
+    }
+    private releaseSlot(): void {
+        const next = this.slotWaiters.shift();
+        if (next) {
+            // Slot transfers to the waiter; active stays the same.
+            next();
+        } else {
+            this.active--;
+        }
+    }
+
+    private track(job: Promise<void>): void {
+        this.inflight.add(job);
+        job.finally(() => this.inflight.delete(job));
+    }
+
     private async consumeLoop(): Promise<void> {
         while (this.running) {
             try {
@@ -214,13 +258,10 @@ export class StreamConsumer {
                 for (const [, entries] of result) {
                     for (const [msgId, fields] of entries) {
                         if (!this.running) break;
-                        this.currentHandlerPromise = this.processMessage(
-                            msgId,
-                            fields,
-                            false
-                        );
-                        await this.currentHandlerPromise;
-                        this.currentHandlerPromise = null;
+                        await this.acquireSlot();
+                        const job = this.processMessage(msgId, fields, false)
+                            .finally(() => this.releaseSlot());
+                        this.track(job);
                     }
                 }
             } catch (error: any) {
@@ -248,7 +289,16 @@ export class StreamConsumer {
             return;
         }
 
-        // DLQ check: if this message has been redelivered too many times,
+        const secret = readRpcSecret();
+        if (secret && !verifyEnvelopeSignature(envelope, secret)) {
+            await this.ack(msgId);
+            this.metrics?.signatureRejected();
+            loggerInstance.warn(
+                { msgId, event: envelope.event, msg: "Rejected envelope — missing or invalid HMAC signature" }
+            );
+            return;
+        }
+
         // move it to the DLQ and ACK the original so the consumer group can
         // progress past it. Disabled when dlqMaxDeliveries is 0.
         if (reclaimed && this.config.dlqMaxDeliveries > 0) {
@@ -340,6 +390,7 @@ export class StreamConsumer {
         envelope: RemoteEnvelope,
         reclaimed: boolean
     ): Promise<void> {
+        if (await this.dropIfDuplicate(msgId, envelope)) return;
         this.metrics?.eventReceived();
         const handlers = this.eventHandlers.get(envelope.event) ?? [];
         if (handlers.length === 0) {
@@ -381,6 +432,7 @@ export class StreamConsumer {
 
         if (allOk) {
             this.metrics?.eventHandled();
+            this.noteProcessed(envelope);
             await this.ack(msgId);
         }
     }
@@ -398,6 +450,17 @@ export class StreamConsumer {
             );
             return;
         }
+
+        if (!isAllowedReplyTo(replyTo)) {
+            await this.ack(msgId);
+            this.metrics?.replyToRejected();
+            loggerInstance.warn(
+                { msgId, replyTo, event, msg: "Rejected RPC replyTo outside rpc:responses: prefix" }
+            );
+            return;
+        }
+
+        if (await this.dropIfDuplicate(msgId, envelope)) return;
 
         // Deadline check — caller may already have timed out
         if (typeof deadline === "number" && Date.now() > deadline) {
@@ -423,6 +486,7 @@ export class StreamConsumer {
                 },
                 respondedAt: Date.now(),
             });
+            this.noteProcessed(envelope);
             await this.ack(msgId);
             return;
         }
@@ -445,6 +509,7 @@ export class StreamConsumer {
                 result,
                 respondedAt: Date.now(),
             });
+            this.noteProcessed(envelope);
             await this.ack(msgId);
             this.metrics?.rpcHandlerExecuted();
         } catch (error: any) {
@@ -458,6 +523,7 @@ export class StreamConsumer {
                 error: { code, message, extensions },
                 respondedAt: Date.now(),
             });
+            this.noteProcessed(envelope);
             await this.ack(msgId);
             this.metrics?.rpcHandlerFailed();
             loggerInstance.error(
@@ -483,7 +549,7 @@ export class StreamConsumer {
                 this.config.responseStreamMaxLen,
                 "*",
                 "data",
-                JSON.stringify(response)
+                encodeEnvelope({ ...response })
             );
         } catch (error: any) {
             loggerInstance.error(
@@ -495,6 +561,24 @@ export class StreamConsumer {
                 }
             );
         }
+    }
+
+    private async dropIfDuplicate(msgId: string, envelope: RemoteEnvelope): Promise<boolean> {
+        if (!envelope.correlationId || !envelope.sourceApp) return false;
+        if (!alreadyProcessed(envelope.sourceApp, envelope.correlationId)) return false;
+        await this.ack(msgId);
+        this.metrics?.duplicateDropped();
+        if (this.config.enableLogging) {
+            loggerInstance.debug(
+                `Duplicate ${envelope.sourceApp}/${envelope.correlationId} at ${msgId}, ACK'd`
+            );
+        }
+        return true;
+    }
+
+    private noteProcessed(envelope: RemoteEnvelope): void {
+        if (!envelope.correlationId || !envelope.sourceApp) return;
+        rememberProcessed(envelope.sourceApp, envelope.correlationId);
     }
 
     private async ack(msgId: string): Promise<void> {

@@ -70,13 +70,19 @@ export class BaseComponent {
             let value = (this as any)[prop];
             if (value !== null && value !== undefined) {
                 if (propMeta.propertyType === Date) {
-                    if (!(value instanceof Date)) {
+                    if (typeof value === 'string') {
+                        const parsed = new Date(value);
+                        if (Number.isNaN(parsed.getTime())) {
+                            throw new Error(`Invalid Date for property '${prop}' on component '${this._comp_name}': ${value}`);
+                        }
+                        value = parsed.toISOString();
+                    } else if (!(value instanceof Date)) {
                         throw new Error(`Type mismatch for property '${prop}' on component '${this._comp_name}': expected Date, got ${typeof value}`);
-                    }
-                    if (Number.isNaN(value.getTime())) {
+                    } else if (Number.isNaN(value.getTime())) {
                         throw new Error(`Invalid Date for property '${prop}' on component '${this._comp_name}'`);
+                    } else {
+                        value = value.toISOString();
                     }
-                    value = value.toISOString();
                 } else if (propMeta.propertyType === Number && typeof value === 'number' && !Number.isFinite(value)) {
                     throw new Error(`Invalid number for property '${prop}' on component '${this._comp_name}': ${value}`);
                 }
@@ -128,7 +134,7 @@ export class BaseComponent {
         if(this.id === "") {
             throw new Error("Component must have an ID to be updated");
         }
-        await trx`UPDATE components SET data = ${this.serializableData()} WHERE id = ${this.id}`
+        await trx`UPDATE components SET data = ${this.serializableData()}, updated_at = NOW() WHERE id = ${this.id}`
     }
 
     public setPersisted(persisted: boolean) {

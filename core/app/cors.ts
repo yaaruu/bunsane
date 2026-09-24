@@ -21,9 +21,11 @@ export function validateOrigin(
     requestOrigin: string | null | undefined,
 ): string | null {
     if (!cors || !requestOrigin) return null;
+    // The literal string "null" is a real Origin value (sandboxed iframes).
+    // Never reflect it when credentials are on.
+    if (requestOrigin === 'null' && cors.credentials) return null;
 
     const configOrigin = cors.origin;
-
     if (configOrigin === undefined) return null;
 
     if (configOrigin === '*') {

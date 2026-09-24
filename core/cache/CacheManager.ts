@@ -6,6 +6,7 @@ import { logger } from '../Logger';
 import type { Entity } from '../Entity';
 import type { BaseComponent } from '../components';
 import type { ComponentData } from '../RequestLoaders';
+import { bumpAllComponentReadFlights, bumpComponentReadFlight } from './componentReadFlight';
 import {
     getEntity as _getEntity,
     setEntityWriteThrough as _setEntityWriteThrough,
@@ -190,6 +191,7 @@ export class CacheManager {
     public async setComponentsBatchWriteThrough(
         entries: Array<{ entityId: string; typeId: string; component: BaseComponent; ttl?: number }>,
     ): Promise<void> {
+        for (const entry of entries) bumpComponentReadFlight(entry.entityId, entry.typeId);
         return _setComponentsBatchWriteThrough(this.provider, this.config, entries);
     }
 
@@ -198,6 +200,7 @@ export class CacheManager {
      * More granular than invalidateComponents which can invalidate all components
      */
     public async invalidateComponent(entityId: string, typeId: string): Promise<void> {
+        bumpComponentReadFlight(entityId, typeId);
         return _invalidateComponent(this.provider, this.config, this._publishInvalidation.bind(this), entityId, typeId);
     }
 
@@ -211,6 +214,7 @@ export class CacheManager {
         componentTypeIds: string[],
         opts?: { includeEntityKey?: boolean },
     ): Promise<void> {
+        for (const typeId of componentTypeIds) bumpComponentReadFlight(entityId, typeId);
         return _invalidateEntityComponents(this.provider, this.config, this._publishInvalidation.bind(this), entityId, componentTypeIds, opts);
     }
 
@@ -219,6 +223,7 @@ export class CacheManager {
      * Useful for bulk invalidation operations
      */
     public async invalidateComponents(components: Array<{ entityId: string; typeId: string }>): Promise<void> {
+        for (const component of components) bumpComponentReadFlight(component.entityId, component.typeId);
         return _invalidateComponents(this.provider, this.config, this._publishInvalidation.bind(this), components);
     }
 
@@ -229,6 +234,7 @@ export class CacheManager {
      * stale L1/L2 cache entries.
      */
     public async invalidateEntities(entityIds: string[]): Promise<void> {
+        if (entityIds.length > 0) bumpAllComponentReadFlights();
         return _invalidateEntities(this.provider, this.config, this._publishInvalidation.bind(this), entityIds);
     }
 
@@ -237,6 +243,7 @@ export class CacheManager {
      * Uses pattern matching to efficiently clear all component caches for an entity
      */
     public async invalidateAllEntityComponents(entityId: string): Promise<void> {
+        bumpAllComponentReadFlights();
         return _invalidateAllEntityComponents(this.provider, this.config, this._publishInvalidation.bind(this), entityId);
     }
 

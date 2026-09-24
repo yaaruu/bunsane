@@ -1,8 +1,10 @@
+import type { ComponentConstructor } from "../components/ComponentRegistry";
 import { Entity } from "../Entity";
 import { getMetadataStorage } from "../metadata";
 import { Query } from "../../query";
 import { getRequestScope } from "../requestScope";
-
+import { resolveRelationTarget, type RelationTarget } from "./relationTarget";
+import { resolveFkOnMap } from "./fkResolve";
 /**
  * Populate relation fields on an entity according to the archetype's relationMap.
  * Extracted from BaseArcheType.populateRelations().
@@ -29,13 +31,13 @@ export async function populateRelations(archetype: any, entity: Entity): Promise
     }
     await Promise.all(fieldPromises);
 }
-
-function resolveRelatedArchetypeInstance(relatedArchetype: any, storage: any): any | null {
-    if (typeof relatedArchetype === "function") {
-        return new (relatedArchetype as any)();
+function resolveRelatedArchetypeInstance(relatedArchetype: RelationTarget): { componentMap: Record<string, ComponentConstructor>; getEntityWithID: (id: string) => Promise<Entity | null> } | null {
+    try {
+        const { ctor } = resolveRelationTarget(relatedArchetype);
+        return new ctor() as unknown as { componentMap: Record<string, ComponentConstructor>; getEntityWithID: (id: string) => Promise<Entity | null> };
+    } catch {
+        return null;
     }
-    const meta = storage.archetypes.find((a: any) => a.name === relatedArchetype);
-    return meta ? new (meta.target as any)() : null;
 }
 
 async function populateBelongsTo(
@@ -62,27 +64,12 @@ async function populateBelongsTo(
             }
         }
     } else {
-        const candidateComponents: Array<{ compCtor: any }> = [];
-        for (const compCtor of Object.values(archetype.componentMap)) {
-            const compCtorAny = compCtor as any;
-            const typeId = storage.getComponentId(compCtorAny.name);
-            const componentProps = storage.getComponentProperties(typeId);
-            const hasForeignKey = componentProps.some((prop: any) => prop.propertyKey === foreignKey);
-            if (hasForeignKey) {
-                candidateComponents.push({ compCtor: compCtorAny });
-            }
-        }
-
-        if (candidateComponents.length > 0) {
-            const componentInstances = await Promise.all(
-                candidateComponents.map(({ compCtor }) => entity.get(compCtor as any))
-            );
-
-            for (const componentInstance of componentInstances) {
-                if (componentInstance && (componentInstance as any)[foreignKey] !== undefined) {
-                    foreignId = (componentInstance as any)[foreignKey];
-                    break;
-                }
+        const fk = resolveFkOnMap(archetype.componentMap, foreignKey);
+        if (fk) {
+            const componentInstance = await entity.get(fk.componentCtor as never);
+            if (componentInstance && typeof componentInstance === "object" && fk.foreignKeyField in componentInstance) {
+                const value = (componentInstance as Record<string, unknown>)[fk.foreignKeyField];
+                if (typeof value === "string") foreignId = value;
             }
         }
     }
@@ -104,7 +91,7 @@ async function populateBelongsTo(
         return;
     }
 
-    const relatedArchetypeInstance = resolveRelatedArchetypeInstance(relatedArchetype, storage);
+    const relatedArchetypeInstance = resolveRelatedArchetypeInstance(relatedArchetype);
     if (!relatedArchetypeInstance) return;
     const relatedEntity = await relatedArchetypeInstance.getEntityWithID(foreignId);
     if (relatedEntity) {
@@ -122,40 +109,27 @@ async function populateHasMany(
     const foreignKey = relationOptions?.foreignKey;
     if (!foreignKey) return;
 
-    const relatedArchetypeInstance = resolveRelatedArchetypeInstance(relatedArchetype, storage);
+    const relatedArchetypeInstance = resolveRelatedArchetypeInstance(relatedArchetype);
     if (!relatedArchetypeInstance) return;
 
-    let foreignKeyComponent: any = null;
-    for (const compCtor of Object.values(relatedArchetypeInstance.componentMap)) {
-        const compCtorAny = compCtor as any;
-        const typeId = storage.getComponentId(compCtorAny.name);
-        const componentProps = storage.getComponentProperties(typeId);
-        const hasForeignKey = componentProps.some((prop: any) => prop.propertyKey === foreignKey);
-        if (hasForeignKey) {
-            foreignKeyComponent = compCtorAny;
-            break;
-        }
-    }
-    if (!foreignKeyComponent) return;
+    const fk = resolveFkOnMap(relatedArchetypeInstance.componentMap, foreignKey);
+    if (!fk) return;
 
-    // Batched path: type-scoped FK loader collapses sibling parents sharing
-    // the same (componentType, fkField) into one query.
     const scope = getRequestScope();
     if (scope?.loaders?.relationsByComponentFk) {
-        const componentTypeId = storage.getComponentId(foreignKeyComponent.name);
-        (entity as any)[fieldName] = await scope.loaders.relationsByComponentFk.load({
+        (entity as unknown as Record<string, unknown>)[fieldName] = await scope.loaders.relationsByComponentFk.load({
             entityId: entity.id,
-            componentTypeId,
-            foreignKeyField: foreignKey,
+            componentTypeId: fk.componentTypeId,
+            foreignKeyField: fk.foreignKeyField,
         });
         return;
     }
+    const query = new Query() as unknown as {
+        with(ctor: ComponentConstructor, options: { filters: Array<{ field: string; operator: "="; value: string }> }): { exec(): Promise<unknown[]> };
+    };
+    const matchingEntities = await query.with(fk.componentCtor as unknown as ComponentConstructor, {
+        filters: [{ field: fk.foreignKeyField, operator: "=", value: entity.id }],
+    }).exec();
 
-    const matchingEntities = await new Query()
-        .with(foreignKeyComponent, {
-            filters: [{ field: foreignKey, operator: '=', value: entity.id }]
-        })
-        .exec();
-
-    (entity as any)[fieldName] = matchingEntities;
+    (entity as unknown as Record<string, unknown>)[fieldName] = matchingEntities;
 }

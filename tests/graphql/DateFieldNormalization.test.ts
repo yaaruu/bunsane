@@ -55,8 +55,8 @@ describe('Date @CompData field normalization', () => {
             inMemoryComp.userId = 'u1';
 
             const result = clockInAtResolver!.resolver(inMemoryComp, {}, {});
-            expect(typeof result).toBe('string');
-            expect(result).toBe('2026-05-17T07:29:08.272Z');
+            if (typeof result !== "string") throw new Error("expected ISO string");
+            expect(result).toBe("2026-05-17T07:29:08.272Z");
             expect(new Date(result).toISOString()).toBe(result);
         });
 
@@ -78,7 +78,7 @@ describe('Date @CompData field normalization', () => {
             expect(result).toBe('2026-05-17T07:29:08.272Z');
         });
 
-        test('returns string fields unchanged', () => {
+        test('does not install a leaf resolver for non-Date props', () => {
             const archetype = new DateTestArchetype();
             const resolvers = archetype.generateFieldResolvers();
 
@@ -87,8 +87,7 @@ describe('Date @CompData field normalization', () => {
                 r => r.typeName === componentTypeName && r.fieldName === 'userId'
             );
 
-            const result = userIdResolver!.resolver({ userId: 'abc' }, {}, {});
-            expect(result).toBe('abc');
+            expect(userIdResolver).toBeUndefined();
         });
     });
 

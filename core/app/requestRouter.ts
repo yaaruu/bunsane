@@ -1,7 +1,9 @@
 import * as path from "path";
 import { logger as MainLogger } from "../Logger";
 import { getMetadataScript } from "../metadata";
+import { isVerboseErrors } from "../envMode";
 import { addCorsHeaders, getCorsHeaders } from "./cors";
+import type { CorsConfig } from "../App";
 import {
     handleHealth,
     handleReady,
@@ -12,99 +14,126 @@ import { getDbStats } from "../../database/instrumentedDb";
 import { isPoolAcquisitionError } from "../../database/poolErrors";
 import { isAdmissionTimeout } from "../../database/gateway";
 import type { RequestStats } from "../RequestContext";
+import { rejectOversizedBody, type BodyLimits } from "./bodyLimit";
+import { bindRequestTimeout } from "./requestTimeout";
+import { authorizeInfo } from "./infoAccess";
+import type { InfoAccess } from "./limits";
+import { DOCS_CSP, STUDIO_CSP, documentGuardHeaders } from "../middleware/SecurityHeaders";
+import { setResponseHeaders } from "../middleware/headers";
+import { docsHtml, SWAGGER_INIT_JS } from "../../swagger/docsPage";
 
 const logger = MainLogger.child({ scope: "App" });
 
+export type RestEndpoint = {
+    method: string;
+    path: string;
+    handler: Function;
+    regex?: RegExp;
+    service?: unknown;
+};
+
 /**
- * Pool exhaustion is a capacity failure, not a request failure: the statement
- * never reached the database. Answer 503 + Retry-After so clients and load
- * balancers treat it as retryable back-pressure, instead of the 500 that says
- * "your request was wrong" and invites no retry.
- *
- * Note this covers the REST and framework paths. GraphQL responses are formatted
- * by Yoga, which reports resolver errors in a 200 body — a pooled-out GraphQL
- * request is still visible via `poolAcquireFailures` in /metrics and the error
- * log, but its HTTP status is Yoga's to decide.
+ * The slice of App the router reads. Private fields are visible at runtime;
+ * App casts itself to this interface so the router is not `app: any`.
  */
+export interface RequestHost {
+    config: { cors?: CorsConfig };
+    name: string;
+    openAPISpecGenerator: { toJSON(): string } | null;
+    studioEnabled: boolean;
+    studioAssetsPath: string | null;
+    studioIndexHtml: string | null;
+    staticAssets: Map<string, string>;
+    restEndpointMap: Map<string, RestEndpoint>;
+    restEndpoints: RestEndpoint[];
+    yoga: ((req: Request) => Promise<Response>) | null | undefined;
+    isReady: boolean;
+    isShuttingDown: boolean;
+    requestTimeoutMs: number;
+    jsonBodyLimit: number;
+    multipartBodyLimit: number;
+    metricsAccess: InfoAccess;
+    docsAccess: InfoAccess;
+    collectMetrics(): Promise<unknown>;
+    remote: { health(): Promise<{ healthy: boolean }> } | null;
+}
+
 function poolExhaustedResponse(): Response {
     return new Response(
         JSON.stringify({
-            error: "Database connection pool exhausted",
+            error: "Service temporarily unavailable",
             code: "POOL_EXHAUSTED",
-            retryable: true,
         }),
         {
             status: 503,
-            headers: { "Content-Type": "application/json", "Retry-After": "1" },
+            headers: {
+                "Content-Type": "application/json",
+                "Retry-After": "1",
+            },
         },
     );
 }
 
-function combineSignals(signals: AbortSignal[]): AbortSignal {
-    const anyFn = (AbortSignal as any).any;
-    if (typeof anyFn === 'function') {
-        return anyFn.call(AbortSignal, signals);
-    }
-    const controller = new AbortController();
-    for (const s of signals) {
-        if (s.aborted) {
-            controller.abort((s as any).reason);
-            return controller.signal;
-        }
-        // { once: true } auto-removes the listener after first fire, so no
-        // explicit removeEventListener is needed; GC cleans up the rest.
-        s.addEventListener('abort', () => controller.abort((s as any).reason), { once: true });
-    }
-    return controller.signal;
+function bodyLimitsOf(app: RequestHost): BodyLimits {
+    return { json: app.jsonBodyLimit, multipart: app.multipartBodyLimit };
 }
 
-export async function handleRequest(app: any, req: Request): Promise<Response> {
+async function loadStudioIndex(app: RequestHost): Promise<string | null> {
+    if (app.studioIndexHtml) return app.studioIndexHtml;
+    if (!app.studioAssetsPath) return null;
+    const indexPath = path.join(app.studioAssetsPath, "index.html");
+    const file = Bun.file(indexPath);
+    if (!(await file.exists())) return null;
+    const html = (await file.text()).replace("</head>", `${getMetadataScript()}</head>`);
+    app.studioIndexHtml = html;
+    return html;
+}
+
+function isStudioShell(pathname: string): boolean {
+    if (pathname === "/studio" || pathname === "/studio/") return true;
+    if (pathname.startsWith("/studio/api/") || pathname.startsWith("/studio/assets/")) return false;
+    const rest = pathname.slice("/studio/".length);
+    return rest.length > 0 && !rest.includes(".");
+}
+
+function withDocumentHeaders(response: Response, csp: string): Response {
+    return setResponseHeaders(response, documentGuardHeaders(csp));
+}
+
+export async function handleRequest(app: RequestHost, req: Request): Promise<Response> {
     const url = new URL(req.url);
     const method = req.method;
     const startTime = Date.now();
 
-    if (method === 'OPTIONS') {
+    if (method === "OPTIONS") {
         return new Response(null, {
             status: 204,
             headers: getCorsHeaders(app.config.cors, req),
         });
     }
 
-    // Request timeout — combine framework wall-clock with client abort signal
-    // and rebind onto the request so downstream handlers (Yoga, REST) see
-    // cancellation propagation (C05).
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => {
-        controller.abort(new Error(`Request timeout after 30000ms: ${method} ${url.pathname}`));
-        const stats = (req as any).__bunsaneStats as RequestStats | undefined;
-        logger.warn({
-            scope: 'App',
-            method,
-            path: url.pathname,
-            operationName: stats?.operationName,
-            dataLoaderCalls: stats?.dataLoaderCalls,
-            dbQueryCount: stats?.dbQueryCount,
-            msg: 'Request timeout',
-        }, `Request timeout: ${method} ${url.pathname}`);
-    }, 30000);
-    // Prevent the timer from keeping the Bun event loop alive at high concurrency.
-    (timeoutId as any).unref?.();
-    const combinedSignal = combineSignals([req.signal, controller.signal]);
-    req = new Request(req, { signal: combinedSignal });
-
     const cors = app.config.cors;
     const wrap = (response: Response) => addCorsHeaders(response, cors, req);
 
+    const tooBig = rejectOversizedBody(req, bodyLimitsOf(app));
+    if (tooBig) return wrap(tooBig);
+
+    const bound = bindRequestTimeout(req, app.requestTimeoutMs, url.pathname);
+    req = bound.req;
+
     try {
         if (url.pathname === "/health") {
-            const response = await handleHealth(app);
-            clearTimeout(timeoutId);
-            return wrap(response);
+            return wrap(await handleHealth(app));
+        }
+
+        if (url.pathname === "/health/ready") {
+            return wrap(await handleReady(app));
         }
 
         if (url.pathname === "/metrics") {
+            const denied = authorizeInfo(app.metricsAccess, req, "x-metrics-token");
+            if (denied) return wrap(denied);
             const metrics = await app.collectMetrics();
-            clearTimeout(timeoutId);
             return wrap(new Response(JSON.stringify(metrics), {
                 status: 200,
                 headers: { "Content-Type": "application/json" },
@@ -112,73 +141,42 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
         }
 
         if (url.pathname === "/health/remote") {
-            const response = await handleRemoteHealth(app);
-            clearTimeout(timeoutId);
-            return wrap(response);
+            const denied = authorizeInfo(app.metricsAccess, req, "x-metrics-token");
+            if (denied) return wrap(denied);
+            return wrap(await handleRemoteHealth(app));
         }
 
-        if (url.pathname === "/health/ready") {
-            const response = await handleReady(app);
-            clearTimeout(timeoutId);
-            return wrap(response);
+        if (url.pathname === "/docs/swagger-init.js") {
+            const denied = authorizeInfo(app.docsAccess, req, "x-docs-token");
+            if (denied) return wrap(denied);
+            return wrap(new Response(SWAGGER_INIT_JS, {
+                headers: {
+                    "Content-Type": "text/javascript; charset=utf-8",
+                    "Cache-Control": "public, max-age=3600",
+                },
+            }));
         }
 
         if (url.pathname === "/openapi.json") {
-            clearTimeout(timeoutId);
+            const denied = authorizeInfo(app.docsAccess, req, "x-docs-token");
+            if (denied) return wrap(denied);
             return wrap(new Response(app.openAPISpecGenerator!.toJSON(), {
                 headers: { "Content-Type": "application/json" },
             }));
         }
 
         if (url.pathname === "/docs") {
-            clearTimeout(timeoutId);
-            const swaggerUIHTML = `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>${app.name} Documentation</title>
-    <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.10.3/swagger-ui.css" />
-    <style>
-        html { box-sizing: border-box; overflow: -moz-scrollbars-vertical; overflow-y: scroll; }
-        *, *:before, *:after { box-sizing: inherit; }
-        body { margin: 0; background: #fafafa; }
-    </style>
-</head>
-<body>
-    <div id="swagger-ui"></div>
-    <script src="https://unpkg.com/swagger-ui-dist@5.10.3/swagger-ui-bundle.js"></script>
-    <script>
-        window.onload = function() {
-            const ui = SwaggerUIBundle({
-                url: '/openapi.json',
-                dom_id: '#swagger-ui',
-                deepLinking: true,
-                presets: [
-                    SwaggerUIBundle.presets.apis,
-                    SwaggerUIBundle.presets.standalone
-                ],
-                plugins: [
-                    SwaggerUIBundle.plugins.DownloadUrl
-                ],
-                layout: "BaseLayout"
-            });
-        };
-    </script>
-</body>
-</html>`;
-            return wrap(new Response(swaggerUIHTML, {
+            const denied = authorizeInfo(app.docsAccess, req, "x-docs-token");
+            if (denied) return wrap(denied);
+            return wrap(withDocumentHeaders(new Response(docsHtml(app.name), {
                 headers: { "Content-Type": "text/html" },
-            }));
+            }), DOCS_CSP));
         }
 
-        // SEC-01: studio is deny-by-default. When it was never enabled, every
-        // /studio path 404s explicitly instead of falling through to the
-        // GraphQL catch-all (which would serve a landing page for GETs).
         if (
             !app.studioEnabled &&
             (url.pathname === "/studio" || url.pathname.startsWith("/studio/"))
         ) {
-            clearTimeout(timeoutId);
             return wrap(new Response(
                 JSON.stringify({ error: "Not found" }),
                 { status: 404, headers: { "Content-Type": "application/json" } },
@@ -187,7 +185,6 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
 
         const studioApiResponse = await routeStudio(app, url, req, method);
         if (studioApiResponse) {
-            clearTimeout(timeoutId);
             return wrap(studioApiResponse);
         }
 
@@ -195,8 +192,6 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
             app.studioEnabled &&
             (url.pathname === "/studio" || url.pathname.startsWith("/studio/"))
         ) {
-            clearTimeout(timeoutId);
-
             if (url.pathname.startsWith("/studio/api/")) {
                 return wrap(new Response(
                     JSON.stringify({ error: "Studio API endpoint not found" }),
@@ -204,81 +199,51 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
                 ));
             }
 
-            if (!url.pathname.startsWith("/studio/assets/")) {
-                const studioIndexPath = path.join(
-                    import.meta.dirname,
-                    "..",
-                    "..",
-                    "studio",
-                    "dist",
-                    "index.html",
-                );
-                try {
-                    const studioFile = Bun.file(studioIndexPath);
-                    if (await studioFile.exists()) {
-                        let html = await studioFile.text();
-                        html = html.replace("</head>", `${getMetadataScript()}</head>`);
-                        return wrap(new Response(html, {
-                            headers: { "Content-Type": "text/html" },
-                        }));
-                    } else {
-                        return wrap(new Response(
-                            "Studio not built. Run `bun run build:studio` to build the studio.",
-                            { status: 404, headers: { "Content-Type": "text/plain" } },
-                        ));
-                    }
-                } catch (error) {
-                    console.log("Error loading studio index.html:", error);
-                    return wrap(new Response("Studio not available", {
-                        status: 404,
-                        headers: { "Content-Type": "text/plain" },
-                    }));
+            if (isStudioShell(url.pathname)) {
+                const html = await loadStudioIndex(app);
+                if (html) {
+                    return wrap(withDocumentHeaders(new Response(html, {
+                        headers: { "Content-Type": "text/html" },
+                    }), STUDIO_CSP));
                 }
+                return wrap(new Response(
+                    "Studio not built. Run `bun run build:studio` to build the studio.",
+                    { status: 404, headers: { "Content-Type": "text/plain" } },
+                ));
             }
         }
 
         for (const [route, folder] of app.staticAssets) {
-            if (url.pathname.startsWith(route)) {
-                const rawRelative = url.pathname.slice(route.length);
-                // Decode percent-encoding first so encoded traversal sequences
-                // (e.g. %2e%2e%2f) can't slip past the containment check.
-                let decodedRelative: string;
-                try {
-                    decodedRelative = decodeURIComponent(rawRelative);
-                } catch {
-                    clearTimeout(timeoutId);
-                    return wrap(new Response("Bad request", {
-                        status: 400,
-                        headers: { "Content-Type": "text/plain" },
-                    }));
+            if (!url.pathname.startsWith(route)) continue;
+            const rawRelative = url.pathname.slice(route.length);
+            let decodedRelative: string;
+            try {
+                decodedRelative = decodeURIComponent(rawRelative);
+            } catch {
+                return wrap(new Response("Bad request", {
+                    status: 400,
+                    headers: { "Content-Type": "text/plain" },
+                }));
+            }
+            const relForResolve = decodedRelative.replace(/^[/\\]+/, "");
+            const resolvedBase = path.resolve(folder);
+            const resolvedFile = path.resolve(resolvedBase, relForResolve);
+            if (
+                resolvedFile !== resolvedBase &&
+                !resolvedFile.startsWith(resolvedBase + path.sep)
+            ) {
+                return wrap(new Response("Forbidden", {
+                    status: 403,
+                    headers: { "Content-Type": "text/plain" },
+                }));
+            }
+            try {
+                const file = Bun.file(resolvedFile);
+                if (await file.exists()) {
+                    return wrap(new Response(file));
                 }
-                // Resolve absolutely and confirm the target stays inside the
-                // served folder — blocks path traversal (../) out of the dir.
-                // Strip leading slashes so path.resolve treats the request as
-                // relative to the folder (an absolute-looking arg would reset
-                // to the filesystem root and bypass containment).
-                const relForResolve = decodedRelative.replace(/^[/\\]+/, "");
-                const resolvedBase = path.resolve(folder);
-                const resolvedFile = path.resolve(resolvedBase, relForResolve);
-                if (
-                    resolvedFile !== resolvedBase &&
-                    !resolvedFile.startsWith(resolvedBase + path.sep)
-                ) {
-                    clearTimeout(timeoutId);
-                    return wrap(new Response("Forbidden", {
-                        status: 403,
-                        headers: { "Content-Type": "text/plain" },
-                    }));
-                }
-                try {
-                    const file = Bun.file(resolvedFile);
-                    if (await file.exists()) {
-                        clearTimeout(timeoutId);
-                        return wrap(new Response(file));
-                    }
-                } catch (error) {
-                    logger.error(`Error serving static file ${resolvedFile}:`, error as any);
-                }
+            } catch (error) {
+                logger.error({ err: error, path: resolvedFile }, `Error serving static file ${resolvedFile}`);
             }
         }
 
@@ -286,7 +251,6 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
         let endpoint = app.restEndpointMap.get(endpointKey);
 
         if (!endpoint) {
-            // Only iterate endpoints that have params (regex precompiled at registration).
             for (const ep of app.restEndpoints) {
                 if (!ep.regex || ep.method !== method) continue;
                 if (ep.regex.test(url.pathname)) {
@@ -302,21 +266,18 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
                 const duration = Date.now() - startTime;
                 logger.trace(`REST ${method} ${url.pathname} completed in ${duration}ms`);
 
-                clearTimeout(timeoutId);
                 if (result instanceof Response) {
                     return wrap(result);
-                } else {
-                    return wrap(new Response(JSON.stringify(result), {
-                        headers: { "Content-Type": "application/json" },
-                    }));
                 }
+                return wrap(new Response(JSON.stringify(result), {
+                    headers: { "Content-Type": "application/json" },
+                }));
             } catch (error) {
                 const duration = Date.now() - startTime;
                 logger.error(
+                    { err: error, method, path: endpoint.path, duration },
                     `Error in REST endpoint ${method} ${endpoint.path} after ${duration}ms`,
-                    error as any,
                 );
-                clearTimeout(timeoutId);
                 if (isPoolAcquisitionError(error) || isAdmissionTimeout(error)) {
                     return wrap(poolExhaustedResponse());
                 }
@@ -324,7 +285,7 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
                     JSON.stringify({
                         error: "Internal server error",
                         code: "INTERNAL_ERROR",
-                        ...(process.env.NODE_ENV === 'development' && {
+                        ...(isVerboseErrors() && {
                             message: (error as Error)?.message,
                         }),
                     }),
@@ -337,18 +298,17 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
             const response = await app.yoga(req);
             const duration = Date.now() - startTime;
             logger.trace(`GraphQL request completed in ${duration}ms`);
-            clearTimeout(timeoutId);
-            return response;
+            return wrap(response);
         }
 
-        clearTimeout(timeoutId);
         return wrap(new Response("Not Found", { status: 404 }));
     } catch (error) {
         const duration = Date.now() - startTime;
-        const stats = (req as any).__bunsaneStats as RequestStats | undefined;
+        const tracked = req as Request & { __bunsaneStats?: RequestStats };
+        const stats = tracked.__bunsaneStats;
         logger.error(
             {
-                scope: 'App',
+                scope: "App",
                 method,
                 path: url.pathname,
                 duration,
@@ -360,7 +320,6 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
             },
             `Request failed after ${duration}ms: ${method} ${url.pathname}`,
         );
-        clearTimeout(timeoutId);
 
         if ((error as Error).name === "AbortError") {
             return wrap(new Response(
@@ -377,11 +336,13 @@ export async function handleRequest(app: any, req: Request): Promise<Response> {
             JSON.stringify({
                 error: "Internal server error",
                 code: "INTERNAL_ERROR",
-                ...(process.env.NODE_ENV === 'development' && {
+                ...(isVerboseErrors() && {
                     message: (error as Error)?.message,
                 }),
             }),
             { status: 500, headers: { "Content-Type": "application/json" } },
         ));
+    } finally {
+        bound.cancel();
     }
 }

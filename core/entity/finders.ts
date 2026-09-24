@@ -4,12 +4,14 @@
 // is needed to avoid a module-eval cycle.
 import { logger } from "../Logger";
 import { dbRun } from "../../database/gateway";
-import db from "../../database";
 import ComponentRegistry from "../components/ComponentRegistry";
 import { uuidv7 } from "../../utils/uuid";
 import { sql, SQL } from "bun";
-import { getMetadataStorage } from "../metadata";
 import { addComponent } from "./componentAccess";
+import { hydrateComponentRow } from "./hydrateComponentRow";
+import { getCacheManager } from "./getCacheManager";
+import { COMPONENT_TOMBSTONE } from "../cache/CacheManager";
+import { trackCacheOp } from "./pendingOps";
 // Value import: the Entity class is only referenced inside function bodies
 // (called at runtime, after module init), so the ESM cycle with Entity.ts
 // resolves via live bindings without a load-order hazard.
@@ -45,18 +47,26 @@ export async function loadMultiple(ids: string[]): Promise<Entity[]> {
         const { id, entity_id, type_id, data } = row;
         const ctor = ComponentRegistry.getConstructor(type_id);
         if (ctor) {
-            const comp = new ctor();
-            const componentData = typeof data === 'string' ? JSON.parse(data) : data;
-            Object.assign(comp, componentData);
-            comp.id = id;
-            comp.setPersisted(true);
-            comp.setDirty(false);
             const target = entitiesMap.get(entity_id);
-            if (target) addComponent(target, comp);
+            if (target) addComponent(target, hydrateComponentRow(ctor, { id, data, typeId: type_id }));
         }
     }
 
     return Array.from(entitiesMap.values());
+}
+
+type EagerComponentRow = {
+    id: string;
+    entity_id: string;
+    type_id: string;
+    data: unknown;
+    created_at?: Date;
+    updated_at?: Date;
+    deleted_at?: Date | null;
+};
+
+function pairKey(entityId: string, typeId: string): string {
+    return `${entityId}\0${typeId}`;
 }
 
 export async function loadComponents(entities: Entity[], componentIds: string[], skipCache: boolean = false): Promise<void> {
@@ -66,32 +76,119 @@ export async function loadComponents(entities: Entity[], componentIds: string[],
     const validEntities = entities.filter(e => e.id && e.id.trim() !== '');
     if (validEntities.length === 0) return;
 
-    const entityIds = validEntities.map(e => e.id);
+    type Pending = { entity: Entity; typeId: string };
+    const pending: Pending[] = [];
+    for (const entity of validEntities) {
+        for (const typeId of componentIds) {
+            if (entity.components.has(typeId)) continue;
+            // skipCache also bypasses the entity-local negative cache so the
+            // caller gets a fresh read. Otherwise a confirmed absence is final.
+            if (!skipCache && entity._missingComponents.has(typeId)) continue;
+            pending.push({ entity, typeId });
+        }
+    }
+    if (pending.length === 0) return;
 
-    const components = await dbRun<any[]>((conn) => conn`
-        SELECT c.id, c.entity_id, c.type_id, c.data
+    const resolved = new Set<string>();
+    const cacheManager = skipCache ? null : getCacheManager().getInstance();
+    const cacheConfig = cacheManager?.getConfig();
+    const cacheOn = !!cacheConfig?.enabled && !!cacheConfig.component?.enabled;
+
+    if (cacheOn && cacheManager) {
+        try {
+            const cached = await cacheManager.getComponents(pending.map((p) => ({ entityId: p.entity.id, typeId: p.typeId })));
+            for (let i = 0; i < cached.length; i++) {
+                const value = cached[i];
+                const req = pending[i]!;
+                const key = pairKey(req.entity.id, req.typeId);
+                if (value === COMPONENT_TOMBSTONE) {
+                    req.entity._missingComponents.add(req.typeId);
+                    resolved.add(key);
+                } else if (value) {
+                    const ctor = ComponentRegistry.getConstructor(req.typeId);
+                    if (ctor) {
+                        addComponent(req.entity, hydrateComponentRow(ctor, { id: value.id, data: value.data, typeId: req.typeId }));
+                    }
+                    resolved.add(key);
+                }
+            }
+        } catch (error) {
+            logger.warn({ scope: "cache", component: "finders", msg: "Cache read failed, falling back to database", error });
+        }
+    }
+
+    const missing = pending.filter((p) => !resolved.has(pairKey(p.entity.id, p.typeId)));
+    if (missing.length === 0) return;
+
+    const entityIds: string[] = [];
+    const typeIds: string[] = [];
+    const seenEntities = new Set<string>();
+    const seenTypes = new Set<string>();
+    for (const item of missing) {
+        if (!seenEntities.has(item.entity.id)) {
+            seenEntities.add(item.entity.id);
+            entityIds.push(item.entity.id);
+        }
+        if (!seenTypes.has(item.typeId)) {
+            seenTypes.add(item.typeId);
+            typeIds.push(item.typeId);
+        }
+    }
+
+    const rows = await dbRun<EagerComponentRow[]>((conn) => conn`
+        SELECT c.id, c.entity_id, c.type_id, c.data, c.created_at, c.updated_at, c.deleted_at
         FROM components c
-        WHERE c.entity_id IN ${sql(entityIds)} AND c.type_id IN ${sql(componentIds)} AND c.deleted_at IS NULL
+        WHERE c.entity_id IN ${sql(entityIds)} AND c.type_id IN ${sql(typeIds)} AND c.deleted_at IS NULL
     `, "finders.eagerLoad", { lane: "request", label: "finders.eagerLoad" });
 
-    // Use Map for O(1) lookups instead of O(n) find() - fixes O(n²) performance issue
     const entityMap = new Map<string, Entity>(validEntities.map(e => [e.id, e]));
+    const missingKeys = new Set(missing.map((item) => pairKey(item.entity.id, item.typeId)));
+    const found = new Set<string>();
+    const cacheRows: Array<{
+        id: string;
+        entityId: string;
+        typeId: string;
+        data: unknown;
+        createdAt: Date;
+        updatedAt: Date;
+        deletedAt: Date | null;
+    }> = [];
 
-    for (const row of components) {
-        const { id, entity_id, type_id, data } = row;
-        const entity = entityMap.get(entity_id);  // O(1) instead of O(n)
-        if (entity) {
-            const ctor = ComponentRegistry.getConstructor(type_id);
-            if (ctor) {
-                const comp = new ctor();
-                const componentData = typeof data === 'string' ? JSON.parse(data) : data;
-                Object.assign(comp, componentData);
-                comp.id = id;
-                comp.setPersisted(true);
-                comp.setDirty(false);
-                addComponent(entity, comp);
-            }
+    for (const row of rows) {
+        const key = pairKey(row.entity_id, row.type_id);
+        if (!missingKeys.has(key)) continue;
+        found.add(key);
+        const entity = entityMap.get(row.entity_id);
+        const ctor = ComponentRegistry.getConstructor(row.type_id);
+        if (entity && ctor && !entity.components.has(row.type_id)) {
+            addComponent(entity, hydrateComponentRow(ctor, { id: row.id, data: row.data, typeId: row.type_id }));
         }
+        if (cacheOn) {
+            cacheRows.push({
+                id: row.id,
+                entityId: row.entity_id,
+                typeId: row.type_id,
+                data: row.data,
+                createdAt: row.created_at ?? new Date(),
+                updatedAt: row.updated_at ?? new Date(),
+                deletedAt: row.deleted_at ?? null,
+            });
+        }
+    }
+
+    for (const item of missing) {
+        if (!found.has(pairKey(item.entity.id, item.typeId))) {
+            item.entity._missingComponents.add(item.typeId);
+        }
+    }
+
+    if (cacheOn && cacheManager) {
+        const requested = missing.map((item) => ({ entityId: item.entity.id, typeId: item.typeId }));
+        const ttl = cacheConfig?.component?.ttl;
+        trackCacheOp(
+            cacheManager.setComponentsWriteThrough(cacheRows, requested, ttl)
+                .catch((error) => logger.warn({ scope: "cache", component: "finders", msg: "Cache write failed after eager load", error }))
+        );
     }
 }
 
@@ -168,34 +265,14 @@ export function deserialize(data: any): Entity {
 
     // Handle serialized format: { id, components: { ComponentName: {...data} } }
     if (data.components && typeof data.components === 'object') {
-        const storage = getMetadataStorage();
-
         for (const [componentName, componentData] of Object.entries(data.components)) {
-            // Find the component constructor by name
             const ComponentCtor = ComponentRegistry.getConstructorByName(componentName);
             if (!ComponentCtor) {
                 logger.warn(`Cannot deserialize component: constructor not found for ${componentName}`);
                 continue;
             }
-
-            const comp = new ComponentCtor();
             const parsedData = typeof componentData === 'string' ? JSON.parse(componentData) : componentData;
-            Object.assign(comp, parsedData);
-
-            // Restore Date objects
-            const typeId = comp.getTypeID();
-            const props = storage.componentProperties.get(typeId);
-            if (props) {
-                for (const prop of props) {
-                    if (prop.propertyType === Date && typeof (comp as any)[prop.propertyKey] === 'string') {
-                        (comp as any)[prop.propertyKey] = new Date((comp as any)[prop.propertyKey]);
-                    }
-                }
-            }
-
-            comp.setPersisted(true);
-            comp.setDirty(false);
-            addComponent(entity, comp);
+            addComponent(entity, hydrateComponentRow(ComponentCtor, { data: parsedData }));
         }
     }
 

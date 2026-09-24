@@ -11,30 +11,112 @@ import { getMetadataStorage } from "../core/metadata";
 import { assertIdentifier, normalizeSortDirection } from "./SqlIdentifier";
 import { getMembershipSource, getMembershipTable } from "./membershipSource";
 
+const numericByComponent = new WeakMap<object, Map<string, boolean>>();
+
 /**
- * Check if a component property is numeric based on metadata
- * Used to apply proper casting in ORDER BY clauses for index usage
+ * Check if a component property is numeric based on metadata.
+ * Result is cached on the component metadata object (WeakMap) so sort/filter
+ * emission does not re-walk property lists. Unregistered components are not
+ * cached — registration may still follow.
  */
 export function isNumericProperty(componentName: string, propertyName: string): boolean {
     const storage = getMetadataStorage();
-    const typeId = storage.getComponentId(componentName);
+    const componentMeta = storage.components_map.get(componentName);
+    if (componentMeta) {
+        const hit = numericByComponent.get(componentMeta)?.get(propertyName);
+        if (hit !== undefined) return hit;
+    }
 
-    // Check indexed fields first (most reliable)
+    const typeId = storage.getComponentId(componentName);
     const indexedFields = storage.getIndexedFields(typeId);
     const indexedField = indexedFields.find(f => f.propertyKey === propertyName);
+    let numeric = false;
     if (indexedField?.indexType === 'numeric') {
-        return true;
+        numeric = true;
+    } else {
+        const props = storage.getComponentProperties(typeId);
+        const prop = props.find(p => p.propertyKey === propertyName);
+        numeric = prop?.propertyType === Number;
     }
 
-    // Check property metadata for Number type
-    const props = storage.getComponentProperties(typeId);
-    const prop = props.find(p => p.propertyKey === propertyName);
-    if (prop?.propertyType === Number) {
-        return true;
+    if (componentMeta) {
+        let cache = numericByComponent.get(componentMeta);
+        if (!cache) {
+            cache = new Map();
+            numericByComponent.set(componentMeta, cache);
+        }
+        cache.set(propertyName, numeric);
     }
-
-    return false;
+    return numeric;
 }
+
+/**
+ * Composite keyset WHERE fragment for a single sort key.
+ * Shared by ComponentInclusionNode and Query's OR / entity-sort wrappers.
+ *
+ * Returns ` ${connective} <predicate>` (leading space). Does not read
+ * QueryContext and does not throw — callers that reject 'before' do so
+ * before calling. Params are pushed only through `addParam`, which must
+ * return the 1-based placeholder index of the value just pushed.
+ *
+ * `direction` is the fetch ORDER BY direction (already flipped for 'before').
+ * `idDirection` is the entity_id tie-break in that same ORDER BY. Forward
+ * pages use ASC (`id > $id`). 'before' fetches use DESC (`id < $id`), including
+ * the NULL-cursor walk. Row comparison is only valid when both columns are ASC.
+ */
+export function buildKeysetCursorWhere(args: {
+    sortExpr: string;
+    entityIdCol: string;
+    connective: 'WHERE' | 'AND';
+    direction: 'ASC' | 'DESC';
+    nullsFirst: boolean;
+    valueCast: '::text' | '::numeric' | '::timestamptz';
+    cursor: { v: string | null; id: string };
+    addParam: (value: unknown) => number;
+    /** Tie-break direction matching ORDER BY entity_id. Default ASC. */
+    idDirection?: 'ASC' | 'DESC';
+}): string {
+    const { sortExpr, entityIdCol, connective, direction, nullsFirst, valueCast, cursor, addParam } = args;
+    const idDesc = args.idDirection === 'DESC';
+    const idOp = idDesc ? '<' : '>';
+    if (cursor.v === null) {
+        const idIdx = addParam(cursor.id);
+        return ` ${connective} (${sortExpr} IS NULL AND ${entityIdCol} ${idOp} $${idIdx}::uuid)`;
+    }
+    if (direction !== 'DESC') {
+        const nullInclude = nullsFirst ? '' : ` OR ${sortExpr} IS NULL`;
+        if (!idDesc) {
+            const vIdx = addParam(cursor.v);
+            const idIdx = addParam(cursor.id);
+            return ` ${connective} ((${sortExpr}, ${entityIdCol}) > ($${vIdx}${valueCast}, $${idIdx}::uuid)${nullInclude})`;
+        }
+        const vGtIdx = addParam(cursor.v);
+        const vEqIdx = addParam(cursor.v);
+        const idIdx = addParam(cursor.id);
+        return ` ${connective} (${sortExpr} > $${vGtIdx}${valueCast} OR (${sortExpr} = $${vEqIdx}${valueCast} AND ${entityIdCol} < $${idIdx}::uuid)${nullInclude})`;
+    }
+    const vLtIdx = addParam(cursor.v);
+    const vEqIdx = addParam(cursor.v);
+    const idIdx = addParam(cursor.id);
+    return ` ${connective} (${sortExpr} < $${vLtIdx}${valueCast} OR (${sortExpr} = $${vEqIdx}${valueCast} AND ${entityIdCol} ${idOp} $${idIdx}::uuid))`;
+}
+
+/** Flip sort + tiebreak when fetching a 'before' page so Query can reverse rows. */
+function cursorSortPresentation(
+    direction: 'ASC' | 'DESC',
+    nullsFirst: boolean,
+    isBefore: boolean,
+): { direction: 'ASC' | 'DESC'; nullsFirst: boolean; nullsClause: string; idDirection: 'ASC' | 'DESC' } {
+    const dir = isBefore ? (direction === 'DESC' ? 'ASC' : 'DESC') : direction;
+    const nf = isBefore ? !nullsFirst : nullsFirst;
+    return {
+        direction: dir,
+        nullsFirst: nf,
+        nullsClause: nf ? 'NULLS FIRST' : 'NULLS LAST',
+        idDirection: isBefore ? 'DESC' : 'ASC',
+    };
+}
+
 
 export class ComponentInclusionNode extends QueryNode {
     private getComponentTableName(compId: string): string {
@@ -45,17 +127,18 @@ export class ComponentInclusionNode extends QueryNode {
     }
 
     /**
-     * Whether the multi-component sort-driven scan applies. Must be pure
+     * Whether the sort-driven / leaf-driven scan applies. Must be pure
      * (no param side effects) — QueryDAG consults it to skip CTE planning
      * and execute() consults it before building any SQL.
      *
-     * Eligible shape: exactly one sort order on a required component, two or
-     * more required components, no findById, no cursor pagination. Filters
-     * on any component are supported (applied inline / via EXISTS).
+     * Eligible shape: exactly one sort order on a required component
+     * (one or more required components — single-component needs no dummy
+     * filters), no findById, no plain entity-id cursor. Filters on any
+     * component are supported (applied inline / via EXISTS).
      */
     public static canUseSortDrivenScan(context: QueryContext): boolean {
         if (context.sortOrders.length !== 1) return false;
-        if (context.componentIds.size < 2) return false;
+        if (context.componentIds.size < 1) return false;
         if (context.withId) return false;
         if (context.cursorId !== null) return false;
         if (context.hasOrQuery) return false;
@@ -63,6 +146,7 @@ export class ComponentInclusionNode extends QueryNode {
         if (!sortTypeId || !context.componentIds.has(sortTypeId)) return false;
         return true;
     }
+
 
     /**
      * Build a filter condition against `<alias>.data`. Shared implementation
@@ -165,49 +249,25 @@ export class ComponentInclusionNode extends QueryNode {
             );
         }
         const sortOrder = context.sortOrders[0]!;
-        const isDesc = sortOrder.direction === 'DESC';
-        const isBefore = context.cursorDirection === 'before';
+        const presented = cursorSortPresentation(
+            sortOrder.direction,
+            !!sortOrder.nullsFirst,
+            context.cursorDirection === 'before',
+        );
 
-        // 'before' direction for component sortBy cursors is not yet implemented:
-        // it requires reversing ORDER BY and post-reversing rows in JS.
-        // Throw rather than returning silently wrong pages.
-        if (isBefore) {
-            throw new Error(
-                "sortedCursor(token, 'before') is not supported for component sortBy(). " +
-                'Use OFFSET pagination or walk pages forward only.'
-            );
-        }
+        return buildKeysetCursorWhere({
+            sortExpr,
+            entityIdCol,
+            connective,
+            direction: presented.direction,
+            nullsFirst: presented.nullsFirst,
+            valueCast: isNumeric ? '::numeric' : '::text',
+            cursor: context.compositeCursor,
+            addParam: (value) => context.addParam(value),
+            idDirection: presented.idDirection,
+        });
 
-        const { v, id } = context.compositeCursor;
-        const cast = isNumeric ? '::numeric' : '::text';
-        const nullsLast = !sortOrder.nullsFirst; // default is NULLS LAST
 
-        if (v === null) {
-            // Cursor is inside the NULL region (sort value was null on the last seen row).
-            // Under NULLS LAST (ASC): NULLs appear at the end; advance within them by id.
-            // Under NULLS FIRST (DESC): NULLs appear at the start; after a null cursor the
-            //   non-null region follows — but that case cannot arise for DESC NULLS FIRST
-            //   because NULLs come first (they'd be returned before any non-null values).
-            // Simplest correct behaviour: walk within the null region by id tiebreak.
-            const idIdx = context.addParam(id);
-            return ` ${connective} (${sortExpr} IS NULL AND ${entityIdCol} > $${idIdx}::uuid)`;
-        }
-
-        // ASC+after: (sort_expr, id) > ($v, $id), plus NULL-sorted rows which come
-        // AFTER all non-null rows under NULLS LAST (forward direction, not yet visited).
-        if (!isDesc) {
-            const vIdx = context.addParam(v);
-            const idIdx = context.addParam(id);
-            const nullInclude = nullsLast ? ` OR ${sortExpr} IS NULL` : '';
-            return ` ${connective} ((${sortExpr}, ${entityIdCol}) > ($${vIdx}${cast}, $${idIdx}::uuid)${nullInclude})`;
-        }
-
-        // DESC+after: values come in decreasing order; "after" (v,id) means smaller
-        // value, or same value and larger id (id is ASC within ties).
-        const vLtIdx = context.addParam(v);
-        const vEqIdx = context.addParam(v);
-        const idGtIdx = context.addParam(id);
-        return ` ${connective} (${sortExpr} < $${vLtIdx}${cast} OR (${sortExpr} = $${vEqIdx}${cast} AND ${entityIdCol} > $${idGtIdx}::uuid))`;
     }
 
     private applySortDrivenScan(context: QueryContext): string | null {
@@ -303,27 +363,30 @@ export class ComponentInclusionNode extends QueryNode {
         // Composite keyset predicate (AND because WHERE already has type_id check).
         const cursorWhere = this.buildCompositeCursorWhere(context, sortExpr, isNumeric, 's.entity_id', 'AND');
 
+        const presented = cursorSortPresentation(
+            sortOrder.direction,
+            !!sortOrder.nullsFirst,
+            context.compositeCursor !== null && context.cursorDirection === 'before',
+        );
         let sql: string;
         if (driveDirect || !getMembershipSource().isLegacy) {
-            // Drive directly from the sort component (partition) table —
-            // membership and component data are the same row.
             sql = `SELECT s.entity_id as id FROM ${sortTable} s
                 WHERE s.type_id = $${context.addParam(sortTypeId)}::text
                 AND s.deleted_at IS NULL${extraConditions}${cursorWhere}
-                ORDER BY ${sortExpr} ${normalizeSortDirection(sortOrder.direction)} ${nullsClause}, s.entity_id ASC`;
+                ORDER BY ${sortExpr} ${normalizeSortDirection(presented.direction)} ${presented.nullsClause}, s.entity_id ${presented.idDirection}`;
         } else {
             sql = `SELECT s.entity_id as id FROM entity_components ec
                 JOIN ${sortTable} s ON s.id = ec.component_id AND s.deleted_at IS NULL
                 WHERE ec.type_id = $${context.addParam(sortTypeId)}::text
                 AND ec.deleted_at IS NULL${extraConditions}${cursorWhere}
-                ORDER BY ${sortExpr} ${normalizeSortDirection(sortOrder.direction)} ${nullsClause}, s.entity_id ASC`;
+                ORDER BY ${sortExpr} ${normalizeSortDirection(presented.direction)} ${presented.nullsClause}, s.entity_id ${presented.idDirection}`;
         }
 
         if (context.limit !== null) {
             sql += ` LIMIT $${context.addParam(context.limit)}`;
         }
         // OFFSET is not used alongside composite cursor pagination.
-        if (!context.compositeCursor && (context.offsetValue > 0 || context.limit !== null)) {
+        if (!context.compositeCursor && context.offsetValue > 0) {
             sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
         }
 
@@ -396,25 +459,16 @@ export class ComponentInclusionNode extends QueryNode {
             }
 
             if (useCTE) {
-                // Use CTE for base entity filtering
-                sql = `SELECT DISTINCT ${context.cteName}.entity_id as id FROM ${context.cteName}`;
-
-                // Filter by the specific component type if not already in CTE
-                if (!componentIds.some(id => context.componentIds.has(id))) {
-                    sql += ` WHERE EXISTS (
-                        SELECT 1 FROM ${getMembershipTable()} ec
-                        WHERE ec.entity_id = ${context.cteName}.entity_id
-                        AND ec.type_id = $${context.addParam(componentId)}::text
-                        AND ec.deleted_at IS NULL
-                    )`;
-                }
+                // CTE already selected this type (and pushed filters when it could).
+                // UNIQUE(entity_id, type_id) — no DISTINCT, no membership re-probe.
+                sql = `SELECT ${context.cteName}.entity_id as id FROM ${context.cteName}`;
             } else {
                 // Prefer partition leaf when available (better pruning + filter indexes).
                 let singleTable = getMembershipTable();
                 if (!getMembershipSource().isLegacy && shouldUseDirectPartition()) {
                     singleTable = this.getComponentTableName(componentId) || singleTable;
                 }
-                sql = `SELECT DISTINCT ec.entity_id as id FROM ${singleTable} ec WHERE ec.type_id = $${context.addParam(componentId)}::text AND ec.deleted_at IS NULL`;
+                sql = `SELECT ec.entity_id as id FROM ${singleTable} ec WHERE ec.type_id = $${context.addParam(componentId)}::text AND ec.deleted_at IS NULL`;
                 // Push field filters into the membership scan when `data` is available
                 // (non-legacy) — avoids a separate EXISTS re-scan (RP-03).
                 if (!getMembershipSource().isLegacy) {
@@ -486,7 +540,7 @@ export class ComponentInclusionNode extends QueryNode {
                         sql += ` LIMIT $${context.addParam(context.limit)}`;
                     }
                     // Only add OFFSET when not using cursor-based pagination
-                    if (context.cursorId === null && (context.offsetValue > 0 || context.limit !== null)) {
+                    if (context.cursorId === null && context.offsetValue > 0) {
                         sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
                     }
                 }
@@ -497,23 +551,9 @@ export class ComponentInclusionNode extends QueryNode {
             const componentParamIndices: Map<string, number> = new Map();
 
             if (useCTE) {
-                // Use CTE for base entity filtering
-                sql = `SELECT DISTINCT ${context.cteName}.entity_id as id FROM ${context.cteName}`;
-
-                // Ensure all required components are present
-                sql += ` WHERE (`;
-                const componentChecks = componentIds.map(compId => {
-                    if (!componentParamIndices.has(compId)) {
-                        componentParamIndices.set(compId, context.addParam(compId));
-                    }
-                    return `EXISTS (
-                        SELECT 1 FROM ${getMembershipTable()} ec
-                        WHERE ec.entity_id = ${context.cteName}.entity_id
-                        AND ec.type_id = $${componentParamIndices.get(compId)}::text
-                        AND ec.deleted_at IS NULL
-                    )`;
-                });
-                sql += componentChecks.join(' AND ') + `)`;
+                // CTE already INTERSECTed every required component (filters pushed
+                // when the membership row carries data). Select the id set directly.
+                sql = `SELECT ${context.cteName}.entity_id as id FROM ${context.cteName}`;
             } else {
                 // Use INTERSECT for multi-component queries (much faster than GROUP BY + HAVING).
                 // Field filters are pushed into each branch when membership rows
@@ -596,7 +636,7 @@ export class ComponentInclusionNode extends QueryNode {
                         sql += ` LIMIT $${context.addParam(context.limit)}`;
                     }
                     // Only add OFFSET when not using cursor-based pagination
-                    if (context.cursorId === null && (context.offsetValue > 0 || context.limit !== null)) {
+                    if (context.cursorId === null && context.offsetValue > 0) {
                         sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
                     }
                 }
@@ -691,52 +731,32 @@ export class ComponentInclusionNode extends QueryNode {
             // filter by keyset predicate, then apply LIMIT.
             const sortOrder = context.sortOrders[0]!;
             const isNumericSv = isNumericProperty(sortOrder.component, sortOrder.property);
-            const nullsClauseSv = sortOrder.nullsFirst ? 'NULLS FIRST' : 'NULLS LAST';
-            const { v, id: cursorId } = context.compositeCursor;
-            const cast = isNumericSv ? '::numeric' : '::text';
-            const isDesc = sortOrder.direction === 'DESC';
-            const isBefore = context.cursorDirection === 'before';
-
-            // Strip the trailing " ASC|DESC NULLS FIRST|LAST" to get the raw scalar subquery.
+            const presented = cursorSortPresentation(
+                sortOrder.direction,
+                !!sortOrder.nullsFirst,
+                context.cursorDirection === 'before',
+            );
             const svExpr = orderByClauses[0]!.replace(/ (ASC|DESC) NULLS (FIRST|LAST)$/, '');
 
-            // 'before' for composite keyset is not implemented — throw instead of
-            // returning silently wrong pages.
-            if (isBefore) {
-                throw new Error(
-                    "sortedCursor(token, 'before') is not supported for component sortBy(). " +
-                    'Use OFFSET pagination or walk pages forward only.'
-                );
-            }
-
-            const nullsLast = !sortOrder.nullsFirst;
-            let keysetWhere: string;
-            if (v === null) {
-                // Cursor is inside the NULL region: advance within it by id tiebreak.
-                const idIdx = context.addParam(cursorId);
-                keysetWhere = `(_sorted._sv IS NULL AND _sorted.id > $${idIdx}::uuid)`;
-            } else if (!isDesc) {
-                // ASC+after: row-comparison + include NULL-sorted rows (NULLS LAST →
-                // they appear at the very end, after all non-null rows).
-                const vIdx = context.addParam(v);
-                const idIdx = context.addParam(cursorId);
-                const nullInclude = nullsLast ? ' OR _sorted._sv IS NULL' : '';
-                keysetWhere = `((_sorted._sv, _sorted.id) > ($${vIdx}${cast}, $${idIdx}::uuid)${nullInclude})`;
-            } else {
-                // DESC+after: smaller value, or same value and larger id.
-                const vLtIdx = context.addParam(v);
-                const vEqIdx = context.addParam(v);
-                const idGtIdx = context.addParam(cursorId);
-                keysetWhere = `(_sorted._sv < $${vLtIdx}${cast} OR (_sorted._sv = $${vEqIdx}${cast} AND _sorted.id > $${idGtIdx}::uuid))`;
-            }
+            const cursorWhere = buildKeysetCursorWhere({
+                sortExpr: '_sorted._sv',
+                entityIdCol: '_sorted.id',
+                connective: 'WHERE',
+                direction: presented.direction,
+                nullsFirst: presented.nullsFirst,
+                valueCast: isNumericSv ? '::numeric' : '::text',
+                cursor: context.compositeCursor,
+                addParam: (value) => context.addParam(value),
+                idDirection: presented.idDirection,
+            });
 
             let sql = `WITH _sorted AS (
                 SELECT base_entities.id, ${svExpr} AS _sv
                 FROM (${baseQuery}) AS base_entities
             )
-            SELECT _sorted.id FROM _sorted
-            WHERE ${keysetWhere}
-            ORDER BY _sorted._sv ${normalizeSortDirection(sortOrder.direction)} ${nullsClauseSv}, _sorted.id ASC`;
+            SELECT _sorted.id FROM _sorted${cursorWhere}
+            ORDER BY _sorted._sv ${normalizeSortDirection(presented.direction)} ${presented.nullsClause}, _sorted.id ${presented.idDirection}`;
+
 
             if (!context.paginationAppliedInCTE && context.limit !== null) {
                 sql += ` LIMIT $${context.addParam(context.limit)}`;
@@ -762,7 +782,7 @@ export class ComponentInclusionNode extends QueryNode {
                 sql += ` LIMIT $${context.addParam(context.limit)}`;
             }
             // Only add OFFSET when not using cursor-based pagination
-            if (!context.compositeCursor && context.cursorId === null && (context.offsetValue > 0 || context.limit !== null)) {
+            if (!context.compositeCursor && context.cursorId === null && context.offsetValue > 0) {
                 sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
             }
         }
@@ -821,24 +841,25 @@ export class ComponentInclusionNode extends QueryNode {
         // must remain (NULLS LAST/FIRST + keyset). Filters already restate it.
         const cursorWhere = this.buildCompositeCursorWhere(context, sortExpr, isNumeric, 'c.entity_id', 'AND');
 
+        const presented = cursorSortPresentation(
+            sortOrder.direction,
+            !!sortOrder.nullsFirst,
+            context.compositeCursor !== null && context.cursorDirection === 'before',
+        );
         let sql: string;
         if (useDirectPartition || !getMembershipSource().isLegacy) {
-            // Direct access on the component (partition) table - most efficient.
-            // No DISTINCT needed since each entity has one component of this type
             sql = `SELECT c.entity_id as id FROM ${componentTableName} c
                 WHERE c.type_id = $${context.addParam(sortTypeId)}::text
                 AND c.deleted_at IS NULL
                 AND ${filterGroup}${cursorWhere}
-                ORDER BY ${sortExpr} ${normalizeSortDirection(sortOrder.direction)} ${nullsClause}, c.entity_id ASC`;
+                ORDER BY ${sortExpr} ${normalizeSortDirection(presented.direction)} ${presented.nullsClause}, c.entity_id ${presented.idDirection}`;
         } else {
-            // Use entity_components junction
-            // No DISTINCT needed since each entity has one component of this type
             sql = `SELECT ec.entity_id as id FROM entity_components ec
                 JOIN ${componentTableName} c ON c.id = ec.component_id AND c.deleted_at IS NULL
                 WHERE ec.type_id = $${context.addParam(sortTypeId)}::text
                 AND ec.deleted_at IS NULL
                 AND ${filterGroup}${cursorWhere}
-                ORDER BY ${sortExpr} ${normalizeSortDirection(sortOrder.direction)} ${nullsClause}, c.entity_id ASC`;
+                ORDER BY ${sortExpr} ${normalizeSortDirection(presented.direction)} ${presented.nullsClause}, c.entity_id ${presented.idDirection}`;
         }
 
         // Add pagination
@@ -847,7 +868,7 @@ export class ComponentInclusionNode extends QueryNode {
                 sql += ` LIMIT $${context.addParam(context.limit)}`;
             }
             // OFFSET is not used alongside composite cursor pagination.
-            if (!context.compositeCursor && context.cursorId === null && (context.offsetValue > 0 || context.limit !== null)) {
+            if (!context.compositeCursor && context.cursorId === null && context.offsetValue > 0) {
                 sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
             }
         }
@@ -891,47 +912,30 @@ export class ComponentInclusionNode extends QueryNode {
 
         if (context.compositeCursor) {
             // Composite keyset via CTE: materialize sort value, filter, then paginate.
-            const { v, id: cursorId } = context.compositeCursor;
-            const cast = isNumeric ? '::numeric' : '::text';
-            const isDesc = sortOrder.direction === 'DESC';
-            const isBefore = context.cursorDirection === 'before';
+            const presented = cursorSortPresentation(
+                sortOrder.direction,
+                !!sortOrder.nullsFirst,
+                context.cursorDirection === 'before',
+            );
 
-            // 'before' for composite keyset is not implemented — throw instead of
-            // returning silently wrong pages.
-            if (isBefore) {
-                throw new Error(
-                    "sortedCursor(token, 'before') is not supported for component sortBy(). " +
-                    'Use OFFSET pagination or walk pages forward only.'
-                );
-            }
-
-            const nullsLast = !sortOrder.nullsFirst;
-            let keysetWhere: string;
-            if (v === null) {
-                // Cursor is inside the NULL region: advance within it by id tiebreak.
-                const idIdx = context.addParam(cursorId);
-                keysetWhere = `(_sorted._sv IS NULL AND _sorted.id > $${idIdx}::uuid)`;
-            } else if (!isDesc) {
-                // ASC+after: row-comparison + include NULL-sorted rows (NULLS LAST →
-                // they appear at the very end, after all non-null rows).
-                const vIdx = context.addParam(v);
-                const idIdx = context.addParam(cursorId);
-                const nullInclude = nullsLast ? ' OR _sorted._sv IS NULL' : '';
-                keysetWhere = `((_sorted._sv, _sorted.id) > ($${vIdx}${cast}, $${idIdx}::uuid)${nullInclude})`;
-            } else {
-                // DESC+after: smaller value, or same value and larger id.
-                const vLtIdx = context.addParam(v);
-                const vEqIdx = context.addParam(v);
-                const idGtIdx = context.addParam(cursorId);
-                keysetWhere = `(_sorted._sv < $${vLtIdx}${cast} OR (_sorted._sv = $${vEqIdx}${cast} AND _sorted.id > $${idGtIdx}::uuid))`;
-            }
+            const cursorWhere = buildKeysetCursorWhere({
+                sortExpr: '_sorted._sv',
+                entityIdCol: '_sorted.id',
+                connective: 'WHERE',
+                direction: presented.direction,
+                nullsFirst: presented.nullsFirst,
+                valueCast: isNumeric ? '::numeric' : '::text',
+                cursor: context.compositeCursor,
+                addParam: (value) => context.addParam(value),
+                idDirection: presented.idDirection,
+            });
 
             let sql = `WITH _sorted AS (
                 SELECT base.id, ${sortSubquery} AS _sv FROM (${baseQuery}) AS base
             )
-            SELECT _sorted.id FROM _sorted
-            WHERE ${keysetWhere}
-            ORDER BY _sorted._sv ${normalizeSortDirection(sortOrder.direction)} ${nullsClause}, _sorted.id ASC`;
+            SELECT _sorted.id FROM _sorted${cursorWhere}
+            ORDER BY _sorted._sv ${normalizeSortDirection(presented.direction)} ${presented.nullsClause}, _sorted.id ${presented.idDirection}`;
+
 
             if (!context.paginationAppliedInCTE && context.limit !== null) {
                 sql += ` LIMIT $${context.addParam(context.limit)}`;
@@ -949,7 +953,7 @@ export class ComponentInclusionNode extends QueryNode {
                 sql += ` LIMIT $${context.addParam(context.limit)}`;
             }
             // Only add OFFSET when not using cursor-based pagination
-            if (context.cursorId === null && (context.offsetValue > 0 || context.limit !== null)) {
+            if (context.cursorId === null && context.offsetValue > 0) {
                 sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
             }
         }

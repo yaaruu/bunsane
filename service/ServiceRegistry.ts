@@ -86,9 +86,7 @@ export class ServiceRegistry {
      */
     public rebuildSchema(): GraphQLSchema | null {
         const servicesArray = Array.from(this.services.values());
-        const result = generateGraphQLSchemaV2(servicesArray, {
-            enableArchetypeOperations: false
-        });
+        const result = generateGraphQLSchemaV2(servicesArray);
         this.schema = result.schema;
         this.schemaVersion++;
         return this.schema;

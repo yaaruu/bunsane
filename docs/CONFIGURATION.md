@@ -46,7 +46,7 @@ A connection requires **either** `DB_CONNECTION_URL` **or**
 | `BUNSANE_STUDIO_DB_TIMEOUT` | `15000` (ms) | Wall-clock budget for **one Studio request**, shared across every query it issues — not a per-query timeout. Studio handlers run in the `background` lane, so admin tooling cannot occupy the pool ahead of user traffic, and the budget covers waiting for capacity as well as running. A shared budget is what bounds handlers that issue a data-dependent number of statements (`/studio/archetypes/*` loops until it fills a page; `/studio/components` is one sample query per component name) — per-query timeouts would bound each statement and the request as a whole not at all. Capacity failures answer **503 + `Retry-After`**, not 500. |
 | `BUNSANE_STUDIO_TOKEN` | unset | Bearer token for the Studio admin surface (SEC-01). Studio is **deny-by-default**: nothing under `/studio` is served until the app calls `app.enableStudio({ token })` (or sets this env var and calls `enableStudio()`). Minimum 16 characters; refusal to enable without one is logged at error. Requests must present the token as `Authorization: Bearer <token>` or `x-studio-token`. With studio disabled, every `/studio/*` path answers 404; with it enabled, bad credentials answer 401. Framework tables (`components`, `entities`, …) are excluded from both the listing and direct `/studio/api/table/<name>` access, and archetype-scoped deletes refuse entity ids that do not belong to the named archetype. |
 | `BUNSANE_STUDIO_QUERY` | unset (off) | Opt-in for the ad-hoc SQL runner at `POST /studio/api/query` (SEC-02). Set `on`/`true` to enable; **anything else — including an unset value and any NODE_ENV — keeps the endpoint 404**. When enabled, every query is vetted as a single read-only statement (literal/comment-aware keyword blacklist covering SET/CALL/VACUUM/MERGE/…), wrapped so results are bounded server-side to 500 rows regardless of comments, and failures are returned as short classified messages rather than raw Postgres internals. Still subject to the studio bearer token when configured. |
-| `rateLimit({ trustProxy })` | `false` | Rate-limiter option (SEC-05). Client-supplied `X-Forwarded-For` / `X-Real-IP` headers key the bucket **only** when `trustProxy: true` — otherwise any client could rotate its own bucket at will. Without trusted proxy headers, middleware cannot see the socket IP (Bun exposes it only via the Server handle), so all un-keyed traffic shares one global bucket as a coarse fuse; pass a custom `keyExtractor` for real per-client limits in that topology. |
+| `rateLimit({ trustProxy })` | `false` | Rate-limiter option (SEC-05). The default key is the socket IP from `server.requestIP` (copied into middleware context by `App.start`). Client `X-Forwarded-For` / `X-Real-IP` headers key the bucket **only** when `trustProxy: true`. If the socket IP is unavailable and `trustProxy` is off, the limiter fails open (one warning) instead of sharing one `'anonymous'` bucket. |
 | `setCors()` | — | CORS policy (SEC-04). `credentials: true` together with `origin: "*"` now **throws at configuration time** (previously warned, then reflected every request Origin — allowing credentialed cross-origin reads from anywhere). Defence in depth: even if such a config object is constructed directly, no `Access-Control-Allow-Origin` is emitted for it. List explicit origins instead. **Breaking change** for apps relying on the old reflected behaviour. |
 | `BUNSANE_ABORT_MODE` | `cancel` | `cancel` (request cancellation on abort, then reject) or `off` (reject without touching the query). **Temporary** diagnostic switch for isolating whether `cancel()` is implicated in pooled connections that never return; will be removed. Note the two modes are now known to be equivalent from the server's side — `cancel()` issues no CancelRequest (POOLING.md B8a) — so this can only bisect client-side effects. |
 | `DB_STATEMENT_TIMEOUT` | unset (opt-in, ms) | Server-side `statement_timeout` appended to the connection URL as the `options` startup parameter. Skipped under PGlite. **Inert behind PgBouncer**, which drops `options` — the boot probe logs at error when it did not stick. Behind a pooler use `ALTER ROLE … SET statement_timeout` instead. |
@@ -79,8 +79,11 @@ directly, and timezone-aware ordering is only possible when the columns are type
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HEALTH_DB_WRITE_PROBE` | `true` (on) | The `/health` and `/health/ready` endpoints run a real **write** probe through the same `db.transaction()` path `Entity.save` uses, so a wedged write pool fails liveness and the orchestrator restarts the container. Set `false` to disable (falls back to read-only `SELECT 1`). |
+| `HEALTH_DB_WRITE_PROBE` | `true` (on) | Inside `deepHealthCheck`, run a real **write** probe through the same `db.transaction()` path `Entity.save` uses, so a wedged write pool fails liveness. Set `false` to fall back to read-only `SELECT 1`. `BUNSANE_HEALTH_PROBE=read` skips the write probe at the HTTP endpoints before this flag is consulted. |
 | `DB_HEALTH_WRITE_TIMEOUT` | `5000` (ms) | Independent, short timeout for the write probe so a wedge is detected fast rather than blocking on the 30s request timeout. |
+| `BUNSANE_HEALTH_PROBE` | `write` | `read` skips the DB write probe. Liveness still runs `SELECT 1` and the cache ping. Default stays `write`. |
+| `BUNSANE_HEALTH_CACHE_MS` | `5000` | Cache TTL for `/health` and `/health/ready`. `0` disables the cache. Concurrent misses share one probe. |
+| `BUNSANE_HEALTH_MAX_RPS` | `20` | Token bucket for `/health` and `/health/ready`. Excess returns 429 without a DB call. `0` disables the limiter. |
 
 See [Liveness & the write probe](#liveness--the-write-probe).
 
@@ -89,16 +92,30 @@ See [Liveness & the write probe](#liveness--the-write-probe).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `APP_PORT` | `3000` | HTTP listen port. |
-| `NODE_ENV` | `development` | `development` \| `production` \| `test`. Affects error verbosity, security headers, logging. |
+| `NODE_ENV` | unset | `development` \| `production` \| `test`. Unset is fail-closed: error details are masked, HSTS stays off, and `/metrics`, `/health/remote`, `/docs`, and `/openapi.json` answer 404 unless a token or explicit public opt-in is set. `development` enables verbose errors and, unless overridden, GraphQL introspection and GraphiQL. `production` alone does **not** send HSTS. A boot warning names the affected behaviours; `BUNSANE_STRICT_ENV` promotes it to a startup failure. |
 | `SHUTDOWN_GRACE_PERIOD_MS` | framework default | Max time to drain in-flight requests on SIGTERM/SIGINT before forced shutdown. Also `app.setShutdownGracePeriod(ms)`. |
-| `MAX_REQUEST_BODY_SIZE` | framework default | Max request body in bytes. Also `app.setMaxRequestBodySize(bytes)`. |
+| `REQUEST_TIMEOUT_MS` | `30000` | Wall-clock request timeout in milliseconds. `0` disables. Also `app.setRequestTimeout(ms)` or `AppConfig.requestTimeoutMs`. `/health` and `/health/ready` never use this timer and are not cloned for it. |
+| `JSON_BODY_LIMIT` | `1048576` (1MB) | Max `Content-Length` for non-multipart bodies. Oversize returns 413 before the body is read. Also `app.setJsonBodyLimit(bytes)` or `AppConfig.bodyLimits.json`. |
+| `MULTIPART_BODY_LIMIT` | `MAX_REQUEST_BODY_SIZE` (50MB) | Multipart `Content-Length` cap. Also `app.setMultipartBodyLimit(bytes)` or `AppConfig.bodyLimits.multipart`. |
+| `MAX_REQUEST_BODY_SIZE` | `52428800` (50MB) | Absolute `Bun.serve` cap and the default multipart cap. Does **not** raise the JSON limit. Also `app.setMaxRequestBodySize(bytes)` or `AppConfig.bodyLimits.max`. Chunked multipart with no `Content-Length` is still bounded only by this Bun cap. |
+| `BUNSANE_METRICS_TOKEN` | unset | Bearer token, or `x-metrics-token`, for `/metrics` and `/health/remote`. Minimum 16 characters. Unset, and not public, answers 404. Also `app.setMetricsAccess({ token })`. |
+| `BUNSANE_METRICS` | unset | `public` serves `/metrics` and `/health/remote` without a token. `off` is accepted by validation and does not open the endpoints. |
+| `BUNSANE_DOCS_TOKEN` | unset | Bearer token, or `x-docs-token`, for `/docs`, `/docs/swagger-init.js`, and `/openapi.json`. Minimum 16 characters. Also `app.setDocsAccess({ token })`. |
+| `BUNSANE_DOCS` | unset | `public` serves those docs routes without a token. `off` does not open them. |
+| `BUNSANE_HSTS` | `off` | `on` sends `Strict-Transport-Security`. `NODE_ENV=production` alone does not. |
+| `BUNSANE_TLS` | `off` | `on` also enables HSTS. This declares that the deployment is behind TLS; it does not terminate TLS. |
+| `BUNSANE_STRICT_ENV` | `off` | `on` or `true` promotes boot warnings to a startup failure: unset `NODE_ENV`, production Redis without a password on a non-loopback host, and `REDIS_TLS=true` (validated but not applied by the client). |
+
+`securityHeaders` and `requestId` are registered in `start()` unless opted out with `setSecurityHeaders(false)` / `setRequestId(false)`, or the matching `AppConfig` fields, before start. `app.use()` after `start()` throws. A second `start()` is a no-op (warning).
 
 ## GraphQL
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GRAPHQL_MAX_DEPTH` | `15` floor | Max query depth. Hard floor of 15 — `0` no longer disables. Also `app.setGraphQLMaxDepth(n)`. |
-| `GRAPHQL_MAX_COMPLEXITY` | `1000` | Max query complexity (per-field cost × `first`/`limit`/`take`). Also `app.setGraphQLMaxComplexity(n)`. |
+| `GRAPHQL_MAX_DEPTH` | `15` | Max query depth. When set, an integer `>= 15` (`app.setGraphQLMaxDepth` / `AppConfig.graphql.maxDepth`). Below 15 throws. `0` does not disable. `graphqlSetup` passes the configured number through and rejects a non-integer or a value `< 1`. |
+| `GRAPHQL_MAX_COMPLEXITY` | `1000` | Max query complexity. Integer `>= 1` (`app.setGraphQLMaxComplexity`). `0` does not disable. `first` / `limit` / `take` use coerced variables, not only literals. Per-operation alias cap is 50. Each `__` field costs 10. Fragment spreads are charged at each use site. |
+| `GRAPHQL_INTROSPECTION` | unset | `on` or `off`. Unset follows `isVerboseErrors()` (only `NODE_ENV=development`). Also `app.setGraphQLIntrospection(boolean)` / `AppConfig.graphql.introspection`, which win over the env var. |
+| `GRAPHQL_GRAPHIQL` | unset | `on` or `off`. Unset follows the same verbosity gate. Off: GraphiQL and the Yoga landing page are disabled; `GET /graphql` with `Accept: text/html` returns 404. Also `app.setGraphQLGraphiQL(boolean)`. |
 
 ## Distributed locking & scheduler
 
@@ -116,11 +133,15 @@ full guide.
 > silently behind a transaction pooler. Single-instance deploys may opt down to
 > `in-process` to avoid the per-lock DB round trips.
 
+Scheduled queries with no `maxEntitiesPerExecution` are limited to 1000 entities (`Query.take`) unless the query already has a smaller `.take()`. A warning is logged once per task when a run returns that many rows. Set `maxEntitiesPerExecution` on the task to raise the cap.
+
+Scheduler locks use the postgres-lease backend by default (`BUNSANE_LOCK_BACKEND=auto`). The lease is renewed while the task runs (about every TTL/3, minimum 1s). Lease TTL is at least the task timeout plus 5 seconds. If the wrapper times out, the lock is held until the underlying task promise settles, so another instance cannot acquire it mid-run.
+
 ## Query engine
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BUNSANE_DEFAULT_QUERY_LIMIT` | `10000` | Default `LIMIT` applied to `Query.exec()` calls with no `.take()`. `0` disables. Emits warning `H-QUERY-1` when applied. |
+| `BUNSANE_DEFAULT_QUERY_LIMIT` | `10000` | Default `LIMIT` on `Query.exec()` that never called `.take()`. `0` disables. When the returned page is full, `query.getLastRouteInfo().truncatedByDefaultLimit` is `true`. In `NODE_ENV=development` that call throws instead of returning a silently truncated page. Production logs one warning per process (`H-QUERY-1`) and returns the capped rows. Explicit `.take(n)` does not set the flag. |
 | `BUNSANE_USE_LATERAL_JOINS` | `true` | Use LATERAL joins for multi-component queries (PG12+). |
 | `BUNSANE_PARTITION_STRATEGY` | `list` | Component partition strategy: `list` or `hash`. ⚠ Changing on an existing DB is guarded against data loss. |
 | `BUNSANE_USE_DIRECT_PARTITION` | `true` | Query partition tables directly. |
@@ -130,6 +151,8 @@ full guide.
 | `BUNSANE_MEMBERSHIP_SOURCE` | `components` | Component membership source table (internal). |
 | `BUNSANE_ORNODE_SINGLE_PASS` | `1` (on) | OR queries over a required base (`.with(X).with(or([...]))`) scan the base set **once** and combine branches as a disjunction of `EXISTS` predicates, instead of embedding the base in every branch and `UNION`-ing (which forced an N× base scan + a per-branch cartesian nested-loop). Parity-proven against the legacy shape; ~20× faster on a 3-branch OR. Kill-switch: set to `0`/`false` to revert to the legacy `UNION` shape instantly (no redeploy). |
 | `BUNSANE_RELATION_TYPED_COLUMN` | — | Typed relation column toggle (internal). |
+
+The framework `PreparedStatementCache`, `Query.getCacheStats()`, and `BUNSANE_QUERY_CACHE_SIZE` are removed. Bun SQL prepares statements per connection. `Query.noCache()` no longer refers to a statement cache; `noCache({ component: true })` still bypasses the component cache. `/metrics` has no `preparedStatements` key.
 
 ## Query Surface Planner (experimental)
 
@@ -149,7 +172,7 @@ full guide.
 
 **Coverage limits (not optional):** routing requires an **exact match** between the query’s `.with` component set and the archetype’s **projected** columns. Empty tag components (no `@CompData`) are not projected — including them in `.with()` forces legacy. Multi-archetype joins, `.without`, OR, ILIKE, and spatial filters are never covered. List-only archetypes (stable core comps, no tags/optionals) are the production pattern — see `docs/QSP_OPERATIONS.md` and `docs/QUERY_LIST_GUIDE.md`.
 
-**Reconcile:** `startReconcileSweep()` is **not** started by `App` automatically; production should call it when QSP ≠ `off` (see QSP ops runbook).
+**Reconcile:** when `BUNSANE_QSP` is `shadow` or `route`, `App.init()` starts `startReconcileSweep()` (default interval 300s) and shutdown stops it. Do not start a second sweep from application code. `off` does not start it.
 
 **Legacy list pagination (independent of QSP):** explicit `.take(N)` fetches `LIMIT N+1` and sets `query.getLastRouteInfo().hasNextPage`. Exact `.count()` remains available when called. Plain `.cursor(entityId)` cannot be combined with `.sortBy()` — use `.sortedCursor(token)` (`docs/READ_PATH_PERFORMANCE.md` §8).
 
@@ -173,6 +196,8 @@ full guide.
 | `CACHE_QUERY_ENABLED` | `true` | Query result cache. |
 | `CACHE_QUERY_TTL` | `1800000` | Query cache TTL (30m). |
 | `CACHE_QUERY_MAX_SIZE` | `10000` | Max cached query results. |
+| `BUNSANE_CACHE_INVALIDATION_SECRET` | unset | HMAC-SHA256 secret for cross-instance L1 invalidation pub/sub. Set the same value on every instance that should apply remote invalidations. Unset: pub/sub stays disabled and a **warn** is logged at startup (not info). Unsigned messages are not accepted. Multi-instance apps that leave it unset serve stale L1 entries until TTL. |
+| `BUNSANE_CACHE_INVALIDATE_MAX` | `10000` | Cap on keys matched by `invalidatePattern` before the call aborts without deleting. The pattern must have a literal prefix (after `REDIS_KEY_PREFIX`). |
 
 ### Redis (when `CACHE_PROVIDER=redis`/`multilevel`, or for Remote)
 
@@ -185,13 +210,27 @@ full guide.
 | `REDIS_KEY_PREFIX` | `bunsane:` | Key prefix. |
 | `REDIS_MAX_RECONNECT_ATTEMPTS` | `20` | Capped reconnect attempts (prevents infinite spin, C03). |
 | `REDIS_ENABLE_OFFLINE_QUEUE` | `false` | Offline command queue. Off by default to bound heap (C02). |
+| `REDIS_TLS` | unset | Validated as `true` or `false`. **Not applied by the Redis client** — do not treat it as transport security. `true` logs a boot warning, and fails startup under `BUNSANE_STRICT_ENV`. Isolate Redis on the network and set `REDIS_PASSWORD`. |
+
+## Remote RPC trust model
+
+Redis Streams RPC and the transactional outbox have no network authentication of their own. Redis MUST be authenticated (`REDIS_PASSWORD`) and not reachable from untrusted networks. Signing is an extra bar for a shared or multi-tenant Redis, not a substitute for network isolation.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BUNSANE_RPC_SECRET` | unset | HMAC-SHA256 secret for RPC request, RPC response, direct emit, and outbox envelopes. Unset = unsigned (legacy) plus one startup warning. Set = producers sign and consumers ACK-drop unsigned or tampered envelopes (fail-closed). Drops increment `security.signatureRejected` on the remote metrics snapshot. |
+| `BUNSANE_RPC_CONSUMER_CONCURRENCY` | `8` | Max in-flight stream messages per `StreamConsumer`. `RemoteManager` config `consumerConcurrency` overrides this. ACK remains per message id. Positive integer when set. |
+
+`replyTo` on an RPC request must be `rpc:responses:<instanceId>`, where the instance id is 1–128 characters of `[A-Za-z0-9._-]`. Any other target is rejected before the handler runs (`security.replyToRejected`).
+
+Outbox publish is at-least-once: the worker claims rows (`claim_token` / `claimed_at`, 60s lease), commits, then `XADD`s. A crash between `XADD` and `published_at` republishes the same logical event under a new Redis id. The envelope `correlationId` is the outbox row id. Consumers drop a duplicate `(sourceApp, correlationId)` for 10 minutes in memory (not across process restart; `security.duplicateDropped`). `sourceApp` is stamped from server config, never from the row payload.
 
 ## Logging
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LOG_LEVEL` | `info` | Pino log level. |
-| `LOG_PRETTY` | — | Pretty-print logs (dev). |
+| `LOG_LEVEL` | `info` | Pino log level: `fatal` \| `error` \| `warn` \| `info` \| `debug` \| `trace` \| `silent`. |
+| `LOG_PRETTY` | unset | `true` pretty-prints via optional `pino-pretty` (installed by default; omitted by `bun install --omit=optional`). If that package is not installed, the logger falls back to JSON and logs a warning — startup does not throw. Leave unset for JSON logs. Avoid `true` in production: pretty output is much slower than JSON. |
 | `DEBUG` | `false` | Framework debug mode. |
 
 ## S3 / file uploads (opt-in)
@@ -288,8 +327,7 @@ are unusable under transaction pooling anyway.
 > **Note:** `?prepare=false` in the URL is *postgres.js* syntax and is **not**
 > reliably honored by Bun's driver. Use `DB_DISABLE_PREPARE=true`.
 >
-> This does **not** relate to the framework's `PreparedStatementCache` class,
-> which is deprecated and a no-op on the hot path — toggling it has no effect.
+> The framework `PreparedStatementCache` class is removed. `DB_DISABLE_PREPARE` only toggles Bun SQL's per-connection `prepare` flag.
 
 > ⚠️ **Counter-evidence from the field, unresolved.** One production deployment
 > (Bun + PgBouncer 1.25.1, transaction mode) reported `DB_DISABLE_PREPARE=true`
@@ -385,6 +423,8 @@ connection — exactly the scenario where a timed-out container kept reporting
 If the write probe fails or times out (`DB_HEALTH_WRITE_TIMEOUT`, default 5s),
 `/health` returns **503**.
 
+Responses omit `uptime` and per-check `latency_ms` (status and check status remain). Successful probes are cached for `BUNSANE_HEALTH_CACHE_MS` (default 5s); a flood above `BUNSANE_HEALTH_MAX_RPS` (default 20) returns 429 without a DB call. `/health` and `/health/ready` are not subject to `REQUEST_TIMEOUT_MS`.
+
 **Point your container's liveness probe at `/health`** (not a static route) so a
 wedge auto-recovers via restart:
 
@@ -406,7 +446,8 @@ HEALTHCHECK --interval=10s --timeout=8s --retries=3 \
 
 | Endpoint | Purpose |
 |----------|---------|
-| `/health` | Deep health (DB read + DB write probe + cache). Drives liveness/restart. |
-| `/health/ready` | Readiness — 503 until `init()` completes and while shutting down; otherwise same deep check. |
-| `/health/remote` | Remote subsystem health (only when `app.enableRemote()` used). |
-| `/metrics` | Process + cache + DB stats (JSON). |
+| `/health` | Liveness: DB read + write probe (unless `BUNSANE_HEALTH_PROBE=read` or `HEALTH_DB_WRITE_PROBE=false`) + cache. Status and check status only. Cached and rate-limited. Not subject to `REQUEST_TIMEOUT_MS`. |
+| `/health/ready` | Readiness — 503 until `init()` completes and while shutting down; otherwise the same deep check, cache, and rate limit. |
+| `/health/remote` | Remote subsystem health (only when `app.enableRemote()` is used). 404 unless `BUNSANE_METRICS_TOKEN` matches or `BUNSANE_METRICS=public`. |
+| `/metrics` | Process + cache + DB stats (JSON). Same token gate as `/health/remote`. No `preparedStatements` key. |
+| `/docs`, `/openapi.json` | Swagger UI and the OpenAPI spec. 404 unless `BUNSANE_DOCS_TOKEN` matches or `BUNSANE_DOCS=public`. |

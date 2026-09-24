@@ -50,7 +50,6 @@ function createTestConfig(overrides: Partial<UploadConfiguration> = {}): UploadC
         validateFileSignature: true,
         sanitizeFileName: true,
         preserveOriginalName: false,
-        generateThumbnails: false,
         uploadPath: "uploads",
         namingStrategy: "uuid",
         ...overrides,

@@ -99,18 +99,20 @@ export class MultiLevelCache implements CacheProvider {
       }
     }
 
-    // If L2 exists and we have missing keys, try L2
     if (this.l2Cache && missingKeys.length > 0) {
       const l2Results = await this.l2Cache.getMany<T>(missingKeys);
+      const promotions: Array<{ key: string; value: T; ttl?: number }> = [];
       for (let i = 0; i < missingKeys.length; i++) {
         const value = l2Results[i];
         const originalIndex = missingIndices[i];
         const missingKey = missingKeys[i];
         if (value !== null && value !== undefined && originalIndex !== undefined && missingKey !== undefined) {
           results[originalIndex] = value;
-          // Promote to L1 cache
-          await this.l1Cache.set(missingKey, value, this.config.defaultTTL);
+          promotions.push({ key: missingKey, value, ttl: this.config.defaultTTL });
         }
+      }
+      if (promotions.length > 0) {
+        await this.l1Cache.setMany(promotions);
       }
     }
 

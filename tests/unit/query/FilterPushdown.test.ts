@@ -101,12 +101,10 @@ describe('RP-03 filter coalesce + membership pushdown', () => {
         expect(sql).toContain("data->>'name'");
         expect(sql).toContain("data->>'age'");
         expect(sql).toContain("data->>'price'");
-        // Outer field EXISTS should not re-apply pushed filters.
-        // (Membership presence EXISTS may still appear in ComponentInclusionNode multi-CTE path.)
-        const existsCount = countExists(sql);
-        // 2 membership re-checks in multi-CTE path are possible; field filters must not
-        // add 3 more EXISTS (one per filter). Cap: presence checks only.
-        expect(existsCount).toBeLessThanOrEqual(3);
+        // Outer query selects the CTE id set directly: no membership re-probe,
+        // no DISTINCT, and pushed filters are not re-applied as EXISTS.
+        expect(countExists(sql)).toBe(0);
+        expect(sql).not.toMatch(/SELECT\s+DISTINCT/i);
     });
 
     test('sort-driven multi-comp with two filters on other component → one EXISTS', () => {

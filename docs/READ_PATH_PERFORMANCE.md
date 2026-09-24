@@ -4,7 +4,7 @@
 **Date:** 2026-08-07 (updated for Wave A/B engine work + product guidance)
 **Scope:** The query READ path only (`Query` builder → SQL → hydrate). Writes (`Entity.save`) are out of scope except QSP dual-write.
 **Audience:** framework maintainers **and** app authors building list/admin endpoints.
-**Related:** `docs/QSP_OPERATIONS.md`, `docs/QUERY_LIST_GUIDE.md`, `docs/TICKETS_READ_PATH_PERF_2026-08.md`, `docs/CONFIGURATION.md`
+**Related:** `docs/QSP_OPERATIONS.md`, `docs/QUERY_LIST_GUIDE.md`, `docs/internal/TICKETS_READ_PATH_PERF_2026-08.md`, `docs/CONFIGURATION.md`
 
 ---
 
@@ -88,7 +88,7 @@ Path selection (`query/QueryDAG.ts:buildBasicQuery`, `query/ComponentInclusionNo
 | **B** | Same-component multi-filter not coalesced | **Fixed (RP-03):** one predicate group per component; INTERSECT/CTE pushdown. | Was high |
 | **C** | Component sort in an ineligible shape → scalar-subquery ORDER BY | Full match-set materialize + sort. Triggers on OR + component sort, **plain `cursor(id)`** + component sort, multi-key sort, CTE path. **`sortedCursor` does not trigger this** — it rides sort-driven scan. | High — narrow |
 | **D** | Exact `count()` for "total pages" | `SELECT COUNT(*) FROM (<full id query>)`, strips LIMIT/sort → full cardinality every request. A second full scan, often the most expensive. | Highest ROI to kill |
-| **E** | Deep OFFSET pagination | O(offset) scan-and-discard. Prefer **`sortedCursor`** for component-sorted lists (fast path). Single-key, forward-only; multi-key / `before` throw. | Medium |
+| **E** | Deep OFFSET pagination | O(offset) scan-and-discard. Prefer **`sortedCursor`** for component-sorted lists (fast path). Single-key `sortedCursor`, including `before`, is implemented; multi-key still throws (F-01 partial). | Medium |
 | **F** | Numeric partial-index mismatch | **Fixed (RP-04):** queries restate `IS NOT NULL` + numeric regex via `database/numericJsonField.ts` so partial `idx_*_numeric` is eligible. | Was high |
 
 **Additional planner notes:**
@@ -125,7 +125,7 @@ Path selection (`query/QueryDAG.ts:buildBasicQuery`, `query/ComponentInclusionNo
 
 ## 6. Roadmap (ROI-ranked) — status as of 0.6.x / 2026-08
 
-Each step ships alone. §7 defines how to measure. Full ticket text: `docs/TICKETS_READ_PATH_PERF_2026-08.md`.
+Each step ships alone. §7 defines how to measure. Full ticket text: `docs/internal/TICKETS_READ_PATH_PERF_2026-08.md`.
 
 | Step | Status | Notes |
 |------|--------|-------|
@@ -134,7 +134,7 @@ Each step ships alone. §7 defines how to measure. Full ticket text: `docs/TICKE
 | **3a — numeric index usable** | **Done (RP-04)** | |
 | **3b — declared composite list-shape indexes** | Open (F-02) | Equality → range/sort → `entity_id` |
 | **4 — generated projected columns (M1)** | Open (RP-08) | `@CompData({ projected: true })` — deferred |
-| **5a — keyset ergonomics** | **Partial (RP-06)** | Docs + throw on `cursor(id)+sortBy`. `sortedCursor` is the fast path; OFFSET still default in product apps. |
+| **5a — keyset ergonomics** | **Partial (RP-06 + F-01)** | Docs + throw on `cursor(id)+sortBy`. Single-key `before` works; multi-key keyset still throws. |
 | **5b — QSP projection tables for hot screens** | **Engine ready; ops open (RP-02)** | `rm_<archetype>`; see `QSP_OPERATIONS.md` |
 | **N+1 instrumentation gate** | **Done (RP-05)** | Relation FK loader batching |
 
@@ -403,10 +403,10 @@ Full runbook: **`docs/QSP_OPERATIONS.md`**. Product patterns: **`docs/QUERY_LIST
 - Numeric predicates: `database/numericJsonField.ts`, `database/IndexingStrategy.ts`
 - QSP: `query/planner/SurfacePlanner.ts`, `database/projection/*`, `docs/QSP_OPERATIONS.md`
 - App list guide: `docs/QUERY_LIST_GUIDE.md`
-- Tickets: `docs/TICKETS_READ_PATH_PERF_2026-08.md`
+- Tickets: `docs/internal/TICKETS_READ_PATH_PERF_2026-08.md`
 - Benchmark: `tests/benchmark/scripts/{generate-db,run-benchmarks}.ts`
 - Real-PG: `tests/pg-setup.ts`
-- Related RFCs: `RFC_MATERIALIZED_READ_MODELS.md`, `RFC_QUERY_SURFACE_PLANNER.md`, `RFC_QSP_ROW_HYDRATION.md`, `QUERY_SORT_PAGINATION_PLAN.md`
+- Related RFCs: `internal/RFC_MATERIALIZED_READ_MODELS.md`, `internal/RFC_QUERY_SURFACE_PLANNER.md`, `internal/RFC_QSP_ROW_HYDRATION.md`, `internal/QUERY_SORT_PAGINATION_PLAN.md`
 
 ---
 

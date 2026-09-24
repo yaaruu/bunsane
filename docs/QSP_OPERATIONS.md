@@ -1,7 +1,7 @@
 # Query Surface Planner (QSP) — Operator Runbook
 
 **Version context:** BunSane 0.6.x (updated 2026-08-07)  
-**Related:** `docs/READ_PATH_PERFORMANCE.md`, `docs/QUERY_LIST_GUIDE.md`, `docs/CONFIGURATION.md`, `docs/RFC_QSP_ROW_HYDRATION.md`
+**Related:** `docs/READ_PATH_PERFORMANCE.md`, `docs/QUERY_LIST_GUIDE.md`, `docs/CONFIGURATION.md`, `docs/internal/RFC_QSP_ROW_HYDRATION.md`
 
 ---
 
@@ -150,27 +150,21 @@ hydrated from `components` (populate / eager load).
 | `BUNSANE_QSP_HYDRATE_SHADOW=on` | Diff hydrate vs legacy; **does not** serve hydrate; **does not** feed READY promotion |
 
 Only components in `fullyColumnarComponents` (entire `@CompData` surface projectable) may be served
-from the row. Empty tags are never fully columnar. See `docs/RFC_QSP_ROW_HYDRATION.md` for null-vs-absent
+from the row. Empty tags are never fully columnar. See `docs/internal/RFC_QSP_ROW_HYDRATION.md` for null-vs-absent
 risks before flipping default on in production.
 
 ---
 
-## Reconcile sweep (not auto-started by App)
+## Reconcile sweep
 
 `startReconcileSweep(intervalMs = 300_000)` (`database/projection/ReconcileSweep.ts`, exported from
 `database/projection`) samples `rm_` rows, recomputes from `components`, repairs drift
 (`qsp_drift_total`). Advisory-leased; acts on READY **and SHADOW**.
 
-**BunSane `App` does not call `startReconcileSweep` automatically.** Production multi-instance
-deployments should start it from app boot when `BUNSANE_QSP ≠ off`, e.g.:
-
-```ts
-import { startReconcileSweep } from 'bunsane/database/projection';
-// after App init / when QSP enabled:
-if (process.env.BUNSANE_QSP === 'shadow' || process.env.BUNSANE_QSP === 'route') {
-  startReconcileSweep(300_000);
-}
-```
+**`App.init()` starts the sweep when `BUNSANE_QSP` is `shadow` or `route`, and shutdown stops it** (F-11).
+`off` does not start it. Do not call `startReconcileSweep()` again from application code — that
+registers a second interval. Standalone scripts that are not an `App` and still need drift repair
+may call it themselves and must stop the returned function before exit.
 
 ---
 

@@ -24,6 +24,22 @@ describe('requestId middleware', () => {
         expect(res.headers.get('X-Request-Id')).toBe('custom-id-123');
     });
 
+    test('rejects unsafe and oversized inbound ids', async () => {
+        const mw = requestId();
+        const unsafe = await mw(new Request('http://localhost/', {
+            headers: { 'X-Request-Id': 'not a safe id' },
+        }), ok);
+        const overlong = await mw(new Request('http://localhost/', {
+            headers: { 'X-Request-Id': 'a'.repeat(65) },
+        }), ok);
+        expect(unsafe.headers.get('X-Request-Id')).toMatch(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+        );
+        expect(overlong.headers.get('X-Request-Id')).toMatch(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+        );
+    });
+
     test('getRequestId() returns current request ID within middleware', async () => {
         const mw = requestId();
         let capturedId: string | undefined;

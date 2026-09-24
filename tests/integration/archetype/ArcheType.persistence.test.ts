@@ -216,19 +216,6 @@ describe('ArcheType Persistence', () => {
         });
     });
 
-    describe('validation', () => {
-        test('withValidation validates input data', () => {
-            const archetype = new TestUserArchetype();
-
-            // Valid data should pass
-            const validResult = archetype.withValidation({
-                user: { name: 'Valid', email: 'valid@example.com', age: 25 }
-            });
-
-            expect(validResult).toBeDefined();
-        });
-    });
-
     describe('component properties', () => {
         test('getComponentsToLoad returns component constructors', () => {
             const archetype = new TestUserArchetype();

@@ -7,7 +7,9 @@ export interface OpenAPIOperation {
     parameters?: OpenAPIParameter[];
     requestBody?: OpenAPIRequestBody;
     responses?: Record<string, OpenAPIResponse>;
-    security?: any[];
+    security?: Array<Record<string, string[]>>;
+    /** When true, the generator requires BearerAuth. Not emitted in the spec. */
+    authenticated?: boolean;
 }
 
 export interface OpenAPIParameter {

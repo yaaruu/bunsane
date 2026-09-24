@@ -7,6 +7,13 @@ import type { QueryFilter } from "../query/Query";
 import type { Query } from "../query/Query";
 import type { ComponentTargetConfig } from "../core/EntityHookManager";
 
+/**
+ * Entities a scheduled query may load when `maxEntitiesPerExecution` is unset
+ * and the query has no smaller `.take()`. A warning is logged once per task
+ * when a run returns this many rows.
+ */
+export const DEFAULT_MAX_ENTITIES_PER_EXECUTION = 1000;
+
 export enum ScheduleInterval {
     MINUTE = "minute",
     HOUR = "hour",
@@ -35,10 +42,10 @@ export interface ScheduledTaskOptions {
     retryDelay?: number;
     /** Whether to continue retrying on failure */
     continueOnError?: boolean;
-    /** 
-     * Maximum number of entities to process per execution
-     * Note: This is applied after the query executes. For better performance,
-     * include .take() in your query function instead.
+    /**
+     * Maximum entities loaded per execution, applied as `Query.take()` before exec.
+     * When unset, the scheduler applies {@link DEFAULT_MAX_ENTITIES_PER_EXECUTION}
+     * unless the query already has a smaller `.take()`.
      */
     maxEntitiesPerExecution?: number;
     /** Whether to enable task metrics collection */

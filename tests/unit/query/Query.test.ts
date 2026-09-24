@@ -71,7 +71,7 @@ describe('Query', () => {
                 { component: TestUser, filters: [{ field: 'age', operator: FilterOp.GT, value: 18 }] },
                 { component: TestProduct, filters: [{ field: 'price', operator: FilterOp.LT, value: 100 }] }
             ]);
-            expect(result).toBe(query);
+            expect(result as unknown).toBe(query);
         });
     });
 

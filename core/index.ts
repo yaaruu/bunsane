@@ -1,9 +1,9 @@
 /**
  * Public `bunsane/core` entry point.
  *
- * Subpath imports (`bunsane/core/App`, `bunsane/core/middleware`, …) remain the
- * primary surface; this barrel re-exports cross-cutting primitives intended to
- * be imported as `bunsane/core`.
+ * Application code should import the authoring set from the package root
+ * (`import { App, Entity, Query, withLock } from "bunsane"`). This subpath
+ * re-exports cross-cutting primitives for callers that already use `bunsane/core`.
  */
 
 export {

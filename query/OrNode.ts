@@ -5,8 +5,9 @@ import { OrQuery } from "./OrQuery";
 import { ComponentRegistry } from "../core/components";
 import { shouldUseDirectPartition } from "../core/Config";
 import { getMembershipTable } from "./membershipSource";
-import { jsonbInListCast } from "./FilterBuilder";
-import { escapeJsonLiteral, assertComponentTableName } from "./SqlIdentifier";
+import { buildComponentFilterGroup } from "./FilterBuilder";
+import type { QueryFilter } from "./QueryContext";
+import { assertComponentTableName } from "./SqlIdentifier";
 
 /**
  * Gate for the base-dependency single-pass OR rewrite (base scanned once,
@@ -43,6 +44,26 @@ export class OrNode extends QueryNode {
         }
         return 'components';
     }
+
+    /**
+     * Predicates for one OR branch, identical to FilterBuilder (numeric
+     * validity predicate, boolean text compare, IN casts). Caller must pass
+     * the local param counter; it is synced onto context before addParam.
+     */
+    private branchFilterSql(
+        filters: QueryFilter[] | undefined,
+        alias: string,
+        context: QueryContext,
+        paramIndex: number,
+    ): { sql: string | null; paramIndex: number } {
+        context.paramIndex = paramIndex;
+        if (!filters?.length) return { sql: null, paramIndex };
+        return {
+            sql: buildComponentFilterGroup(filters, alias, context),
+            paramIndex: context.paramIndex,
+        };
+    }
+
 
     /**
      * Check if we can use the optimized UNION ALL approach with direct partition access.
@@ -99,60 +120,16 @@ export class OrNode extends QueryNode {
 
         const partitionTable = assertComponentTableName(ComponentRegistry.getPartitionTableName(componentId) || 'components', 'OrNode.partitionTable');
 
-            // Simple, direct query to partition table - no EXISTS, no subqueries
-            let branchSql = `SELECT entity_id FROM ${partitionTable} WHERE type_id = $${paramIndex} AND deleted_at IS NULL`;
+            // Alias required so FilterBuilder's `<alias>.data` path is valid.
+            let branchSql = `SELECT c.entity_id FROM ${partitionTable} c WHERE c.type_id = $${paramIndex} AND c.deleted_at IS NULL`;
 
             context.params.push(componentId);
             paramIndex++;
 
-            // Add filters for this branch - inline in WHERE clause
-            if (branch.filters && branch.filters.length > 0) {
-                for (const filter of branch.filters) {
-                    const { field, operator, value } = filter;
-                    const jsonPath = `data->>'${escapeJsonLiteral(field)}'`;
+            const built = this.branchFilterSql(branch.filters, 'c', context, paramIndex);
+            paramIndex = built.paramIndex;
+            if (built.sql) branchSql += ` AND ${built.sql}`;
 
-                    switch (operator) {
-                        case "=":
-                        case ">":
-                        case "<":
-                        case ">=":
-                        case "<=":
-                        case "!=":
-                            if (typeof value === "string") {
-                                branchSql += ` AND ${jsonPath} ${operator} $${paramIndex}::text`;
-                            } else {
-                                branchSql += ` AND (${jsonPath})::numeric ${operator} $${paramIndex}`;
-                            }
-                            context.params.push(value);
-                            paramIndex++;
-                            break;
-                        case "LIKE":
-                        case "ILIKE":
-                            branchSql += ` AND ${jsonPath} ${operator} $${paramIndex}::text`;
-                            context.params.push(value);
-                            paramIndex++;
-                            break;
-                        case "IN":
-                            if (Array.isArray(value)) {
-                                const cast = jsonbInListCast(value);
-                                const placeholders = value.map(() => `$${paramIndex++}${cast.param}`).join(', ');
-                                branchSql += ` AND ${cast.lhs(jsonPath)} IN (${placeholders})`;
-                                context.params.push(...value);
-                            }
-                            break;
-                        case "NOT IN":
-                            if (Array.isArray(value)) {
-                                const cast = jsonbInListCast(value);
-                                const placeholders = value.map(() => `$${paramIndex++}${cast.param}`).join(', ');
-                                branchSql += ` AND ${cast.lhs(jsonPath)} NOT IN (${placeholders})`;
-                                context.params.push(...value);
-                            }
-                            break;
-                        default:
-                            throw new Error(`Unsupported operator: ${operator}`);
-                    }
-                }
-            }
 
             branches.push(branchSql);
         }
@@ -233,70 +210,17 @@ export class OrNode extends QueryNode {
         for (const branch of this.orQuery.branches) {
             const conditions: string[] = [];
 
-            // Use literal component type value (no parameter) to avoid type inference issues
-            conditions.push(`type_id = '${componentId}'`);
+            // Literal type id (registry sha256 hex) avoids UNION param-type inference.
+            conditions.push(`c.type_id = '${componentId}'`);
 
-            // Add filters for this branch
-            if (branch.filters && branch.filters.length > 0) {
-                for (const filter of branch.filters) {
-                    const { field, operator, value } = filter;
-                    const jsonPath = `data->>'${escapeJsonLiteral(field)}'`;
+            const built = this.branchFilterSql(branch.filters, 'c', context, paramIndex);
+            paramIndex = built.paramIndex;
+            if (built.sql) conditions.push(built.sql);
 
-                    switch (operator) {
-                        case "=":
-                        case ">":
-                        case "<":
-                        case ">=":
-                        case "<=":
-                        case "!=":
-                            // SEC-03 + bugfix: numbers need the numeric cast.
-                            // `data->>'k'` is text, so a raw number param made
-                            // PG fail with `text = integer`. Mirrors the
-                            // buildBranchExists switch below.
-                            if (typeof value === "number") {
-                                conditions.push(`(${jsonPath})::numeric ${operator} $${paramIndex}`);
-                            } else if (typeof value === "boolean") {
-                                conditions.push(`(${jsonPath})::boolean ${operator} $${paramIndex}`);
-                            } else {
-                                conditions.push(`${jsonPath} ${operator} $${paramIndex}`);
-                            }
-                            context.params.push(value);
-                            paramIndex++;
-                            break;
-                        case "LIKE":
-                        case "ILIKE":
-                            conditions.push(`${jsonPath} ${operator} $${paramIndex}`);
-                            context.params.push(value);
-                            paramIndex++;
-                            break;
-                        case "IN":
-                            if (Array.isArray(value)) {
-                                const cast = jsonbInListCast(value);
-                                const placeholders = value.map(() => `$${paramIndex++}${cast.param}`).join(', ');
-                                conditions.push(`${cast.lhs(jsonPath)} IN (${placeholders})`);
-                                context.params.push(...value);
-                            }
-                            break;
-                        case "NOT IN":
-                            if (Array.isArray(value)) {
-                                const cast = jsonbInListCast(value);
-                                const placeholders = value.map(() => `$${paramIndex++}${cast.param}`).join(', ');
-                                conditions.push(`${cast.lhs(jsonPath)} NOT IN (${placeholders})`);
-                                context.params.push(...value);
-                            }
-                            break;
-                        default:
-                            throw new Error(`Unsupported operator: ${operator}`);
-                    }
-                }
-            }
-
-            // Combine conditions for this branch with AND
             orConditions.push(`(${conditions.join(' AND ')})`);
         }
 
-        // Build the main query
-        let sql = `SELECT entity_id as id FROM ${partitionTable} WHERE deleted_at IS NULL AND (${orConditions.join(' OR ')})`;
+        let sql = `SELECT c.entity_id as id FROM ${partitionTable} c WHERE c.deleted_at IS NULL AND (${orConditions.join(' OR ')})`;
 
         // Apply global constraints
         const conditions: string[] = [];
@@ -313,7 +237,7 @@ export class OrNode extends QueryNode {
         if (context.excludedComponentIds.size > 0) {
             const excludedTypes = Array.from(context.excludedComponentIds);
             const placeholders = excludedTypes.map(() => `$${paramIndex++}`).join(', ');
-            conditions.push(`NOT EXISTS (SELECT 1 FROM ${getMembershipTable()} ec_ex WHERE ec_ex.entity_id = ${partitionTable}.entity_id AND ec_ex.type_id IN (${placeholders}) AND ec_ex.deleted_at IS NULL)`);
+            conditions.push(`NOT EXISTS (SELECT 1 FROM ${getMembershipTable()} ec_ex WHERE ec_ex.entity_id = c.entity_id AND ec_ex.type_id IN (${placeholders}) AND ec_ex.deleted_at IS NULL)`);
             context.params.push(...excludedTypes);
         }
 
@@ -445,64 +369,9 @@ export class OrNode extends QueryNode {
             context.params.push(componentId);
             paramIndex++;
 
-            // Add filters for this branch - applied to the latest component data
-            const filterConditions: string[] = [];
-            if (branch.filters && branch.filters.length > 0) {
-                for (const filter of branch.filters) {
-                    const { field, operator, value } = filter;
-
-                    // Build JSON path for nested properties
-                    const jsonPath = `c.data->>'${escapeJsonLiteral(field)}'`;
-
-                    switch (operator) {
-                        case "=":
-                        case ">":
-                        case "<":
-                        case ">=":
-                        case "<=":
-                        case "!=":
-                            if (typeof value === "string") {
-                                filterConditions.push(`${jsonPath} ${operator} $${paramIndex}`);
-                                context.params.push(value);
-                                paramIndex++;
-                            } else {
-                                filterConditions.push(`(${jsonPath})::numeric ${operator} $${paramIndex}`);
-                                context.params.push(value);
-                                paramIndex++;
-                            }
-                            break;
-                        case "LIKE":
-                        case "ILIKE":
-                            filterConditions.push(`${jsonPath} ${operator} $${paramIndex}`);
-                            context.params.push(value);
-                            paramIndex++;
-                            break;
-                        case "IN":
-                            if (Array.isArray(value)) {
-                                const cast = jsonbInListCast(value);
-                                const placeholders = value.map(() => `$${paramIndex++}${cast.param}`).join(', ');
-                                filterConditions.push(`${cast.lhs(jsonPath)} IN (${placeholders})`);
-                                context.params.push(...value);
-                            }
-                            break;
-                        case "NOT IN":
-                            if (Array.isArray(value)) {
-                                const cast = jsonbInListCast(value);
-                                const placeholders = value.map(() => `$${paramIndex++}${cast.param}`).join(', ');
-                                filterConditions.push(`${cast.lhs(jsonPath)} NOT IN (${placeholders})`);
-                                context.params.push(...value);
-                            }
-                            break;
-                        default:
-                            throw new Error(`Unsupported operator: ${operator}`);
-                    }
-                }
-            }
-
-            // Apply filters inside the EXISTS/WHERE clause
-            if (filterConditions.length > 0) {
-                branchSql += ` AND ${filterConditions.join(' AND ')}`;
-            }
+            const built = this.branchFilterSql(branch.filters, 'c', context, paramIndex);
+            paramIndex = built.paramIndex;
+            if (built.sql) branchSql += ` AND ${built.sql}`;
 
             branchSql += ")";
 
@@ -605,53 +474,10 @@ export class OrNode extends QueryNode {
         context.params.push(componentId);
         paramIndex++;
 
-        if (branch.filters && branch.filters.length > 0) {
-            for (const filter of branch.filters) {
-                const { field, operator, value } = filter;
-                const jsonPath = `c.data->>'${escapeJsonLiteral(field)}'`;
+        const built = this.branchFilterSql(branch.filters, 'c', context, paramIndex);
+        paramIndex = built.paramIndex;
+        if (built.sql) sql += ` AND ${built.sql}`;
 
-                switch (operator) {
-                    case "=":
-                    case ">":
-                    case "<":
-                    case ">=":
-                    case "<=":
-                    case "!=":
-                        if (typeof value === "string") {
-                            sql += ` AND ${jsonPath} ${operator} $${paramIndex}`;
-                        } else {
-                            sql += ` AND (${jsonPath})::numeric ${operator} $${paramIndex}`;
-                        }
-                        context.params.push(value);
-                        paramIndex++;
-                        break;
-                    case "LIKE":
-                    case "ILIKE":
-                        sql += ` AND ${jsonPath} ${operator} $${paramIndex}`;
-                        context.params.push(value);
-                        paramIndex++;
-                        break;
-                    case "IN":
-                        if (Array.isArray(value)) {
-                            const cast = jsonbInListCast(value);
-                            const placeholders = value.map(() => `$${paramIndex++}${cast.param}`).join(', ');
-                            sql += ` AND ${cast.lhs(jsonPath)} IN (${placeholders})`;
-                            context.params.push(...value);
-                        }
-                        break;
-                    case "NOT IN":
-                        if (Array.isArray(value)) {
-                            const cast = jsonbInListCast(value);
-                            const placeholders = value.map(() => `$${paramIndex++}${cast.param}`).join(', ');
-                            sql += ` AND ${cast.lhs(jsonPath)} NOT IN (${placeholders})`;
-                            context.params.push(...value);
-                        }
-                        break;
-                    default:
-                        throw new Error(`Unsupported operator: ${operator}`);
-                }
-            }
-        }
 
         sql += ")";
         return { sql, paramIndex };

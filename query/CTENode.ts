@@ -85,7 +85,7 @@ export class CTENode extends QueryNode {
         if (componentIds.length === 1) {
             const { table, canPushFilters } = this.membershipTableFor(componentIds[0]!);
             const paramIdx = context.addParam(componentIds[0]!);
-            cteSql += `    SELECT DISTINCT ec.entity_id\n`;
+            cteSql += `    SELECT ec.entity_id\n`;
             cteSql += `    FROM ${table} ec\n`;
             cteSql += `    WHERE ec.type_id = $${paramIdx}::text\n`;
             cteSql += `    AND ec.deleted_at IS NULL\n`;
@@ -128,7 +128,7 @@ export class CTENode extends QueryNode {
             if (context.limit !== null) {
                 cteSql += `    LIMIT $${context.addParam(context.limit)}\n`;
             }
-            if (context.cursorId === null && (context.offsetValue > 0 || context.limit !== null)) {
+            if (context.cursorId === null && context.offsetValue > 0) {
                 cteSql += `    OFFSET $${context.addParam(context.offsetValue)}\n`;
             }
             context.paginationAppliedInCTE = true;

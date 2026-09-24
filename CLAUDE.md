@@ -116,7 +116,7 @@ class UserService extends BaseService {
 - App authors: `docs/QUERY_LIST_GUIDE.md` (pagination, N+1, tags, when QSP applies).
 - Engine analysis: `docs/READ_PATH_PERFORMANCE.md` (RP-01…08 status, EXPLAIN protocol).
 - QSP ops: `docs/QSP_OPERATIONS.md` (coverage rules, empty tags, multi-archetype limits, reconcile).
-- Tickets: `docs/TICKETS_READ_PATH_PERF_2026-08.md`.
+- Tickets: `docs/internal/TICKETS_READ_PATH_PERF_2026-08.md`.
 
 ### Caching
 

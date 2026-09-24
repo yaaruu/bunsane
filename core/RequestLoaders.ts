@@ -1,14 +1,14 @@
 import DataLoader from 'dataloader';
 import { Entity } from './Entity';
-import db from '../database';
 import { inList } from '../database/sqlHelpers';
 import { incrementDataLoaderCall, type PerRequestCounters } from '../database/instrumentedDb';
 import { dbExec } from '../database/gateway';
-import {logger as MainLogger} from './Logger';
+import { logger as MainLogger } from './Logger';
 const logger = MainLogger.child({ module: 'RequestLoaders' });
-import { getMetadataStorage } from './metadata';
 import type { CacheManager } from './cache/CacheManager';
 import { COMPONENT_TOMBSTONE } from './cache/CacheManager';
+import { trackCacheOp } from './entity/pendingOps';
+import { bumpAllComponentReadFlights, bumpComponentReadFlight, componentReadEpoch } from './cache/componentReadFlight';
 
 export type ComponentData = {
   id: string;  // Component ID for updates
@@ -27,8 +27,213 @@ export type RequestLoaders = {
   relationsByComponentFk: DataLoader<{ entityId: string; componentTypeId: string; foreignKeyField: string }, Entity[]>;
 };
 
+const SQL_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function assertSqlIdentifier(value: string, label: string): string {
+  if (!SQL_IDENTIFIER.test(value)) {
+    throw new Error(`Invalid ${label}: ${value}`);
+  }
+  return value;
+}
+
+function componentFlightKey(entityId: string, typeId: string): string {
+  return `${entityId}\0${typeId}`;
+}
+
+/**
+ * Cross-request singleflight for component cache misses. The flight records
+ * the epoch at start. A joiner whose signal is still live does not inherit
+ * the leader's abort — that flight resolves to a sentinel and the joiner
+ * re-queries. A key written or cleared after the flight started is not joinable.
+ */
+const FLIGHT_ABORTED = Symbol('component-flight-aborted');
+type FlightValue = ComponentData | null | typeof FLIGHT_ABORTED;
+const componentMissFlights = new Map<string, { promise: Promise<FlightValue>; epoch: number }>();
+
+type Pair = { entityId: string; typeId: string };
+
+function pairValues(pairs: readonly Pair[], paramIndex: number): { sql: string; params: string[]; newParamIndex: number } {
+  const params: string[] = [];
+  const tuples: string[] = [];
+  let i = paramIndex;
+  for (const pair of pairs) {
+    tuples.push(`($${i}::uuid, $${i + 1}::varchar)`);
+    params.push(pair.entityId, pair.typeId);
+    i += 2;
+  }
+  return { sql: tuples.join(', '), params, newParamIndex: i };
+}
+
+function rowToComponent(row: {
+  id: string;
+  entity_id: string;
+  type_id: string;
+  data: unknown;
+  created_at: Date;
+  updated_at: Date;
+  deleted_at: Date | null;
+}): ComponentData {
+  return {
+    id: row.id,
+    entityId: row.entity_id,
+    typeId: row.type_id,
+    data: row.data,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at,
+  };
+}
+
+async function queryComponentPairs(
+  keys: readonly Pair[],
+  signal: AbortSignal | undefined,
+  perRequest: PerRequestCounters | undefined,
+): Promise<Map<string, ComponentData | null>> {
+  const seen = new Set<string>();
+  const pairs: Pair[] = [];
+  for (const key of keys) {
+    const flightKey = componentFlightKey(key.entityId, key.typeId);
+    if (seen.has(flightKey)) continue;
+    seen.add(flightKey);
+    pairs.push(key);
+  }
+
+  const result = new Map<string, ComponentData | null>();
+  for (const pair of pairs) result.set(componentFlightKey(pair.entityId, pair.typeId), null);
+  if (pairs.length === 0) return result;
+
+  // type_id IN keeps LIST partition pruning. The VALUES predicate drops the
+  // cartesian product of entity_id IN (...) AND type_id IN (...).
+  const typeIds = [...new Set(pairs.map(pair => pair.typeId))];
+  const typeIdList = inList(typeIds, 1);
+  const pairList = pairValues(pairs, typeIdList.newParamIndex);
+  const rows = await dbExec<Array<{
+    id: string;
+    entity_id: string;
+    type_id: string;
+    data: unknown;
+    created_at: Date;
+    updated_at: Date;
+    deleted_at: Date | null;
+  }>>(`
+    SELECT id, entity_id, type_id, data, created_at, updated_at, deleted_at
+    FROM components
+    WHERE deleted_at IS NULL
+      AND type_id IN ${typeIdList.sql}
+      AND (entity_id, type_id) IN (VALUES ${pairList.sql})
+  `, [...typeIdList.params, ...pairList.params], {
+    lane: 'request',
+    label: 'loader.component.byEntityTypes',
+    signal,
+    perRequest,
+  });
+
+  for (const row of rows) {
+    const comp = rowToComponent(row);
+    result.set(componentFlightKey(comp.entityId, comp.typeId), comp);
+  }
+  return result;
+}
+
+function isLeaderCancellation(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true;
+}
+
+/**
+ * Join in-flight misses or become the leader for keys nobody else owns.
+ * Registration is synchronous so a concurrent batch cannot start a second query
+ * for the same epoch. A flight started before a write (lower epoch) is skipped.
+ */
+async function singleflightComponentMisses(
+  keys: readonly Pair[],
+  signal: AbortSignal | undefined,
+  leader: (owned: Pair[]) => Promise<Map<string, ComponentData | null>>,
+): Promise<Map<string, ComponentData | null>> {
+  const out = new Map<string, ComponentData | null>();
+  const waiting: Promise<void>[] = [];
+  const retries: Pair[] = [];
+  const owned: Pair[] = [];
+  const resolveOwned = new Map<string, (value: FlightValue) => void>();
+  const rejectOwned = new Map<string, (error: unknown) => void>();
+  const registered = new Map<string, Promise<FlightValue>>();
+
+  for (const key of keys) {
+    const flightKey = componentFlightKey(key.entityId, key.typeId);
+    const existing = componentMissFlights.get(flightKey);
+    if (existing && existing.epoch === componentReadEpoch(key.entityId, key.typeId)) {
+      waiting.push(existing.promise.then((value) => {
+        if (value === FLIGHT_ABORTED) retries.push(key);
+        else out.set(flightKey, value);
+      }));
+      continue;
+    }
+    owned.push(key);
+    const epoch = componentReadEpoch(key.entityId, key.typeId);
+    const { promise, resolve, reject } = Promise.withResolvers<FlightValue>();
+    promise.catch(() => {});
+    resolveOwned.set(flightKey, resolve);
+    rejectOwned.set(flightKey, reject);
+    registered.set(flightKey, promise);
+    componentMissFlights.set(flightKey, { promise, epoch });
+  }
+
+  let leaderError: unknown;
+  if (owned.length > 0) {
+    try {
+      const fetched = await leader(owned);
+      for (const key of owned) {
+        const flightKey = componentFlightKey(key.entityId, key.typeId);
+        const value = fetched.get(flightKey) ?? null;
+        out.set(flightKey, value);
+        resolveOwned.get(flightKey)!(value);
+      }
+    } catch (error) {
+      leaderError = error;
+      const cancelled = isLeaderCancellation(signal);
+      for (const key of owned) {
+        const flightKey = componentFlightKey(key.entityId, key.typeId);
+        if (cancelled) resolveOwned.get(flightKey)!(FLIGHT_ABORTED);
+        else rejectOwned.get(flightKey)!(error);
+      }
+    } finally {
+      for (const key of owned) {
+        const flightKey = componentFlightKey(key.entityId, key.typeId);
+        if (componentMissFlights.get(flightKey)?.promise === registered.get(flightKey)) {
+          componentMissFlights.delete(flightKey);
+        }
+      }
+    }
+  }
+
+  if (waiting.length > 0) {
+    try {
+      await Promise.all(waiting);
+    } catch (error) {
+      if (!leaderError) leaderError = error;
+    }
+  }
+
+  if (retries.length > 0) {
+    if (signal?.aborted) {
+      throw signal.reason ?? new Error('Query aborted');
+    }
+    const again = await singleflightComponentMisses(retries, signal, leader);
+    for (const [key, value] of again) out.set(key, value);
+  }
+
+  if (leaderError && owned.length > 0) throw leaderError;
+  return out;
+}
+
+function cacheEnabled(cacheManager: CacheManager | undefined, kind: 'entity' | 'component'): boolean {
+  if (!cacheManager) return false;
+  const config = cacheManager.getConfig();
+  if (!config.enabled) return false;
+  return kind === 'entity' ? !!config.entity?.enabled : !!config.component?.enabled;
+}
+
 export function createRequestLoaders(
-  db: any,
+  _db: unknown,
   cacheManager?: CacheManager,
   signal?: AbortSignal,
   perRequest?: PerRequestCounters,
@@ -37,7 +242,6 @@ export function createRequestLoaders(
     incrementDataLoaderCall('entity', perRequest);
     const startTime = Date.now();
     try {
-      // Filter out empty/invalid IDs to prevent PostgreSQL UUID parsing errors
       const validIds = ids.filter(id => id && typeof id === 'string' && id.trim() !== '');
       if (validIds.length === 0) {
         return ids.map(() => null);
@@ -46,55 +250,39 @@ export function createRequestLoaders(
       const uniqueIds = [...new Set(validIds)];
       const results = new Map<string, Entity | null>();
 
-      // Note: Entity cache now only tracks existence, not full entity data
-      // Full entities are always loaded from database for component access
+      // Entity cache stores only the id and nothing on the read path consults
+      // it (full entities are always loaded from the database). Do not
+      // write-through those ids — it added a Redis round trip for no hit.
 
-      // Find missing entities that weren't in cache
-      const missingIds = uniqueIds.filter(id => !results.has(id));
-      
-      if (missingIds.length > 0) {
-        const idList = inList(missingIds, 1);
-        const rows = await dbExec<any[]>(`
-          SELECT id
-          FROM entities
-          WHERE id IN ${idList.sql}
-            AND deleted_at IS NULL
-        `, idList.params, { lane: 'request', label: 'loader.entity.byIds', signal, perRequest });
-        
-        const entities = rows.map((row: any) => {
-          const entity = new Entity(row.id);
-          entity.setPersisted(true);
-          return entity;
-        });
+      const idList = inList(uniqueIds, 1);
+      const rows = await dbExec<Array<{ id: string }>>(`
+        SELECT id
+        FROM entities
+        WHERE id IN ${idList.sql}
+          AND deleted_at IS NULL
+      `, idList.params, { lane: 'request', label: 'loader.entity.byIds', signal, perRequest });
 
-        // Cache the loaded entities if cache is enabled
-        if (cacheManager && cacheManager.getConfig().enabled && cacheManager.getConfig().entity?.enabled) {
-          try {
-            await cacheManager.setEntitiesWriteThrough(entities, cacheManager.getConfig().entity!.ttl);
-          } catch (error) {
-            logger.warn({ scope: 'cache', component: 'RequestLoaders', msg: 'Cache write failed for entities', error });
-          }
-        }
-
-        entities.forEach((e: Entity) => results.set(e.id, e));
+      for (const row of rows) {
+        const entity = new Entity(row.id);
+        entity.setPersisted(true);
+        results.set(entity.id, entity);
       }
 
       const duration = Date.now() - startTime;
-      if (duration > 1000) { // Log slow queries
+      if (duration > 1000) {
         logger.warn(`Slow entityById query: ${duration}ms for ${ids.length} entities`);
       }
-      
-      // Return null for invalid IDs
+
       return ids.map(id => {
         if (!id || typeof id !== 'string' || id.trim() === '') return null;
         return results.get(id) ?? null;
       });
-    } catch (error: any) {
-      logger.error(`Error in entityById DataLoader:`, error);
+    } catch (error) {
+      logger.error({ error }, 'Error in entityById DataLoader');
       throw error;
     }
   }, {
-    maxBatchSize: 100 // Prevent extremely large batches
+    maxBatchSize: 100
   });
 
   const componentsByEntityType = new DataLoader<{ entityId: string; typeId: string }, ComponentData | null, string>(
@@ -102,23 +290,21 @@ export function createRequestLoaders(
       incrementDataLoaderCall('component', perRequest);
       const startTime = Date.now();
       try {
-        // Filter out keys with empty/invalid entity IDs to prevent PostgreSQL UUID parsing errors
         const validKeys = keys.filter(k => k.entityId && typeof k.entityId === 'string' && k.entityId.trim() !== '');
         if (validKeys.length === 0) {
           return keys.map(() => null);
         }
 
         const results = new Map<string, ComponentData | null>();
+        const componentCacheOn = cacheEnabled(cacheManager, 'component');
 
-        // Check cache first if cache manager is available. Tombstone hits
-        // are recorded as null in `results` so the DB-fetch step skips them.
         let cacheHits = 0;
         let cacheMisses = 0;
-        if (cacheManager && cacheManager.getConfig().enabled && cacheManager.getConfig().component?.enabled) {
+        if (componentCacheOn) {
           try {
-            const cachedComponents = await cacheManager.getComponents(validKeys);
+            const cachedComponents = await cacheManager!.getComponents(validKeys);
             cachedComponents.forEach((value, index) => {
-              const key = `${validKeys[index]!.entityId}-${validKeys[index]!.typeId}`;
+              const key = componentFlightKey(validKeys[index]!.entityId, validKeys[index]!.typeId);
               if (value === COMPONENT_TOMBSTONE) {
                 results.set(key, null);
                 cacheHits++;
@@ -129,7 +315,7 @@ export function createRequestLoaders(
                 cacheMisses++;
               }
             });
-          } catch (error: any) {
+          } catch (error) {
             logger.warn({ scope: 'cache', component: 'RequestLoaders', msg: 'Cache read failed for components, falling back to database', error });
             cacheMisses += validKeys.length;
           }
@@ -150,82 +336,66 @@ export function createRequestLoaders(
           });
         }
 
-        // Find missing components that weren't in cache
-        const missingKeys = validKeys.filter(k => !results.has(`${k.entityId}-${k.typeId}`));
-        
+        const missingKeys = validKeys.filter(k => !results.has(componentFlightKey(k.entityId, k.typeId)));
         if (missingKeys.length > 0) {
-          const entityIds = [...new Set(missingKeys.map(k => k.entityId))];
-          const typeIds = [...new Set(missingKeys.map(k => k.typeId))];
-          const entityIdList = inList(entityIds, 1);
-          const typeIdList = inList(typeIds, entityIdList.newParamIndex);
-          const rows = await dbExec<any[]>(`
-            SELECT id, entity_id, type_id, data, created_at, updated_at, deleted_at
-            FROM components
-            WHERE entity_id IN ${entityIdList.sql}
-              AND type_id IN ${typeIdList.sql}
-              AND deleted_at IS NULL
-          `, [...entityIdList.params, ...typeIdList.params], { lane: 'request', label: 'loader.component.byEntityTypes', signal, perRequest });
-          
-          const components: ComponentData[] = rows.map((row: any) => ({
-            id: row.id,
-            entityId: row.entity_id,
-            typeId: row.type_id,
-            data: row.data,
-            createdAt: row.created_at,
-            updatedAt: row.updated_at,
-            deletedAt: row.deleted_at,
-          }));
-
-          // Cache the loaded components + tombstone any requested keys whose
-          // row was absent (single setMany — see CacheManager.setComponentsWriteThrough).
-          if (cacheManager && cacheManager.getConfig().enabled && cacheManager.getConfig().component?.enabled) {
-            try {
-              await cacheManager.setComponentsWriteThrough(
-                components,
-                missingKeys,
-                cacheManager.getConfig().component!.ttl,
+          const fetched = await singleflightComponentMisses(missingKeys, signal, async (owned) => {
+            const map = await queryComponentPairs(owned, signal, perRequest);
+            if (componentCacheOn) {
+              const components: ComponentData[] = [];
+              for (const value of map.values()) {
+                if (value) components.push(value);
+              }
+              trackCacheOp(
+                cacheManager!.setComponentsWriteThrough(
+                  components,
+                  owned,
+                  cacheManager!.getConfig().component!.ttl,
+                ).catch((error) => {
+                  logger.warn({ scope: 'cache', component: 'RequestLoaders', msg: 'Cache write failed for components', error });
+                })
               );
-            } catch (error: any) {
-              logger.warn({ scope: 'cache', component: 'RequestLoaders', msg: 'Cache write failed for components', error });
             }
-          }
-
-          components.forEach((comp: ComponentData) => {
-            const key = `${comp.entityId}-${comp.typeId}`;
-            results.set(key, comp);
+            return map;
           });
+          for (const [key, value] of fetched) results.set(key, value);
         }
 
         const duration = Date.now() - startTime;
-        if (duration > 1000) { // Log slow queries
+        if (duration > 1000) {
           logger.warn(`Slow componentsByEntityType query: ${duration}ms for ${keys.length} keys`);
         }
-        
-        // Return null for keys with invalid entity IDs
+
         return keys.map(k => {
           if (!k.entityId || typeof k.entityId !== 'string' || k.entityId.trim() === '') return null;
-          return results.get(`${k.entityId}-${k.typeId}`) ?? null;
+          return results.get(componentFlightKey(k.entityId, k.typeId)) ?? null;
         });
-      } catch (error: any) {
-        logger.error(`Error in componentsByEntityType DataLoader:`, error);
+      } catch (error) {
+        logger.error({ error }, 'Error in componentsByEntityType DataLoader');
         throw error;
       }
     },
     {
-      maxBatchSize: 100, // Prevent extremely large batches
-      // Object keys default to identity (===) comparison, which never dedups
-      // distinct literals — collapse to a stable string so sibling resolvers
-      // requesting the same (entity, type) share one load within a request.
+      maxBatchSize: 100,
       cacheKeyFn: (k: { entityId: string; typeId: string }) => `${k.entityId}\x00${k.typeId}`,
     }
   );
+
+  const clearKey = componentsByEntityType.clear.bind(componentsByEntityType);
+  componentsByEntityType.clear = (key) => {
+    bumpComponentReadFlight(key.entityId, key.typeId);
+    return clearKey(key);
+  };
+  const clearAllKeys = componentsByEntityType.clearAll.bind(componentsByEntityType);
+  componentsByEntityType.clearAll = () => {
+    bumpAllComponentReadFlights();
+    return clearAllKeys();
+  };
 
   const relationsByEntityField = new DataLoader<{ entityId: string; relationField: string; relatedType: string; foreignKey?: string }, Entity[], string>(
     async (keys: readonly { entityId: string; relationField: string; relatedType: string; foreignKey?: string }[]) => {
       incrementDataLoaderCall('relation', perRequest);
       const startTime = Date.now();
       try {
-        // Filter valid keys
         const validKeys = keys.filter(k => k.entityId && typeof k.entityId === 'string' && k.entityId.trim() !== '');
         if (validKeys.length === 0) {
           return keys.map(() => []);
@@ -233,7 +403,6 @@ export function createRequestLoaders(
 
         const resultMap = new Map<string, Entity[]>();
 
-        // Negative-cache lookup: skip DB for keys recorded as empty.
         let keysToQuery = validKeys;
         const relCacheEnabled = !!(cacheManager
           && cacheManager.getConfig().enabled
@@ -245,8 +414,7 @@ export function createRequestLoaders(
             tombstones.forEach((isEmpty, i) => {
               const k = validKeys[i]!;
               if (isEmpty) {
-                const mapKey = `${k.entityId}\x00${k.relationField}\x00${k.relatedType}`;
-                resultMap.set(mapKey, []);
+                resultMap.set(`${k.entityId}\x00${k.relationField}\x00${k.relatedType}`, []);
               } else {
                 remaining.push(k);
               }
@@ -257,38 +425,30 @@ export function createRequestLoaders(
           }
         }
 
-        // Group keys by foreign key for efficient batching
         const keysByForeignKey = new Map<string, typeof keysToQuery>();
         for (const key of keysToQuery) {
           const fk = key.foreignKey || 'default';
-          if (!keysByForeignKey.has(fk)) {
-            keysByForeignKey.set(fk, []);
-          }
-          keysByForeignKey.get(fk)!.push(key);
+          const group = keysByForeignKey.get(fk);
+          if (group) group.push(key);
+          else keysByForeignKey.set(fk, [key]);
         }
 
-        // OPTIMIZED: Batch query for each foreign key type (instead of N separate queries)
         for (const [foreignKey, groupedKeys] of keysByForeignKey) {
           const entityIds = [...new Set(groupedKeys.map(k => k.entityId))];
-          const entityIdList = inList(entityIds, 1);
-
           let foreignKeyField: string;
           let whereClause: string;
-          
+
           if (foreignKey !== 'default') {
-            // Use specific foreign key from relation metadata
-            foreignKeyField = foreignKey;
-            whereClause = `c.data->>'${foreignKey}' = ANY($1)`;
+            foreignKeyField = assertSqlIdentifier(foreignKey, 'relation foreign key');
+            whereClause = `c.data->>'${foreignKeyField}' = ANY($1)`;
           } else {
-            // Fallback for backward compatibility
-            foreignKeyField = 'user_id'; // Default field for result mapping
+            foreignKeyField = 'user_id';
             whereClause = `(c.data->>'user_id' = ANY($1) OR c.data->>'parent_id' = ANY($1))`;
           }
 
           logger.trace(`[RelationLoader] Batched query for ${groupedKeys.length} keys with foreign key ${foreignKey}`);
 
-          // SINGLE BATCHED QUERY for all entities in this group
-          const rows = await dbExec<any[]>(`
+          const rows = await dbExec<Array<{ entity_id: string; fk_value: string | null; fallback_fk_value: string | null }>>(`
             SELECT DISTINCT
               c.entity_id,
               c.data,
@@ -304,44 +464,36 @@ export function createRequestLoaders(
 
           logger.trace(`[RelationLoader] Found ${rows.length} total components for ${entityIds.length} entities`);
 
-          // Map results back to original keys
           for (const key of groupedKeys) {
             const relatedEntityIds = rows
-              .filter((row: any) => {
-                // Match by specific foreign key or fallback
+              .filter(row => {
                 const fkValue = foreignKey !== 'default' ? row.fk_value : row.fallback_fk_value;
                 return fkValue === key.entityId;
               })
-              .map((row: any) => row.entity_id);
+              .map(row => row.entity_id);
 
-            const uniqueEntityIds = [...new Set(relatedEntityIds)];
-            const entities = uniqueEntityIds.map(id => {
-              const entity = new Entity(id as string);
+            const entities = [...new Set(relatedEntityIds)].map(id => {
+              const entity = new Entity(id);
               entity.setPersisted(true);
               return entity;
             });
 
-            // Use null byte separator to prevent key collision when fields contain hyphens
-            const mapKey = `${key.entityId}\x00${key.relationField}\x00${key.relatedType}`;
-            resultMap.set(mapKey, entities);
-            
+            resultMap.set(`${key.entityId}\x00${key.relationField}\x00${key.relatedType}`, entities);
             logger.trace(`[RelationLoader] Mapped ${entities.length} entities for ${key.relationField} on ${key.entityId}`);
           }
         }
 
-        // Write tombstones for queried keys whose result was empty.
         if (relCacheEnabled && keysToQuery.length > 0) {
           const emptyKeys = keysToQuery.filter(k => {
-            const mapKey = `${k.entityId}\x00${k.relationField}\x00${k.relatedType}`;
-            const r = resultMap.get(mapKey);
-            return !r || r.length === 0;
+            const mapped = resultMap.get(`${k.entityId}\x00${k.relationField}\x00${k.relatedType}`);
+            return !mapped || mapped.length === 0;
           });
           if (emptyKeys.length > 0) {
-            try {
-              await cacheManager!.setRelationsEmpty(emptyKeys);
-            } catch (error) {
-              logger.warn({ scope: 'cache', component: 'RequestLoaders', msg: 'Cache write failed for relation tombstones', error });
-            }
+            trackCacheOp(
+              cacheManager!.setRelationsEmpty(emptyKeys).catch((error) => {
+                logger.warn({ scope: 'cache', component: 'RequestLoaders', msg: 'Cache write failed for relation tombstones', error });
+              })
+            );
           }
         }
 
@@ -353,39 +505,21 @@ export function createRequestLoaders(
         }
 
         return keys.map(k => {
-          if (!k.entityId || typeof k.entityId !== 'string' || k.entityId.trim() === '') {
-            return [];
-          }
-          // Use null byte separator to prevent key collision when fields contain hyphens
-          const mapKey = `${k.entityId}\x00${k.relationField}\x00${k.relatedType}`;
-          const result = resultMap.get(mapKey) || [];
-          return result;
+          if (!k.entityId || typeof k.entityId !== 'string' || k.entityId.trim() === '') return [];
+          return resultMap.get(`${k.entityId}\x00${k.relationField}\x00${k.relatedType}`) ?? [];
         });
       } catch (error) {
-        logger.error(`Error in relationsByEntityField DataLoader:`);
-        logger.error(error);
-        // Return empty arrays for all keys on error
-        return keys.map(() => []);
+        logger.error({ error }, 'Error in relationsByEntityField DataLoader');
+        throw error;
       }
     },
     {
-      // Add batch size limit to prevent extremely large queries
       maxBatchSize: 50,
-      // Stable string key (null-byte separated, matches the result-map key) so
-      // identical relation requests dedup within a request instead of being
-      // treated as distinct object identities.
       cacheKeyFn: (k: { entityId: string; relationField: string; relatedType: string; foreignKey?: string }) =>
         `${k.entityId}\x00${k.relationField}\x00${k.relatedType}\x00${k.foreignKey ?? ''}`,
     }
   );
 
-  // Type-scoped foreign-key relation loader. Backs @HasMany/@BelongsToMany
-  // array relations that declare a `foreignKey`. Previously those resolved one
-  // `new Query().exec()` PER PARENT ROW (a hard N+1). This batches all parents
-  // sharing a (componentType, fkField) into a single `data->>'fk' = ANY($2)`
-  // query. Unlike relationsByEntityField it pins `type_id`, preserving the
-  // exact semantics of the per-parent Query (which filtered by the specific
-  // component type) rather than matching any component sharing the field name.
   const relationsByComponentFk = new DataLoader<{ entityId: string; componentTypeId: string; foreignKeyField: string }, Entity[], string>(
     async (keys: readonly { entityId: string; componentTypeId: string; foreignKeyField: string }[]) => {
       incrementDataLoaderCall('relation', perRequest);
@@ -395,29 +529,23 @@ export function createRequestLoaders(
         if (validKeys.length === 0) return keys.map(() => []);
 
         const resultMap = new Map<string, Entity[]>();
-
-        // Group by (componentTypeId, foreignKeyField) so each distinct relation
-        // shape is one batched query.
         const groups = new Map<string, typeof validKeys>();
         for (const key of validKeys) {
           const gk = `${key.componentTypeId}\x00${key.foreignKeyField}`;
-          if (!groups.has(gk)) groups.set(gk, []);
-          groups.get(gk)!.push(key);
+          const group = groups.get(gk);
+          if (group) group.push(key);
+          else groups.set(gk, [key]);
         }
 
         for (const [gk, groupedKeys] of groups) {
           const sep = gk.indexOf('\x00');
           const componentTypeId = gk.slice(0, sep);
-          const foreignKeyField = gk.slice(sep + 1);
+          const foreignKeyField = assertSqlIdentifier(gk.slice(sep + 1), 'relation foreign key');
           const entityIds = [...new Set(groupedKeys.map(k => k.entityId))];
           if (entityIds.length === 0) continue;
 
-          // type_id + entity ids are parameterized via inList (the proven
-          // pattern — passing a JS array to `= ANY($n)` is serialized as a
-          // comma-string by the Bun SQL driver and fails). foreignKeyField
-          // comes from trusted relation decorator metadata.
           const entityList = inList(entityIds, 2);
-          const rows = await dbExec<any[]>(`
+          const rows = await dbExec<Array<{ entity_id: string; fk_value: string | null }>>(`
             SELECT c.entity_id, c.data->>'${foreignKeyField}' AS fk_value
             FROM components c
             INNER JOIN entities e ON c.entity_id = e.id
@@ -429,12 +557,12 @@ export function createRequestLoaders(
 
           for (const key of groupedKeys) {
             const relatedIds = [...new Set(
-              rows.filter((r: any) => r.fk_value === key.entityId).map((r: any) => r.entity_id)
+              rows.filter(row => row.fk_value === key.entityId).map(row => row.entity_id)
             )];
             const entities = relatedIds.map(id => {
-              const e = new Entity(id as string);
-              e.setPersisted(true);
-              return e;
+              const entity = new Entity(id);
+              entity.setPersisted(true);
+              return entity;
             });
             resultMap.set(`${key.entityId}\x00${componentTypeId}\x00${foreignKeyField}`, entities);
           }
@@ -447,12 +575,11 @@ export function createRequestLoaders(
 
         return keys.map(k => {
           if (!k.entityId || typeof k.entityId !== 'string' || k.entityId.trim() === '') return [];
-          return resultMap.get(`${k.entityId}\x00${k.componentTypeId}\x00${k.foreignKeyField}`) || [];
+          return resultMap.get(`${k.entityId}\x00${k.componentTypeId}\x00${k.foreignKeyField}`) ?? [];
         });
       } catch (error) {
-        logger.error(`Error in relationsByComponentFk DataLoader:`);
-        logger.error(error);
-        return keys.map(() => []);
+        logger.error({ error }, 'Error in relationsByComponentFk DataLoader');
+        throw error;
       }
     },
     {

@@ -1,6 +1,5 @@
 import { logger as MainLogger } from "../Logger";
 import { SchedulerManager } from "../SchedulerManager";
-import { preparedStatementCache } from "../../database/PreparedStatementCache";
 import { getDbStats } from "../../database/instrumentedDb";
 import { getGatewayStats } from "../../database/gateway";
 import type { CacheManager } from "../cache/CacheManager";
@@ -22,7 +21,6 @@ export async function collectMetrics(app: any) {
         process: process.memoryUsage(),
         cache: cacheStats,
         scheduler: SchedulerManager.getInstance().getMetrics(),
-        preparedStatements: preparedStatementCache.getStats(),
         db: getDbStats(),
         // Admission is the signal that tells saturation ("queue has depth, work
         // is waiting") apart from a merely busy pool. Alert on queueDepth and

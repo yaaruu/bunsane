@@ -35,7 +35,7 @@ export class SourceNode extends QueryNode {
                 sql += ` LIMIT $${context.addParam(context.limit)}`;
             }
             // Only include OFFSET when not using cursor-based pagination
-            if (context.cursorId === null && (context.offsetValue > 0 || context.limit !== null)) {
+            if (context.cursorId === null && context.offsetValue > 0) {
                 sql += ` OFFSET $${context.addParam(context.offsetValue)}`;
             }
         }

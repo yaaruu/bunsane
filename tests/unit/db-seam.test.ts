@@ -51,6 +51,7 @@ const ALLOWED: Record<string, string> = {
     // `armGateway()`, so routing them would add a timeout and nothing else.
     // The 37 `unsafe()` sites in this file ARE routed.
     'database/DatabaseHelper.ts': 'tagged-template boot DDL; converting changes the wire protocol',
+    'database/maintenance.ts': 'manual downgrade/benchmark DDL moved out of DatabaseHelper; same tagged-template protocol hazard, never on a request path',
 
     // Correctness beats admission here: lock renewal is one autocommit statement
     // per lock per ttl/3, bounded by construction. Admission could only ever
@@ -63,6 +64,7 @@ const ALLOWED: Record<string, string> = {
     // report "wedged" when the truth is "busy" and the orchestrator restarts a
     // healthy container.
     'core/health.ts': 'liveness/readiness probe; must bypass admission',
+    'core/app/healthEndpoints.ts': 'read-mode liveness probe (SELECT 1); must bypass admission like core/health.ts',
     'database/connectionProbe.ts': 'boot probe, runs before the gateway is armed',
     'core/remote/health.ts': 'health probe',
 
@@ -75,10 +77,6 @@ const ALLOWED: Record<string, string> = {
     'core/components/BaseComponent.ts': 'operates on a caller-supplied trx',
     'core/cache/txInvalidation.ts': 'owns the transaction wrapper itself',
 
-    // Dead code: `execute()` has no callers (Bun auto-prepares, so the cache is
-    // a shell). Routing dead code whose ownership semantics are unknowable is
-    // worse than recording that it is dead.
-    'database/PreparedStatementCache.ts': 'unused execute() path; no callers',
 
     // Outbox/remote transport owns its own connection lifecycle.
     'core/remote/OutboxWorker.ts': 'outbox transport',
@@ -92,10 +90,19 @@ const ALLOWED: Record<string, string> = {
     'query/planner/HydrationParity.ts': 'parity comparison must bypass routing',
 };
 
-/** `db.unsafe(`, `sql.unsafe(`, or a `` db`…` `` tagged template. */
-const RAW_DB = /(?:^|[^.\w])(?:db|sql)\s*(?:\.unsafe\s*\(|`)/;
+/** `db.unsafe(`, `sql.unsafe(`, a `` db`…` `` / `` sql`…` `` template, or a `` dbConn`…` `` alias. */
+const RAW_DB = /(?:^|[^.\w])(?:dbConn|db|sql)\s*(?:\.unsafe\s*\(|`)/;
 /** A raw `db.transaction(` — should be `dbTransaction`. */
 const RAW_TXN = /(?:^|[^.\w])db\s*\.\s*transaction\s*\(/;
+
+describe('DB execution seam patterns', () => {
+    test('dbConn tagged templates and unsafe calls count as raw driver access', () => {
+        expect(RAW_DB.test('await dbConn`SELECT 1`')).toBe(true);
+        expect(RAW_DB.test('dbConn.unsafe("select 1")')).toBe(true);
+        expect(RAW_DB.test('await trx`SELECT 1`')).toBe(false);
+        expect(RAW_DB.test('await opts.trx`SELECT 1`')).toBe(false);
+    });
+});
 
 function walk(dir: string, out: string[] = []): string[] {
     let entries: string[];

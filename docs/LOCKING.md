@@ -99,7 +99,7 @@ on session state.
 ## `withLock` contention semantics
 
 ```ts
-import { withLock, LockUnavailableError } from "bunsane/core/scheduler";
+import { withLock, LockUnavailableError } from "bunsane";
 
 const res = await withLock("rebuild-index", async () => rebuild());
 if (!res.acquired) {

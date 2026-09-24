@@ -22,22 +22,6 @@ export interface GraphQLField {
 }
 
 
-
-// TODO: Remove this when we have a better way to define GraphQL type
-// Current usage is for custom input types in Operation decorators
-export enum GraphQLFieldTypes {
-    ID = "ID",
-    ID_REQUIRED = "ID!",
-    INT = "Int",
-    INT_REQUIRED = "Int!",
-    FLOAT = "Float",
-    FLOAT_REQUIRED = "Float!",
-    STRING = "String",
-    STRING_REQUIRED = "String!",
-    BOOLEAN = "Boolean",
-    BOOLEAN_REQUIRED = "Boolean!",
-}
-
 export const GraphQLList = {
     of: (type: string) => `[${type}]`,
     ofRequired: (type: string) => `[${type}]!`,

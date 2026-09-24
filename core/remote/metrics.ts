@@ -36,6 +36,11 @@ export interface RemoteMetricsSnapshot {
         trips: number;
         rejected: number;
     };
+    security: {
+        signatureRejected: number;
+        replyToRejected: number;
+        duplicateDropped: number;
+    };
 }
 
 function emptySnapshot(): RemoteMetricsSnapshot {
@@ -53,6 +58,7 @@ function emptySnapshot(): RemoteMetricsSnapshot {
         },
         outbox: { claimed: 0, published: 0, publishFailed: 0 },
         circuitBreaker: { trips: 0, rejected: 0 },
+        security: { signatureRejected: 0, replyToRejected: 0, duplicateDropped: 0 },
     };
 }
 
@@ -88,6 +94,10 @@ export class RemoteMetrics {
     // Circuit Breaker
     cbTripped(): void { this.snapshot.circuitBreaker.trips++; }
     cbRejected(): void { this.snapshot.circuitBreaker.rejected++; }
+
+    signatureRejected(): void { this.snapshot.security.signatureRejected++; }
+    replyToRejected(): void { this.snapshot.security.replyToRejected++; }
+    duplicateDropped(): void { this.snapshot.security.duplicateDropped++; }
 
     getSnapshot(): RemoteMetricsSnapshot {
         return JSON.parse(JSON.stringify(this.snapshot));

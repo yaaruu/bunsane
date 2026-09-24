@@ -7,7 +7,11 @@ const BASE = `http://localhost:${PORT}`;
 let app: App;
 
 beforeAll(async () => {
-    app = new App("E2E Test App", "0.0.1");
+    app = new App({
+        name: "E2E Test App",
+        version: "0.0.1",
+        docs: { public: true },
+    });
     // Start without init() — skips DB/component lifecycle
     process.env.APP_PORT = String(PORT);
     await app.start();
@@ -18,16 +22,16 @@ afterAll(async () => {
 });
 
 describe("E2E HTTP Routes", () => {
-    it("GET /health returns JSON with expected structure", async () => {
+    it("GET /health returns a softened JSON body", async () => {
         const res = await fetch(`${BASE}/health`);
         expect(res.headers.get("Content-Type")).toBe("application/json");
         const body = await res.json();
         expect(body).toHaveProperty("status");
         expect(body).toHaveProperty("timestamp");
-        expect(body).toHaveProperty("uptime");
-        expect(body).toHaveProperty("checks");
+        expect(body).not.toHaveProperty("uptime");
         expect(body.checks).toHaveProperty("database");
         expect(body.checks).toHaveProperty("cache");
+        expect(body.checks.database).not.toHaveProperty("latency_ms");
     });
 
     it("GET /health/ready returns 200 when server is up", async () => {
@@ -35,21 +39,12 @@ describe("E2E HTTP Routes", () => {
         const body = await res.json();
         expect(body).toHaveProperty("status");
         expect(body).toHaveProperty("timestamp");
-        expect(body).toHaveProperty("uptime");
+        expect(body).not.toHaveProperty("uptime");
     });
 
-    it("GET /metrics returns JSON with process and cache stats", async () => {
+    it("GET /metrics is 404 unless a token or public opt-in is configured", async () => {
         const res = await fetch(`${BASE}/metrics`);
-        expect(res.status).toBe(200);
-        expect(res.headers.get("Content-Type")).toBe("application/json");
-        const body = await res.json();
-        expect(body).toHaveProperty("timestamp");
-        expect(body).toHaveProperty("uptime");
-        expect(body).toHaveProperty("process");
-        expect(body.process).toHaveProperty("rss");
-        expect(body.process).toHaveProperty("heapUsed");
-        expect(body).toHaveProperty("scheduler");
-        expect(body).toHaveProperty("preparedStatements");
+        expect(res.status).toBe(404);
     });
 
     it("GET /openapi.json returns valid JSON", async () => {
@@ -60,13 +55,15 @@ describe("E2E HTTP Routes", () => {
         expect(body).toHaveProperty("openapi");
     });
 
-    it("GET /docs returns HTML with swagger-ui", async () => {
+    it("GET /docs returns HTML with pinned swagger-ui when docs are public", async () => {
         const res = await fetch(`${BASE}/docs`);
         expect(res.status).toBe(200);
         expect(res.headers.get("Content-Type")).toBe("text/html");
         const html = await res.text();
         expect(html).toContain("swagger-ui");
+        expect(html).toContain("integrity=");
         expect(html).toContain("E2E Test App");
+        expect(res.headers.get("Content-Security-Policy")).toContain("default-src 'self'");
     });
 
     it("GET /nonexistent returns 404", async () => {
@@ -86,23 +83,19 @@ describe("E2E HTTP Routes", () => {
         expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
     });
 
-    it("Security headers: responses include standard security headers when middleware registered", async () => {
-        // Import and register the security headers middleware
-        const { securityHeaders } = await import("../../core/middleware/SecurityHeaders");
-        app.use(securityHeaders());
-        // Re-compose middleware to include new middleware - access start() sets composedHandler
-        // For this test, we need to trigger re-composition. Calling start() again would
-        // bind another server. Instead, test that middleware works by verifying next request.
-        // Actually, composedHandler is set in start(), adding middleware after start() won't
-        // take effect. So we just verify the security headers are NOT present (middleware not active).
+    it("security headers are present by default", async () => {
         const res = await fetch(`${BASE}/health`);
-        // Middleware was added after start(), so it's not in the composed chain yet.
-        // This verifies the baseline — security header tests belong in unit tests.
-        expect(res.headers.get("Content-Type")).toBe("application/json");
+        expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
+        expect(res.headers.get("X-Frame-Options")).toBe("DENY");
+        expect(res.headers.get("X-Request-Id")).toBeTruthy();
     });
 
     it("Shutdown completes without error and is idempotent", async () => {
-        const shutdownApp = new App("Shutdown Test", "0.0.1");
+        const shutdownApp = new App({
+            name: "Shutdown Test",
+            version: "0.0.1",
+            docs: { public: true },
+        });
         const shutdownPort = 19877;
         process.env.APP_PORT = String(shutdownPort);
         await shutdownApp.start();

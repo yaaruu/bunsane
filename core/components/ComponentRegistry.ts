@@ -10,13 +10,16 @@ import {
     CreateRelationIndexes,
     GetPartitionStrategy,
 } from "../../database/DatabaseHelper";
-import { ensureMultipleJSONBPathIndexes, ensureLegacyIndexedFields } from "../../database/IndexingStrategy";
+import {
+    ensureMultipleJSONBPathIndexes,
+    ensureLegacyIndexedFields,
+    loadComponentIndexCatalog,
+    type IndexBootContext,
+} from "../../database/IndexingStrategy";
 import { GetSchema } from "../../database/DatabaseHelper";
 import { logger as MainLogger } from "../Logger";
 import { getMetadataStorage } from "../metadata";
 import { registerDecoratedHooks } from "../decorators/EntityHooks";
-import ServiceRegistry from "../../service/ServiceRegistry";
-import { preparedStatementCache } from "../../database/PreparedStatementCache";
 const logger = MainLogger.child({ scope: "ComponentRegistry" });
 
 type ComponentConstructor = new () => BaseComponent;
@@ -34,7 +37,10 @@ class ComponentRegistry {
     private readinessPromises = new Map<string, Promise<void>>();
     private readinessResolvers = new Map<string, () => void>();
     private componentsRegistered: boolean = false;
-    private cachedPartitionStrategy: string | null = null;
+    private cachedPartitionStrategy: 'list' | 'hash' | null = null;
+    private indexBoot: IndexBootContext | undefined;
+    private schemaChangedThisBoot = false;
+    private registerAllInFlight: Promise<void> | null = null;
 
     constructor() {}
 
@@ -79,6 +85,8 @@ class ComponentRegistry {
             this.register(name, generateTypeId(name), ctor).then(() => {
                 const resolve = this.readinessResolvers.get(name);
                 if (resolve) resolve();
+            }).catch((error) => {
+                logger.error(`Failed to register component ${name}: ${error}`);
             });
         }
     }
@@ -150,62 +158,55 @@ class ComponentRegistry {
         return this.typeIdToCtor.get(typeId);
     }
 
-    // TODO: OLD LOGIC Remove if not needed
-    // async registerAllComponents(): Promise<void> {
-    //     logger.trace(`Registering all components`);
-    //     for(const [name, ctor] of this.componentQueue) {
-    //         const typeId = generateTypeId(name);
-    //         await this.register(name, typeId, ctor);
-    //     }
-    //     ApplicationLifecycle.setPhase(ApplicationPhase.COMPONENTS_READY);
-    //     // Resolve all pending readiness promises
-    //     for(const [name] of this.componentQueue) {
-    //         const resolve = this.readinessResolvers.get(name);
-    //         if(resolve) resolve();
-    //     }
-    // }
-
     async registerAllComponents(): Promise<void> {
-        if (this.componentsRegistered) {
-            return; // Already registered
-        }
+        if (this.componentsRegistered) return;
+        if (this.registerAllInFlight) return this.registerAllInFlight;
+        this.registerAllInFlight = this.runRegisterAll().finally(() => {
+            this.registerAllInFlight = null;
+        });
+        return this.registerAllInFlight;
+    }
+
+    private async runRegisterAll(): Promise<void> {
+        if (this.componentsRegistered) return;
 
         logger.trace("Registering Components...");
         ApplicationLifecycle.setPhase(ApplicationPhase.COMPONENTS_REGISTERING);
 
         await this.populateCurrentTables();
+        const strategy = await GetPartitionStrategy();
+        this.cachedPartitionStrategy = strategy === "hash" || strategy === "list" ? strategy : null;
+        this.indexBoot = {
+            existing: await loadComponentIndexCatalog(),
+            partitionStrategy: this.cachedPartitionStrategy,
+            indexCreated: false,
+        };
+        this.schemaChangedThisBoot = false;
+
         const storage = getMetadataStorage();
-        const promises = storage.components.map(async (metadata) => {
+        // Sequential: CREATE TABLE ... PARTITION OF takes ACCESS EXCLUSIVE on
+        // `components`. Parallel attaches deadlock or queue behind that lock.
+        for (const metadata of storage.components) {
             const { name, target: ctor, typeId } = metadata;
             if (this.componentsMap.has(name)) {
                 logger.trace(`Component already registered: ${name}`);
-                return;
+                continue;
             }
-            this.readinessPromises.set(
-                name,
-                new Promise<void>((resolve) => {
-                    this.readinessResolvers.set(name, resolve);
-                })
-            );
+            const { promise, resolve } = Promise.withResolvers<void>();
+            this.readinessPromises.set(name, promise);
+            this.readinessResolvers.set(name, resolve);
             await this.register(name, typeId, ctor as ComponentConstructor);
-            const resolve = this.readinessResolvers.get(name);
-            if (resolve) resolve();
-        });
-        await Promise.all(promises);
+            resolve();
+        }
         this.componentsRegistered = true;
 
-        // Handle component-related setup that was previously in App.init()
         await this.setupComponentFeatures();
 
         ApplicationLifecycle.setPhase(ApplicationPhase.COMPONENTS_READY);
     }
 
-    register(name: string, typeid: string, ctor: ComponentConstructor) {
-        // Warn when a LIST partition is being attached after startup registration
-        // completed. CREATE TABLE ... PARTITION OF takes ACCESS EXCLUSIVE on the
-        // parent `components` table, stalling all component I/O during the lock.
-        // Fine at boot; dangerous if a request triggers first use of a new type.
-        if (this.componentsRegistered && this.cachedPartitionStrategy === 'list') {
+    async register(name: string, typeid: string, ctor: ComponentConstructor): Promise<boolean> {
+        if (this.componentsRegistered && this.cachedPartitionStrategy === "list") {
             logger.warn(
                 `Runtime partition attach for component "${name}" takes ACCESS EXCLUSIVE on the ` +
                 `components table, stalling all component reads and writes until the DDL completes. ` +
@@ -213,25 +214,24 @@ class ComponentRegistry {
                 `to avoid per-component partitions.`
             );
         }
-        return new Promise<boolean>(async (resolve) => {
-            const partitionTableName = GenerateTableName(name);
-            // await this.populateCurrentTables();
-            // const instance = new ctor();
-            // const indexedProps = instance.indexedProperties();
-            if (!this.currentTables.includes(partitionTableName)) {
-                logger.trace(
-                    `Partition table ${partitionTableName} does not exist. Creating... name: ${name}, typeId: ${typeid}`
-                );
-                // await CreateComponentPartitionTable(name, typeid, indexedProps); // TODO: OLD Logic with indexedProps, remove if not needed
-                await CreateComponentPartitionTable(name, typeid);
-                // await this.populateCurrentTables();
+        const partitionTableName = GenerateTableName(name);
+        if (!this.currentTables.includes(partitionTableName)) {
+            logger.trace(
+                `Partition table ${partitionTableName} does not exist. Creating... name: ${name}, typeId: ${typeid}`
+            );
+            const created = await CreateComponentPartitionTable(name, typeid, {
+                strategy: this.cachedPartitionStrategy,
+                boot: this.indexBoot,
+            });
+            if (created) {
+                this.schemaChangedThisBoot = true;
+                this.currentTables.push(partitionTableName);
             }
-            // await UpdateComponentIndexes(partitionTableName, indexedProps); // TODO: OLD Logic with indexedProps, remove if not needed
-            this.componentsMap.set(name, typeid);
-            this.typeIdToName.set(typeid, name);
-            this.typeIdToCtor.set(typeid, ctor);
-            resolve(true);
-        });
+        }
+        this.componentsMap.set(name, typeid);
+        this.typeIdToName.set(typeid, name);
+        this.typeIdToCtor.set(typeid, ctor);
+        return true;
     }
 
     private async registerComponentFromMetadata(component: any): Promise<void> {
@@ -293,40 +293,32 @@ class ComponentRegistry {
 
     private async setupComponentFeatures(): Promise<void> {
         const components = this.getComponents();
+        const partitionStrategy = this.cachedPartitionStrategy;
+        if (!this.indexBoot) {
+            this.indexBoot = {
+                existing: await loadComponentIndexCatalog(),
+                partitionStrategy,
+                indexCreated: false,
+            };
+        }
 
-        // Invalidate prepared statement cache when component schemas change
-        preparedStatementCache.clear();
-        logger.trace(
-            "Cleared prepared statement cache due to component schema changes"
-        );
-
-        // Check partitioning strategy for index creation
-        const partitionStrategy = await GetPartitionStrategy();
-        this.cachedPartitionStrategy = partitionStrategy;
-
-        // Update component indexes for components that have indexed properties
-        // NOTE: Index operations are serialized to prevent deadlocks with ANALYZE
         const storage = getMetadataStorage();
         for (const { name } of components) {
             const table_name = GenerateTableName(name);
-            // For HASH partitioning, redirect index operations to parent table
-            const indexTableName =
-                partitionStrategy === "hash" ? "components" : table_name;
+            const indexTableName = partitionStrategy === "hash" ? "components" : table_name;
 
-            // Handle legacy @CompData(indexed: true) properties — Phase 1 type-aware:
-            // scalars -> btree/numeric (serve =, ORDER BY); arrays/objects -> GIN.
             const componentId = storage.getComponentId(name);
             const legacyIndexed = storage
                 .getComponentProperties(componentId)
                 .filter((p) => p.indexed);
             if (legacyIndexed.length > 0) {
-                await ensureLegacyIndexedFields(indexTableName, legacyIndexed);
+                const created = await ensureLegacyIndexedFields(indexTableName, legacyIndexed, this.indexBoot);
+                if (created) this.schemaChangedThisBoot = true;
                 logger.trace(
                     `Updated legacy (type-aware) indexes for component: ${name} on table: ${indexTableName}`
                 );
             }
 
-            // Handle new @IndexedField decorators
             const indexedFields = this.getIndexedFieldsForComponent(name);
             if (indexedFields.length > 0) {
                 const indexDefinitions = indexedFields.map((field) => ({
@@ -335,17 +327,21 @@ class ComponentRegistry {
                     indexType: field.indexType,
                     isDateField: field.isDateField,
                 }));
-                await ensureMultipleJSONBPathIndexes(
+                const created = await ensureMultipleJSONBPathIndexes(
                     indexTableName,
-                    indexDefinitions
+                    indexDefinitions,
+                    this.indexBoot,
                 );
+                if (created) this.schemaChangedThisBoot = true;
                 logger.trace(
                     `Created specialized indexes for component: ${name} on table: ${indexTableName}`
                 );
             }
         }
 
-        // Automatically register decorated hooks for all services
+        // Static import cycles through ServiceRegistry → gql → components.
+        // Loaded here, after partitions exist, so the cycle never runs at module init.
+        const { default: ServiceRegistry } = await import("../../service/ServiceRegistry");
         const services = ServiceRegistry.getServices();
         for (const service of services) {
             try {
@@ -359,21 +355,18 @@ class ComponentRegistry {
         }
         logger.info(`Registered hooks for ${services.length} services`);
 
-        // Create btree indexes on archetype relation foreign-key fields
-        // (data->>'fk'). Without these, @BelongsTo/@HasMany resolver queries
-        // sequentially scan the relation component partition tables. Runs
-        // before ANALYZE so the planner picks up fresh stats for the new
-        // indexes. Idempotent (IF NOT EXISTS) and CONCURRENTLY on LIST
-        // partitions, so it is safe to re-run on every startup against live
-        // tables.
         try {
-            await CreateRelationIndexes();
+            const created = await CreateRelationIndexes(this.indexBoot);
+            if (created) this.schemaChangedThisBoot = true;
         } catch (error) {
             logger.warn(`Failed to create relation FK indexes: ${error}`);
         }
 
-        // Run ANALYZE on all component tables to update query planner statistics
-        await AnalyzeAllComponentTables();
+        if (this.schemaChangedThisBoot || this.indexBoot.indexCreated) {
+            await AnalyzeAllComponentTables();
+        } else {
+            logger.trace("Skipping ANALYZE; no partition or index was created this boot");
+        }
     }
 }
 

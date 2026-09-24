@@ -1,66 +1,94 @@
 import type { BaseComponent } from "../components";
 import type ArcheType from "../ArcheType";
 import type { LifecycleEvent } from "../events/EntityLifecycleEvents";
-import type { ComponentTargetConfig } from "./registry";
-import { typeIdOfCtor } from "./registry";
+import type { CompiledComponentTarget, ComponentTargetConfig } from "./registry";
+import { compileComponentTarget, typeIdOfCtor } from "./registry";
 
 /**
- * Check if an event matches the component targeting configuration
+ * Check if an event matches a component target compiled at registration.
+ * Does not allocate type-id sets for the hook's filters — those live on `compiled`.
  */
-export function matchesComponentTarget(event: LifecycleEvent, componentTarget?: ComponentTargetConfig): boolean {
-    // If no component targeting is specified, always match
-    if (!componentTarget) {
-        return true;
+export function matchesCompiledTarget(event: LifecycleEvent, compiled?: CompiledComponentTarget): boolean {
+    if (!compiled) return true;
+
+    const entityComponents = event.getEntity().componentList();
+    const entityTypes = new Set<string>();
+    for (const comp of entityComponents) {
+        entityTypes.add(comp.getTypeID());
     }
 
-    const entity = event.getEntity();
-    const entityComponents = entity.componentList();
-
-    // Check archetype matching first (most specific)
-    if (componentTarget.archetype) {
-        if (!matchesArchetype(entityComponents, componentTarget.archetype, !!(componentTarget.includeComponents?.length || componentTarget.excludeComponents?.length))) {
+    if (compiled.hasArchetype) {
+        if (!compiled.archetypeTypeIds || !typeSetCovers(entityTypes, compiled.archetypeTypeIds, compiled.allowExtra)) {
             return false;
         }
     }
 
-    // Check multiple archetypes (OR logic)
-    if (componentTarget.archetypes && componentTarget.archetypes.length > 0) {
-        const allowExtra = !!(componentTarget.includeComponents?.length || componentTarget.excludeComponents?.length);
-        const matchesAnyArchetype = componentTarget.archetypes.some(archetype =>
-            matchesArchetype(entityComponents, archetype, allowExtra)
-        );
-        if (!matchesAnyArchetype) {
-            return false;
+    if (compiled.archetypesTypeIds) {
+        let any = false;
+        for (const expected of compiled.archetypesTypeIds) {
+            if (expected && typeSetCovers(entityTypes, expected, compiled.allowExtra)) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) return false;
+    }
+
+    if (compiled.includeTypeIds) {
+        if (compiled.requireAllIncluded) {
+            for (const typeId of compiled.includeTypeIds) {
+                if (!entityTypes.has(typeId)) return false;
+            }
+        } else {
+            let any = false;
+            for (const typeId of compiled.includeTypeIds) {
+                if (entityTypes.has(typeId)) {
+                    any = true;
+                    break;
+                }
+            }
+            if (!any) return false;
         }
     }
 
-    // Check included components
-    if (componentTarget.includeComponents && componentTarget.includeComponents.length > 0) {
-        const includeMatch = checkComponentPresence(
-            entityComponents,
-            componentTarget.includeComponents,
-            componentTarget.requireAllIncluded ?? true
-        );
-
-        if (!includeMatch) {
-            return false;
-        }
-    }
-
-    // Check excluded components
-    if (componentTarget.excludeComponents && componentTarget.excludeComponents.length > 0) {
-        const excludeMatch = checkComponentAbsence(
-            entityComponents,
-            componentTarget.excludeComponents,
-            componentTarget.requireAllExcluded ?? true
-        );
-
-        if (!excludeMatch) {
-            return false;
+    if (compiled.excludeTypeIds) {
+        if (compiled.requireAllExcluded) {
+            for (const typeId of compiled.excludeTypeIds) {
+                if (entityTypes.has(typeId)) return false;
+            }
+        } else {
+            let anyAbsent = false;
+            for (const typeId of compiled.excludeTypeIds) {
+                if (!entityTypes.has(typeId)) {
+                    anyAbsent = true;
+                    break;
+                }
+            }
+            if (!anyAbsent) return false;
         }
     }
 
     return true;
+}
+
+/**
+ * Exact match, or "expected ⊆ entity" when extra components are allowed.
+ */
+function typeSetCovers(entityTypes: Set<string>, expected: ReadonlySet<string>, allowExtra: boolean): boolean {
+    if (!allowExtra && expected.size !== entityTypes.size) return false;
+    for (const typeId of expected) {
+        if (!entityTypes.has(typeId)) return false;
+    }
+    return true;
+}
+
+/**
+ * Check if an event matches the component targeting configuration.
+ * Prefer {@link matchesCompiledTarget} on the dispatch path — this compiles on the call.
+ */
+export function matchesComponentTarget(event: LifecycleEvent, componentTarget?: ComponentTargetConfig): boolean {
+    if (!componentTarget) return true;
+    return matchesCompiledTarget(event, compileComponentTarget(componentTarget));
 }
 
 /**
@@ -78,12 +106,9 @@ export function checkComponentPresence(
     const requiredTypeIds = requiredComponents.map(typeIdOfCtor);
 
     if (requireAll) {
-        // ALL required components must be present (AND logic)
         return requiredTypeIds.every(typeId => entityComponentTypes.has(typeId));
-    } else {
-        // ANY required component must be present (OR logic)
-        return requiredTypeIds.some(typeId => entityComponentTypes.has(typeId));
     }
+    return requiredTypeIds.some(typeId => entityComponentTypes.has(typeId));
 }
 
 /**
@@ -101,55 +126,28 @@ export function checkComponentAbsence(
     const excludedTypeIds = excludedComponents.map(typeIdOfCtor);
 
     if (requireAll) {
-        // ALL excluded components must be absent (AND logic)
         return excludedTypeIds.every(typeId => !entityComponentTypes.has(typeId));
-    } else {
-        // ANY excluded component must be absent (OR logic) - this is less common but supported
-        return excludedTypeIds.some(typeId => !entityComponentTypes.has(typeId));
     }
+    return excludedTypeIds.some(typeId => !entityComponentTypes.has(typeId));
 }
 
 /**
  * Check if entity components match a specific archetype
  */
 export function matchesArchetype(entityComponents: BaseComponent[], archetype: ArcheType, allowExtraComponents: boolean = false): boolean {
-    // Get the expected component types from the archetype
-    // We need to access the private componentMap from ArcheType
-    const archetypeComponentMap = (archetype as any).componentMap as Record<string, typeof BaseComponent>;
+    const archetypeComponentMap = archetype.componentMap;
 
     if (!archetypeComponentMap) {
         return false;
     }
 
     const expectedComponentTypes = new Set(
-        Object.values(archetypeComponentMap).map(compCtor => typeIdOfCtor(compCtor as any))
+        Object.values(archetypeComponentMap).map(compCtor => typeIdOfCtor(compCtor as new () => BaseComponent))
     );
 
     const entityComponentTypes = new Set(
         entityComponents.map(comp => comp.getTypeID())
     );
 
-    if (allowExtraComponents) {
-        // Entity must have at least all the component types from the archetype
-        // (allows additional components beyond the archetype)
-        for (const expectedType of expectedComponentTypes) {
-            if (!entityComponentTypes.has(expectedType)) {
-                return false;
-            }
-        }
-        return true;
-    } else {
-        // Entity must have exactly the same component types as the archetype
-        if (expectedComponentTypes.size !== entityComponentTypes.size) {
-            return false;
-        }
-
-        // All expected component types must be present in the entity
-        for (const expectedType of expectedComponentTypes) {
-            if (!entityComponentTypes.has(expectedType)) {
-                return false;
-            }
-        }
-        return true;
-    }
+    return typeSetCovers(entityComponentTypes, expectedComponentTypes, allowExtraComponents);
 }

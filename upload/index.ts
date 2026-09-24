@@ -45,7 +45,6 @@ export {
 // Types
 export type {
     UploadConfiguration,
-    ImageProcessingOptions,
     ValidationOptions,
     ValidationResult,
     UploadResult,
@@ -94,7 +93,7 @@ export async function initializeS3Storage(config: S3StorageConfig): Promise<void
  */
 export class QuickSetup {
     /**
-     * Setup for image uploads with thumbnails
+     * Restrict uploads to common image types. Does not generate thumbnails.
      */
     static async forImages(): Promise<void> {
         const uploadManager = UploadManager.getInstance();
@@ -102,21 +101,11 @@ export class QuickSetup {
             maxFileSize: 5 * 1024 * 1024, // 5MB
             allowedMimeTypes: ["image/jpeg", "image/png", "image/gif", "image/webp"],
             allowedExtensions: [".jpg", ".jpeg", ".png", ".gif", ".webp"],
-            generateThumbnails: true,
-            imageProcessing: {
-                generateThumbnails: true,
-                thumbnailSizes: [
-                    { width: 150, height: 150, suffix: "_thumb" },
-                    { width: 300, height: 300, suffix: "_medium" }
-                ],
-                compress: true,
-                quality: 85
-            }
         });
     }
 
     /**
-     * Setup for document uploads
+     * Restrict uploads to common document types.
      */
     static async forDocuments(): Promise<void> {
         const uploadManager = UploadManager.getInstance();
@@ -130,12 +119,11 @@ export class QuickSetup {
             ],
             allowedExtensions: [".pdf", ".txt", ".doc", ".docx"],
             validateFileSignature: true,
-            generateThumbnails: false
         });
     }
 
     /**
-     * Setup for secure uploads with strict validation
+     * Tight image allow-list and signature checks. Does not scan for malware.
      */
     static async forSecureUploads(): Promise<void> {
         const uploadManager = UploadManager.getInstance();
@@ -146,7 +134,6 @@ export class QuickSetup {
             validateFileSignature: true,
             sanitizeFileName: true,
             validation: {
-                scanForMalware: true,
                 strictMimeType: true
             }
         });

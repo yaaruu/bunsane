@@ -1,13 +1,14 @@
-import {createSchema, createYoga, type Plugin} from 'graphql-yoga';
+import {createSchema, createYoga, type Plugin, type YogaServerInstance} from 'graphql-yoga';
+export type YogaInstance = YogaServerInstance<Record<string, unknown>, Record<string, unknown>>;
 import { useValidationRule } from '@envelop/core';
-import { GraphQLSchema, GraphQLError } from 'graphql';
+import { GraphQLSchema, GraphQLError, NoSchemaIntrospectionCustomRule } from 'graphql';
 import { depthLimitRule } from './depthLimit';
-import { complexityLimitRule } from './complexityLimit';
+import { useComplexityLimit } from './complexityLimit';
 import { GraphQLObjectType, GraphQLField, GraphQLOperation, GraphQLScalarType, GraphQLSubscription } from './Generator';
-import {GraphQLFieldTypes} from "./types"
 import {logger as MainLogger} from "../core/Logger"
 import { isVerboseErrors } from "../core/envMode"
 import { isFieldRequested } from './helpers';
+import { t, type InferInput } from "./schema";
 import * as z from "zod";
 
 const logger = MainLogger.child({scope: "GQL"});
@@ -17,15 +18,12 @@ import {
 } from "./helpers";
 import type {
     GraphQLType,
-    TypeFromGraphQL,
-    ResolverInput
 } from "./helpers";
 export {
     GraphQLObjectType,
     GraphQLField,
     GraphQLOperation,
     GraphQLSubscription,
-    GraphQLFieldTypes,
     isValidGraphQLType,
     GraphQLScalarType,
     isFieldRequested
@@ -35,11 +33,9 @@ export { generateGraphQLSchemaV2 } from "./GeneratorV2";
 export { maskError };
 export { Middleware, composeOperationMiddleware } from "./middleware";
 export type { OperationMiddleware } from "./middleware";
-export type {
-    GraphQLType,
-    TypeFromGraphQL,
-    ResolverInput
-}
+export type { GraphQLType };
+export { t };
+export type { InferInput };
 interface Entity {
     id: string;
     name: string;
@@ -147,16 +143,50 @@ const maskError = (error: any, message: string): GraphQLError => {
     return isGQLError(error) ? (error instanceof GraphQLError ? error : new GraphQLError(error.message, { extensions: error.extensions })) : new GraphQLError(message, { originalError: error });
 };
 
+export const DEFAULT_MAX_DEPTH = 15;
+export const DEFAULT_MAX_COMPLEXITY = 1000;
+
+export interface YogaCorsOptions {
+    origin?: string | string[];
+    credentials?: boolean;
+    allowedHeaders?: string[];
+    methods?: string[];
+}
+
 export interface YogaInstanceOptions {
-    cors?: {
-        origin?: string | string[] | ((origin: string) => boolean);
-        credentials?: boolean;
-        allowedHeaders?: string[];
-        methods?: string[];
-    };
+    /** `false` disables Yoga's CORS plugin. Omit to leave Yoga's default. */
+    cors?: false | YogaCorsOptions;
     maxDepth?: number;
-    /** Maximum query complexity (default: 1000). 0 disables. */
+    /** Maximum query complexity. Must be an integer >= 1. Omit for 1000. */
     maxComplexity?: number;
+    /** Override introspection. Omit to follow GRAPHQL_INTROSPECTION then isVerboseErrors(). */
+    introspection?: boolean;
+    /** Override GraphiQL. Omit to follow GRAPHQL_GRAPHIQL then isVerboseErrors(). */
+    graphiql?: boolean;
+}
+
+function assertPositiveInt(name: string, value: number): number {
+    if (!Number.isInteger(value) || value < 1) {
+        throw new Error(
+            `${name} ${String(value)} is invalid. Pass an integer >= 1. The limit cannot be disabled.`,
+        );
+    }
+    return value;
+}
+
+function parseOnOff(name: string, raw: string | undefined): boolean | undefined {
+    if (raw === undefined || raw === "") return undefined;
+    const value = raw.trim().toLowerCase();
+    if (value === "on" || value === "true" || value === "1") return true;
+    if (value === "off" || value === "false" || value === "0") return false;
+    throw new Error(`${name}=${raw} is invalid. Use on or off.`);
+}
+
+function resolveReconFlag(explicit: boolean | undefined, envName: string): boolean {
+    if (typeof explicit === "boolean") return explicit;
+    const fromEnv = parseOnOff(envName, process.env[envName]);
+    if (fromEnv !== undefined) return fromEnv;
+    return isVerboseErrors();
 }
 
 /**
@@ -173,45 +203,63 @@ export type SchemaProvider =
 export function createYogaInstance(
     schema?: SchemaProvider,
     plugins: Plugin[] = [],
-    contextFactory?: (context: any) => any,
+    contextFactory?: (context: unknown) => unknown,
     options?: YogaInstanceOptions
-) {
-    // Prepend depth limit plugin. Enforce a hard minimum so maxDepth: 0 or
-    // undefined cannot silently disable the guard (C06). If a deployment
-    // explicitly needs a higher bound, raise it — but we never allow it off.
-    const HARD_MIN_DEPTH = 15;
-    const effectiveDepth = Math.max(options?.maxDepth ?? HARD_MIN_DEPTH, HARD_MIN_DEPTH);
+): YogaInstance {
+    const effectiveDepth = assertPositiveInt(
+        "GraphQL maxDepth",
+        options?.maxDepth ?? DEFAULT_MAX_DEPTH,
+    );
+    const complexityBudget = assertPositiveInt(
+        "GraphQL maxComplexity",
+        options?.maxComplexity ?? DEFAULT_MAX_COMPLEXITY,
+    );
+    const introspection = resolveReconFlag(options?.introspection, "GRAPHQL_INTROSPECTION");
+    const graphiql = resolveReconFlag(options?.graphiql, "GRAPHQL_GRAPHIQL");
+
     const allPlugins: Plugin[] = [];
     allPlugins.push(useValidationRule(depthLimitRule(effectiveDepth)) as Plugin);
-
-    // Complexity budget: count per-field cost with `first`/`limit`/`take`
-    // multipliers. 0 disables, undefined defaults to 1000.
-    const complexityBudget = options?.maxComplexity ?? 1000;
-    if (complexityBudget > 0) {
-        allPlugins.push(useValidationRule(complexityLimitRule(complexityBudget)) as Plugin);
+    allPlugins.push(useComplexityLimit(complexityBudget));
+    if (!introspection) {
+        allPlugins.push(useValidationRule(NoSchemaIntrospectionCustomRule) as Plugin);
+    }
+    if (!graphiql) {
+        allPlugins.push({
+            onRequest({ request, endResponse, fetchAPI }) {
+                const accept = request.headers.get("accept") ?? "";
+                if (request.method === "GET" && accept.includes("text/html")) {
+                    endResponse(new fetchAPI.Response(null, { status: 404, statusText: "Not Found" }));
+                }
+            },
+        });
     }
     allPlugins.push(...plugins);
 
-    const yogaConfig: any = {
+    const yogaConfig: {
+        plugins: Plugin[];
+        maskedErrors: { maskError: typeof maskError };
+        cors?: false | YogaCorsOptions;
+        context?: (context: unknown) => unknown;
+        graphiql?: boolean;
+        landingPage?: false;
+        schema?: GraphQLSchema | (() => GraphQLSchema);
+    } = {
         plugins: allPlugins,
-        maskedErrors: {
-            maskError,
-        },
+        maskedErrors: { maskError },
+        graphiql,
+        landingPage: false,
     };
 
-    // Add CORS if provided
-    if (options?.cors) {
+    if (options?.cors === false) {
+        yogaConfig.cors = false;
+    } else if (options?.cors) {
         yogaConfig.cors = options.cors;
     }
 
-    // Add context factory if provided
     if (contextFactory) {
         yogaConfig.context = contextFactory;
     }
 
-    // Memoized static placeholder schema. Kept stable so Yoga's per-schema
-    // internal caches (parse/validate) are not thrashed when a factory falls
-    // back to it across requests.
     let fallbackSchema: GraphQLSchema | undefined;
     const getFallback = (): GraphQLSchema => {
         if (!fallbackSchema) {
@@ -224,8 +272,6 @@ export function createYogaInstance(
     };
 
     if (typeof schema === "function") {
-        // Factory form: read per request so runtime swaps reflect live.
-        // Stable refs keep Yoga's caches warm; only a changed ref re-primes.
         yogaConfig.schema = () => schema() ?? getFallback();
     } else if (schema) {
         yogaConfig.schema = schema;
@@ -236,5 +282,3 @@ export function createYogaInstance(
 }
 
 export const Upload = z.union([z.literal("Upload"), z.any()]);
-
-export const yoga = createYogaInstance();

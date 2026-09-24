@@ -17,7 +17,7 @@ import type {
 } from "./types";
 import type { CircuitBreaker } from "./CircuitBreaker";
 import type { RemoteMetrics } from "./metrics";
-
+import { encodeEnvelope, readRpcSecret, verifyEnvelopeSignature } from "./envelopeSign";
 const loggerInstance = logger.child({ scope: "RpcCaller" });
 
 interface PendingEntry {
@@ -168,7 +168,7 @@ export class RpcCaller {
                 target,
             });
 
-            const envelope = JSON.stringify({
+            const envelope = encodeEnvelope({
                 kind: "rpc_request",
                 sourceApp,
                 event: method,
@@ -293,9 +293,18 @@ export class RpcCaller {
             const parsed = JSON.parse(payload);
             if (
                 !parsed ||
+                typeof parsed !== "object" ||
                 typeof parsed.correlationId !== "string" ||
                 typeof parsed.success !== "boolean"
             ) {
+                return null;
+            }
+            const secret = readRpcSecret();
+            if (secret && !verifyEnvelopeSignature(parsed, secret)) {
+                this.metrics?.signatureRejected();
+                loggerInstance.warn(
+                    { correlationId: parsed.correlationId, msg: "Rejected RPC response — invalid HMAC signature" }
+                );
                 return null;
             }
             return parsed as RpcResponse;

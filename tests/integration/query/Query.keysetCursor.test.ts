@@ -413,16 +413,29 @@ describe('Composite keyset cursor pagination for sorted queries', () => {
         await expect(q.exec()).rejects.toThrow('does not support NULLS FIRST');
     });
 
-    test("sortedCursor(token, 'before') throws a clear error for component sortBy", async () => {
-        const token = Query.encodeSortedCursor(5, 'a1b2c3d4-e5f6-7890-abcd-ef1234567890');
-        const q = base().sortBy(KCData, 'score', 'ASC').sortedCursor(token, 'before').take(5);
-        await expect(q.exec()).rejects.toThrow("sortedCursor(token, 'before') is not supported");
+    test("sortedCursor(token, 'before') returns the previous component-sort page in order", async () => {
+        const forward = await base().sortBy(KCData, 'score', 'ASC').take(4).exec();
+        expect(forward.length).toBe(4);
+        const last = forward[forward.length - 1]!;
+        const lastIdx = idsByIndex.indexOf(last.id);
+        const after = Query.encodeSortedCursor(scoreByIndex[lastIdx]!, last.id);
+        const next = await base().sortBy(KCData, 'score', 'ASC').sortedCursor(after).take(4).exec();
+        expect(next.length).toBe(4);
+        const firstNext = next[0]!;
+        const nextIdx = idsByIndex.indexOf(firstNext.id);
+        const before = Query.encodeSortedCursor(scoreByIndex[nextIdx]!, firstNext.id);
+        const back = await base().sortBy(KCData, 'score', 'ASC').sortedCursor(before, 'before').take(4).exec();
+        expect(back.map((e) => e.id)).toEqual(forward.map((e) => e.id));
     });
 
-    test("sortedCursor(token, 'before') throws a clear error for sortByCreatedAt", async () => {
-        const token = Query.encodeSortedCursor(new Date(), 'a1b2c3d4-e5f6-7890-abcd-ef1234567890');
-        const q = base().sortByCreatedAt('ASC').sortedCursor(token, 'before').take(5);
-        await expect(q.exec()).rejects.toThrow("sortedCursor(token, 'before') is not supported");
+
+
+    test("sortedCursor(token, 'before') returns the previous createdAt page", async () => {
+        const asc = await base().sortByCreatedAt('ASC').take(N).exec();
+        const cursorRow = asc[3]!;
+        const token = Query.encodeSortedCursor(await getCreatedAt(cursorRow.id), cursorRow.id);
+        const prev = await base().sortByCreatedAt('ASC').sortedCursor(token, 'before').take(3).exec();
+        expect(prev.map((e) => e.id)).toEqual(asc.slice(0, 3).map((e) => e.id));
     });
 
     test('mixing sortByCreatedAt and sortBy throws a clear error', async () => {
@@ -510,10 +523,6 @@ describe('Composite keyset cursor pagination for sorted queries', () => {
             allIds.push(e.id);
             nullIds.push(e.id);
         }
-
-        const q = () => new Query().with(KCTag, { filters: [
-            Query.filter('id', FilterOp.IN, allIds)
-        ] });
 
         // note: cannot use KCTag.note for sortBy easily without indexing.
         // Instead assert with score (sortBy on score, where non-null have distinct

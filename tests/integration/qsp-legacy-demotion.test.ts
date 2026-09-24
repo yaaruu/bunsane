@@ -12,9 +12,9 @@
 //      NO scan of the components tables. The SAME shape run through the legacy
 //      compiler DOES touch the components tables with correlated sub-plans —
 //      proving the demotion is real, not vacuous.
-//   2. The true INTERSECT worst-case (an id-cursor + sort query, the exact P0
-//      knob) is NOT covered by the planner, so it stays on legacy and its plan
-//      still contains INTERSECT + SubPlan — routing never touched it.
+//   2. The id-cursor + sort shape (the old P0 knob) is NOT covered by the
+//      planner, and since RP-06b the legacy compiler rejects it outright
+//      (exec and explain both throw) instead of running INTERSECT + SubPlan.
 //
 // NOTE: env is set at top; Query.ts reads BUNSANE_QSP at call time so this
 // works despite ES import hoisting. explainAnalyze() ALWAYS compiles the legacy
@@ -226,17 +226,10 @@ if (!isPGlite) {
             const req = reqOf(idCursorQuery());
             expect(SurfacePlanner.instance.resolve(req).surface).toBe('legacy');
 
-            const q = idCursorQuery();
-            await q.exec();
-            expect(q.getLastRouteInfo().routed).toBe(false);
-            expect(q.getLastRouteInfo().surface).toBe('legacy');
-
-            // The legacy plan for this shape still contains the INTERSECT membership
-            // and the correlated SubPlan (scalar-subquery ORDER BY + per-filter EXISTS).
-            const legacyPlan = await idCursorQuery().explainAnalyze(true);
-            console.log('\n=== LEGACY id-cursor INTERSECT plan (P0 worst case) ===\n' + legacyPlan);
-            expect(legacyPlan).toMatch(/Intersect/i);
-            expect(legacyPlan).toMatch(/SubPlan/);
+            // RP-06b: legacy now rejects the shape outright instead of running the
+            // INTERSECT + correlated SubPlan worst case, on both exec and explain.
+            await expect(idCursorQuery().exec()).rejects.toThrow(/cursor\(entityId\) cannot be combined with sortBy\(\)/);
+            await expect(idCursorQuery().explainAnalyze(true)).rejects.toThrow(/cursor\(entityId\) cannot be combined with sortBy\(\)/);
         }, 120_000);
     });
 }

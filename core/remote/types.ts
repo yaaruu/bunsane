@@ -42,6 +42,8 @@ export interface RemoteEnvelope {
     correlationId?: string;
     replyTo?: string;
     deadline?: number;
+    /** HMAC-SHA256 hex over the other fields. Present when BUNSANE_RPC_SECRET is set. */
+    sig?: string;
 }
 
 export type RpcHandler<TIn = unknown, TOut = unknown> = (
@@ -143,6 +145,11 @@ export interface RemoteManagerConfig {
     circuitBreakerResetMs?: number;
     /** Max deliveries before routing a message to DLQ (default: 3, 0 disables) */
     dlqMaxDeliveries?: number;
+    /**
+     * Max in-flight stream messages (default: 8, or BUNSANE_RPC_CONSUMER_CONCURRENCY).
+     * ACK stays per-message: a failure still skips XACK so the PEL can redeliver.
+     */
+    consumerConcurrency?: number;
     /**
      * Test-only: override how Redis clients are constructed. Return a
      * connected client compatible with the ioredis `Redis` interface.
