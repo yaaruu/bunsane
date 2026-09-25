@@ -21,7 +21,7 @@ bun run build
 tsc --noEmit
 
 # Tests (requires PostgreSQL)
-bun test                    # Unit + integration + GraphQL tests
+bun test                    # unit + integration + graphql + tests/public-api
 bun run test:unit           # Unit tests only
 bun run test:integration    # Integration tests only
 bun run test:graphql        # GraphQL schema tests only
@@ -64,13 +64,13 @@ await entity.save();
 @Component
 class Position extends BaseComponent {
     @CompData() x: number = 0;
-    @CompData({ indexed: true }) y: number = 0;  // Creates DB index
+    @CompData({ indexed: true }) y: number = 0;  // key index (bk_*), not GIN
 }
 ```
 
 **BaseArcheType** (`core/ArcheType.ts`):
 - Predefined entity templates with required components
-- Auto-generates GraphQL types and CRUD operations
+- Auto-generates GraphQL types. CRUD is an explicit `@GraphQLOperation`, not generated. Field, relation, and `@ArcheTypeFunction` resolvers attach at schema build (`registerFieldResolvers` is optional and idempotent).
 
 **Query** (`query/Query.ts`):
 ```typescript
@@ -78,7 +78,7 @@ const entities = await new Query()
     .with(Position)                       // Require component
     .with(Velocity, { filters: [...] })   // With filters
     .populate()                           // Load all components
-    .limit(10)
+    .take(10)
     .exec();
 ```
 
@@ -95,19 +95,19 @@ class UserService extends BaseService {
 - Schema generated automatically from decorated services and archetypes
 - Input types use Schema DSL (`gql/schema/index.ts`) via `t.` API
 - Operations: `@GraphQLOperation`, `@GraphQLSubscription`
-- Archetypes: `@ArcheTypeFunction` for computed fields
+- Archetypes: `@ArcheTypeFunction` for computed fields. `{ batch: true }` (0.8+) receives the parents for the request in one call.
 
 ### Database
 
 - PostgreSQL with Bun's native SQL driver (`Bun.SQL`)
 - Auto-migrations on startup for base tables
 - Component data stored as JSONB
-- Indexed fields create GIN indexes automatically
+- Scalar `@CompData({ indexed: true })` fields get a key index (`bk_*` = `((key), entity_id)`), not a GIN index. Arrays still use GIN. `@CompositeIndex` (root export) adds a multi-field key index. The index reconciler (`database/indexReconciler.ts`) creates missing `bk_` indexes during `App.init()` and finishes large tables in the background.
 - **Behind PgBouncer transaction pooling**: set `DB_DISABLE_PREPARE=true` (Bun auto-prepares per-connection, which breaks under transaction pooling and can wedge the write path). See `docs/CONFIGURATION.md`.
 
 ### Configuration
 
-- All environment variables are documented in `docs/CONFIGURATION.md` (DB, cache, GraphQL, health, S3, logging, QSP).
+- All environment variables are documented in `docs/CONFIGURATION.md` (DB, cache, GraphQL, health, S3, logging, QSP). Upgrade notes: `docs/UPGRADING.md` (0.6.x → 0.8, then 0.8 → 0.9).
 - `core/validateEnv.ts` validates a subset on startup.
 - `/health` runs a real DB **write** probe (not just `SELECT 1`) so a wedged write path fails liveness → container restart. Point liveness probes at `/health`.
 
@@ -117,13 +117,14 @@ class UserService extends BaseService {
 - Engine analysis: `docs/READ_PATH_PERFORMANCE.md` (RP-01…08 status, EXPLAIN protocol).
 - QSP ops: `docs/QSP_OPERATIONS.md` (coverage rules, empty tags, multi-archetype limits, reconcile).
 - Tickets: `docs/internal/TICKETS_READ_PATH_PERF_2026-08.md`.
+- Upgrade (0.6.x → 0.8, then 0.8 → 0.9): `docs/UPGRADING.md`.
 
 ### Caching
 
 - Multi-level cache: L1 (memory) + L2 (Redis)
 - `CacheManager.initialize(config)` is async - always await it
 - Strategies: write-through, write-invalidate
-- Cross-instance invalidation via Redis pub/sub
+- Cross-instance invalidation via Redis pub/sub requires `BUNSANE_CACHE_INVALIDATION_SECRET` on every instance. Unset: pub/sub is disabled (startup warning) and each instance serves its own L1 until TTL.
 
 ### File Uploads
 
@@ -135,12 +136,14 @@ class UserService extends BaseService {
 ## Critical Rules
 
 ### Import Style
-**ALWAYS use relative imports** (`./`, `../`) for internal modules. Never use bare imports like `from "core/Logger"` - this breaks consumer typechecking.
+**This repository:** ALWAYS use relative imports (`./`, `../`). Never bare imports like `from "core/Logger"` — that breaks consumer typechecking.
+
+**Consumer apps:** import the authoring surface from the root barrel (`import { App, Entity, Query, t } from "bunsane"`). Deep paths (`bunsane/database`, `bunsane/core/readmodel`, …) are only for symbols the barrel does not export (`getDb`, `@ReadModel`, `@IndexedField`, HTTP decorators, `@Upload`). See `docs/UPGRADING.md`.
 
 ### Architecture Decisions
 - No Dependency Injection - uses singletons + global exports
-- Singleton access: `CacheManager.getInstance()`, `EntityManager.instance`, etc.
-- Services registered via `ServiceRegistry.register()`
+- Singleton access: `CacheManager.getInstance()`. `EntityManager` is not a class export; import the default from `core/EntityManager` (already the instance). `EntityManager.instance` on that import is undefined.
+- Services registered via `ServiceRegistry.registerService()` (the barrel export is the singleton, not the class)
 
 ### Test Database Setup
 - Tests require `.env.test` with PostgreSQL config (or use PGlite mode)
@@ -231,7 +234,8 @@ gql/            # GraphQL generation, Schema DSL
   schema/       # t.* Schema DSL for inputs
 query/          # Fluent Query builder, FilterBuilder
 service/        # BaseService, ServiceRegistry
-upload/         # File uploads, S3StorageProvider
+upload/         # File uploads, UploadManager
+storage/        # S3StorageProvider
 scheduler/      # Cron-style task scheduling
 tests/          # Unit, integration, GraphQL, E2E, stress tests
 ```

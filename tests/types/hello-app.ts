@@ -33,7 +33,7 @@ class Notebook extends BaseArcheType {
 const noteInput = { text: t.string().required() };
 
 class NoteService extends BaseService {
-    @GraphQLOperation({ type: "Query", input: noteInput, output: "Notebook" })
+    @GraphQLOperation({ type: "Query", input: noteInput, output: "[Notebook]" })
     notes(input: InferInput<typeof noteInput>): Promise<unknown> | unknown {
         const entity = Entity.Create();
         entity.add(Note, { text: input.text });

@@ -31,7 +31,7 @@ const { hasNextPage, routed, surface, archetype } = q.getLastRouteInfo();
 | `.eagerLoadComponents([...])` or `.populate()` for fields you read | `await entity.get(C)` in a loop without eager load |
 | Batch FK companions (`WHERE order_id = ANY($1)`) | Nested `new Query().with(...).filter(fk, parent.id)` per row |
 
-**RP-06b:** `.sortBy(...).cursor(entityId)` **throws**. Use:
+**Throws:** `.sortBy(...).cursor(entityId)` and `.sortByCreatedAt()` / `.sortByUpdatedAt().cursor(entityId)`. Use:
 
 ```ts
 const token = Query.encodeSortedCursor(lastSortValue, lastEntityId);
@@ -79,7 +79,7 @@ Matcher-style queries (many tags + `.without` + spatial) stay on **legacy** — 
 | Membership SQL | Slow single statement | Indexes, sort-driven shape, QSP for covered sets |
 | Hydrate | `get` after `exec` without eager load | `.eagerLoadComponents([A,B,C])` or `.populate()` |
 | GraphQL relations | N queries for `@BelongsTo` / `@HasMany` | Request DataLoaders (`createRequestLoaders`) |
-| GraphQL computed fields | Query-per-parent in `@ArcheTypeFunction` | Batch by parent ids once; attach map |
+| GraphQL computed fields | Query-per-parent in `@ArcheTypeFunction` | `@ArcheTypeFunction({ batch: true })`, or batch by parent ids once and attach a map |
 | Stats / dashboards | `take(50000)` + sum in JS | Cross-entity: `@ReadModel` + `ReadModel(T).where/groupBy/sum`. Same entity: `Query.groupBy` + `countBy`/`sumBy`/`maxBy`. Open rows: `FilterOp.IS_NULL` |
 
 **Diagnose:** per-request `dbQueryCount` in access logs. If it scales with page size while `EXPLAIN` looks fine, you have N+1, not a bad query plan.
@@ -96,7 +96,7 @@ Matcher-style queries (many tags + `.without` + spatial) stay on **legacy** — 
 | Deep sorted pages | `sortedCursor` (not OFFSET) |
 | Unsorted id pages | `.cursor(entityId)` **without** `sortBy` |
 
-Framework default LIMIT (when you never call `.take`) does **not** run n+1 / hasNextPage — only **explicit** `.take(N)`.
+On the component-table path, the framework default LIMIT (when you never call `.take`) does **not** set `hasNextPage` — only **explicit** `.take(N)` does. A routed QSP read (`BUNSANE_QSP=route`, projection READY) applies that default limit before routing and then fetches `limit+1`, so `hasNextPage` can be true without `.take()`.
 
 ---
 
@@ -109,7 +109,7 @@ Framework default LIMIT (when you never call `.take`) does **not** run n+1 / has
 | Customer order history (fixed comps) | Queries that need `.without(Tag)` |
 | | Lists that require empty tags in `.with()` |
 
-Ops: `docs/QSP_OPERATIONS.md` checklist (`shadow` → soak → `route`, scope `BUNSANE_QSP_ARCHETYPES`, start reconcile sweep yourself).
+Ops: `docs/QSP_OPERATIONS.md` (`shadow` → soak → `route`, scope `BUNSANE_QSP_ARCHETYPES`). `App.init()` starts the reconcile sweep when QSP is `shadow` or `route`; do not start a second one.
 
 ---
 

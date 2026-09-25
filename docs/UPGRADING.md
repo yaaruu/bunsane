@@ -2,39 +2,52 @@
 
 ## 0.8 → 0.9 (unreleased)
 
-No code changes are required. What changes is how list queries are indexed and ordered. Details: [CHANGELOG.md](../CHANGELOG.md) `## Unreleased`.
+Some call sites throw, and tie order changes. Indexing and list plans also change on first boot. Details: [CHANGELOG.md](../CHANGELOG.md) `## Unreleased`. npm `latest` is still 0.6.1; this section is unreleased `main` (`package.json` still says `0.8.0`).
 
-### What happens on first boot
-
-- `init()` creates the SQL function `bunsane_num_v1` and a `bk_…` key index for every `@CompData({ indexed: true })` scalar and `@IndexedField("btree" | "numeric")` field, plus `created_at` / `updated_at` indexes on `entities`.
-- Tables estimated below `BUNSANE_INDEX_SYNC_MAX_ROWS` (100 000) are indexed during `init()`. Bigger tables are indexed by a background task after `init()`, one instance at a time; lists on those tables are correct but not yet fast until it finishes (logged at info).
-- Once a `bk_` index is valid, the framework drops the old `idx_<leaf>_<field>_btree` / `_btree_date` / `_numeric` (and scalar `_gin`) index it replaces. QSP's `idx_rm_<archetype>__cover` is replaced the same way.
-- Plan for the disk and I/O of one index build per indexed field on large tables. Builds use `CREATE INDEX CONCURRENTLY`, so writes are not blocked.
-
-### Check your app for
+### Code that throws or changes order
 
 | Change | What to look for |
 |---|---|
-| Ties follow the sort direction | UI or tests that assumed equal values come out in ascending id order under a DESC sort. A 0.8 cursor that ends inside a tie group may repeat or skip a few rows once after the deploy. |
-| Non-numeric text in numeric fields sorts/filters as missing | Code that relied on the query failing, or data like `"n/a"` in number fields that you expect to see ranked. |
-| Entity timestamp order is by millisecond | Sub-millisecond ordering of entities created in the same millisecond now falls back to id. |
-| `sortByCreatedAt().with(X)` excludes soft-deleted entities; `.cursor(id)` with it throws | Use `sortedCursor`. |
-| Sorting by unindexed fields | Works as before (full scan). In development a one-time warning names the field; add `@CompData({ indexed: true })`, or `@CompositeIndex(["status", "total"])` for "filter by one field, sort by another" on the same component. |
+| `.cursor(id)` with `sortByCreatedAt` / `sortByUpdatedAt` throws | Calls that paged an entity-timestamp sort by id. Use `sortedCursor` and `Query.encodeSortedCursor`. (`.sortBy().cursor(id)` already threw in 0.8.) |
+| Ties follow the sort direction | Equal sort values are ordered by entity id in that direction (`DESC` breaks ties by `entity_id DESC`; 0.8 always used ASC). Applies to component sorts, `sortByCreatedAt` / `sortByUpdatedAt`, OR + sort, multi-key sorts (the last key's direction), and QSP `rm_` routes. A 0.8 cursor that ends inside a tie group may repeat or skip rows of that group once. |
+| Entity timestamps are UTC milliseconds on every page | `sortByCreatedAt` / `sortByUpdatedAt` page 1 used raw microseconds and keyset pages used milliseconds. Both now use milliseconds. Sub-millisecond ties fall to entity id, in the sort direction. |
+| Entity-timestamp sorts with membership exclude soft-deleted entities | `sortByCreatedAt` / `sortByUpdatedAt` combined with `.with()`, OR, or `.without()` now require `entities.deleted_at IS NULL`. A list that showed soft-deleted rows drops them. |
+| Non-numeric text in a numeric field is NULL | Sorting or filtering a number field that holds `"n/a"` used to fail with `invalid input syntax for type numeric`. It now sorts and filters as a missing value. |
+| DESC keyset under NULLS LAST includes rows with no value | Pages after a non-null cursor used to end before the NULL tail. They now return those rows (component sorts, OR + sort, QSP). |
+| Sorting by a field with no key index | Still a full scan plus top-N. In development a one-time warning names the field. Add `@CompData({ indexed: true })`, or `@CompositeIndex(["status", "total"])` when you filter on one field and sort or range on the next field of the same component. `@CompositeIndex` is a root-barrel export and needs at least two fields. An unknown field fails boot. |
 
-New settings: `BUNSANE_INDEX_SYNC_MAX_ROWS`, `BUNSANE_ENTITY_SORT_PROBE` ([CONFIGURATION.md](CONFIGURATION.md#query-engine)). Both are validated at boot.
+### What happens on first boot
+
+- `init()` creates `bunsane_num_v1` (IMMUTABLE numeric-or-NULL; never `CREATE OR REPLACE`) and a `bk_<slug>_<hash>` key index for every scalar `@CompData({ indexed: true })` and `@IndexedField("btree" | "numeric")` field, plus `created_at` / `updated_at` keys on `entities`. The index is `((key), entity_id)`, not partial, so the planner keeps expression statistics. `@IndexedField` is not on the root barrel (`bunsane/core/decorators/IndexedField`). Its default type is `"gin"`, which is not a sort key.
+- The index reconciler (`database/indexReconciler.ts`) creates missing `bk_` indexes (`CONCURRENTLY` on real PostgreSQL, not PGlite), rebuilds invalid ones, and drops a legacy `idx_<leaf>_<field>_btree` / `_btree_date` / `_numeric` (and scalar `_gin`) index only after a valid `bk_` replacement exists. QSP's `idx_rm_<archetype>__cover` is dropped the same way. Indexes without the `bk_` prefix are left alone, except those known legacy names. An explicit `@IndexedField("gin")` on a key field survives boot.
+- Tables estimated below `BUNSANE_INDEX_SYNC_MAX_ROWS` (100 000) are indexed during `init()`. Bigger tables, and unanalyzed tables larger than 64 MB, are indexed by a background task after `init()` under `withLock("bunsane:index-reconcile")` (one instance at a time). Lists stay correct but are not yet fast until that finishes (logged at info). Shutdown does not wait past the grace budget. A component `register()` after boot still gets key indexes.
+- Plan for the disk and I/O of one index build per indexed field on large tables. `CREATE INDEX CONCURRENTLY` does not block writes.
+- Invalid `BUNSANE_INDEX_SYNC_MAX_ROWS` or `BUNSANE_ENTITY_SORT_PROBE` fails `init()`. See [CONFIGURATION.md](CONFIGURATION.md#query-engine).
+
+These helpers are removed: `ensureNumericIndex`, `ensureCompositeIndex`, `ensureLegacyIndexedFields`, `pickScalarIndexType`, `createCoveringIndex`, and `database/numericJsonField.ts`.
+
+### Query plans
+
+Call sites stay the same. The SQL does not.
+
+- A single-key sort on a key field walks the index and stops at the limit: two ordered branches (non-null keys, then NULL keys, or the reverse when `nullsFirst` is set) and row-comparison keyset predicates.
+- Unsorted multi-component pages and `count()` use a driving leaf plus `EXISTS`. They no longer emit `INTERSECT`.
+- `sortByCreatedAt` / `sortByUpdatedAt` with no `.with()`, OR, or `.without()` is index-driven (`getLastRouteInfo().entitySortPlan === 'index'`), including both timestamps together. With membership, a single entity sort runs an adaptive probe over `min(cap, max(64, ceil(4 × pageLimit / componentShare)))`, capped by `BUNSANE_ENTITY_SORT_PROBE` (default 5000). The probe is kept (`'probe'`) when that window is exhausted or the page is full, so a short page from an exhausted window is the answer. It falls back to hash join plus top-N (`'fallback'`) only when the window was not exhausted and the page did not fill. `OFFSET > 0`, an estimate over the cap, and `sortByCreatedAt()` plus `sortByUpdatedAt()` together with membership skip the probe and are `'fallback'`. When the component's rows are clustered in time, that fallback is the 0.8 plan plus ~10% (see CHANGELOG `## Unreleased`); use QSP for that list.
+- QSP `rm_` routes use the same ordering and keyset builder and per-column `bk_` indexes. `before` cursors and keyset plus `nullsFirst` now route when the query is otherwise covered. Multi-key sorts still do not route.
+- Numeric filters compare `bunsane_num_v1(data->>'f')` instead of restating a regex predicate.
 
 ---
 
 ## 0.6.x → 0.8
 
-0.7.0 and 0.8.0 were cut on the same day. Upgrade straight to 0.8; there is no reason to stop at 0.7. This guide covers both releases. The full list is in [CHANGELOG.md](../CHANGELOG.md) (`## 0.8.0`, `## 0.7.0`).
+0.7.0 and 0.8.0 were cut on the same day. There is no reason to stop at 0.7. This section covers both. If you are moving onto current `main`, finish this section and then apply the 0.8 → 0.9 section above. npm `latest` is still 0.6.1; v0.7.0 and v0.8.0 are GitHub tags. The full list is in [CHANGELOG.md](../CHANGELOG.md) (`## 0.8.0`, `## 0.7.0`).
 
 No manual SQL migration is needed. `App.init()` creates the new read-model tables it needs; existing tables are unchanged. What does need attention is configuration (several endpoints and features are now closed by default), a handful of code patterns that now throw instead of silently doing the wrong thing, and the rollout order if you run more than one instance.
 
 ### Checklist
 
 1. [Set the new environment variables](#1-environment) before deploying.
-2. `bun add bunsane@0.8.0`, then `bunx tsc --noEmit` and [fix what the compiler finds](#2-code-changes-the-compiler-finds).
+2. Install the GitHub tag (`bun add github:yaaruu/bunsane#v0.8.0`) or `main` for unreleased 0.9, then `bunx tsc --noEmit` and [fix what the compiler finds](#2-code-changes-the-compiler-finds).
 3. Boot once with `NODE_ENV=development` and [fix what schema build and queries throw](#3-code-changes-that-throw-at-boot-or-at-runtime).
 4. [Update your tests](#4-tests).
 5. [Tell GraphQL/HTTP clients](#5-client-visible-changes) what changed.
@@ -308,7 +321,7 @@ Share this with frontend and integration owners.
 | JSON body limit 1 MB | Larger bodies get 413. |
 | Multipart without `Content-Length` | 411 `{ "error": "Length Required", "code": "LENGTH_REQUIRED", "limit" }`. |
 | Depth ≥ 15 always enforced | Very deep queries that passed with depth disabled now fail. |
-| Unknown operation output types | Fields that used to be `String` / `[Any]` now have real types. |
+| Unrecognised `@GraphQLOperation` output | Schema build throws instead of emitting `String` / `[Any]`. Fix the `output` before clients can query. |
 
 ---
 
@@ -335,7 +348,7 @@ Not required, but these are where most of the 0.7 performance gains are. Measure
   }
   ```
 
-  A parent missing from the map resolves to `null`. If the method throws, every parent in the batch rejects.
+  A parent missing from the map resolves to `null`. Function fields are nullable; there is no option that makes a missing key an error. If the method throws, every parent in the batch rejects.
 - **Multi-key keyset pagination.** `sortedCursor` supports several sort keys, mixed directions, and `'before'`. Encode with `Query.encodeSortedCursor([k1, k2], lastId)`.
 - **Drop `registerFieldResolvers` calls.** Field, relation, and function resolvers attach at schema build. The call is still harmless.
 - **`Entity.saveMany(entities)`** saves in one transaction with batched writes.
@@ -348,6 +361,6 @@ Not required, but these are where most of the 0.7 performance gains are. Measure
 
 - `bunx tsc --noEmit` is clean.
 - Boot logs have no warnings about `NODE_ENV`, the cache invalidation secret, Redis TLS, or `rateLimit` failing open.
-- `/health` returns 200; `/metrics` returns 200 with your token and 404 without.
+- `/health` returns 200. `/metrics` returns 200 when the request carries `BUNSANE_METRICS_TOKEN`. With that token configured, a missing or wrong header is 401. 404 is only when no token is configured and the route is not `public`.
 - A GraphQL smoke query over your main lists returns the same data as before. Compare statement counts via `/metrics` if you track them.
 - In development, look for `truncatedByDefaultLimit` throws on list endpoints and add `.take()` where they fire.

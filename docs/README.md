@@ -5,8 +5,8 @@ The package is experimental. Application code imports the authoring set from the
 ## App authors
 
 - [Install, tsconfig, env, hello world](../README.md)
-- [Upgrading](UPGRADING.md) — 0.6.x → 0.8: env, code, tests, clients, rollout order
-- [List queries](QUERY_LIST_GUIDE.md) — pagination, N+1, tags, when QSP applies
+- [Upgrading](UPGRADING.md) — 0.6.x → 0.8, then 0.8 → 0.9 (unreleased): env, throws, tests, clients, key indexes and sort order
+- [List queries](QUERY_LIST_GUIDE.md) — pagination, sorted cursors, N+1, aggregates, read models, when QSP applies
 - [Standalone scripts](STANDALONE_SCRIPTS.md) — migrations, backfills, drain-before-exit
 - [Locks](LOCKING.md) — `withLock` and what breaks under transaction pooling
 - [Configuration](CONFIGURATION.md) — environment variables you set in an app
@@ -35,3 +35,7 @@ Design notes, RFCs, and tickets. Not published in the npm package (`package.json
 - [Query sort / pagination plan](internal/QUERY_SORT_PAGINATION_PLAN.md)
 - [entity_components removal plan](internal/ENTITY_COMPONENTS_REMOVAL_PLAN.md)
 - [Scalability plan](internal/SCALABILITY_PLAN.md)
+- [Index-driven lists RFC](internal/RFC_INDEX_DRIVEN_LISTS.md) — 0.9 key indexes and list plans (implemented)
+- [0.9 benchmark results](internal/benchmark-0.9/RESULTS.md) — measured list plans on real PostgreSQL
+- [0.9 benchmark before notes](internal/benchmark-0.9/BEFORE.md) — pre-change plans those results compare against
+- [0.7 benchmark notes](internal/BENCHMARK_0.7.md) — real-PostgreSQL before/after for the 0.7 read path

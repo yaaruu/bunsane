@@ -28,7 +28,7 @@ Index-driven list reads. Design: `docs/internal/RFC_INDEX_DRIVEN_LISTS.md`; meas
 
 - **Sorted lists walk the index and stop at the limit.** Single-key sorts on a key field run as two index-ordered branches (non-null keys, then NULL keys, per NULLS placement) with row-comparison keyset predicates.
 - **Unsorted multi-component pages and `count()`** use a driving leaf + `EXISTS` semi-joins instead of `INTERSECT`.
-- **`sortByCreatedAt/UpdatedAt`**: index-driven without membership; with `.with()` an adaptive probe walks entities in index order over a window sized from table statistics (`4 × pageLimit / componentShare`, capped by `BUNSANE_ENTITY_SORT_PROBE`, default 5000), falling back to hash join + top-N when the page does not fill or the estimate exceeds the cap.
+- **`sortByCreatedAt/UpdatedAt`**: index-driven without membership, including both timestamps together. With membership, a single entity sort runs an adaptive probe over a window sized from table statistics (`4 × pageLimit / componentShare`, capped by `BUNSANE_ENTITY_SORT_PROBE`, default 5000). The probe is kept when the window is exhausted or the page is full. It falls back to hash join + top-N only when the window was not exhausted and the page did not fill, or when the estimate exceeds the cap. `OFFSET > 0` and two entity sorts together with membership skip the probe.
 - **QSP `rm_` routes** share the same ordering/keyset builder and per-column `bk_` key indexes; `before` cursors and keyset + `nullsFirst` now route.
 - Numeric filters compare `bunsane_num_v1(data->>'f')` instead of restating a regex predicate.
 
@@ -43,6 +43,7 @@ Index-driven list reads. Design: `docs/internal/RFC_INDEX_DRIVEN_LISTS.md`; meas
 
 - `docs/UPGRADING.md` (0.6.x → 0.8) — env vars, breaking changes, tests, clients, rollout order.
 - `docs/CONFIGURATION.md`, `docs/READ_PATH_PERFORMANCE.md`, `docs/QUERY_LIST_GUIDE.md`, `docs/QSP_OPERATIONS.md` describe key indexes and the new plans.
+- Docs refresh for `main`: repo guides (README, upgrading, configuration, list, QSP, and read-path), the published docs site, and the Claude skill. They describe 0.7 through unreleased 0.9, including key indexes and the 0.8 → 0.9 code changes.
 
 ## 0.8.0 — 2026-09-24
 
