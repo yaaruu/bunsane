@@ -5,6 +5,7 @@ The package is experimental. Application code imports the authoring set from the
 ## App authors
 
 - [Install, tsconfig, env, hello world](../README.md)
+- [Upgrading](UPGRADING.md) — 0.6.x → 0.8: env, code, tests, clients, rollout order
 - [List queries](QUERY_LIST_GUIDE.md) — pagination, N+1, tags, when QSP applies
 - [Standalone scripts](STANDALONE_SCRIPTS.md) — migrations, backfills, drain-before-exit
 - [Locks](LOCKING.md) — `withLock` and what breaks under transaction pooling

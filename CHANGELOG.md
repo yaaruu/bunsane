@@ -2,6 +2,12 @@
 
 All notable changes to bunsane are documented here.
 
+## Unreleased
+
+### Documentation
+
+- **`docs/UPGRADING.md`** — 0.6.x → 0.8 guide: new env vars and closed-by-default endpoints, compile-time and runtime breaking changes, test changes, client-visible GraphQL/HTTP changes, and multi-instance rollout order for the cache-invalidation and RPC secrets.
+
 ## 0.8.0 — 2026-09-24
 
 ### Breaking
