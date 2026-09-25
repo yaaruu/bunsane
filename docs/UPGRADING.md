@@ -36,6 +36,11 @@ Call sites stay the same. The SQL does not.
 - QSP `rm_` routes use the same ordering and keyset builder and per-column `bk_` indexes. `before` cursors and keyset plus `nullsFirst` now route when the query is otherwise covered. Multi-key sorts still do not route.
 - Numeric filters compare `bunsane_num_v1(data->>'f')` instead of restating a regex predicate.
 
+### Other behavior changes
+
+- **Scoped QSP rollout auto-backfills.** If you set `BUNSANE_QSP_ARCHETYPES`, those archetypes used to be pre-registered `DISABLED` at boot and stayed that way until you called `runBackfill` by hand. They now backfill automatically on the boot that registers them (a new `projection_state` row starts `BACKFILLING`), same as the unscoped lazy path. An existing row — including one already `DISABLED` from before this fix — keeps its status; `runBackfill("<Archetype>")` (or `UPDATE projection_state SET status='BACKFILLING' WHERE archetype='<Archetype>'` plus a restart) still picks it up by hand. See `docs/QSP_OPERATIONS.md`.
+- **Caller-transaction saves wait for the caller's commit.** `entity.save(trx)` / `saveMany(..., { trx })` where `trx` came from `db.transaction` / `db.begin` / `getDb().transaction|begin` / `dbTransaction`, or from `trx.savepoint(...)` on one of those: cache invalidation and `entity.created`/`entity.updated` hooks now run after the outer transaction's `COMMIT`, and are skipped if that transaction (or the savepoint the save ran in) rolls back. A rollback also restores the entity's dirty/persisted flags so a retried `save()` reissues every statement, instead of silently seeing a "clean" entity. This does not apply to untracked handles (`sql.reserve()`, a transaction handle used after it already ended), which behave as before.
+
 ---
 
 ## 0.6.x → 0.8

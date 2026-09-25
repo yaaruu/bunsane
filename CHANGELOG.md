@@ -14,6 +14,8 @@ Index-driven list reads. Design: `docs/internal/RFC_INDEX_DRIVEN_LISTS.md`; meas
 - `sortByCreatedAt/UpdatedAt` combined with `.with()` / OR / `.without()` exclude soft-deleted entities; `.cursor(id)` with an entity sort throws (use `sortedCursor`).
 - **Framework indexes are replaced.** `idx_<leaf>_<field>_btree|_btree_date|_numeric` (and `_gin` on scalar `@CompData({ indexed: true })` fields) are dropped once their `bk_` key-index replacement is valid; QSP's `idx_rm_<archetype>__cover` is dropped likewise. `ensureNumericIndex`, `ensureCompositeIndex`, `ensureLegacyIndexedFields`, `pickScalarIndexType`, `createCoveringIndex`, and `database/numericJsonField.ts` are removed.
 - `BUNSANE_ENTITY_SORT_PROBE` and `BUNSANE_INDEX_SYNC_MAX_ROWS` are validated at boot (invalid values fail `init()`).
+- **Scoped QSP rollout auto-backfills on first boot.** `BUNSANE_QSP_ARCHETYPES` no longer pre-registers archetypes as `DISABLED` and waits for a manual `runBackfill` call — `ProjectionManager.initialize()` now inserts a *new* row `BACKFILLING` and starts the backfill in the background, exactly like the unscoped lazy path. An existing row keeps its status, so a pre-0.9 row left `DISABLED` is untouched (see `docs/UPGRADING.md`).
+- **Caller-transaction save hooks now run after commit, not before.** Cache invalidation and `entity.created`/`entity.updated` hooks for a save passed a transaction opened through `db`/`getDb()`/`dbTransaction` now wait for that transaction's `COMMIT` and are skipped entirely on rollback. Previously they ran as soon as `save(trx)` returned, even if the caller later rolled back.
 
 ### Added
 
@@ -38,6 +40,8 @@ Index-driven list reads. Design: `docs/internal/RFC_INDEX_DRIVEN_LISTS.md`; meas
 - `sortByCreatedAt/UpdatedAt` page 1 and keyset pages disagreed on sub-millisecond tie order.
 - `@CompData({ indexed: true })` fields of components registered after boot got no index.
 - An explicit `@IndexedField("gin")` on a key field survives boot (was dropped as legacy).
+- Scoped QSP rollout (`BUNSANE_QSP_ARCHETYPES` set) never backfilled on its own: `initialize()` inserted new rows `DISABLED` and the lazy `ensureProjection` path returned immediately, so a scoped archetype stayed on the legacy plan until an operator remembered to call `runBackfill`. New rows now start `BACKFILLING` and the backfill runs automatically; a row stuck `BACKFILLING` (instance died mid-scan) resumes from its watermark on the next boot. New `ProjectionManager.instance.awaitBackfills()` for tests/scripts.
+- A save passed a caller-owned transaction (`save(trx)` / `saveMany(..., { trx })`) that later rolled back left the entity's dirty/persisted flags applied, so a retried `save()` silently skipped work it needed to redo. Every transaction opened through the pool (`db.transaction`/`db.begin`/`getDb().transaction|begin`/`dbTransaction`) is now tracked; a rollback restores the flags (and re-queues removals) so a retry writes everything again. A `trx.savepoint(...)` on a tracked handle is tracked too — a save inside a savepoint that rolls back gets its flags restored and its side effects dropped even if the outer transaction commits, and a released savepoint's side effects wait for the outer `COMMIT`. Untracked handles (a `sql.reserve()` connection, a transaction handle used after it already ended) are unaffected — no observable end, so behavior there is unchanged.
 
 ### Documentation
 

@@ -33,6 +33,7 @@ export class ProjectionManager {
     private statusCache = new Map<string, ProjectionStatus>();
     private shadowCounters = new Map<string, { compared: number; diverged: number }>();
     private ensuring = new Set<string>();
+    private backfills = new Map<string, Promise<void>>();
     private pollHandle: ReturnType<typeof setInterval> | null = null;
     private archetypeNames: string[] = [];
 
@@ -51,14 +52,18 @@ export class ProjectionManager {
             .map(name => name.trim())
             .filter(Boolean);
 
+        const pending: string[] = [];
         for (const archetypeName of this.archetypeNames) {
             try {
                 const descriptor = deriveProjectionDescriptor(archetypeName);
                 this.descriptors.set(archetypeName, descriptor);
                 await createRmTable(archetypeName, descriptor.columns);
+                // A new row starts BACKFILLING, exactly like the lazy path. An
+                // existing row keeps its status: DISABLED is the operator's
+                // per-archetype rollback and must survive a restart.
                 await projExec('projection.state.register',
                     `INSERT INTO projection_state (archetype, shape_hash, status, shape_version)
-                     VALUES ($1, $2, 'DISABLED', $3)
+                     VALUES ($1, $2, 'BACKFILLING', $3)
                      ON CONFLICT (archetype) DO UPDATE SET shape_hash = EXCLUDED.shape_hash`,
                     [descriptor.archetype, descriptor.shapeHash, descriptor.shapeVersion]
                 );
@@ -67,11 +72,11 @@ export class ProjectionManager {
                 await syncRmSchema(archetypeName, descriptor);
                 await ensureRmKeyIndexes(archetypeName, descriptor.columns);
 
-
-
                 const rows = await projExec<any[]>('projection.state.status',
                     `SELECT status FROM projection_state WHERE archetype = $1`, [descriptor.archetype]);
-                this.statusCache.set(archetypeName, (rows[0]?.status ?? 'DISABLED') as ProjectionStatus);
+                const status = (rows[0]?.status ?? 'DISABLED') as ProjectionStatus;
+                this.statusCache.set(archetypeName, status);
+                if (status === 'BACKFILLING') pending.push(archetypeName);
             } catch (error) {
                 logger.warn(`Failed to initialize projection for ${archetypeName}: ${error}`);
             }
@@ -79,6 +84,7 @@ export class ProjectionManager {
 
         this.dependencyMap = buildDependencyMap(this.archetypeNames);
         this.startPoll();
+        for (const archetypeName of pending) this.startBackfill(archetypeName);
     }
 
     getStatus(archetype: string): ProjectionStatus {
@@ -115,12 +121,35 @@ export class ProjectionManager {
     }
 
     /**
+     * Run (or resume from the watermark) the backfill for an archetype whose
+     * row is BACKFILLING. One run per archetype per process; across instances
+     * the backfill's distributed lock lets exactly one proceed. Descriptor and
+     * rm_ table must already be registered (dual-write first).
+     */
+    private startBackfill(archetype: string): void {
+        if (this.backfills.has(archetype)) return;
+        const job = import('./BackfillJob')
+            .then(({ run }) => run(archetype, { resume: true }))
+            .catch(err => logger.warn(`backfill failed for ${archetype}: ${err}`))
+            .finally(() => this.backfills.delete(archetype));
+        this.backfills.set(archetype, job);
+    }
+
+    /** Resolves when every backfill this process started has settled. */
+    async awaitBackfills(): Promise<void> {
+        while (this.backfills.size > 0) {
+            await Promise.all([...this.backfills.values()]);
+        }
+    }
+
+    /**
      * Lazy trigger for a covered query. Idempotent across calls and instances:
-     * INSERT ... 'BACKFILLING' ON CONFLICT DO NOTHING - only the winner kicks
-     * the backfill. Both winner and loser ensure the rm_ table and its key
-     * indexes (CREATE INDEX IF NOT EXISTS). dual-write-FIRST: the rm_ table is
-     * created and the archetype registered locally (dual-write live) BEFORE the
-     * backfill scan, so live writes during backfill are captured.
+     * INSERT ... 'BACKFILLING' ON CONFLICT DO NOTHING creates the row once.
+     * Every instance ensures the rm_ table and its key indexes (CREATE INDEX IF
+     * NOT EXISTS). dual-write-FIRST: the rm_ table is created and the archetype
+     * registered locally (dual-write live) BEFORE the backfill scan, so live
+     * writes during backfill are captured. A BACKFILLING row starts (or
+     * resumes) the backfill; the backfill lock admits one instance.
      */
     async ensureProjection(archetype: string): Promise<void> {
         if (!qspActive() || !qspInScope(archetype)) return;
@@ -129,26 +158,22 @@ export class ProjectionManager {
         this.ensuring.add(archetype);
         try {
             const descriptor = deriveProjectionDescriptor(archetype);
-            const rows = await projExec<any[]>('projection.state.claim',
+            await projExec('projection.state.claim',
                 `INSERT INTO projection_state (archetype, shape_hash, status, shape_version)
                  VALUES ($1, $2, 'BACKFILLING', $3)
-                 ON CONFLICT (archetype) DO NOTHING
-                 RETURNING archetype`,
+                 ON CONFLICT (archetype) DO NOTHING`,
                 [descriptor.archetype, descriptor.shapeHash, descriptor.shapeVersion]
             );
-            const won = rows.length > 0;
             await createRmTable(archetype, descriptor.columns);
             await syncRmSchema(archetype, descriptor);
             await ensureRmKeyIndexes(archetype, descriptor.columns);
             this.registerArchetype(archetype, descriptor);
             const s = await projExec<any[]>('projection.state.status',
                 `SELECT status FROM projection_state WHERE archetype = $1`, [archetype]);
-            this.statusCache.set(archetype, (s[0]?.status ?? 'BACKFILLING') as ProjectionStatus);
+            const status = (s[0]?.status ?? 'BACKFILLING') as ProjectionStatus;
+            this.statusCache.set(archetype, status);
             this.startPoll();
-            if (won) {
-                const { run } = await import('./BackfillJob');
-                void run(archetype).catch(err => logger.warn(`ensureProjection backfill failed for ${archetype}: ${err}`));
-            }
+            if (status === 'BACKFILLING') this.startBackfill(archetype);
         } catch (err) {
             logger.warn(`ensureProjection(${archetype}) failed: ${err}`);
         } finally {

@@ -10,8 +10,13 @@ const ZERO_UUID = '00000000-0000-0000-0000-000000000000';
 
 export const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-
-export async function run(archetypeName: string): Promise<void> {
+/**
+ * Backfill `rm_<archetype>` from `components`, resuming from the watermark.
+ * `resume`: started automatically for a row read as BACKFILLING. The status
+ * is re-read under the lock, so a run that waited for another instance's
+ * backfill to finish does not demote the now SHADOW/READY projection.
+ */
+export async function run(archetypeName: string, opts: { resume?: boolean } = {}): Promise<void> {
     if (!ProjectionManager.enabled) return;
 
     const lock = getDistributedLock();
@@ -24,10 +29,12 @@ export async function run(archetypeName: string): Promise<void> {
         const descriptor = mgr.getDescriptor(archetypeName);
         if (!descriptor) return;
 
+        const stateRows = await projExec<any[]>('projection.backfill.watermark',
+            `SELECT status, watermark FROM projection_state WHERE archetype = $1`, [archetypeName]);
+        if (opts.resume && stateRows[0]?.status !== 'BACKFILLING') return;
+
         await mgr.setStatus(archetypeName, 'BACKFILLING');
 
-        const stateRows = await projExec<any[]>('projection.backfill.watermark',
-            `SELECT watermark FROM projection_state WHERE archetype = $1`, [archetypeName]);
         let watermark = stateRows[0]?.watermark ?? ZERO_UUID;
         const batchSize = parseInt(process.env.BUNSANE_QSP_BACKFILL_BATCH ?? '5000', 10);
         const throttle = parseInt(process.env.BUNSANE_QSP_BACKFILL_THROTTLE_MS ?? '50', 10);

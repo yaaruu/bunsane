@@ -1,6 +1,7 @@
 import {SQL} from "bun";
 import { logger } from "../core/Logger";
 import { setPoolMax } from "./instrumentedDb";
+import { instrumentTransactions } from "./txLifecycle";
 
 // Query timeout in milliseconds (default 30s, configurable via env)
 // This is used by Query.exec(), Entity.save(), etc.
@@ -160,7 +161,7 @@ function createDatabase(): SQL {
         logger.info('Prepared statements disabled (DB_DISABLE_PREPARE=true) — required for PgBouncer transaction pooling');
     }
 
-    return new SQL({
+    const sql = new SQL({
         url,
         max,
         idleTimeout,
@@ -187,6 +188,10 @@ function createDatabase(): SQL {
             logger.trace("New database connection established");
         }
     });
+    // Every transaction opened on the pool gets commit/rollback hooks
+    // (Entity.save with a caller trx relies on them).
+    instrumentTransactions(sql);
+    return sql;
 }
 
 /**

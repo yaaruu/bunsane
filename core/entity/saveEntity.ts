@@ -3,12 +3,16 @@
 // §3.2). Pure functions take the entity instance as the first parameter.
 //
 // Persisted/dirty flags and the removal sets are mutated only after every
-// statement in the transaction succeeds (entity upsert, deletes, inserts,
-// component upserts, QSP projection, read-model sync). A rolled-back save
-// must leave the instance dirty so the next save() reissues every statement.
+// statement of the save succeeds (entity upsert, deletes, inserts, component
+// upserts, QSP projection, read-model sync), so later saves in the same
+// transaction see them. If the enclosing transaction then rolls back — ours,
+// or a caller's `trx` opened through `db` — the flags are restored so the next
+// save() reissues every statement (database/txLifecycle.ts). Post-commit side
+// effects of a caller-trx save wait for that transaction's commit.
 import { logger } from "../Logger";
 import { QUERY_TIMEOUT_MS } from "../../database";
 import { dbTransaction } from "../../database/gateway";
+import { onCommit, onRollback } from "../../database/txLifecycle";
 import { runWithSignal } from "../../database/cancellable";
 import ComponentRegistry from "../components/ComponentRegistry";
 import type { BaseComponent } from "../components";
@@ -194,22 +198,28 @@ export async function saveMany(entities: Entity[], opts?: SaveManyOptions): Prom
     }
 
     const profileForPost = profile && unique.length === 1;
-    for (const cap of captured) {
-        const sideEffectPromise = new Promise<void>((resolve) => {
-            queueMicrotask(() => {
-                runPostCommitSideEffects(
-                    cap.entity,
-                    cap.wasNew,
-                    cap.changedComponentTypeIds,
-                    cap.removedComponentTypeIds,
-                    context,
-                    profileForPost ? phases : undefined,
-                    profileForPost ? phaseStart : undefined,
-                ).finally(() => resolve());
+    const scheduleSideEffects = (): void => {
+        for (const cap of captured) {
+            const sideEffectPromise = new Promise<void>((resolve) => {
+                queueMicrotask(() => {
+                    runPostCommitSideEffects(
+                        cap.entity,
+                        cap.wasNew,
+                        cap.changedComponentTypeIds,
+                        cap.removedComponentTypeIds,
+                        context,
+                        profileForPost ? phases : undefined,
+                        profileForPost ? phaseStart : undefined,
+                    ).finally(() => resolve());
+                });
             });
-        });
-        trackSideEffect(sideEffectPromise);
-    }
+            trackSideEffect(sideEffectPromise);
+        }
+    };
+    // A caller's transaction has not committed yet: cache invalidation and
+    // lifecycle hooks wait for it (and are dropped if it rolls back). An
+    // untracked handle has no observable commit, so they run now.
+    if (!callerTrx || !onCommit(callerTrx, scheduleSideEffects)) scheduleSideEffects();
 
     return true;
 }
@@ -343,9 +353,28 @@ function planEntity(entity: Entity): EntitySavePlan {
     return { entity, removedTypeIds, toInsert, toUpdate, insertedComps, updatedComps };
 }
 
-function applySaveFlags(plans: EntitySavePlan[]): void {
+/** What a rollback must put back after `applySaveFlags` ran for one entity. */
+type SaveFlagsUndo = {
+    entity: Entity;
+    wasPersisted: boolean;
+    removedTypeIds: string[];
+    newlySavedRemoved: string[];
+    insertedComps: BaseComponent[];
+    updatedComps: BaseComponent[];
+};
+
+function applySaveFlags(plans: EntitySavePlan[], trx: SQL): void {
+    const undo: SaveFlagsUndo[] = [];
     for (const plan of plans) {
         const entity = plan.entity;
+        undo.push({
+            entity,
+            wasPersisted: flagsOf(entity)._persisted,
+            removedTypeIds: plan.removedTypeIds,
+            newlySavedRemoved: plan.removedTypeIds.filter((typeId) => !entity.savedRemovedComponents.has(typeId)),
+            insertedComps: plan.insertedComps,
+            updatedComps: plan.updatedComps,
+        });
         for (const typeId of plan.removedTypeIds) {
             entity.savedRemovedComponents.add(typeId);
         }
@@ -361,6 +390,24 @@ function applySaveFlags(plans: EntitySavePlan[]): void {
         }
         entity.setPersisted(true);
         entity.setDirty(false);
+    }
+    // A savepoint rollback also undoes (savepoints share the handle). Untracked
+    // handles (reserved connection, finished transaction) keep the flags.
+    onRollback(trx, () => undoSaveFlags(undo));
+}
+
+/** Nothing the rolled-back save wrote exists; mark all of it unsaved again. */
+function undoSaveFlags(undo: SaveFlagsUndo[]): void {
+    for (const u of undo) {
+        for (const typeId of u.newlySavedRemoved) u.entity.savedRemovedComponents.delete(typeId);
+        for (const typeId of u.removedTypeIds) u.entity.removedComponents.add(typeId);
+        for (const comp of u.insertedComps) {
+            comp.setPersisted(false);
+            comp.setDirty(true);
+        }
+        for (const comp of u.updatedComps) comp.setDirty(true);
+        u.entity.setPersisted(u.wasPersisted);
+        u.entity.setDirty(true);
     }
 }
 
@@ -503,7 +550,7 @@ async function executeBatch(entities: Entity[], trx: SQL, signal?: AbortSignal):
         await ReadModelManager.instance.syncOnSave(entity, trx);
     }
 
-    applySaveFlags(plans);
+    applySaveFlags(plans, trx);
     return true;
 }
 

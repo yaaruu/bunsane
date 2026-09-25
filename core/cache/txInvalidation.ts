@@ -7,14 +7,14 @@
  * entity.save() uses (CacheManager.invalidateEntityComponents → deleteMany +
  * cross-instance pub/sub).
  *
- * Bun.SQL exposes no commit hook, so "on commit" means: after the
- * `db.transaction(cb)` promise resolves. The `transaction()` wrapper below owns
- * that boundary. Tracking is keyed by the trx object via a WeakMap, so
- * `trackComponentDirty` is a cheap no-op for any comp.save() that runs outside a
- * tracked transaction (top-level db, or entity.save() which handles its own
- * cache) — zero behavior change for existing callers.
+ * Commit timing comes from database/txLifecycle: every transaction opened on
+ * the pool is observable, so `beginTxTracking(trx)` registers the flush as a
+ * commit hook. Dirty tracking itself is opt-in (the `transaction()` wrapper or
+ * an explicit `beginTxTracking`), so `trackComponentDirty` stays a cheap no-op
+ * for any comp.save() outside it — entity.save() handles its own cache.
  */
 import { logger as MainLogger } from '../Logger';
+import { onCommit as onTxCommit } from '../../database/txLifecycle';
 
 const logger = MainLogger.child({ scope: 'TxCacheInvalidation' });
 
@@ -26,18 +26,25 @@ type SQLLike = Bun.SQL;
 interface TxState {
     /** entityId -> set of touched component type_ids */
     dirty: Map<string, Set<string>>;
+    /** Callbacks for an untracked handle; flushed only by an explicit flushTxTracking. */
     onCommit: Array<() => void | Promise<void>>;
 }
 
 /** Tracking state keyed by the transaction's SQL handle. */
 const txRegistry = new WeakMap<SQLLike, TxState>();
 
-/** Begin tracking for a transaction handle. Idempotent. */
+/**
+ * Begin tracking for a transaction handle. Idempotent. On a transaction opened
+ * through `db` the flush runs automatically after commit; on any other handle
+ * the caller must call `flushTxTracking` after it commits.
+ */
 export function beginTxTracking(trx: SQLLike): TxState {
     let state = txRegistry.get(trx);
     if (!state) {
-        state = { dirty: new Map(), onCommit: [] };
-        txRegistry.set(trx, state);
+        const created: TxState = { dirty: new Map(), onCommit: [] };
+        txRegistry.set(trx, created);
+        onTxCommit(trx, () => flushTxTracking(created));
+        state = created;
     }
     return state;
 }
@@ -94,15 +101,16 @@ export function markDirty(trx: SQLLike, entityId: string, component: ComponentRe
 
 /** Register a callback to run after the transaction commits. */
 export function registerOnCommit(trx: SQLLike, cb: () => void | Promise<void>): void {
-    const state = beginTxTracking(trx);
-    state.onCommit.push(cb);
+    if (onTxCommit(trx, cb)) return;
+    beginTxTracking(trx).onCommit.push(cb);
 }
 
 /**
- * Flush accumulated invalidations + run onCommit callbacks. Call ONLY after the
- * transaction has committed. Errors are logged, never thrown — a cache flush
- * failure must not surface as a transaction failure (the data is already
- * committed; stale cache is recoverable, a thrown error is not).
+ * Flush accumulated invalidations + run callbacks queued on an untracked
+ * handle. Runs automatically after commit for transactions opened through
+ * `db`. Errors are logged, never thrown — a cache flush failure must not
+ * surface as a transaction failure (the data is already committed; stale
+ * cache is recoverable, a thrown error is not).
  */
 export async function flushTxTracking(state: TxState | undefined): Promise<void> {
     if (!state) return;
@@ -124,7 +132,8 @@ export async function flushTxTracking(state: TxState | undefined): Promise<void>
         logger.error({ error, msg: 'Error during transaction cache flush' });
     }
 
-    for (const cb of state.onCommit) {
+    const callbacks = state.onCommit.splice(0);
+    for (const cb of callbacks) {
         try {
             await cb();
         } catch (error) {
@@ -167,17 +176,14 @@ export async function transaction<T>(
     const { getDb } = require('../../database');
     const db: SQLLike = getDb();
 
-    let state: TxState | undefined;
-    const result = await db.transaction(async (trx: SQLLike) => {
-        state = beginTxTracking(trx);
+    // The pool's transaction() is tracked: the flush registered by
+    // beginTxTracking runs after COMMIT and before this promise resolves.
+    return await db.transaction(async (trx: SQLLike) => {
+        beginTxTracking(trx);
         const ctx: TxContext = {
             markDirty: (entityId, component) => markDirty(trx, entityId, component),
             onCommit: (cb) => registerOnCommit(trx, cb),
         };
         return await fn(trx, ctx);
-    });
-
-    // Transaction committed (resolved without throwing) → flush invalidations.
-    await flushTxTracking(state);
-    return result as T;
+    }) as T;
 }

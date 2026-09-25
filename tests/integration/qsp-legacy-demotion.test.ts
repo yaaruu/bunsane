@@ -87,6 +87,9 @@ if (!isPGlite) {
                 updated_at timestamptz NOT NULL DEFAULT now()
             );`;
             await db.unsafe(`DELETE FROM projection_state WHERE archetype = $1`, [archetypeName]);
+            // Operator-disabled start: an existing DISABLED row is kept by initialize(), so
+            // seeding below skips dual-write and the explicit runBackfill rebuilds rm_.
+            await db.unsafe(`INSERT INTO projection_state (archetype, shape_hash, status) VALUES ($1, '', 'DISABLED')`, [archetypeName]);
 
             ProjectionManager.reset();
             await ProjectionManager.instance.initialize(); // rm_ table + covering index, status DISABLED
