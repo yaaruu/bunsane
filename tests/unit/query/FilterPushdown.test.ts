@@ -58,8 +58,7 @@ describe('RP-03 filter coalesce + membership pushdown', () => {
         expect(ageHits).toBeGreaterThanOrEqual(1);
     });
 
-    test('multi-component INTERSECT branches include field filters (pushdown)', () => {
-        // Single filter total → no CTE; INTERSECT path in ComponentInclusionNode.
+    test('multi-component membership pushes the filtered component and probes the other', () => {
         const { sql } = compileSql((ctx) => {
             ctx.componentIds.add(userId);
             ctx.componentIds.add(productId);
@@ -68,22 +67,13 @@ describe('RP-03 filter coalesce + membership pushdown', () => {
             ]);
         });
 
-        expect(sql.toUpperCase()).toContain('INTERSECT');
-        // Filter predicate appears inside the query (membership branch), not only outer EXISTS.
+        expect(sql.toUpperCase()).not.toContain('INTERSECT');
         expect(sql).toContain("data->>'name'");
-        // With pushdown, filtersAppliedInMembership skips outer field EXISTS.
-        // Presence EXISTS for product may still exist only if CTE path — here no CTE.
-        // INTERSECT pushdown should leave zero outer field EXISTS for the name filter.
-        const afterIntersect = sql.split(/INTERSECT/i).slice(1).join('INTERSECT');
-        // At least one INTERSECT branch fragment should contain the name predicate
-        // (pushdown), not only a trailing EXISTS after the whole INTERSECT.
-        expect(sql).toMatch(
-            /SELECT\s+ec\.entity_id\s+FROM[\s\S]*?data->>'name'[\s\S]*?INTERSECT/i
-        );
-        void afterIntersect;
+        expect(countExists(sql)).toBe(1);
+        expect((sql.match(/data->>'name'/g) ?? []).length).toBe(1);
     });
 
-    test('multi-component multi-filter CTE pushes filters into each branch', () => {
+    test('multi-component multi-filter CTE pushes filters into the driving scan and probes', () => {
         const { sql } = compileSql((ctx) => {
             ctx.componentIds.add(userId);
             ctx.componentIds.add(productId);
@@ -97,13 +87,11 @@ describe('RP-03 filter coalesce + membership pushdown', () => {
         });
 
         expect(sql).toMatch(/WITH\s+base_entities/i);
-        expect(sql.toUpperCase()).toContain('INTERSECT');
+        expect(sql.toUpperCase()).not.toContain('INTERSECT');
         expect(sql).toContain("data->>'name'");
         expect(sql).toContain("data->>'age'");
         expect(sql).toContain("data->>'price'");
-        // Outer query selects the CTE id set directly: no membership re-probe,
-        // no DISTINCT, and pushed filters are not re-applied as EXISTS.
-        expect(countExists(sql)).toBe(0);
+        expect(countExists(sql)).toBe(1);
         expect(sql).not.toMatch(/SELECT\s+DISTINCT/i);
     });
 

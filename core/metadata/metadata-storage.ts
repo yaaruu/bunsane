@@ -2,7 +2,8 @@ import { createHash } from 'crypto';
 import type { 
     ComponentMetadata,
     ComponentPropertyMetadata,
-    IndexedFieldMetadata
+    IndexedFieldMetadata,
+    CompositeIndexMetadata
  } from "./definitions/Component";
 import type { ArcheTypeMetadata, ArcheTypeFieldOptions, ArcheTypeFunctionMetadata } from './definitions/ArcheType';
 import type { RelationOptions } from '../ArcheType';
@@ -27,6 +28,7 @@ export class MetadataStorage {
     components_map: Map<string, ComponentMetadata> = new Map();
     componentProperties: Map<string, ComponentPropertyMetadata[]> = new Map();
     indexedFields: Map<string, IndexedFieldMetadata[]> = new Map();
+    compositeIndexes: Map<string, CompositeIndexMetadata[]> = new Map();
     archetypes: ArcheTypeMetadata[] = [];
     archetypes_field_map: Map<string, ArcheTypeFieldMap[]> = new Map();
     archetypes_relations_map: Map<string, ArcheTypeRelationMap[]> = new Map();
@@ -66,6 +68,16 @@ export class MetadataStorage {
 
     getIndexedFields(componentId: string): IndexedFieldMetadata[] {
         return this.indexedFields.get(componentId) || [];
+    }
+
+    collectCompositeIndex(metadata: CompositeIndexMetadata): void {
+        const list = this.compositeIndexes.get(metadata.componentId) ?? [];
+        list.push(metadata);
+        this.compositeIndexes.set(metadata.componentId, list);
+    }
+
+    getCompositeIndexes(componentId: string): readonly CompositeIndexMetadata[] {
+        return this.compositeIndexes.get(componentId) ?? [];
     }
 
 

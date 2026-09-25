@@ -16,6 +16,7 @@ export { Entity } from "./core/Entity";
 
 export { BaseComponent } from "./core/components/BaseComponent";
 export { Component, CompData } from "./core/components/Decorators";
+export { CompositeIndex } from "./core/decorators/CompositeIndex";
 
 export { default as BaseArcheType } from "./core/ArcheType";
 export {

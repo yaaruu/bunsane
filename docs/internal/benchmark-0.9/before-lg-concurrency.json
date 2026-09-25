@@ -1,0 +1,200 @@
+{
+  "label": "base",
+  "commit": "04f73c6f0f1779af615af1792c5a1e8498425b02",
+  "packageVersion": "0.8.0",
+  "scale": "lg",
+  "compositeIndex": false,
+  "maxParallelWorkersPerGather": "0",
+  "dataset": {
+    "users": 100000,
+    "products": 200000,
+    "orders": 300000,
+    "orderItems": 300000,
+    "reviews": 100000,
+    "flags": 300000,
+    "entities": 1000000,
+    "componentRows": 1300000,
+    "insertMs": 126994,
+    "cancelled": 6000,
+    "missingScore": 10000,
+    "dirtyLegacy": 200
+  },
+  "seedChecks": {
+    "entities": 1000000,
+    "componentRows": 1300000,
+    "insertMs": 126994,
+    "cancelled": 6000,
+    "missingScore": 10000,
+    "dirtyLegacy": 200,
+    "reviewMin": "2024-01-14T21:20:00.000Z",
+    "otherMax": "2024-01-14T21:19:59.000Z",
+    "userMin": "2024-01-01T00:00:00.000Z",
+    "userMax": "2024-01-05T15:06:36.000Z",
+    "orderMin": "2024-01-01T00:00:02.000Z",
+    "orderMax": "2024-01-14T21:19:58.000Z",
+    "overlapped": true
+  },
+  "seedMs": 131101,
+  "pgVersion": "PostgreSQL 17.10 (Debian 17.10-1.pgdg13+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+  "bunVersion": "1.4.0",
+  "platform": "win32-x64",
+  "cpu": "Intel(R) Core(TM) Ultra 7 265K",
+  "memoryGb": 31.4,
+  "shapes": [],
+  "concurrency": {
+    "clients": 16,
+    "durationS": 30,
+    "warmupS": 3,
+    "poolMax": 16,
+    "elapsedMs": 32362,
+    "queries": 279,
+    "errors": 0,
+    "queriesPerSec": 8.62,
+    "shapes": [
+      {
+        "name": "a-sort-rating-20",
+        "samples": 16,
+        "errors": 0,
+        "p50Ms": 1636.48,
+        "p95Ms": 3391.69,
+        "p99Ms": 3391.69
+      },
+      {
+        "name": "a-sort-rating-100",
+        "samples": 16,
+        "errors": 0,
+        "p50Ms": 1655.45,
+        "p95Ms": 3380.49,
+        "p99Ms": 3380.49
+      },
+      {
+        "name": "a-sort-rating-asc-20",
+        "samples": 16,
+        "errors": 0,
+        "p50Ms": 1639.8,
+        "p95Ms": 3402.67,
+        "p99Ms": 3402.67
+      },
+      {
+        "name": "a-sort-username-asc-50",
+        "samples": 16,
+        "errors": 0,
+        "p50Ms": 1590.89,
+        "p95Ms": 3305.46,
+        "p99Ms": 3305.46
+      },
+      {
+        "name": "a-sort-score-desc-20",
+        "samples": 16,
+        "errors": 0,
+        "p50Ms": 1638.23,
+        "p95Ms": 3445.11,
+        "p99Ms": 3445.11
+      },
+      {
+        "name": "c-two-filter-sort-20",
+        "samples": 15,
+        "errors": 0,
+        "p50Ms": 1689.36,
+        "p95Ms": 2832.07,
+        "p99Ms": 2832.07
+      },
+      {
+        "name": "c-selective-filter-sort-20",
+        "samples": 15,
+        "errors": 0,
+        "p50Ms": 1511.36,
+        "p95Ms": 3105.26,
+        "p99Ms": 3105.26
+      },
+      {
+        "name": "d-populate-100",
+        "samples": 16,
+        "errors": 0,
+        "p50Ms": 3226.24,
+        "p95Ms": 5790.8,
+        "p99Ms": 5790.8
+      },
+      {
+        "name": "d-count-two-components",
+        "samples": 15,
+        "errors": 0,
+        "p50Ms": 1743.89,
+        "p95Ms": 2986.67,
+        "p99Ms": 2986.67
+      },
+      {
+        "name": "b-created-at-20",
+        "samples": 15,
+        "errors": 0,
+        "p50Ms": 1819.38,
+        "p95Ms": 3371.74,
+        "p99Ms": 3371.74
+      },
+      {
+        "name": "b-created-at-100",
+        "samples": 15,
+        "errors": 0,
+        "p50Ms": 1738.12,
+        "p95Ms": 3447.56,
+        "p99Ms": 3447.56
+      },
+      {
+        "name": "b-created-at-review-desc-20",
+        "samples": 15,
+        "errors": 0,
+        "p50Ms": 1618.68,
+        "p95Ms": 3483.43,
+        "p99Ms": 3483.43
+      },
+      {
+        "name": "b-created-at-review-asc-20",
+        "samples": 15,
+        "errors": 0,
+        "p50Ms": 1603.23,
+        "p95Ms": 2910.69,
+        "p99Ms": 2910.69
+      },
+      {
+        "name": "b-created-at-keyset-20",
+        "samples": 15,
+        "errors": 0,
+        "p50Ms": 1735.83,
+        "p95Ms": 2423.28,
+        "p99Ms": 2423.28
+      },
+      {
+        "name": "f-keyset-next-20",
+        "samples": 15,
+        "errors": 0,
+        "p50Ms": 1502.36,
+        "p95Ms": 1753.43,
+        "p99Ms": 1753.43
+      },
+      {
+        "name": "f-keyset-deep-20",
+        "samples": 16,
+        "errors": 0,
+        "p50Ms": 1623,
+        "p95Ms": 3491.11,
+        "p99Ms": 3491.11
+      },
+      {
+        "name": "f-keyset-before-20",
+        "samples": 16,
+        "errors": 0,
+        "p50Ms": 1622.73,
+        "p95Ms": 3436.47,
+        "p99Ms": 3436.47
+      },
+      {
+        "name": "f-keyset-score-into-nulls",
+        "samples": 16,
+        "errors": 0,
+        "p50Ms": 1646.42,
+        "p95Ms": 3387.11,
+        "p99Ms": 3387.11
+      }
+    ]
+  }
+}

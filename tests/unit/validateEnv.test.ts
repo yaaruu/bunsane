@@ -79,4 +79,29 @@ describe("validateEnv", () => {
         process.env.GRAPHQL_MAX_DEPTH = "15";
         expect(() => validateEnv()).not.toThrow();
     });
+
+    test("BUNSANE_ENTITY_SORT_PROBE must be a positive integer", () => {
+        process.env.DB_CONNECTION_URL = "postgres://user:pass@localhost:5432/db";
+        delete process.env.BUNSANE_ENTITY_SORT_PROBE;
+        expect(() => validateEnv()).not.toThrow();
+        process.env.BUNSANE_ENTITY_SORT_PROBE = "5000";
+        expect(() => validateEnv()).not.toThrow();
+        process.env.BUNSANE_ENTITY_SORT_PROBE = "0";
+        expect(() => validateEnv()).toThrow(/BUNSANE_ENTITY_SORT_PROBE/);
+        process.env.BUNSANE_ENTITY_SORT_PROBE = "nope";
+        expect(() => validateEnv()).toThrow(/BUNSANE_ENTITY_SORT_PROBE/);
+    });
+
+    test("BUNSANE_INDEX_SYNC_MAX_ROWS must be a non-negative integer", () => {
+        process.env.DB_CONNECTION_URL = "postgres://user:pass@localhost:5432/db";
+        delete process.env.BUNSANE_INDEX_SYNC_MAX_ROWS;
+        expect(() => validateEnv()).not.toThrow();
+        process.env.BUNSANE_INDEX_SYNC_MAX_ROWS = "0";
+        expect(() => validateEnv()).not.toThrow();
+        process.env.BUNSANE_INDEX_SYNC_MAX_ROWS = "100000";
+        expect(() => validateEnv()).not.toThrow();
+        process.env.BUNSANE_INDEX_SYNC_MAX_ROWS = "100k";
+        expect(() => validateEnv()).toThrow(/BUNSANE_INDEX_SYNC_MAX_ROWS/);
+        delete process.env.BUNSANE_INDEX_SYNC_MAX_ROWS;
+    });
 });

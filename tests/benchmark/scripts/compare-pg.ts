@@ -1,16 +1,19 @@
 #!/usr/bin/env bun
 /**
- * Real-PostgreSQL before/after comparison for the 0.7 read path.
+ * Real-PostgreSQL before/after comparison for the read path.
  *
- * Provisions a scratch database per tree, runs tests/benchmark/scripts/pg-scenario.ts
- * inside that tree (so each commit's Query/GraphQL code is what executes), then
- * drops the database.
+ * Provisions a scratch database per tree, copies the scenario into that tree
+ * (so each commit's Query/GraphQL code is what executes), then drops the database.
  *
  *   bun tests/benchmark/scripts/compare-pg.ts
- *   bun tests/benchmark/scripts/compare-pg.ts --scale smoke
+ *   bun tests/benchmark/scripts/compare-pg.ts --scale smoke|md|lg
  *   bun tests/benchmark/scripts/compare-pg.ts --self --label head
  *   bun tests/benchmark/scripts/compare-pg.ts --gate
  *   bun tests/benchmark/scripts/compare-pg.ts --write-baseline
+ *   bun tests/benchmark/scripts/compare-pg.ts --scale lg --concurrency 16 --duration 30
+ *   bun tests/benchmark/scripts/compare-pg.ts --skip-shapes --concurrency 16 --duration 30
+ *
+ * Unknown --scale is an error. The gate reads tests/benchmark/baseline/<scale>-pg.json.
  *
  * Default trees, when present:
  *   ../bunsane-wt-base  (label base)
@@ -32,7 +35,9 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..", "..", "..");
 const RESULTS_DIR = join(REPO_ROOT, "tests", "benchmark", "results");
-const BASELINE_PATH = join(REPO_ROOT, "tests", "benchmark", "baseline", "md-pg.json");
+const SCENARIO_FILES = ["pg-scenario.ts", "pg-scale.ts", "pg-seed.ts"] as const;
+const SCALES = ["smoke", "md", "lg"] as const;
+type ScaleName = (typeof SCALES)[number];
 
 interface TreeSpec {
     label: string;
@@ -56,6 +61,27 @@ interface ShapeResult {
     error?: string;
 }
 
+interface ConcurrencyShape {
+    name: string;
+    samples: number;
+    errors: number;
+    p50Ms: number;
+    p95Ms: number;
+    p99Ms: number;
+}
+
+interface ConcurrencyResult {
+    clients: number;
+    durationS: number;
+    warmupS: number;
+    poolMax: number;
+    elapsedMs: number;
+    queries: number;
+    errors: number;
+    queriesPerSec: number;
+    shapes: ConcurrencyShape[];
+}
+
 interface TreeResult {
     label: string;
     commit: string;
@@ -69,6 +95,7 @@ interface TreeResult {
     cpu: string;
     memoryGb: number;
     shapes: ShapeResult[];
+    concurrency?: ConcurrencyResult;
 }
 
 function argValue(flag: string): string | undefined {
@@ -79,6 +106,30 @@ function argValue(flag: string): string | undefined {
 
 function hasFlag(flag: string): boolean {
     return process.argv.includes(flag);
+}
+
+function requireIntFlag(flag: string): number | undefined {
+    const idx = process.argv.indexOf(flag);
+    if (idx < 0) return undefined;
+    const raw = process.argv[idx + 1];
+    if (raw === undefined || raw.startsWith("--")) {
+        console.error(`[compare-pg] ${flag} requires an integer`);
+        process.exit(1);
+    }
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 0) {
+        console.error(`[compare-pg] ${flag} requires a non-negative integer, got ${raw}`);
+        process.exit(1);
+    }
+    return n;
+}
+
+function isScale(value: string): value is ScaleName {
+    return value === "smoke" || value === "md" || value === "lg";
+}
+
+function baselinePath(scale: ScaleName): string {
+    return join(REPO_ROOT, "tests", "benchmark", "baseline", `${scale}-pg.json`);
 }
 
 function defaultTrees(): TreeSpec[] {
@@ -110,19 +161,19 @@ function parseTrees(): TreeSpec[] {
 }
 
 async function gitCommit(cwd: string): Promise<string> {
-    return await new Promise((resolvePromise, reject) => {
-        const proc = spawn("git", ["rev-parse", "HEAD"], { cwd });
-        let out = "";
-        proc.stdout?.on("data", (chunk: Buffer) => {
-            out += chunk.toString();
-        });
-        proc.on("exit", (code) => {
-            if (code === 0) resolvePromise(out.trim());
-            else reject(new Error(`git rev-parse failed in ${cwd} (${code})`));
-        });
+    const { promise, resolve, reject } = Promise.withResolvers<string>();
+    const proc = spawn("git", ["rev-parse", "HEAD"], { cwd });
+    let out = "";
+    proc.stdout?.on("data", (chunk: Buffer) => {
+        out += chunk.toString();
     });
+    proc.on("error", reject);
+    proc.on("exit", (code) => {
+        if (code === 0) resolve(out.trim());
+        else reject(new Error(`git rev-parse failed in ${cwd} (${code})`));
+    });
+    return promise;
 }
-
 async function createScratch(name: string, adminUrl: URL, testRole: string): Promise<void> {
     await withAdmin(adminUrl, async (db) => {
         await db.unsafe(
@@ -131,6 +182,11 @@ async function createScratch(name: string, adminUrl: URL, testRole: string): Pro
         );
         await db.unsafe(`DROP DATABASE IF EXISTS ${name}`);
         await db.unsafe(`CREATE DATABASE ${name} OWNER ${testRole}`);
+        // Docker Desktop's 64MB /dev/shm cannot resize POSIX DSM segments
+        // ("No space left on device" even with free space). Parallel gather
+        // plans die at 1M rows. The scratch DB stays non-parallel so seq scan
+        // vs index is still measured, without Gather nodes.
+        await db.unsafe(`ALTER DATABASE ${name} SET max_parallel_workers_per_gather = 0`);
     });
 }
 
@@ -150,7 +206,28 @@ async function dropScratch(name: string, adminUrl: URL): Promise<void> {
     }
 }
 
-function childEnv(scratchUrl: URL, scratchName: string, outPath: string, scale: string, label: string): NodeJS.ProcessEnv {
+function installScenario(treePath: string): void {
+    const destDir = join(treePath, "tests", "benchmark", "scripts");
+    mkdirSync(destDir, { recursive: true });
+    for (const file of SCENARIO_FILES) {
+        const src = join(__dirname, file);
+        if (!existsSync(src)) {
+            throw new Error(`scenario file missing: ${src}`);
+        }
+        writeFileSync(join(destDir, file), readFileSync(src));
+    }
+}
+
+function childEnv(
+    scratchUrl: URL,
+    scratchName: string,
+    outPath: string,
+    scale: ScaleName,
+    label: string,
+    concurrency: number,
+    durationS: number,
+    skipShapes: boolean,
+): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = {
         ...process.env,
         DB_CONNECTION_URL: scratchUrl.toString(),
@@ -159,17 +236,26 @@ function childEnv(scratchUrl: URL, scratchName: string, outPath: string, scale: 
         POSTGRES_USER: decodeURIComponent(scratchUrl.username),
         POSTGRES_PASSWORD: decodeURIComponent(scratchUrl.password),
         POSTGRES_DB: scratchName,
-        POSTGRES_MAX_CONNECTIONS: "8",
-        DB_QUERY_TIMEOUT: "120000",
+        POSTGRES_MAX_CONNECTIONS: String(Math.max(8, concurrency)),
+        DB_QUERY_TIMEOUT: scale === "lg" ? "600000" : "180000",
         BENCH_OUT: outPath,
         BENCH_SCALE: scale,
         BENCH_LABEL: label,
         BENCH_ITERATIONS: argValue("--iterations") ?? process.env.BENCH_ITERATIONS ?? "30",
         BENCH_WARMUP: argValue("--warmup") ?? process.env.BENCH_WARMUP ?? "5",
+        BENCH_SKIP_SHAPES: skipShapes ? "1" : "0",
         LOG_LEVEL: "warn",
         NODE_ENV: "production",
         CACHE_ENABLED: "false",
     };
+    if (concurrency > 0) {
+        env.BENCH_CONCURRENCY = String(concurrency);
+        env.BENCH_DURATION = String(durationS);
+        env.DB_CONNECTION_TIMEOUT = "120";
+    } else {
+        delete env.BENCH_CONCURRENCY;
+        delete env.BENCH_DURATION;
+    }
     delete env.DB_DISABLE_PREPARE;
     delete env.USE_PGLITE;
     delete env.BUNSANE_QSP;
@@ -182,29 +268,27 @@ async function runTree(
     tree: TreeSpec,
     scratchUrl: URL,
     scratchName: string,
-    scale: string,
+    scale: ScaleName,
+    concurrency: number,
+    durationS: number,
+    skipShapes: boolean,
 ): Promise<TreeResult> {
-    const scenarioSrc = join(__dirname, "pg-scenario.ts");
-    const scenarioDest = join(tree.path, "tests", "benchmark", "scripts", "pg-scenario.ts");
-    const body = readFileSync(scenarioSrc, "utf8");
-    mkdirSync(dirname(scenarioDest), { recursive: true });
-    writeFileSync(scenarioDest, body);
-
+    installScenario(tree.path);
     mkdirSync(RESULTS_DIR, { recursive: true });
     const outPath = join(RESULTS_DIR, `pg-${tree.label}.json`);
     if (existsSync(outPath)) {
         writeFileSync(outPath, "");
     }
 
-    const code = await new Promise<number>((resolvePromise, reject) => {
-        const proc = spawn("bun", ["tests/benchmark/scripts/pg-scenario.ts"], {
-            cwd: tree.path,
-            env: childEnv(scratchUrl, scratchName, outPath, scale, tree.label),
-            stdio: "inherit",
-        });
-        proc.on("error", reject);
-        proc.on("exit", (exitCode) => resolvePromise(exitCode ?? 1));
+    const { promise, resolve, reject } = Promise.withResolvers<number>();
+    const proc = spawn("bun", ["tests/benchmark/scripts/pg-scenario.ts"], {
+        cwd: tree.path,
+        env: childEnv(scratchUrl, scratchName, outPath, scale, tree.label, concurrency, durationS, skipShapes),
+        stdio: "inherit",
     });
+    proc.on("error", reject);
+    proc.on("exit", (exitCode) => resolve(exitCode ?? 1));
+    const code = await promise;
     if (code !== 0) {
         throw new Error(`${tree.label} scenario exited ${code}`);
     }
@@ -219,38 +303,58 @@ function round(n: number): number {
     return Math.round(n * 100) / 100;
 }
 
+function cell(shape: ShapeResult | undefined): string {
+    if (!shape) return "-";
+    if (shape.skipped) return "skip";
+    if (shape.error) return "err";
+    return shape.p50Ms.toFixed(2);
+}
+
 function printTable(results: TreeResult[]): void {
     const byLabel = new Map(results.map((r) => [r.label, r]));
     const base = byLabel.get("base");
     const head = byLabel.get("head") ?? results[results.length - 1];
     if (!head) return;
     const names = head.shapes.map((s) => s.name);
-    console.log("\nshape                          base p50   head p50   delta%   base p95   head p95   stmts b/h");
+    console.log("\nshape                            base p50   head p50   delta%   base p95   head p95   stmts b/h");
     for (const name of names) {
         const h = head.shapes.find((s) => s.name === name);
         const b = base?.shapes.find((s) => s.name === name);
-        const hp = h?.skipped ? "skip" : h ? h.p50Ms.toFixed(2) : "-";
-        const bp = b?.skipped ? "skip" : b ? b.p50Ms.toFixed(2) : "-";
         let delta = "-";
-        if (b && h && !b.skipped && !h.skipped && b.p50Ms > 0) {
+        if (b && h && !b.skipped && !h.skipped && !b.error && !h.error && b.p50Ms > 0) {
             delta = (((h.p50Ms - b.p50Ms) / b.p50Ms) * 100).toFixed(1);
         }
-        const bp95 = b && !b.skipped ? b.p95Ms.toFixed(2) : "-";
-        const hp95 = h && !h.skipped ? h.p95Ms.toFixed(2) : "-";
+        const bp95 = b && !b.skipped && !b.error ? b.p95Ms.toFixed(2) : "-";
+        const hp95 = h && !h.skipped && !h.error ? h.p95Ms.toFixed(2) : "-";
         const stmts = `${b ? round(b.statementsPerIter) : "-"}/${h ? round(h.statementsPerIter) : "-"}`;
         console.log(
-            `${name.padEnd(30)} ${String(bp).padStart(9)} ${String(hp).padStart(10)} ${delta.padStart(8)} ${String(bp95).padStart(10)} ${String(hp95).padStart(10)} ${stmts}`,
+            `${name.padEnd(32)} ${cell(b).padStart(9)} ${cell(h).padStart(10)} ${delta.padStart(8)} ${bp95.padStart(10)} ${hp95.padStart(10)} ${stmts}`,
         );
+    }
+    for (const result of results) {
+        if (!result.concurrency) continue;
+        const c = result.concurrency;
+        console.log(
+            `\n${result.label} concurrency clients=${c.clients} duration=${c.durationS}s pool=${c.poolMax} qps=${c.queriesPerSec} errors=${c.errors}`,
+        );
+        console.log("shape                            samples    p50    p95    p99  errors");
+        for (const shape of c.shapes) {
+            console.log(
+                `${shape.name.padEnd(32)} ${String(shape.samples).padStart(7)} ${shape.p50Ms.toFixed(2).padStart(7)} ${shape.p95Ms.toFixed(2).padStart(7)} ${shape.p99Ms.toFixed(2).padStart(7)} ${String(shape.errors).padStart(7)}`,
+            );
+        }
     }
 }
 
 interface BaselineFile {
     capturedAt: string;
     sourceCommit: string;
+    scale?: string;
     shapes: Record<string, { p50Ms: number; p95Ms: number; meanMs: number }>;
 }
 
-function writeBaseline(result: TreeResult): void {
+function writeBaseline(result: TreeResult, scale: ScaleName): void {
+    const path = baselinePath(scale);
     const shapes: BaselineFile["shapes"] = {};
     for (const shape of result.shapes) {
         if (shape.skipped || shape.error) continue;
@@ -259,11 +363,12 @@ function writeBaseline(result: TreeResult): void {
     const file: BaselineFile = {
         capturedAt: new Date().toISOString(),
         sourceCommit: result.commit,
+        scale,
         shapes,
     };
-    mkdirSync(dirname(BASELINE_PATH), { recursive: true });
-    writeFileSync(BASELINE_PATH, JSON.stringify(file, null, 2));
-    console.log(`[compare-pg] Wrote ${BASELINE_PATH}`);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify(file, null, 2));
+    console.log(`[compare-pg] Wrote ${path}`);
 }
 
 /**
@@ -273,12 +378,13 @@ function writeBaseline(result: TreeResult): void {
  */
 const GATE_MAX_PCT = 50;
 const GATE_MIN_ABS_MS = 2;
-function gateAgainstBaseline(result: TreeResult): number {
-    if (!existsSync(BASELINE_PATH)) {
-        console.error(`[compare-pg] No baseline at ${BASELINE_PATH}. Run with --write-baseline first.`);
+function gateAgainstBaseline(result: TreeResult, scale: ScaleName): number {
+    const path = baselinePath(scale);
+    if (!existsSync(path)) {
+        console.error(`[compare-pg] No baseline at ${path}. Run with --write-baseline first.`);
         return 1;
     }
-    const baseline = JSON.parse(readFileSync(BASELINE_PATH, "utf8")) as BaselineFile;
+    const baseline = JSON.parse(readFileSync(path, "utf8")) as BaselineFile;
     let failed = 0;
     for (const shape of result.shapes) {
         if (shape.skipped || shape.error) continue;
@@ -293,15 +399,31 @@ function gateAgainstBaseline(result: TreeResult): number {
             );
         }
     }
-    if (failed === 0) console.log("[compare-pg] PG gate passed.");
+    if (failed === 0) console.log(`[compare-pg] PG gate passed (${scale}).`);
     return failed === 0 ? 0 : 1;
 }
 
-const scale = argValue("--scale") ?? "md";
+const scaleArg = argValue("--scale") ?? "md";
+if (!isScale(scaleArg)) {
+    console.error(`[compare-pg] Unknown scale "${scaleArg}". Expected smoke, md, or lg.`);
+    process.exit(1);
+}
+const scale: ScaleName = scaleArg;
+const concurrency = requireIntFlag("--concurrency") ?? 0;
+const durationS = requireIntFlag("--duration") ?? 30;
+const skipShapes = hasFlag("--skip-shapes");
+if (concurrency > 0 && durationS <= 0) {
+    console.error("[compare-pg] --duration must be > 0 when --concurrency is set");
+    process.exit(1);
+}
+
 const trees = parseTrees();
 const endpoints = resolvePgEndpoints(REPO_ROOT);
 console.log(`[compare-pg] Admin ${redactUrl(endpoints.adminUrl)} (port via ${endpoints.directPortSource})`);
 console.log(`[compare-pg] Scale ${scale}; trees: ${trees.map((t) => `${t.label}@${t.path}`).join(", ")}`);
+if (concurrency > 0) {
+    console.log(`[compare-pg] Concurrency ${concurrency} for ${durationS}s${skipShapes ? " (shapes skipped)" : ""}`);
+}
 
 const results: TreeResult[] = [];
 let exitCode = 0;
@@ -314,8 +436,9 @@ try {
         console.log(`[compare-pg] ${tree.label} ${commit.slice(0, 12)} scratch ${scratchName}`);
         await createScratch(scratchName, endpoints.adminUrl, endpoints.testRole);
         try {
-            const result = await runTree(tree, scratchUrl, scratchName, scale);
+            const result = await runTree(tree, scratchUrl, scratchName, scale, concurrency, durationS, skipShapes);
             results.push(result);
+            console.log(`[compare-pg] ${tree.label} seed ${result.seedMs}ms scale=${result.scale}`);
         } finally {
             await dropScratch(scratchName, endpoints.adminUrl);
         }
@@ -338,11 +461,11 @@ if (results.length > 0) {
     printTable(results);
     if (hasFlag("--write-baseline")) {
         const head = results.find((r) => r.label === "head") ?? results[results.length - 1];
-        if (head) writeBaseline(head);
+        if (head) writeBaseline(head, scale);
     }
     if (hasFlag("--gate")) {
         const current = results[results.length - 1];
-        if (current) exitCode = gateAgainstBaseline(current) || exitCode;
+        if (current) exitCode = gateAgainstBaseline(current, scale) || exitCode;
     }
 }
 

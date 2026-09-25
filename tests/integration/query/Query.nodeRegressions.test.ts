@@ -193,7 +193,7 @@ describe('query node regressions', () => {
         pageCtx.sortOrders = [{ component: 'LeafOnly', property: 'score', direction: 'ASC', nullsFirst: false }];
         pageCtx.limit = 3;
         const page1 = QueryDAG.buildBasicQuery(pageCtx).execute(pageCtx);
-        expect(page1.sql).toMatch(/\(s\.data->>'score'\)::numeric ASC NULLS LAST, s\.entity_id ASC/);
+
         expect(page1.sql.toUpperCase()).not.toContain('EXISTS');
         expect(await idsFrom(page1.sql, page1.params)).toEqual(byScore.slice(0, 3).map(r => r.id));
 
@@ -203,7 +203,7 @@ describe('query node regressions', () => {
         page2Ctx.compositeCursor = { v: String(byScore[2]!.score), id: byScore[2]!.id };
         page2Ctx.limit = 10;
         const page2 = QueryDAG.buildBasicQuery(page2Ctx).execute(page2Ctx);
-        expect(page2.sql).toMatch(/::numeric/);
+
         expect(await idsFrom(page2.sql, page2.params)).toEqual(byScore.slice(3).map(r => r.id));
     });
 });

@@ -99,6 +99,11 @@ if (!isPGlite) {
 
             const columns = await existingRmColumns(archetypeName);
             expect(columns.has(newColumn)).toBe(true);
+            const indexes = await db.unsafe(
+                `SELECT indexdef FROM pg_indexes WHERE tablename = $1 AND indexname LIKE 'bk_%'`,
+                [tableName],
+            ) as Array<{ indexdef: string }>;
+            expect(indexes.some(row => row.indexdef.includes(`"${newColumn}"`) || row.indexdef.includes(newColumn))).toBe(true);
 
             const state = await db.unsafe(
                 `SELECT field_state, shape_hash FROM projection_state WHERE archetype = $1`,

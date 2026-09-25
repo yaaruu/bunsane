@@ -12,10 +12,11 @@ import {
 } from "../../database/DatabaseHelper";
 import {
     ensureMultipleJSONBPathIndexes,
-    ensureLegacyIndexedFields,
     loadComponentIndexCatalog,
-    type IndexBootContext,
 } from "../../database/IndexingStrategy";
+import type { IndexBootContext } from "../../database/IndexingStrategy";
+import { reconcileKeyIndexes } from "../../database/indexReconciler";
+import type { KeyIndexComponent } from "../../database/indexReconciler";
 import { GetSchema } from "../../database/DatabaseHelper";
 import { logger as MainLogger } from "../Logger";
 import { getMetadataStorage } from "../metadata";
@@ -231,6 +232,17 @@ class ComponentRegistry {
         this.componentsMap.set(name, typeid);
         this.typeIdToName.set(typeid, name);
         this.typeIdToCtor.set(typeid, ctor);
+        if (this.componentsRegistered) {
+            await this.setupNonKeyIndexes(name);
+            const shared = this.cachedPartitionStrategy === "hash";
+            await reconcileKeyIndexes({
+                components: shared
+                    ? this.getComponents().map(({ name: componentName }) => this.keyIndexComponent(componentName))
+                    : [this.keyIndexComponent(name)],
+                includeEntities: false,
+                dropUndesired: true,
+            });
+        }
         return true;
     }
 
@@ -291,6 +303,55 @@ class ComponentRegistry {
         return storage.getIndexedFields(componentId);
     }
 
+    private keyIndexComponent(name: string): KeyIndexComponent {
+        const strategy = this.cachedPartitionStrategy === "hash" ? "hash" : "list";
+        return {
+            name,
+            table: strategy === "hash" ? "components" : GenerateTableName(name),
+            strategy,
+        };
+    }
+
+    /** gin / hash / fulltext only. btree and numeric are key indexes. */
+    private async setupNonKeyIndexes(name: string): Promise<boolean> {
+        const indexTableName = this.cachedPartitionStrategy === "hash" ? "components" : GenerateTableName(name);
+        const storage = getMetadataStorage();
+        const componentId = storage.getComponentId(name);
+        let created = false;
+
+        const arrayIndexed = storage
+            .getComponentProperties(componentId)
+            .filter((p) => p.indexed && p.arrayOf != null);
+        if (arrayIndexed.length > 0) {
+            created = await ensureMultipleJSONBPathIndexes(
+                indexTableName,
+                arrayIndexed.map((p) => ({
+                    tableName: indexTableName,
+                    field: p.propertyKey,
+                    indexType: "gin" as const,
+                })),
+                this.indexBoot,
+            ) || created;
+        }
+
+        const indexedFields = this.getIndexedFieldsForComponent(name).filter(
+            (field) => field.indexType !== "btree" && field.indexType !== "numeric",
+        );
+        if (indexedFields.length > 0) {
+            created = await ensureMultipleJSONBPathIndexes(
+                indexTableName,
+                indexedFields.map((field) => ({
+                    tableName: indexTableName,
+                    field: field.propertyKey,
+                    indexType: field.indexType,
+                    isDateField: field.isDateField,
+                })),
+                this.indexBoot,
+            ) || created;
+        }
+        return created;
+    }
+
     private async setupComponentFeatures(): Promise<void> {
         const components = this.getComponents();
         const partitionStrategy = this.cachedPartitionStrategy;
@@ -302,41 +363,8 @@ class ComponentRegistry {
             };
         }
 
-        const storage = getMetadataStorage();
         for (const { name } of components) {
-            const table_name = GenerateTableName(name);
-            const indexTableName = partitionStrategy === "hash" ? "components" : table_name;
-
-            const componentId = storage.getComponentId(name);
-            const legacyIndexed = storage
-                .getComponentProperties(componentId)
-                .filter((p) => p.indexed);
-            if (legacyIndexed.length > 0) {
-                const created = await ensureLegacyIndexedFields(indexTableName, legacyIndexed, this.indexBoot);
-                if (created) this.schemaChangedThisBoot = true;
-                logger.trace(
-                    `Updated legacy (type-aware) indexes for component: ${name} on table: ${indexTableName}`
-                );
-            }
-
-            const indexedFields = this.getIndexedFieldsForComponent(name);
-            if (indexedFields.length > 0) {
-                const indexDefinitions = indexedFields.map((field) => ({
-                    tableName: indexTableName,
-                    field: field.propertyKey,
-                    indexType: field.indexType,
-                    isDateField: field.isDateField,
-                }));
-                const created = await ensureMultipleJSONBPathIndexes(
-                    indexTableName,
-                    indexDefinitions,
-                    this.indexBoot,
-                );
-                if (created) this.schemaChangedThisBoot = true;
-                logger.trace(
-                    `Created specialized indexes for component: ${name} on table: ${indexTableName}`
-                );
-            }
+            if (await this.setupNonKeyIndexes(name)) this.schemaChangedThisBoot = true;
         }
 
         // Static import cycles through ServiceRegistry → gql → components.
@@ -361,6 +389,12 @@ class ComponentRegistry {
         } catch (error) {
             logger.warn(`Failed to create relation FK indexes: ${error}`);
         }
+
+        await reconcileKeyIndexes({
+            components: components.map(({ name }) => this.keyIndexComponent(name)),
+            includeEntities: true,
+            dropUndesired: true,
+        });
 
         if (this.schemaChangedThisBoot || this.indexBoot.indexCreated) {
             await AnalyzeAllComponentTables();

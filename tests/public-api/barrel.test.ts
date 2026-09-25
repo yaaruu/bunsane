@@ -37,7 +37,7 @@ function runProbe(): Promise<{ code: number; stdout: string; stderr: string }> {
             process.exit(5);
         }
         const required = [
-            "App", "Entity", "BaseComponent", "Component", "CompData",
+            "App", "Entity", "BaseComponent", "Component", "CompData", "CompositeIndex",
             "BaseArcheType", "ArcheType", "ArcheTypeField", "ArcheTypeFunction",
             "Query", "or", "FilterOp", "BaseService", "ServiceRegistry",
             "GraphQLOperation", "GraphQLSubscription", "t", "logger",

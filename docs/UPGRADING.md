@@ -1,5 +1,30 @@
 # Upgrading
 
+## 0.8 → 0.9 (unreleased)
+
+No code changes are required. What changes is how list queries are indexed and ordered. Details: [CHANGELOG.md](../CHANGELOG.md) `## Unreleased`.
+
+### What happens on first boot
+
+- `init()` creates the SQL function `bunsane_num_v1` and a `bk_…` key index for every `@CompData({ indexed: true })` scalar and `@IndexedField("btree" | "numeric")` field, plus `created_at` / `updated_at` indexes on `entities`.
+- Tables estimated below `BUNSANE_INDEX_SYNC_MAX_ROWS` (100 000) are indexed during `init()`. Bigger tables are indexed by a background task after `init()`, one instance at a time; lists on those tables are correct but not yet fast until it finishes (logged at info).
+- Once a `bk_` index is valid, the framework drops the old `idx_<leaf>_<field>_btree` / `_btree_date` / `_numeric` (and scalar `_gin`) index it replaces. QSP's `idx_rm_<archetype>__cover` is replaced the same way.
+- Plan for the disk and I/O of one index build per indexed field on large tables. Builds use `CREATE INDEX CONCURRENTLY`, so writes are not blocked.
+
+### Check your app for
+
+| Change | What to look for |
+|---|---|
+| Ties follow the sort direction | UI or tests that assumed equal values come out in ascending id order under a DESC sort. A 0.8 cursor that ends inside a tie group may repeat or skip a few rows once after the deploy. |
+| Non-numeric text in numeric fields sorts/filters as missing | Code that relied on the query failing, or data like `"n/a"` in number fields that you expect to see ranked. |
+| Entity timestamp order is by millisecond | Sub-millisecond ordering of entities created in the same millisecond now falls back to id. |
+| `sortByCreatedAt().with(X)` excludes soft-deleted entities; `.cursor(id)` with it throws | Use `sortedCursor`. |
+| Sorting by unindexed fields | Works as before (full scan). In development a one-time warning names the field; add `@CompData({ indexed: true })`, or `@CompositeIndex(["status", "total"])` for "filter by one field, sort by another" on the same component. |
+
+New settings: `BUNSANE_INDEX_SYNC_MAX_ROWS`, `BUNSANE_ENTITY_SORT_PROBE` ([CONFIGURATION.md](CONFIGURATION.md#query-engine)). Both are validated at boot.
+
+---
+
 ## 0.6.x → 0.8
 
 0.7.0 and 0.8.0 were cut on the same day. Upgrade straight to 0.8; there is no reason to stop at 0.7. This guide covers both releases. The full list is in [CHANGELOG.md](../CHANGELOG.md) (`## 0.8.0`, `## 0.7.0`).

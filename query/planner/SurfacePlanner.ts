@@ -54,14 +54,15 @@ export class SurfacePlanner {
             if (s.kind === 'component') {
                 const col = columnLookup.get(`${s.component}:${s.field}`);
                 if (!col) return false;
+                // uuid __cid columns are hydration ids, not sort keys.
+                if (col.sqlType === 'uuid' || col.kind === 'component_id') return false;
                 const fs = fieldState[col.columnName] ?? fieldState[col.field] ?? fieldState[`${col.component}:${col.field}`];
                 if (fs === 'FILLING') return false;
             }
-            if (req.cursor && req.cursor.kind === 'keyset' && s.nullsFirst) return false;
         }
 
         if (req.cursor) {
-            if (req.cursor.direction !== 'after') return false;
+
             if (req.cursor.kind === 'keyset') { if (req.sorts.length !== 1) return false; }
             else if (req.cursor.kind === 'id') { if (req.sorts.length !== 0) return false; }
         }

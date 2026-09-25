@@ -3,6 +3,7 @@ import { dbExec } from "./gateway";
 import { logger as MainLogger } from "../core/Logger";
 import { getMetadataStorage } from "../core/metadata";
 import { ensureMultipleJSONBPathIndexes, type IndexBootContext, indexCatalogKey } from "./IndexingStrategy";
+import { boundIndexName, ensureNumericKeyFunction } from "./indexReconciler";
 import { ProjectionManager, qspActive } from "./projection";
 const logger = MainLogger.child({ scope: "DatabaseHelper" });
 
@@ -136,6 +137,12 @@ export const HasValidBaseTable = async (): Promise<boolean> => {
 
 export const PrepareDatabase = async () => {
     logger.trace(`Initializing Database.`);
+    try {
+        await ensureNumericKeyFunction();
+    } catch (error) {
+        logger.error(`Failed to create numeric key function: ${error}`);
+        throw error;
+    }
     try {
         await SetupDatabaseExtensions();
     } catch (error) {
@@ -460,7 +467,9 @@ export const CreateComponentPartitionTable = async (
 
     const storage = getMetadataStorage();
     const componentId = storage.getComponentId(comp_name);
-    const indexedFields = storage.getIndexedFields(componentId);
+    const indexedFields = storage.getIndexedFields(componentId).filter(
+        (field) => field.indexType !== "btree" && field.indexType !== "numeric",
+    );
     if (indexedFields.length > 0) {
         const indexDefinitions = indexedFields.map(field => ({
             tableName: table_name,
@@ -515,6 +524,7 @@ export const DeleteComponentPartitionTable = async (comp_name: string) => {
 
 export const EnsureDatabaseMigrations = async () => {
     logger.trace(`Checking for database migrations...`);
+    await ensureNumericKeyFunction();
 
     // `entity_components` is no longer created, migrated, or written (Phase 3
     // of docs/ENTITY_COMPONENTS_REMOVAL_PLAN.md). Any pre-existing table is
@@ -608,7 +618,7 @@ export const CreateForeignKeyIndex = async (
     tableName = validateIdentifier(tableName);
     foreignKeyField = validateIdentifier(foreignKeyField);
 
-    const indexName = `idx_${tableName}_fk_${foreignKeyField}`;
+    const indexName = boundIndexName(`idx_${tableName}_fk_${foreignKeyField}`);
     const catalogKey = indexCatalogKey(tableName, indexName);
     if (boot?.existing.has(catalogKey)) {
         logger.trace(`Foreign key index ${indexName} already exists`);

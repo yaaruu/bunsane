@@ -22,7 +22,7 @@ import { logger as MainLogger } from '../../core/Logger';
 import { getMetadataStorage } from '../../core/metadata';
 import { getDistributedLock } from '../../core/scheduler/DistributedLock';
 import { assertIdentifier } from '../../query/SqlIdentifier';
-import { addColumn, rmTableName, assertRmTableName } from './DDLGenerator';
+import { addColumn, ensureRmColumnKeyIndex, rmTableName, assertRmTableName } from './DDLGenerator';
 import { projectionSourceExpr } from './ProjectionSource';
 import type { ProjectedColumn, ProjectionDescriptor } from './types';
 
@@ -97,6 +97,7 @@ export async function syncRmSchema(
 
     for (const col of missing) {
         await addColumn(archetype, col);
+        await ensureRmColumnKeyIndex(archetype, col);
     }
 
     if (missing.length > 0) {

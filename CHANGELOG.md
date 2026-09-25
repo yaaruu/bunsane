@@ -4,9 +4,45 @@ All notable changes to bunsane are documented here.
 
 ## Unreleased
 
+Index-driven list reads. Design: `docs/internal/RFC_INDEX_DRIVEN_LISTS.md`; measurements: `docs/internal/benchmark-0.9/RESULTS.md`. Real PostgreSQL 17, 1M entities, p50: top-20 sort 50 → 0.8 ms, keyset pages 60 → 0.7 ms, filter + sort 84 → 1.2 ms, two-component page 118 → 1.6 ms, `sortByCreatedAt` keyset 278 → 1.5 ms; mixed-workload throughput 8.6 → 22.6 queries/s at 16 clients. One accepted residual: `sortByCreatedAt().with(X)` when X is clustered in time falls back to the 0.8 plan plus ~10% (use QSP for that list).
+
+### Breaking
+
+- **Tie order follows the sort direction.** Rows with equal sort values are ordered by entity id in the sort direction (DESC sorts break ties by `entity_id DESC`; was always ASC). Applies to component sorts, `sortByCreatedAt/UpdatedAt`, OR + sort, multi-key (last key's direction), and QSP `rm_` routes. A cursor issued by 0.8 inside a tie group may repeat or skip rows of that group once.
+- **Non-numeric text in a numeric field is NULL.** Sorting or filtering a numeric field that holds e.g. `"n/a"` used to fail with `invalid input syntax for type numeric`; it now sorts/filters as a missing value.
+- **Entity timestamp order is UTC milliseconds on every page.** `sortByCreatedAt/UpdatedAt` page 1 used raw microsecond timestamps and keyset pages milliseconds; both now use milliseconds, with sub-millisecond ties falling to entity id.
+- `sortByCreatedAt/UpdatedAt` combined with `.with()` / OR / `.without()` exclude soft-deleted entities; `.cursor(id)` with an entity sort throws (use `sortedCursor`).
+- **Framework indexes are replaced.** `idx_<leaf>_<field>_btree|_btree_date|_numeric` (and `_gin` on scalar `@CompData({ indexed: true })` fields) are dropped once their `bk_` key-index replacement is valid; QSP's `idx_rm_<archetype>__cover` is dropped likewise. `ensureNumericIndex`, `ensureCompositeIndex`, `ensureLegacyIndexedFields`, `pickScalarIndexType`, `createCoveringIndex`, and `database/numericJsonField.ts` are removed.
+- `BUNSANE_ENTITY_SORT_PROBE` and `BUNSANE_INDEX_SYNC_MAX_ROWS` are validated at boot (invalid values fail `init()`).
+
+### Added
+
+- **Key indexes.** Every `@CompData({ indexed: true })` scalar and `@IndexedField("btree" | "numeric")` field gets `bk_<slug>_<hash>` = `((key), entity_id)` (not partial, so the planner keeps expression statistics) on its leaf; numeric keys use `bunsane_num_v1()`, an IMMUTABLE numeric-or-NULL cast created at boot. One index serves `=`, ranges, both sort directions, both NULLS placements, and keyset pages. `entities` gets `created_at` / `updated_at` keys.
+- **`@CompositeIndex(["status", "total"])`** (component class decorator, exported from the root): `(status, total, entity_id)` for equality on leading fields + sort/range on the next.
+- **Index reconciler** (`database/indexReconciler.ts`): creates missing `bk_` indexes (`CONCURRENTLY` on real PG), rebuilds invalid ones, drops obsolete/legacy ones only after a valid replacement, never touches indexes without the `bk_` prefix. Tables above `BUNSANE_INDEX_SYNC_MAX_ROWS` (default 100 000; unanalyzed tables > 64 MB) build in a background task after `init()` under `withLock("bunsane:index-reconcile")`; shutdown does not wait past the grace budget. Late `register()` gets key indexes too.
+- `getLastRouteInfo().entitySortPlan`: `'index' | 'probe' | 'fallback'`.
+- Development warning (once per component field) when sorting by a field with no key index.
+- Benchmarks: `lg` scale (1M entities), `--concurrency N --duration S`, per-scale baselines and id-set hashes (`bench:pg:compare:lg`, `bench:pg:gate:lg`, `bench:pg:concurrency`).
+
+### Changed
+
+- **Sorted lists walk the index and stop at the limit.** Single-key sorts on a key field run as two index-ordered branches (non-null keys, then NULL keys, per NULLS placement) with row-comparison keyset predicates.
+- **Unsorted multi-component pages and `count()`** use a driving leaf + `EXISTS` semi-joins instead of `INTERSECT`.
+- **`sortByCreatedAt/UpdatedAt`**: index-driven without membership; with `.with()` an adaptive probe walks entities in index order over a window sized from table statistics (`4 × pageLimit / componentShare`, capped by `BUNSANE_ENTITY_SORT_PROBE`, default 5000), falling back to hash join + top-N when the page does not fill or the estimate exceeds the cap.
+- **QSP `rm_` routes** share the same ordering/keyset builder and per-column `bk_` key indexes; `before` cursors and keyset + `nullsFirst` now route.
+- Numeric filters compare `bunsane_num_v1(data->>'f')` instead of restating a regex predicate.
+
+### Fixed
+
+- DESC keyset pages under NULLS LAST never returned the rows with no value; they now do (component sorts, OR + sort, QSP).
+- `sortByCreatedAt/UpdatedAt` page 1 and keyset pages disagreed on sub-millisecond tie order.
+- `@CompData({ indexed: true })` fields of components registered after boot got no index.
+- An explicit `@IndexedField("gin")` on a key field survives boot (was dropped as legacy).
+
 ### Documentation
 
-- **`docs/UPGRADING.md`** — 0.6.x → 0.8 guide: new env vars and closed-by-default endpoints, compile-time and runtime breaking changes, test changes, client-visible GraphQL/HTTP changes, and multi-instance rollout order for the cache-invalidation and RPC secrets.
+- `docs/UPGRADING.md` (0.6.x → 0.8) — env vars, breaking changes, tests, clients, rollout order.
+- `docs/CONFIGURATION.md`, `docs/READ_PATH_PERFORMANCE.md`, `docs/QUERY_LIST_GUIDE.md`, `docs/QSP_OPERATIONS.md` describe key indexes and the new plans.
 
 ## 0.8.0 — 2026-09-24
 

@@ -1,7 +1,7 @@
 import { DDL_TIMEOUT_MS, QUERY_TIMEOUT_MS } from "./index";
 import { dbExec } from "./gateway";
 import { logger } from "../core/Logger";
-import { numericJsonTextValidPredicate } from "./numericJsonField";
+import { boundIndexName } from "./indexReconciler";
 
 /**
  * Catalog lookup — "does this index exist", "is this table partitioned".
@@ -119,7 +119,7 @@ export const ensureJSONBPathIndex = async (
     tableName = validateIdentifier(tableName);
     field = validateIdentifier(field);
 
-    const indexName = `idx_${tableName}_${field}_${indexType}${isDateField ? '_date' : ''}`;
+    const indexName = boundIndexName(`idx_${tableName}_${field}_${indexType}${isDateField ? '_date' : ''}`);
 
     try {
 
@@ -141,17 +141,6 @@ export const ensureJSONBPathIndex = async (
                 indexSQL = `CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} ${indexName} ON ${tableName} USING GIN ((data->'${field}') jsonb_path_ops)`;
                 break;
 
-            case 'btree':
-                if (isDateField) {
-                    // BTREE index on date field - store as text and let PostgreSQL handle conversions at query time
-                    // Note: Direct casting in index expressions requires IMMUTABLE functions
-                    // Storing as text allows the index to work while queries can still cast when filtering
-                    indexSQL = `CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} ${indexName} ON ${tableName} ((data->>'${field}'))`;
-                } else {
-                    // BTREE index on text field
-                    indexSQL = `CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} ${indexName} ON ${tableName} ((data->>'${field}'))`;
-                }
-                break;
 
             case 'hash':
                 // HASH index (generally not recommended for JSONB fields)
@@ -213,9 +202,9 @@ export const ensureMultipleJSONBPathIndexes = async (
 ): Promise<boolean> => {
     let created = false;
     for (const def of indexDefinitions) {
-        if (def.indexType === 'numeric') {
-            created = await ensureNumericIndex(def.tableName, def.field, boot) || created;
-        } else if (def.indexType === 'fulltext') {
+        // btree/numeric are key indexes (bk_), created by the reconciler.
+        if (def.indexType === 'btree' || def.indexType === 'numeric') continue;
+        if (def.indexType === 'fulltext') {
             created = await ensureFullTextIndex(def.tableName, def.field, 'english', boot) || created;
         } else {
             created = await ensureJSONBPathIndex(
@@ -246,67 +235,6 @@ export const analyzeTable = async (tableName: string): Promise<void> => {
     }
 };
 
-/**
- * Analyzes all component partition tables
- */
-/**
- * Creates a functional index on a JSONB numeric field for efficient range queries.
- * This is critical for queries like `WHERE (data->>'age')::numeric BETWEEN 25 AND 35`
- *
- * @param tableName The table name to create index on
- * @param field The JSONB field path containing numeric values
- */
-export const ensureNumericIndex = async (
-    tableName: string,
-    field: string,
-    boot?: IndexBootContext,
-): Promise<boolean> => {
-    tableName = validateIdentifier(tableName);
-    field = validateIdentifier(field);
-
-    const indexName = `idx_${tableName}_${field}_numeric`;
-
-    try {
-        logger.trace(`Ensuring numeric index ${indexName} on ${tableName} for field ${field}`);
-
-        if (await indexAlreadyExists(tableName, indexName, boot)) {
-            logger.trace(`Index ${indexName} already exists`);
-            return false;
-        }
-
-        const isPartitioned = await tableIsPartitioned(tableName, boot);
-        const useConcurrently = !isPartitioned && !process.env.USE_PGLITE;
-
-        // Partial index: only rows where the field is a valid number. Prevents
-        // cast errors on dirty JSON. Query emission MUST restate this predicate
-        // (see numericJsonField.ts) or the planner cannot use the index (BUG-1).
-        const indexSQL = `CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} ${indexName}
-            ON ${tableName} (((data->>'${field}')::numeric))
-            WHERE ${numericJsonTextValidPredicate(`data->>'${field}'`)}`;
-
-        logger.trace(`Creating numeric index with SQL: ${indexSQL}`);
-        await ddlStatement("index.create", indexSQL);
-        logger.info(`Created numeric index ${indexName} on ${tableName}${useConcurrently ? ' (concurrently)' : ' (blocking)'}`);
-        noteIndexCreated(boot, tableName, indexName);
-        return true;
-
-    } catch (error: any) {
-        if (error.message && (
-            error.message.includes('already exists') ||
-            error.code === '42P07'
-        )) {
-            logger.trace(`Index ${indexName} already exists (confirmed by error), skipping creation`);
-            if (boot) boot.existing.add(indexCatalogKey(tableName, indexName));
-            return false;
-        }
-        if (error.code === '40P01' || (error.message && error.message.includes('deadlock'))) {
-            logger.warn(`Deadlock detected while creating index ${indexName}, skipping`);
-            return false;
-        }
-        logger.error(`Failed to create numeric index on ${tableName} for field ${field}: ${error}`);
-        throw error;
-    }
-};
 
 /**
  * Creates a GIN index on a JSONB field for full-text search using to_tsvector.
@@ -328,7 +256,7 @@ export const ensureFullTextIndex = async (
     tableName = validateIdentifier(tableName);
     field = validateIdentifier(field);
 
-    const indexName = `idx_${tableName}_${field}_fts`;
+    const indexName = boundIndexName(`idx_${tableName}_${field}_fts`);
 
     try {
         logger.trace(`Ensuring full-text GIN index ${indexName} on ${tableName} for field ${field} (language: ${language})`);
@@ -369,143 +297,3 @@ export const ensureFullTextIndex = async (
     }
 };
 
-/**
- * Creates a composite index on multiple JSONB fields for efficient combined filter queries.
- * Useful for queries like `WHERE status = 'active' AND age >= 21`
- *
- * @param tableName The table name to create index on
- * @param fields Array of field definitions with type information
- */
-export const ensureCompositeIndex = async (
-    tableName: string,
-    fields: Array<{ name: string; type: 'text' | 'numeric' | 'boolean' }>,
-    boot?: IndexBootContext,
-): Promise<boolean> => {
-    tableName = validateIdentifier(tableName);
-    fields.forEach(f => validateIdentifier(f.name));
-
-    const fieldNames = fields.map(f => f.name).join('_');
-    const indexName = `idx_${tableName}_${fieldNames}_composite`;
-
-    try {
-        logger.trace(`Ensuring composite index ${indexName} on ${tableName}`);
-
-        if (await indexAlreadyExists(tableName, indexName, boot)) {
-            logger.trace(`Index ${indexName} already exists`);
-            return false;
-        }
-
-        const isPartitioned = await tableIsPartitioned(tableName, boot);
-        const useConcurrently = !isPartitioned && !process.env.USE_PGLITE;
-
-        const indexExpressions = fields.map(f => {
-            switch (f.type) {
-                case 'numeric':
-                    return `((data->>'${f.name}')::numeric)`;
-                case 'boolean':
-                    return `((data->>'${f.name}')::boolean)`;
-                default:
-                    return `(data->>'${f.name}')`;
-            }
-        }).join(', ');
-
-        const indexSQL = `CREATE INDEX${useConcurrently ? ' CONCURRENTLY' : ''} ${indexName}
-            ON ${tableName} (${indexExpressions})`;
-
-        logger.trace(`Creating composite index with SQL: ${indexSQL}`);
-        await ddlStatement("index.create", indexSQL);
-        logger.info(`Created composite index ${indexName} on ${tableName}${useConcurrently ? ' (concurrently)' : ' (blocking)'}`);
-        noteIndexCreated(boot, tableName, indexName);
-        return true;
-
-    } catch (error: any) {
-        if (error.message && (
-            error.message.includes('already exists') ||
-            error.code === '42P07'
-        )) {
-            logger.trace(`Index ${indexName} already exists (confirmed by error), skipping creation`);
-            if (boot) boot.existing.add(indexCatalogKey(tableName, indexName));
-            return false;
-        }
-        if (error.code === '40P01' || (error.message && error.message.includes('deadlock'))) {
-            logger.warn(`Deadlock detected while creating index ${indexName}, skipping`);
-            return false;
-        }
-        logger.error(`Failed to create composite index on ${tableName}: ${error}`);
-        throw error;
-    }
-};
-
-/**
- * Picks the right index type for a legacy `@CompData({ indexed: true })` field.
- *
- * The historical default was GIN for every indexed field, but a per-field GIN
- * (`(data->'field') jsonb_path_ops`) only serves containment (`@>`), NOT the
- * `data->>'field'` text equality / `ORDER BY` the Query builder actually emits.
- * So scalar fields silently fell back to sequential scans. We now route:
- *   - array/object fields  -> GIN     (containment is the real use)
- *   - numeric fields       -> numeric (functional index on `(...)::numeric`)
- *   - everything else      -> btree   (`(data->>'field')` — serves =, <, ORDER BY)
- */
-export const pickScalarIndexType = (p: { propertyType?: any; arrayOf?: any }): IndexType => {
-    if (p.arrayOf != null) return 'gin';
-    if (p.propertyType === Number) return 'numeric';
-    return 'btree';
-};
-
-/**
- * Drops an index if it exists (best-effort, non-throwing). Identifier is
- * framework-generated from already-validated table/field names; we only guard
- * against malformed input, not length (Postgres truncates to 63 chars and the
- * same truncation applies to DROP, so they still match).
- */
-export const dropIndexIfExists = async (tableName: string, indexName: string, boot?: IndexBootContext): Promise<void> => {
-    tableName = validateIdentifier(tableName);
-    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(indexName)) {
-        throw new Error(`Invalid index name: ${indexName}`);
-    }
-    if (boot && !boot.existing.has(indexCatalogKey(tableName, indexName))) {
-        return;
-    }
-    try {
-        await ddlStatement("index.drop", `DROP INDEX IF EXISTS ${indexName}`);
-        boot?.existing.delete(indexCatalogKey(tableName, indexName));
-        logger.info(`Dropped legacy index ${indexName} on ${tableName} (superseded by btree/numeric)`);
-    } catch (error: any) {
-        if (error.message && (error.message.includes('does not exist') || error.message.includes('not found'))) {
-            return;
-        }
-        logger.warn(`Failed to drop legacy index ${indexName} on ${tableName}: ${error.message ?? error}`);
-    }
-};
-
-/**
- * Phase 1 (RFC_MATERIALIZED_READ_MODELS §8): create type-aware indexes for
- * legacy `@CompData({ indexed: true })` fields, and migrate away from the
- * scalar-GIN footgun by dropping the obsolete per-field GIN where it has been
- * replaced by a btree/numeric index (pure write amplification otherwise).
- *
- * Idempotent — safe to re-run on every startup against a live DB.
- * Returns true when at least one index was created (caller may ANALYZE).
- */
-export const ensureLegacyIndexedFields = async (
-    tableName: string,
-    properties: Array<{ propertyKey: string; propertyType?: any; arrayOf?: any }>,
-    boot?: IndexBootContext,
-): Promise<boolean> => {
-    const defs: IndexDefinition[] = properties.map((p) => ({
-        tableName,
-        field: p.propertyKey,
-        indexType: pickScalarIndexType(p),
-        isDateField: p.propertyType === Date,
-    }));
-    const created = await ensureMultipleJSONBPathIndexes(tableName, defs, boot);
-    // Migrate off the scalar-GIN footgun: a field now served by btree/numeric no
-    // longer needs (and cannot use) the old `idx_<table>_<field>_gin`.
-    for (const def of defs) {
-        if (def.indexType !== 'gin') {
-            await dropIndexIfExists(tableName, `idx_${tableName}_${def.field}_gin`, boot);
-        }
-    }
-    return created;
-};

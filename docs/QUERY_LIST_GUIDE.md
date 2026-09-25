@@ -1,7 +1,7 @@
 # Query List Guide (app authors)
 
-**Audience:** teams building admin/ops list endpoints on BunSane 0.6.x  
-**Date:** 2026-08-07  
+**Audience:** teams building admin/ops list endpoints on BunSane 0.9  
+**Date:** 2026-08-07, updated 2026-09-25 (index-driven lists)
 **Deeper engine detail:** `docs/READ_PATH_PERFORMANCE.md` · QSP ops: `docs/QSP_OPERATIONS.md`
 
 This guide is the **product-facing** checklist for “filter + sort + page + hydrate” lists.
@@ -26,8 +26,8 @@ const { hasNextPage, routed, surface, archetype } = q.getLastRouteInfo();
 | Do | Don’t |
 |----|--------|
 | Explicit `.take(N)` and use `hasNextPage` | Call `.count()` on every page for infinite scroll |
-| One sort key + `sortedCursor` for deep pages | Deep `.offset(10000)` or `.cursor(id)` with `sortBy` |
-| `@CompData({ indexed: true })` on filter/sort fields | Filter/sort unindexed JSON paths |
+| One sort key + `sortedCursor` for deep pages | Deep `.offset(10000)` or `.cursor(id)` with `sortBy` / `sortByCreatedAt` |
+| `@CompData({ indexed: true })` on every field you sort or filter by; `@CompositeIndex(["status", "total"])` for "filter by status, sort by total" on one component | Sort by unindexed fields (full scan + sort; development logs a warning) |
 | `.eagerLoadComponents([...])` or `.populate()` for fields you read | `await entity.get(C)` in a loop without eager load |
 | Batch FK companions (`WHERE order_id = ANY($1)`) | Nested `new Query().with(...).filter(fk, parent.id)` per row |
 
@@ -37,6 +37,8 @@ const { hasNextPage, routed, surface, archetype } = q.getLastRouteInfo();
 const token = Query.encodeSortedCursor(lastSortValue, lastEntityId);
 await new Query() /* same with/sort */ .take(N).sortedCursor(token).exec();
 ```
+
+Ties on the sort value are broken by entity id **in the sort direction**, and rows with no value (missing key, `null`, or non-numeric text in a numeric field) come last unless you pass `nullsFirst`. Every page — first page, `sortedCursor` after/before, and `offset` — uses that same order.
 
 ---
 
@@ -80,7 +82,7 @@ Matcher-style queries (many tags + `.without` + spatial) stay on **legacy** — 
 | GraphQL computed fields | Query-per-parent in `@ArcheTypeFunction` | Batch by parent ids once; attach map |
 | Stats / dashboards | `take(50000)` + sum in JS | Cross-entity: `@ReadModel` + `ReadModel(T).where/groupBy/sum`. Same entity: `Query.groupBy` + `countBy`/`sumBy`/`maxBy`. Open rows: `FilterOp.IS_NULL` |
 
-**Diagnose:** per-request `dbQueryCount` in access logs. If it scales with page size while `EXPLAIN` looks fine, you have N+1, not a bad INTERSECT.
+**Diagnose:** per-request `dbQueryCount` in access logs. If it scales with page size while `EXPLAIN` looks fine, you have N+1, not a bad query plan.
 
 ---
 
@@ -188,7 +190,8 @@ Site: `bunsane-docs/docs/query-aggregates.md`, `bunsane-docs/docs/read-models.md
 |---------|----------|
 | Query builder | `query/Query.ts` |
 | Filter coalesce / pushdown | `query/FilterBuilder.ts`, `ComponentInclusionNode.ts`, `CTENode.ts` |
-| Numeric index predicates | `database/numericJsonField.ts` |
+| Sort/filter key expressions + ordered page SQL | `query/orderPlan.ts` |
+| Key index specs / reconciler | `database/keyIndexSpec.ts`, `database/indexReconciler.ts` |
 | QSP planner | `query/planner/SurfacePlanner.ts` |
 | Projection metadata | `database/projection/ProjectionMetadata.ts` |
 | M3 read models | `core/readmodel/`, `database/readmodel/` |

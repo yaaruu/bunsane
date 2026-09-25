@@ -2,7 +2,10 @@ import type { SQL } from 'bun';
 import { projDdl } from './exec';
 import { getMetadataStorage } from '../../core/metadata';
 import { assertIdentifier, InvalidIdentifierError } from '../../query/SqlIdentifier';
-import type { ProjectedColumn, ProjectionSqlType } from './types';
+import { entityTimestampKey, rmColumnKey, type EntityTimestampColumn } from '../../query/orderPlan';
+import { expressionKeyIndexSpec, type KeyIndexSpec } from '../keyIndexSpec';
+import { reconcileKeyIndexSpecs } from '../indexReconciler';
+import { COMPONENT_ID_FIELD, type ProjectedColumn, type ProjectionSqlType } from './types';
 
 const SQL_TYPES: Record<ProjectionSqlType, string> = {
     text: 'text',
@@ -55,25 +58,85 @@ export const createRmTable = async (
     )`, trx);
 };
 
-export const createCoveringIndex = async (
+const useConcurrently = (trx?: SQL): boolean => !trx && process.env.USE_PGLITE !== 'true';
+
+function columnKeySpec(tableName: string, column: ProjectedColumn): KeyIndexSpec | null {
+    if (column.kind === 'component_id' || column.field === COMPONENT_ID_FIELD || column.sqlType === 'uuid') return null;
+    const key = rmColumnKey(`"${assertIdentifier(column.columnName, 'projectedColumn')}"`, column.sqlType);
+    if (!key) return null;
+    return expressionKeyIndexSpec(tableName, [tableName, column.columnName], key.expr);
+}
+
+/** Per projected column, plus `created_at` / `updated_at`. Same expressions the sort SQL emits. */
+export function rmKeyIndexSpecs(tableName: string, columns: readonly ProjectedColumn[]): KeyIndexSpec[] {
+    const specs: KeyIndexSpec[] = [];
+    for (const column of columns) {
+        const spec = columnKeySpec(tableName, column);
+        if (spec) specs.push(spec);
+    }
+    const timestamps: EntityTimestampColumn[] = ['created_at', 'updated_at'];
+    for (const column of timestamps) {
+        specs.push(expressionKeyIndexSpec(tableName, [tableName, column], entityTimestampKey(null, column)));
+    }
+    return specs;
+}
+
+async function createIndex(label: string, sql: string, trx?: SQL): Promise<void> {
+    try {
+        await runDdl(label, sql, trx);
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        // Winner and loser can both ensure the same index. IF NOT EXISTS does not
+        // cover two CREATE INDEX CONCURRENTLY calls that pass the catalog check together.
+        if (/already exists/i.test(message)) return;
+        throw err;
+    }
+}
+
+async function dropCoveringIndex(tableName: string, trx?: SQL): Promise<void> {
+    const indexName = assertIdentifier(`idx_${tableName}__cover`.slice(0, 63), 'projectionIndex');
+    const concurrently = useConcurrently(trx) ? ' CONCURRENTLY' : '';
+    await runDdl('projection.dropCoveringIndex', `DROP INDEX${concurrently} IF EXISTS ${indexName}`, trx);
+}
+
+/**
+ * Key indexes for every sortable projected column and for entity timestamps.
+ * Drops the legacy `__cover` index only after the replacements exist.
+ */
+export const ensureRmKeyIndexes = async (
     archetypeName: string,
-    opts: { equalityColumns: string[]; sortColumn?: string; sortDir?: 'ASC' | 'DESC' },
-    trx?: SQL
+    columns: readonly ProjectedColumn[],
+    trx?: SQL,
 ): Promise<void> => {
     const tableName = assertRmTableName(rmTableName(archetypeName));
-    const indexName = assertIdentifier(`idx_${tableName}__cover`.slice(0, 63), 'projectionIndex');
-    const equalityColumns = opts.equalityColumns.map(col => `"${assertIdentifier(col, 'projectionIndexColumn')}"`);
-    const sortDir = opts.sortDir === 'ASC' || opts.sortDir === 'DESC' ? opts.sortDir : 'ASC';
-    const sortColumn = opts.sortColumn ? [`"${assertIdentifier(opts.sortColumn, 'projectionSortColumn')}" ${sortDir}`] : [];
-    const indexColumns = [...equalityColumns, ...sortColumn, 'entity_id'].join(', ');
-    const concurrently = trx ? '' : (process.env.USE_PGLITE ? '' : ' CONCURRENTLY');
-
-    await runDdl(
-        'projection.createCoveringIndex',
-        `CREATE INDEX${concurrently} IF NOT EXISTS ${indexName} ON ${tableName} (${indexColumns}) INCLUDE (created_at, updated_at) WHERE deleted_at IS NULL`,
-        trx,
-    );
+    const specs = rmKeyIndexSpecs(tableName, columns);
+    if (trx) {
+        for (const spec of specs) {
+            await createIndex('projection.ensureKeyIndex', spec.createSql(false), trx);
+        }
+        await dropCoveringIndex(tableName, trx);
+        return;
+    }
+    const cover = assertIdentifier(`idx_${tableName}__cover`.slice(0, 63), 'projectionIndex');
+    await reconcileKeyIndexSpecs({
+        specs,
+        dropUndesired: true,
+        coverIndexes: [{ table: tableName, name: cover }],
+    });
 };
+
+/** Key index for one column added by schema growth. No-op for uuid `__cid`. */
+export const ensureRmColumnKeyIndex = async (
+    archetypeName: string,
+    column: ProjectedColumn,
+    trx?: SQL,
+): Promise<void> => {
+    const tableName = assertRmTableName(rmTableName(archetypeName));
+    const spec = columnKeySpec(tableName, column);
+    if (!spec) return;
+    await createIndex('projection.ensureColumnKeyIndex', spec.createSql(useConcurrently(trx)), trx);
+};
+
 
 export const addColumn = async (
     archetypeName: string,

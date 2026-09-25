@@ -50,6 +50,7 @@ import { collectMetrics as collectMetricsFn } from "./app/metricsCollector";
 import { createPhaseListener } from "./app/bootstrap";
 import { handleRequest as handleRequestFn, type RequestHost } from "./app/requestRouter";
 import { qspActive, startReconcileSweep } from "../database/projection";
+import { scheduleBackgroundIndexReconcile } from "../database/indexReconciler";
 import { defaultStudioDistDir, resolveStudioDist } from "./app/studioAssets";
 import {
     assertGraphQLComplexity,
@@ -337,6 +338,7 @@ export default class App {
             ApplicationLifecycle.setPhase(ApplicationPhase.SYSTEM_REGISTERING);
         }
         this.ensureReconcileSweep();
+        scheduleBackgroundIndexReconcile();
     }
 
     /**

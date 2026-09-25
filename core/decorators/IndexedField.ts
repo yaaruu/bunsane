@@ -1,15 +1,16 @@
 import { getMetadataStorage } from '../metadata';
 
 /**
- * Decorator to mark component fields that should have dedicated database indexes
- * This is used for frequently filtered fields to improve query performance
+ * Marks a component field for a dedicated database index.
  *
- * @param indexType The type of index to create:
- *   - 'gin': GIN index for JSONB containment queries (default)
- *   - 'btree': BTREE index for equality and text comparisons
- *   - 'hash': HASH index for exact equality lookups
- *   - 'numeric': BTREE index with numeric cast for range queries (>, <, BETWEEN)
- * @param isDateField Whether this field contains date values (affects BTREE index casting)
+ * @param indexType
+ *   - 'gin': GIN index on `data->field` for JSONB containment (default). Not a sort key.
+ *   - 'btree': key index `(<key expr>, entity_id) WHERE deleted_at IS NULL`. Serves equality, sort, and keyset in either direction.
+ *   - 'hash': HASH index on `data->>'field'` for exact equality. Not a sort key.
+ *   - 'numeric': key index on `bunsane_num_v1(data->>'field')`. Non-numeric text is NULL, never a cast error.
+ *   - 'fulltext': GIN tsvector index. Not a sort key.
+ * @param isDateField Recorded on the field. It does not change the index expression:
+ *   btree and numeric are key indexes, and a date is indexed as text (`data->>'field'`), same as any other btree key.
  */
 export function IndexedField(indexType: 'gin' | 'btree' | 'hash' | 'numeric' | 'fulltext' = 'gin', isDateField: boolean = false) {
     return function(target: any, propertyKey: string) {

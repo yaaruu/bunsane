@@ -5,6 +5,7 @@ import { getMembershipSource, getMembershipTable } from "./membershipSource";
 import { shouldUseDirectPartition } from "../core/Config";
 import { ComponentRegistry } from "../core/components";
 import { buildComponentFilterGroup } from "./FilterBuilder";
+import { buildMembershipIdSelect } from "./listSelect";
 
 export class CTENode extends QueryNode {
     /**
@@ -35,51 +36,6 @@ export class CTENode extends QueryNode {
         }
 
         let anyFilterPushed = false;
-
-        let cursorCondition = "";
-        if (context.cursorId !== null) {
-            const operator = context.cursorDirection === 'after' ? '>' : '<';
-            cursorCondition = ` AND ec.entity_id ${operator} $${context.addParam(context.cursorId)}`;
-        }
-
-        let exclusionCondition = "";
-        if (excludedIds.length > 0) {
-            const membershipTable = getMembershipTable();
-            const excludedPlaceholders = excludedIds.map((id) => `$${context.addParam(id)}`).join(', ');
-            exclusionCondition = ` AND NOT EXISTS (
-                SELECT 1 FROM ${membershipTable} ec_ex
-                WHERE ec_ex.entity_id = ec.entity_id
-                AND ec_ex.type_id IN (${excludedPlaceholders})
-                AND ec_ex.deleted_at IS NULL
-            )`;
-        }
-
-        let entityExclusionCondition = "";
-        if (context.excludedEntityIds.size > 0) {
-            const entityExcludedIds = Array.from(context.excludedEntityIds);
-            const entityPlaceholders = entityExcludedIds.map((id) => `$${context.addParam(id)}`).join(', ');
-            entityExclusionCondition = ` AND ec.entity_id NOT IN (${entityPlaceholders})`;
-        }
-
-        const buildBranch = (compId: string): string => {
-            const { table, canPushFilters } = this.membershipTableFor(compId);
-            const paramIdx = context.addParam(compId);
-            let subquery =
-                `SELECT ec.entity_id FROM ${table} ec WHERE ec.type_id = $${paramIdx}::text AND ec.deleted_at IS NULL`;
-            if (canPushFilters) {
-                const filters = context.componentFilters.get(compId) ?? [];
-                const group = buildComponentFilterGroup(filters, 'ec', context);
-                if (group) {
-                    subquery += ` AND ${group}`;
-                    anyFilterPushed = true;
-                }
-            }
-            if (cursorCondition) subquery += cursorCondition;
-            if (exclusionCondition) subquery += exclusionCondition;
-            if (entityExclusionCondition) subquery += entityExclusionCondition;
-            return subquery;
-        };
-
         let cteSql = "WITH base_entities AS (\n";
 
         if (componentIds.length === 1) {
@@ -91,20 +47,47 @@ export class CTENode extends QueryNode {
             cteSql += `    AND ec.deleted_at IS NULL\n`;
             if (canPushFilters) {
                 const filters = context.componentFilters.get(componentIds[0]!) ?? [];
-                const group = buildComponentFilterGroup(filters, 'ec', context);
+                const group = buildComponentFilterGroup(filters, "ec", context);
                 if (group) {
                     cteSql += `    AND ${group}\n`;
                     anyFilterPushed = true;
                 }
             }
-            if (cursorCondition) cteSql += `    ${cursorCondition.trim()}\n`;
-            if (exclusionCondition) cteSql += `    ${exclusionCondition.trim()}\n`;
-            if (entityExclusionCondition) cteSql += `    ${entityExclusionCondition.trim()}\n`;
+            if (context.cursorId !== null) {
+                const operator = context.cursorDirection === "after" ? ">" : "<";
+                cteSql += `    AND ec.entity_id ${operator} $${context.addParam(context.cursorId)}\n`;
+            }
+            if (excludedIds.length > 0) {
+                const membershipTable = getMembershipTable();
+                const excludedPlaceholders = excludedIds.map((id) => `$${context.addParam(id)}`).join(", ");
+                cteSql += `    AND NOT EXISTS (SELECT 1 FROM ${membershipTable} ec_ex WHERE ec_ex.entity_id = ec.entity_id AND ec_ex.type_id IN (${excludedPlaceholders}) AND ec_ex.deleted_at IS NULL)\n`;
+            }
+            if (context.excludedEntityIds.size > 0) {
+                const entityPlaceholders = Array.from(context.excludedEntityIds).map((id) => `$${context.addParam(id)}`).join(", ");
+                cteSql += `    AND ec.entity_id NOT IN (${entityPlaceholders})\n`;
+            }
         } else {
-            const intersectQueries = componentIds.map((compId) => `(${buildBranch(compId)})`);
-            cteSql += `    SELECT entity_id FROM (\n`;
-            cteSql += `        ${intersectQueries.join('\n        INTERSECT\n        ')}\n`;
-            cteSql += `    ) AS intersected\n`;
+            const built = buildMembershipIdSelect({
+                context,
+                componentIds,
+                selectSql: "s.entity_id",
+            });
+            if (built.filtersPushed) anyFilterPushed = true;
+            let body = built.sql;
+            if (context.cursorId !== null) {
+                const operator = context.cursorDirection === "after" ? ">" : "<";
+                body += ` AND s.entity_id ${operator} $${context.addParam(context.cursorId)}`;
+            }
+            if (excludedIds.length > 0) {
+                const membershipTable = getMembershipTable();
+                const excludedPlaceholders = excludedIds.map((id) => `$${context.addParam(id)}`).join(", ");
+                body += ` AND NOT EXISTS (SELECT 1 FROM ${membershipTable} ec_ex WHERE ec_ex.entity_id = s.entity_id AND ec_ex.type_id IN (${excludedPlaceholders}) AND ec_ex.deleted_at IS NULL)`;
+            }
+            if (context.excludedEntityIds.size > 0) {
+                const entityPlaceholders = Array.from(context.excludedEntityIds).map((id) => `$${context.addParam(id)}`).join(", ");
+                body += ` AND s.entity_id NOT IN (${entityPlaceholders})`;
+            }
+            cteSql += `    ${body}\n`;
         }
 
         if (anyFilterPushed) {
@@ -114,16 +97,15 @@ export class CTENode extends QueryNode {
         // LIMIT/OFFSET + ORDER BY entity_id only when the CTE is the final
         // ordering authority. Outer component/entity sorts re-order the full
         // id set after the CTE — applying LIMIT or an inner ORDER BY here is
-        // wasted (or wrong). RP-07: do not emit ORDER BY when pagination is
-        // deferred to the outer query.
+        // wasted (or wrong).
         const filtersRemainOuter =
             context.componentFilters.size > 0 && !context.filtersAppliedInMembership;
         const hasOuterSort =
             context.sortOrders.length > 0 || context.entitySortOrders.length > 0;
 
         if (!filtersRemainOuter && !hasOuterSort) {
-            const orderDirection = context.cursorDirection === 'before' ? 'DESC' : 'ASC';
-            const orderColumn = componentIds.length === 1 ? 'ec.entity_id' : 'entity_id';
+            const orderDirection = context.cursorDirection === "before" ? "DESC" : "ASC";
+            const orderColumn = componentIds.length === 1 ? "ec.entity_id" : "s.entity_id";
             cteSql += `    ORDER BY ${orderColumn} ${orderDirection}\n`;
             if (context.limit !== null) {
                 cteSql += `    LIMIT $${context.addParam(context.limit)}\n`;

@@ -1,7 +1,7 @@
 # Read-Path Performance: Filtered + Sorted + Paginated List Queries
 
-**Status:** Canonical analysis + measurement guide + shipped roadmap (0.6.x)
-**Date:** 2026-08-07 (updated for Wave A/B engine work + product guidance)
+**Status:** Canonical analysis + measurement guide + shipped roadmap (0.6.x → 0.9 index-driven lists)
+**Date:** 2026-08-07, updated 2026-09-25 for index-driven lists (`docs/internal/RFC_INDEX_DRIVEN_LISTS.md`)
 **Scope:** The query READ path only (`Query` builder → SQL → hydrate). Writes (`Entity.save`) are out of scope except QSP dual-write.
 **Audience:** framework maintainers **and** app authors building list/admin endpoints.
 **Related:** `docs/QSP_OPERATIONS.md`, `docs/QUERY_LIST_GUIDE.md`, `docs/internal/TICKETS_READ_PATH_PERF_2026-08.md`, `docs/CONFIGURATION.md`
@@ -14,11 +14,15 @@ Writes are fast. The pain is the **filtered + sorted + paginated list read** —
 
 Root cause is structural: a logical record's fields are scattered across **multiple JSONB component rows** (one partition row per component type). A predicate that a relational schema serves with **one composite-index range scan** becomes, in the ECS model, **N index probes + a set INTERSECT + a join**. Postgres cannot build a single covering index over fields that live in different physical rows.
 
+### 0.9: index-driven lists
+
+Every list shape that used to be `Seq Scan → top-N sort` now reads O(limit) rows from an index when the sort/filter field has a key index (`@CompData({ indexed: true })`, `@IndexedField("btree" | "numeric")`, `@CompositeIndex`). Key indexes are `bk_*` expression indexes `((key), entity_id)` (not partial, so the planner keeps expression statistics); numeric keys use `bunsane_num_v1()`, an IMMUTABLE numeric-or-NULL cast, so one non-partial index serves `=`, ranges, both sort directions, both NULLS placements, and keyset pages. Sorts are two index-ordered branches (non-null keys, NULL keys) merged by NULLS placement; keyset pages are row comparisons (index conditions). Unsorted multi-component pages are a driving leaf + `EXISTS` (no more `INTERSECT`). `sortByCreatedAt/UpdatedAt` use `entities` key indexes, with an adaptive probe when combined with `.with()`. Measurements: `docs/internal/benchmark-0.9/`.
+
 ### Shipped engine fixes (2026-08, see tickets RP-01…07)
 
 | Item | Status | What changed |
 |------|--------|--------------|
-| **BUG-1** numeric partial index unused | **Fixed (RP-04)** | Filters/sorts restate `IS NOT NULL` + numeric regex via `database/numericJsonField.ts` so `idx_*_numeric` is planner-eligible |
+| **BUG-1** numeric partial index unused | **Superseded (0.9)** | RP-04 restated the partial predicate on filters; 0.9 replaces the partial index with `bunsane_num_v1()` key indexes that also serve sorts |
 | **BUG-2** N EXISTS per same-component filter | **Fixed (RP-03)** | One predicate group per component; INTERSECT/CTE membership pushdown; sort-driven EXISTS dedupe |
 | Legacy **hasNextPage** without second `count()` | **Shipped (RP-01)** | Explicit `.take(N)` → SQL `LIMIT N+1`, trim, `getLastRouteInfo().hasNextPage` |
 | Plain **cursor(id) + sortBy** footgun | **Throws (RP-06b)** | Use `sortedCursor(token)` for sorted lists |
@@ -44,39 +48,37 @@ Data model:
 - `entities(id uuid pk, created_at timestamptz, updated_at timestamptz, deleted_at)` — real indexed columns.
 - `components(id, entity_id, type_id text, data jsonb, created_at, updated_at, deleted_at)` — LIST-partitioned by `type_id`. One row per (entity, component-type). Component fields live inside `data`. This is the single membership source.
 
-`.with(A).with(B)` → **INTERSECT** of per-type membership selects. **After RP-03**, each component’s field filters are **pushed into that component’s membership branch** (and same-component filters are a single AND group — not one `EXISTS` per filter). Outer filter `EXISTS` is skipped when membership already applied the group (`filtersAppliedInMembership`).
+`.with(A).with(B)` unsorted → a **driving leaf + `EXISTS`** per other component (0.9; was `INTERSECT`). Each component's field filters stay in that component's predicate group (RP-03).
 
 ```sql
--- .with(Order,{status='open', total>100}).with(Customer,{tier='gold'})  -- post RP-03 shape
-SELECT entity_id FROM components_order   -- or parent + type_id when not direct partition
-  WHERE deleted_at IS NULL
-    AND data->>'status' = $1
-    AND data->>'total' IS NOT NULL
-    AND data->>'total' ~ '^-?[0-9]…'     -- restates partial numeric index (RP-04)
-    AND (data->>'total')::numeric > $2
-INTERSECT
-SELECT entity_id FROM components_customer
-  WHERE deleted_at IS NULL
-    AND data->>'tier' = $3
+-- .with(Order,{status='open', total>100}).with(Customer,{tier='gold'}).take(20)  -- 0.9 shape
+SELECT s.entity_id FROM components_order s
+  WHERE s.deleted_at IS NULL
+    AND s.data->>'status' = $1
+    AND bunsane_num_v1(s.data->>'total') > $2::numeric
+    AND EXISTS (SELECT 1 FROM components_customer c
+                WHERE c.entity_id = s.entity_id AND c.deleted_at IS NULL AND c.data->>'tier' = $3)
+  ORDER BY s.entity_id LIMIT $4
 ```
 
-**Historical (pre-RP-03):** membership was type-only, then N outer `EXISTS` — one per filter, including two for the same Order component. That shape is gone on the legacy INTERSECT/CTE path.
+**Historical:** pre-RP-03 emitted one outer `EXISTS` per filter; 0.6–0.8 emitted `INTERSECT` of per-component membership selects, which materialized and sorted both full sets.
 
-**Index reality:** `@CompData({ indexed: true })` routes by field type (`database/IndexingStrategy.ts:pickScalarIndexType`):
+**Index reality (0.9):** key fields get `bk_*` indexes (`database/keyIndexSpec.ts`):
 
-| Field | Index emitted | Serves |
+| Field | Index | Serves |
 |---|---|---|
-| text | btree-expr `(data->>'f')` | `=`, `<`, `LIKE 'prefix%'`, `ORDER BY` |
-| Number | partial numeric `((data->>'f')::numeric) WHERE data->>'f' ~ '^-?[0-9]…'` | range/`=` **when query restates predicate (RP-04)** |
-| array/object | GIN `(data->'f') jsonb_path_ops` | `@>`, `<@` containment only |
+| text / enum / boolean / Date | `((data->>'f'), entity_id)` | `=`, ranges, `ORDER BY` either direction, keyset |
+| Number | `((bunsane_num_v1(data->>'f')), entity_id)` | same; non-numeric text is NULL, never an error |
+| `@CompositeIndex([a, b])` | `((k_a), (k_b), entity_id) …` | `a = ?` + sort/range on `b` |
+| array/object | GIN `(data->'f') jsonb_path_ops` | `@>` containment only |
 
-A **single** field predicate can use an index. A **GIN on whole `data` cannot serve `->>` scalar filters** — only `@>`. **No composite/covering index across fields is ever auto-created.**
+A **single** field predicate can use an index. A **GIN on whole `data` cannot serve `->>` scalar filters** — only `@>`. Composite indexes exist only when declared with `@CompositeIndex` and only within one component (fields in different components live in different rows).
 
 Path selection (`query/QueryDAG.ts:buildBasicQuery`, `query/ComponentInclusionNode.ts`):
 
-- **Sort-driven scan** (`canUseSortDrivenScan`): exactly 1 sort key, ≥2 required components, no `findById`, no plain `cursor(id)` (`cursorId`), no OR. Drives FROM the sort component's table, probes others via `EXISTS`, walks the sort-expression index, stops at `LIMIT`. **This is the fast path.** It *does* support filters on other components, OFFSET, and **`sortedCursor()`** (composite keyset — `sortedCursor` nulls `cursorId` and injects the keyset into the fast scan). Plain `.cursor(id)` disables this path.
-- **Single-pass filter+sort** (`applySinglePassFilterSort`): 1 component, 1 sort, all filters on that component. One scan.
-- **Scalar-subquery ORDER BY** (`applySortingWithComponentJoins`): the fallback for everything else — multi-key sort, OR + component sort, plain `cursor(id)` + component sort, CTE path. `ORDER BY (SELECT data->>'f' … LIMIT 1)` forces materializing the full match set, computing the key per row, sorting, then `LIMIT`. **No index serves ordering here.**
+- **Sort-driven scan** (`canUseSortDrivenScan`): ≥1 sort key, every sort component required, no `findById`, no plain `cursor(id)`, no OR. Drives FROM the sort component's leaf, probes others via `EXISTS`. Single key with a key index → the two-branch null split walking the `bk_` index and stopping at `LIMIT` (`query/orderPlan.ts:buildOrderedIdSelect`); without a key index, one statement with top-N sort. Supports filters, OFFSET, and `sortedCursor()` (row-comparison keyset).
+- **Multi-key sort**: one statement, expanded OR keyset; index-driven only when a `@CompositeIndex` matches an all-ASC key order.
+- **Correlated ORDER BY** (`findById` + sort, OR + sort): materializes the match set and sorts. **No index serves ordering here.**
 
 ---
 
@@ -84,16 +86,16 @@ Path selection (`query/QueryDAG.ts:buildBasicQuery`, `query/ComponentInclusionNo
 
 | # | Cost center | What happens | Severity |
 |---|---|---|---|
-| **A** | Cross-component filters can't share an index | `order.status AND customer.tier` = INTERSECT + separate EXISTS probes joined by `entity_id`. One composite seek becomes N probes + join. Selectivity estimation on `data->>'x'` expression indexes is also weaker than on real columns. | High — structural |
-| **B** | Same-component multi-filter not coalesced | **Fixed (RP-03):** one predicate group per component; INTERSECT/CTE pushdown. | Was high |
-| **C** | Component sort in an ineligible shape → scalar-subquery ORDER BY | Full match-set materialize + sort. Triggers on OR + component sort, **plain `cursor(id)`** + component sort, multi-key sort, CTE path. **`sortedCursor` does not trigger this** — it rides sort-driven scan. | High — narrow |
-| **D** | Exact `count()` for "total pages" | `SELECT COUNT(*) FROM (<full id query>)`, strips LIMIT/sort → full cardinality every request. A second full scan, often the most expensive. | Highest ROI to kill |
-| **E** | Deep OFFSET pagination | O(offset) scan-and-discard. Prefer **`sortedCursor`** for component-sorted lists (fast path). Single-key `sortedCursor`, including `before`, is implemented; multi-key still throws (F-01 partial). | Medium |
-| **F** | Numeric partial-index mismatch | **Fixed (RP-04):** queries restate `IS NOT NULL` + numeric regex via `database/numericJsonField.ts` so partial `idx_*_numeric` is eligible. | Was high |
+| **A** | Cross-component filters can't share an index | `order.status AND customer.tier` = driving leaf + `EXISTS` probes joined by `entity_id`. One composite seek becomes N probes. Selectivity estimation on expression indexes is weaker than on real columns. | High — structural (QSP's job) |
+| **B** | Same-component multi-filter not coalesced | **Fixed (RP-03):** one predicate group per component. | Was high |
+| **C** | Component sort in an ineligible shape → correlated ORDER BY | Full match-set materialize + sort. Triggers on OR + component sort and `findById` + sort. Plain `cursor(id)` + sort throws (RP-06b); multi-key and `sortedCursor` stay on the sort-driven scan. | Medium — narrow |
+| **D** | Exact `count()` for "total pages" | `SELECT COUNT(*) FROM (<full id query>)`, strips LIMIT/sort → full cardinality every request. | Highest ROI to kill |
+| **E** | Deep OFFSET pagination | O(offset) scan-and-discard. Prefer **`sortedCursor`** (single and multi-key, `before`). | Medium |
+| **F** | Sort/filter index mismatch | **Fixed (0.9):** `bk_` key indexes match the emitted ORDER BY and filter expressions by construction (`query/orderPlan.ts`). | Was high |
 
 **Additional planner notes:**
 
-- **Base INTERSECT is unselective:** membership branches (`type_id=$X`) produce broad inputs before field filters apply. Pushing each component's filters *into* its INTERSECT branch shrinks the inputs and lets composite indexes matter.
+- **Unindexed sort fields** still do a full leaf scan + top-N sort. In development the engine logs a one-time warning naming the field; add `@CompData({ indexed: true })` or a `@CompositeIndex`.
 - **work_mem spill:** the scalar-subquery ORDER BY + exact count both risk external sorts / large scans; `LIMIT` does not save a sort whose key is computed for all candidates.
 - **Partition pruning:** LIST partitioning helps only when the query hits a leaf. `BUNSANE_USE_DIRECT_PARTITION=true` names the leaf table directly and is materially better for hot list paths than a generic `type_id=$1` against the parent.
 - **HOT-update bloat:** frequent component updates reduce index-only-scan reliability (visibility map churn) even when a covering index exists.

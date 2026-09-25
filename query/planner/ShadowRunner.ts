@@ -70,6 +70,11 @@ export function shadowRunExec(req: CoverageRequest, legacyIds: string[]): void {
             const { sql, params } = buildRmQuery(archetype, req, plan.columns);
             const rows: any[] = await db.unsafe(sql, params);
             const rmIds: string[] = rows.map((r: any) => r.entity_id);
+            // Legacy ids are already flipped back to user order. rm_ SQL is fetch order.
+            if (req.cursor?.direction === 'before' && req.sorts.length > 0) {
+                rmIds.reverse();
+                rows.reverse();
+            }
             recordShadowCompared();
             if (legacyIds.length !== rmIds.length) {
                 const firstDiffIndex = 0;

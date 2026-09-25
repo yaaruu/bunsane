@@ -1,0 +1,112 @@
+{
+  "capturedAt": "2026-09-25T06:41:09.894Z",
+  "sourceCommit": "04f73c6f0f1779af615af1792c5a1e8498425b02",
+  "scale": "lg",
+  "shapes": {
+    "a-sort-rating-20": {
+      "p50Ms": 0.95,
+      "p95Ms": 1.78,
+      "meanMs": 1.02
+    },
+    "a-sort-rating-100": {
+      "p50Ms": 0.97,
+      "p95Ms": 2.2,
+      "meanMs": 1.11
+    },
+    "a-sort-rating-asc-20": {
+      "p50Ms": 0.77,
+      "p95Ms": 1.04,
+      "meanMs": 0.79
+    },
+    "a-sort-username-asc-50": {
+      "p50Ms": 0.68,
+      "p95Ms": 1.26,
+      "meanMs": 0.78
+    },
+    "a-sort-score-desc-20": {
+      "p50Ms": 0.73,
+      "p95Ms": 2.05,
+      "meanMs": 0.84
+    },
+    "b-created-at-20": {
+      "p50Ms": 234.85,
+      "p95Ms": 253.73,
+      "meanMs": 236.11
+    },
+    "b-created-at-100": {
+      "p50Ms": 240.69,
+      "p95Ms": 262.74,
+      "meanMs": 241.19
+    },
+    "b-created-at-review-desc-20": {
+      "p50Ms": 3.82,
+      "p95Ms": 5.27,
+      "meanMs": 3.94
+    },
+    "b-created-at-review-asc-20": {
+      "p50Ms": 110.23,
+      "p95Ms": 127.94,
+      "meanMs": 110.81
+    },
+    "b-created-at-keyset-20": {
+      "p50Ms": 1.46,
+      "p95Ms": 2.49,
+      "meanMs": 1.61
+    },
+    "c-two-filter-sort-20": {
+      "p50Ms": 1.26,
+      "p95Ms": 2.72,
+      "meanMs": 1.45
+    },
+    "c-selective-filter-sort-20": {
+      "p50Ms": 0.72,
+      "p95Ms": 1.38,
+      "meanMs": 0.77
+    },
+    "d-populate-100": {
+      "p50Ms": 1.88,
+      "p95Ms": 3.8,
+      "meanMs": 2.19
+    },
+    "d-count-two-components": {
+      "p50Ms": 55.08,
+      "p95Ms": 59.04,
+      "meanMs": 55.52
+    },
+    "e-graphql-list-50": {
+      "p50Ms": 15.62,
+      "p95Ms": 18.14,
+      "meanMs": 15.92
+    },
+    "e2-graphql-list-50-batched": {
+      "p50Ms": 7.82,
+      "p95Ms": 12.7,
+      "meanMs": 8
+    },
+    "f-keyset-next-20": {
+      "p50Ms": 0.71,
+      "p95Ms": 2.28,
+      "meanMs": 0.86
+    },
+    "f-keyset-deep-20": {
+      "p50Ms": 0.75,
+      "p95Ms": 3.34,
+      "meanMs": 0.94
+    },
+    "f-keyset-before-20": {
+      "p50Ms": 0.58,
+      "p95Ms": 0.8,
+      "meanMs": 0.64
+    },
+    "f-keyset-score-into-nulls": {
+      "p50Ms": 0.71,
+      "p95Ms": 1.73,
+      "meanMs": 0.82
+    },
+    "g-legacyscore-sort": {
+      "p50Ms": 0.69,
+      "p95Ms": 1.01,
+      "meanMs": 0.73
+    }
+  }
+}

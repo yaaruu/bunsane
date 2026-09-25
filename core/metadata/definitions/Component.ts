@@ -23,3 +23,9 @@ export interface IndexedFieldMetadata {
     indexType: 'gin' | 'btree' | 'hash' | 'numeric' | 'fulltext';
     isDateField: boolean;
 }
+
+/** `@CompositeIndex([...])` on a component class: key index over these fields, in order. */
+export interface CompositeIndexMetadata {
+    componentId: string;
+    fields: readonly string[];
+}

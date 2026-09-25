@@ -2,6 +2,7 @@ import ApplicationLifecycle from "../ApplicationLifecycle";
 import { logger as MainLogger } from "../Logger";
 import { SchedulerManager } from "../SchedulerManager";
 import { closeDatabase } from "../../database";
+import { stopIndexReconcile } from "../../database/indexReconciler";
 import { setRemoteManager } from "../remote";
 
 const logger = MainLogger.child({ scope: "App" });
@@ -14,6 +15,7 @@ export async function runShutdown(app: any): Promise<void> {
 
     const shutdownStart = Date.now();
     logger.info({ scope: 'app', component: 'App', msg: 'Shutting down application', gracePeriodMs: app.shutdownGracePeriod });
+    const indexReconcileDone = stopIndexReconcile();
 
     const budgetRemaining = () => Math.max(500, app.shutdownGracePeriod - (Date.now() - shutdownStart));
     const fail = (msg: string, error?: unknown) => {
@@ -78,6 +80,31 @@ export async function runShutdown(app: any): Promise<void> {
         logger.info({ scope: 'cache', component: 'App', msg: 'Cache shutdown completed' });
     } catch (error) {
         fail('Cache shutdown error', error);
+    }
+
+    try {
+        const waitMs = budgetRemaining();
+        let timedOut = false;
+        await Promise.race([
+            indexReconcileDone,
+            new Promise<void>((resolve) => {
+                const timer = setTimeout(() => {
+                    timedOut = true;
+                    resolve();
+                }, waitMs);
+                timer.unref?.();
+            }),
+        ]);
+        if (timedOut) {
+            logger.warn({
+                scope: 'app',
+                component: 'App',
+                msg: 'Index reconcile still running after the shutdown budget; CREATE INDEX continues server-side and the next boot rebuilds an invalid index',
+                waitMs,
+            });
+        }
+    } catch (error) {
+        fail('Index reconcile stop error', error);
     }
 
     try {

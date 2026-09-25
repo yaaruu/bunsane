@@ -1,8 +1,16 @@
 import { ProjectionManager } from "../../database/projection/ProjectionManager";
 import { rmTableName, assertRmTableName } from "../../database/projection/DDLGenerator";
 import { assertIdentifier } from "../SqlIdentifier";
-import type { CoverageRequest } from "./CoverageRequest";
+import type { CoverageRequest, CoverageSort } from "./CoverageRequest";
 import type { ProjectedColumn } from "../../database/projection/types";
+import {
+    buildOrderedRowSelect,
+    entityTimestampKey,
+    fetchOrder,
+    rmColumnKey,
+    type EntityTimestampColumn,
+    type SortKeyKind,
+} from "../orderPlan";
 
 /**
  * Shared filter WHERE construction for rm_ SELECT / COUNT / EXPLAIN estimate.
@@ -11,8 +19,8 @@ import type { ProjectedColumn } from "../../database/projection/types";
 function buildRmFilterWhere(archetype: string, req: CoverageRequest): {
     table: string;
     whereClauses: string[];
-    params: any[];
-    p: (v: any) => string;
+    params: unknown[];
+    p: (value: unknown) => string;
     columnLookup: Map<string, ProjectedColumn>;
 } {
     const descriptor = ProjectionManager.instance.getDescriptor(archetype);
@@ -26,9 +34,9 @@ function buildRmFilterWhere(archetype: string, req: CoverageRequest): {
     }
 
     const table = assertRmTableName(rmTableName(archetype));
-    const params: any[] = [];
-    const p = (v: any): string => {
-        params.push(v);
+    const params: unknown[] = [];
+    const p = (value: unknown): string => {
+        params.push(value);
         return `$${params.length}`;
     };
 
@@ -39,8 +47,7 @@ function buildRmFilterWhere(archetype: string, req: CoverageRequest): {
         if (!col) {
             throw new Error(`Filter column not found in descriptor: ${f.component}:${f.field}`);
         }
-        const colName = assertIdentifier(col.columnName, 'rmFilterColumn');
-        const colRef = `"${colName}"`;
+        const colRef = `"${assertIdentifier(col.columnName, 'rmFilterColumn')}"`;
         if (f.operator === 'IN' || f.operator === 'NOT IN') {
             const vals = Array.isArray(f.value) ? f.value : [];
             const phs = vals.map(v => p(v)).join(', ');
@@ -53,128 +60,102 @@ function buildRmFilterWhere(archetype: string, req: CoverageRequest): {
     return { table, whereClauses, params, p, columnLookup };
 }
 
+function resolveSort(
+    sort: CoverageSort,
+    columnLookup: Map<string, ProjectedColumn>,
+): { expr: string; kind: SortKeyKind } {
+    if (sort.kind === 'entity') {
+        const column: EntityTimestampColumn = sort.field === 'updated_at' ? 'updated_at' : 'created_at';
+        return { expr: entityTimestampKey(null, column), kind: 'timestamp' };
+    }
+    const col = columnLookup.get(`${sort.component}:${sort.field}`);
+    if (!col) {
+        throw new Error(`Sort column not found: ${sort.component}:${sort.field}`);
+    }
+    const quoted = `"${assertIdentifier(col.columnName, 'rmSortColumn')}"`;
+    const key = rmColumnKey(quoted, col.sqlType);
+    if (!key) {
+        throw new Error(`rm_ column ${col.columnName} (${col.sqlType}) is not a sort key`);
+    }
+    return key;
+}
+
+function hydrateSelect(columns: readonly ProjectedColumn[]): string[] {
+    const seen = new Set<string>();
+    const extra: string[] = [];
+    for (const col of columns) {
+        const name = assertIdentifier(col.columnName, 'rmHydrateColumn');
+        if (seen.has(name) || name === 'entity_id') continue;
+        seen.add(name);
+        extra.push(`"${name}"`);
+    }
+    return extra;
+}
+
 export function buildRmQuery(
     archetype: string,
     req: CoverageRequest,
-    hydrateColumns: ProjectedColumn[] = []
-): { sql: string; params: any[] } {
+    hydrateColumns: ProjectedColumn[] = [],
+): { sql: string; params: unknown[] } {
+    if (req.sorts.length > 1) {
+        throw new Error('rm_ plans do not support multi-key sorts');
+    }
+
     const { table, whereClauses, params, p, columnLookup } = buildRmFilterWhere(archetype, req);
+    const extraSelect = hydrateSelect(hydrateColumns);
+    const isBefore = req.cursor?.direction === 'before';
+    const sort = req.sorts[0];
 
-    const hasKeyset = req.cursor?.kind === 'keyset';
-    const hasIdCursor = req.cursor?.kind === 'id' && !hasKeyset;
-
-    if (hasKeyset && req.cursor) {
-        const c = req.cursor;
-        const s = req.sorts[0]!; // guaranteed by planner
-        if (s.kind === 'entity') {
-            const col = s.field === 'updated_at' ? 'updated_at' : 'created_at';
-            const trunc = `date_trunc('milliseconds', "${col}")`;
-            const rawCol = `"${col}"`;
-            const v = c.v ?? null;
-            const id = c.id;
-            if (v === null) {
-                whereClauses.push('FALSE');
-            } else if (s.direction === 'ASC') {
-                const vPh = p(v);
-                const idPh = p(id);
-                whereClauses.push(`((${trunc}, entity_id) > (${vPh}::timestamptz, ${idPh}::uuid) OR ${rawCol} IS NULL)`);
-            } else {
-                const vLt = p(v);
-                const vEq = p(v);
-                const idGt = p(id);
-                whereClauses.push(`(${trunc} < ${vLt}::timestamptz OR (${trunc} = ${vEq}::timestamptz AND entity_id > ${idGt}::uuid))`);
-            }
-        } else {
-            // component sort
-            const col = columnLookup.get(`${s.component}:${s.field}`);
-            if (!col) {
-                throw new Error(`Sort column not found: ${s.component}:${s.field}`);
-            }
-            const colName = assertIdentifier(col.columnName, 'rmSortColumn');
-            const expr = `"${colName}"`;
-            const cast = col.sqlType === 'numeric' ? '::numeric' : '::text';
-            const v = c.v ?? null;
-            const id = c.id;
-            const isDesc = s.direction === 'DESC';
-            const nullsLast = !s.nullsFirst;
-            if (v === null) {
-                const idPh = p(id);
-                whereClauses.push(`(${expr} IS NULL AND entity_id > ${idPh}::uuid)`);
-            } else if (!isDesc) {
-                const vPh = p(v);
-                const idPh = p(id);
-                const nullInclude = nullsLast ? ` OR ${expr} IS NULL` : '';
-                whereClauses.push(`((${expr}, entity_id) > (${vPh}${cast}, ${idPh}::uuid)${nullInclude})`);
-            } else {
-                const vLt = p(v);
-                const vEq = p(v);
-                const idGt = p(id);
-                whereClauses.push(`(${expr} < ${vLt}${cast} OR (${expr} = ${vEq}${cast} AND entity_id > ${idGt}::uuid))`);
-            }
-        }
+    if (sort) {
+        const key = resolveSort(sort, columnLookup);
+        const fetched = fetchOrder(sort.direction === 'DESC' ? 'DESC' : 'ASC', sort.nullsFirst, isBefore);
+        const cursor = req.cursor?.kind === 'keyset'
+            ? { value: req.cursor.v ?? null, id: req.cursor.id }
+            : null;
+        const sql = buildOrderedRowSelect({
+            idExpr: 'entity_id',
+            fromSql: table,
+            where: whereClauses,
+            key: {
+                expr: key.expr,
+                kind: key.kind,
+                direction: fetched.direction,
+                nullsFirst: fetched.nullsFirst,
+            },
+            cursor,
+            limit: req.limit,
+            // A keyset cursor already positions the page. sortedCursor() clears offset.
+            offset: cursor ? 0 : req.offset,
+            addParam: (value: unknown) => {
+                params.push(value);
+                return params.length;
+            },
+            // Every routed sort column has a bk_ key index (created with the table).
+            indexed: true,
+        }, {
+            idAlias: 'entity_id',
+            extraSelect,
+        });
+        return { sql, params };
     }
 
-    if (hasIdCursor && req.cursor) {
-        // Only 'after' supported
-        const idPh = p(req.cursor.id);
-        whereClauses.push(`entity_id > ${idPh}::uuid`);
+    if (req.cursor?.kind === 'keyset') {
+        throw new Error('rm_ keyset cursor requires exactly one sort');
+    }
+    if (req.cursor?.kind === 'id') {
+        const op = isBefore ? '<' : '>';
+        whereClauses.push(`entity_id ${op} ${p(req.cursor.id)}::uuid`);
     }
 
-    let orderBy = '';
-    if (req.sorts.length === 1) {
-        const s = req.sorts[0]!;
-        const dir = s.direction === 'DESC' ? 'DESC' : 'ASC';
-        const nulls = s.nullsFirst ? 'NULLS FIRST' : 'NULLS LAST';
-        if (s.kind === 'component') {
-            const col = columnLookup.get(`${s.component}:${s.field}`);
-            if (!col) {
-                throw new Error(`Sort column not found: ${s.component}:${s.field}`);
-            }
-            const colName = assertIdentifier(col.columnName, 'rmSortColumn');
-            const colRef = `"${colName}"`;
-            orderBy = ` ORDER BY ${colRef} ${dir} ${nulls}, entity_id ASC`;
-        } else {
-            // entity
-            const col = s.field === 'updated_at' ? 'updated_at' : 'created_at';
-            if (hasKeyset) {
-                orderBy = ` ORDER BY date_trunc('milliseconds', "${col}") ${dir} ${nulls}, entity_id ASC`;
-            } else {
-                orderBy = ` ORDER BY "${col}" ${dir} ${nulls}, entity_id ASC`;
-            }
-        }
-    } else if (hasIdCursor || (!hasKeyset && req.sorts.length === 0)) {
-        orderBy = ' ORDER BY entity_id ASC';
-    }
-
-    let limitClause = '';
-    if (req.limit !== null) {
-        limitClause = ` LIMIT ${p(req.limit)}`;
-    }
-
-    let offsetClause = '';
-    if (!hasKeyset && req.offset > 0) {
-        offsetClause = ` OFFSET ${p(req.offset)}`;
-    }
-
-    // Widened SELECT for row hydration. Column names go through the same assertIdentifier
-    // guard as filter/sort columns — never interpolate a raw name. Deduped because a column
-    // may appear in the plan more than once only through caller error, and a duplicated
-    // output name would make the row object ambiguous.
-    const seen = new Set<string>();
-    const selectList = ['entity_id'];
-    for (const col of hydrateColumns) {
-        const colName = assertIdentifier(col.columnName, 'rmHydrateColumn');
-        if (seen.has(colName)) continue;
-        seen.add(colName);
-        selectList.push(`"${colName}"`);
-    }
-
-    const whereSql = whereClauses.join(' AND ');
-    const sql = `SELECT ${selectList.join(', ')} FROM ${table} WHERE ${whereSql}${orderBy}${limitClause}${offsetClause}`;
+    const dir = isBefore ? 'DESC' : 'ASC';
+    const selectList = ['entity_id', ...extraSelect].join(', ');
+    let sql = `SELECT ${selectList} FROM ${table} WHERE ${whereClauses.join(' AND ')} ORDER BY entity_id ${dir}`;
+    if (req.limit !== null) sql += ` LIMIT ${p(req.limit)}`;
+    if (!req.cursor && req.offset > 0) sql += ` OFFSET ${p(req.offset)}`;
     return { sql, params };
 }
 
-export function buildRmCountQuery(archetype: string, req: CoverageRequest): { sql: string; params: any[] } {
+export function buildRmCountQuery(archetype: string, req: CoverageRequest): { sql: string; params: unknown[] } {
     const { table, whereClauses, params } = buildRmFilterWhere(archetype, req);
     const whereSql = whereClauses.join(' AND ');
     const sql = `SELECT count(*)::bigint AS count FROM ${table} WHERE ${whereSql}`;
@@ -185,7 +166,7 @@ export function buildRmCountQuery(archetype: string, req: CoverageRequest): { sq
  * Same filter WHERE as count, no ORDER/LIMIT — intended for EXPLAIN (FORMAT JSON)
  * under BUNSANE_QSP_COUNT=estimate.
  */
-export function buildRmEstimateQuery(archetype: string, req: CoverageRequest): { sql: string; params: any[] } {
+export function buildRmEstimateQuery(archetype: string, req: CoverageRequest): { sql: string; params: unknown[] } {
     const { table, whereClauses, params } = buildRmFilterWhere(archetype, req);
     const whereSql = whereClauses.join(' AND ');
     const sql = `SELECT 1 FROM ${table} WHERE ${whereSql}`;

@@ -75,6 +75,8 @@ const envSchema = z
         REDIS_TLS_SERVERNAME: z.string().optional(),
         REDIS_TLS_REJECT_UNAUTHORIZED: z.enum(["true", "false"]).optional(),
         BUNSANE_RPC_CONSUMER_CONCURRENCY: numeric("BUNSANE_RPC_CONSUMER_CONCURRENCY"),
+        BUNSANE_ENTITY_SORT_PROBE: numeric("BUNSANE_ENTITY_SORT_PROBE"),
+        BUNSANE_INDEX_SYNC_MAX_ROWS: numeric("BUNSANE_INDEX_SYNC_MAX_ROWS"),
     })
     .refine(
         (env) => {
@@ -123,6 +125,24 @@ const envSchema = z
     .refine(
         (env) => !env.BUNSANE_RPC_CONSUMER_CONCURRENCY || parseInt(env.BUNSANE_RPC_CONSUMER_CONCURRENCY, 10) >= 1,
         { message: "BUNSANE_RPC_CONSUMER_CONCURRENCY must be a positive integer (default 8)" },
+    )
+    .refine(
+        (env) => {
+            const raw = env.BUNSANE_ENTITY_SORT_PROBE;
+            if (!raw) return true;
+            const n = Number(raw);
+            return Number.isSafeInteger(n) && n >= 1;
+        },
+        { message: "BUNSANE_ENTITY_SORT_PROBE must be a positive integer (default 5000)" },
+    )
+    .refine(
+        (env) => {
+            const raw = env.BUNSANE_INDEX_SYNC_MAX_ROWS;
+            if (!raw) return true;
+            const n = Number(raw);
+            return Number.isSafeInteger(n) && n >= 0;
+        },
+        { message: "BUNSANE_INDEX_SYNC_MAX_ROWS must be a non-negative integer (default 100000)" },
     );
 
 function isLoopbackOrLinkLocal(host: string): boolean {

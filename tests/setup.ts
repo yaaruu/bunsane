@@ -45,7 +45,7 @@ if (!process.env.LOG_LEVEL) {
 
 // Now import the rest after env is loaded
 import db from '../database';
-import { PrepareDatabase, HasValidBaseTable } from '../database/DatabaseHelper';
+import { PrepareDatabase, HasValidBaseTable, EnsureDatabaseMigrations } from '../database/DatabaseHelper';
 import ApplicationLifecycle, { ApplicationPhase } from '../core/ApplicationLifecycle';
 import EntityManager from '../core/EntityManager';
 import { ComponentRegistry } from '../core/components';
@@ -79,6 +79,8 @@ async function initializeTestEnvironment(): Promise<void> {
             await PrepareDatabase();
             logger.info({ scope: 'test-setup' }, 'Base database tables created');
         } else {
+            // Same path App.init() takes for an existing schema (creates bunsane_num_v1 if missing).
+            await EnsureDatabaseMigrations();
             logger.info({ scope: 'test-setup' }, 'Base database tables already exist');
         }
 

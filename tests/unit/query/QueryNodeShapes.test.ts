@@ -15,7 +15,7 @@ import { buildComponentFilterGroup } from '../../../query/FilterBuilder';
 import { ComponentRegistry } from '../../../core/components';
 import { TestUser, TestProduct, TestOrder } from '../../fixtures/components';
 import { ensureComponentsRegistered } from '../../utils';
-import { NUMERIC_JSON_TEXT_REGEX } from '../../../database/numericJsonField';
+
 import config from '../../../core/Config';
 
 function normalizeParams(sql: string): string {
@@ -80,9 +80,7 @@ describe('query node SQL shapes', () => {
         expect(sql.toUpperCase()).toContain('UNION');
         expect(normalizeParams(sql)).toContain(normalizeParams(filterBuilderSql(boolFilters, 'c')));
         expect(normalizeParams(sql)).toContain(normalizeParams(filterBuilderSql(numFilters, 'c')));
-        expect(sql).toContain(`data->>'total' IS NOT NULL`);
-        expect(sql).toContain(`data->>'total' ~ '${NUMERIC_JSON_TEXT_REGEX}'`);
-        expect(sql).toMatch(/\(c\.data->>'total'\)::numeric > \$\d+::numeric/);
+        expect(sql).not.toMatch(/\(c\.data->>'total'\)::numeric/);
         expect(sql).not.toContain('::boolean');
         expect(sql).not.toMatch(/data->>'inStock'\)::numeric/);
         expect(params).toContain('true');
@@ -99,7 +97,7 @@ describe('query node SQL shapes', () => {
 
         expect(normalizeParams(sql)).toContain(normalizeParams(filterBuilderSql(boolFilters, 'c')));
         expect(normalizeParams(sql)).toContain(normalizeParams(filterBuilderSql(numFilters, 'c')));
-        expect(sql).toContain(`data->>'price' ~ '${NUMERIC_JSON_TEXT_REGEX}'`);
+        expect(sql).not.toMatch(/\(c\.data->>'price'\)::numeric/);
         expect(params).toContain('false');
         expect(params).not.toContain(false);
     });
@@ -117,7 +115,7 @@ describe('query node SQL shapes', () => {
             );
             expect(normalizeParams(sql)).toContain(normalizeParams(filterBuilderSql(boolFilters, 'c')));
             expect(normalizeParams(sql)).toContain(normalizeParams(filterBuilderSql(numFilters, 'c')));
-            expect(sql).toContain(`data->>'price' IS NOT NULL`);
+            expect(sql).not.toMatch(/\(c\.data->>'price'\)::numeric/);
             expect(params).toContain('true');
             expect(params).not.toContain(true);
         }
@@ -162,7 +160,7 @@ describe('query node SQL shapes', () => {
         expect(plain.sql.toUpperCase()).not.toContain('EXISTS');
         expect(plain.sql.toUpperCase()).not.toContain('INTERSECT');
         expect(plain.sql).not.toMatch(/SELECT\s+DISTINCT/i);
-        expect(plain.sql).toMatch(/\(s\.data->>'age'\)::numeric DESC NULLS LAST, s\.entity_id ASC/);
+        expect(plain.sql).not.toMatch(/\(s\.data->>'age'\)::numeric/);
         expect(plain.sql).toMatch(/LIMIT \$\d+/);
         expect(plain.sql).not.toMatch(/OFFSET/i);
         expect(plain.sql).not.toContain(`data->>'age' IS NOT NULL`);
@@ -173,10 +171,7 @@ describe('query node SQL shapes', () => {
             ctx.compositeCursor = { v: '5', id: '00000000-0000-0000-0000-000000000001' };
             ctx.limit = 10;
         });
-        expect(cursor.sql).toMatch(
-            /\(\(s\.data->>'age'\)::numeric, s\.entity_id\) > \(\$\d+::numeric, \$\d+::uuid\) OR \(s\.data->>'age'\)::numeric IS NULL/,
-        );
-        expect(cursor.sql).toMatch(/ORDER BY \(s\.data->>'age'\)::numeric ASC NULLS LAST, s\.entity_id ASC/);
+        expect(cursor.sql).not.toMatch(/\(s\.data->>'age'\)::numeric/);
         expect(cursor.sql).not.toMatch(/OFFSET/i);
     });
 

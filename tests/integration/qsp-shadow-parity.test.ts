@@ -165,8 +165,8 @@ if (!isPGlite) {
             expect(res.surface).toBe('rm');
             const { sql, params } = buildRmQuery(res.archetype!, req);
 
-            // Small tables favor a Seq Scan; force index consideration so we prove the covering
-            // index CAN serve this index-only (no correlated SubPlan, no data->> scan).
+            // Small tables favor a Seq Scan; force index consideration so we prove a
+            // key index can serve this sort (no correlated SubPlan, no data->> scan).
             let text = '';
             await db.transaction(async (tx: any) => {
                 await tx.unsafe('SET LOCAL enable_seqscan = off');

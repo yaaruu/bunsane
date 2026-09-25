@@ -1,7 +1,7 @@
 # Tickets: Read-Path Performance (Filter + Sort + Pagination)
 
-**Status:** Wave A+B engine complete; RP-02 ops open (staging soak); RP-08 deferred; F-01, F-09, F-11 done (post-0.7.0)
-**Date:** 2026-08-07 (status refreshed 2026-09-24)
+**Status:** Wave A+B engine complete; index-driven lists (0.9, `RFC_INDEX_DRIVEN_LISTS.md`) done; RP-02 ops open (staging soak); RP-08 deferred; F-01, F-02, F-09, F-11 done
+**Date:** 2026-08-07 (status refreshed 2026-09-25)
 **Basis:** `docs/READ_PATH_PERFORMANCE.md` + product sample review + Opus ticket review  
 **Scope:** List-read path only (`Query` → SQL → hydrate). Writes out of scope unless a ticket explicitly dual-writes.  
 **App-facing guides:** `docs/QUERY_LIST_GUIDE.md`, `docs/QSP_OPERATIONS.md`
@@ -158,6 +158,8 @@ SELECT entity_id FROM components_customer
 
 Shipped: `database/numericJsonField.ts` shared by index DDL + query emission; filters/sorts restate partial-index predicate; dirty non-numeric JSON excluded. Tests: `NumericIndexPredicate.test.ts`, `Query.numericFilter.test.ts`.
 
+**Superseded 2026-09-25 (0.9):** the partial numeric index and `numericJsonField.ts` are gone. Numeric keys are `bunsane_num_v1(data->>'f')` (IMMUTABLE, NULL for non-numeric text) with a non-partial `bk_` key index that serves filters and sorts.
+
 ### Problem
 `IndexingStrategy` creates a **partial** numeric index with  
 `WHERE data->>'f' ~ '^-?[0-9]…'`  
@@ -276,7 +278,7 @@ Emit CTE `ORDER BY` only when the CTE is the final ordering authority (unsorted 
 
 ## RP-08 — Generated projected columns (M1) for fields that stay on legacy
 
-**Status: OPEN.** Generated projected columns are not implemented.
+**Status: OPEN, re-scoped.** Generated projected columns are not implemented. After 0.9 every declared key field has an index that serves filter + sort + keyset on legacy; RP-08 now only matters for planner selectivity on expression indexes and for cross-component shapes QSP cannot cover.
 
 ### Problem
 Expression indexes + JSONB extraction remain planner-weak vs real typed columns. Overlaps QSP for hot archetypes; still valuable for ad-hoc queries that never hit `rm_`.
@@ -312,7 +314,7 @@ Filter+sort on single hot component: index-only or index scan on `proj_*`; compa
 | ID | Item | Notes |
 |----|------|--------|
 | F-01 | Multi-key keyset + `direction: 'before'` | **Done (post-0.7.0):** N-key `sortedCursor` with mixed directions, per-key NULLS, and `'before'` for component sorts, `sortByCreatedAt` + `sortByUpdatedAt`, and OR + multi-sort. Legacy single-key tokens still decode. QSP still routes multi-sort to legacy. |
-| F-02 | Composite list-shape indexes (equality → range → entity_id) | After RP-03/04 so SQL can use them |
+| F-02 | Composite list-shape indexes (equality → range → entity_id) | **Done (0.9):** `@CompositeIndex([...])` on a component builds `(k1, k2, …, entity_id)`; `sortKeyIndexed` uses it when the leading fields are pinned by `=`. Single-field key indexes for every indexed field. |
 | F-03 | CTE LIMIT pushdown when filters selective | Harder correctness; after RP-03 |
 | F-04 | OR + component sort uses sort-driven or rm_ | Currently JOIN wrapper full sort |
 | F-05 | Count result cache (short TTL by query signature) | Alternative to estimate for dashboards |

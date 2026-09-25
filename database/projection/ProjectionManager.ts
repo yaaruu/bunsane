@@ -8,7 +8,7 @@ import type { ProjectionDescriptor, ProjectionStatus } from './types';
 import { deriveProjectionDescriptor } from './ProjectionMetadata';
 import { buildDependencyMap } from './DependencyMap';
 import { projectEntity } from './projectEntity';
-import { createCoveringIndex, createRmTable, rmTableName, assertRmTableName } from './DDLGenerator';
+import { ensureRmKeyIndexes, createRmTable, rmTableName, assertRmTableName } from './DDLGenerator';
 import { syncRmSchema } from './SchemaSync';
 import { assertIdentifier } from '../../query/SqlIdentifier';
 import { qspActive, qspMode, qspInScope } from './qspConfig';
@@ -36,13 +36,6 @@ export class ProjectionManager {
     private pollHandle: ReturnType<typeof setInterval> | null = null;
     private archetypeNames: string[] = [];
 
-    private coveringIndexOpts(descriptor: ProjectionDescriptor): { equalityColumns: string[]; sortColumn?: string; sortDir: 'DESC' } {
-        const equalityColumns = descriptor.columns
-            .filter(col => col.sqlType === 'text' || col.sqlType === 'boolean' || col.sqlType === 'timestamptz')
-            .map(col => col.columnName);
-        const sortColumn = descriptor.columns.find(col => col.sqlType === 'numeric')?.columnName;
-        return { equalityColumns, sortColumn, sortDir: 'DESC' };
-    }
 
     private registerArchetype(archetype: string, descriptor: ProjectionDescriptor): void {
         this.descriptors.set(archetype, descriptor);
@@ -63,18 +56,19 @@ export class ProjectionManager {
                 const descriptor = deriveProjectionDescriptor(archetypeName);
                 this.descriptors.set(archetypeName, descriptor);
                 await createRmTable(archetypeName, descriptor.columns);
-                await createCoveringIndex(archetypeName, this.coveringIndexOpts(descriptor));
-
                 await projExec('projection.state.register',
                     `INSERT INTO projection_state (archetype, shape_hash, status, shape_version)
                      VALUES ($1, $2, 'DISABLED', $3)
                      ON CONFLICT (archetype) DO UPDATE SET shape_hash = EXCLUDED.shape_hash`,
                     [descriptor.archetype, descriptor.shapeHash, descriptor.shapeVersion]
                 );
-                // Shape growth: an existing rm_ table never gains columns from
-                // CREATE TABLE IF NOT EXISTS. Diff and ALTER, marking new
-                // columns FILLING until filled (B7).
+                // Shape growth: CREATE TABLE IF NOT EXISTS does not add columns.
+                // Diff and ALTER, then key-index every column including the new ones.
                 await syncRmSchema(archetypeName, descriptor);
+                await ensureRmKeyIndexes(archetypeName, descriptor.columns);
+
+
+
                 const rows = await projExec<any[]>('projection.state.status',
                     `SELECT status FROM projection_state WHERE archetype = $1`, [descriptor.archetype]);
                 this.statusCache.set(archetypeName, (rows[0]?.status ?? 'DISABLED') as ProjectionStatus);
@@ -122,9 +116,11 @@ export class ProjectionManager {
 
     /**
      * Lazy trigger for a covered query. Idempotent across calls and instances:
-     * INSERT ... 'BACKFILLING' ON CONFLICT DO NOTHING - only the winner creates rm_ + index + kicks
-     * the backfill. dual-write-FIRST: the rm_ table is created and the archetype registered locally
-     * (dual-write live) BEFORE the backfill scan, so live writes during backfill are captured.
+     * INSERT ... 'BACKFILLING' ON CONFLICT DO NOTHING - only the winner kicks
+     * the backfill. Both winner and loser ensure the rm_ table and its key
+     * indexes (CREATE INDEX IF NOT EXISTS). dual-write-FIRST: the rm_ table is
+     * created and the archetype registered locally (dual-write live) BEFORE the
+     * backfill scan, so live writes during backfill are captured.
      */
     async ensureProjection(archetype: string): Promise<void> {
         if (!qspActive() || !qspInScope(archetype)) return;
@@ -143,9 +139,7 @@ export class ProjectionManager {
             const won = rows.length > 0;
             await createRmTable(archetype, descriptor.columns);
             await syncRmSchema(archetype, descriptor);
-            if (won) {
-                await createCoveringIndex(archetype, this.coveringIndexOpts(descriptor));
-            }
+            await ensureRmKeyIndexes(archetype, descriptor.columns);
             this.registerArchetype(archetype, descriptor);
             const s = await projExec<any[]>('projection.state.status',
                 `SELECT status FROM projection_state WHERE archetype = $1`, [archetype]);
@@ -184,6 +178,7 @@ export class ProjectionManager {
                         const descriptor = deriveProjectionDescriptor(archetype);
                         await createRmTable(archetype, descriptor.columns);
                         await syncRmSchema(archetype, descriptor);
+                        await ensureRmKeyIndexes(archetype, descriptor.columns);
                         this.registerArchetype(archetype, descriptor);
                     } catch (e) {
                         logger.warn(`syncActiveProjections: cannot register ${archetype}: ${e}`);

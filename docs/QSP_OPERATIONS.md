@@ -9,11 +9,11 @@
 
 QSP is a transparent read-path accelerator. For an eligible **archetype** it maintains a
 columnar read-model table `rm_<archetype>` (one row per entity, projected component fields
-as real typed columns) with a covering index, kept in sync by a synchronous dual-write on
-`entity.save()`. When a list query is **fully covered** by that archetype (same component
-set, supported filters/sort/keyset) and the projection is **READY**, the planner serves it
-from `rm_<archetype>` with a single index scan — bypassing the legacy INTERSECT / correlated
-`EXISTS` / scalar-subquery query DAG. Anything not covered, not READY, or not eligible is
+as real typed columns) with a `bk_` key index per projected column and on `created_at` /
+`updated_at`, kept in sync by a synchronous dual-write on `entity.save()`. When a list query is
+**fully covered** by that archetype (same component set, supported filters/sort/keyset) and the
+projection is **READY**, the planner serves it from `rm_<archetype>` with index-ordered scans in
+the same canonical order as the legacy engine (`query/orderPlan.ts`). Anything not covered, not READY, or not eligible is
 served by the **unchanged** legacy compiler. Every routed query has a transparent
 try/catch fallback to legacy, so QSP can never return wrong results or hard-fail a read.
 
@@ -53,7 +53,7 @@ Implemented in `query/planner/SurfacePlanner.ts` (`isCovered`) + column derivati
 2. **Exact component-set match:** the query’s required `.with(...)` component **names** equal the set of components that appear in the archetype’s **projected columns** (not the GraphQL archetype field list alone).
 3. Filters use only: `=`, `!=`, `>`, `<`, `>=`, `<=`, `IN`, `NOT IN` (empty `IN`/`NOT IN` arrays fail coverage).
 4. At most **one** sort key; if component sort, that field is projected and not `FILLING`.
-5. Cursor: id-cursor only if unsorted; keyset only with single sort, direction **`after`** (not `before`); keyset + `nullsFirst` not covered.
+5. Cursor: id-cursor only if unsorted; keyset only with a single sort key (`after` and `before`, either NULLS placement).
 6. No OR query, no `findById` / `withId`, no excluded components (`.without`), no excluded entity ids.
 
 ### Does **not** route (always legacy — results still correct)
@@ -108,7 +108,7 @@ After exec: `query.getLastRouteInfo()` → `{ routed: true, surface: 'rm', arche
 `projection_state` row (and `BUNSANE_QSP` ≠ `off`) fires `ensureProjection(archetype)` fire-and-forget
 while serving that request from legacy. It is idempotent — `INSERT ... 'BACKFILLING' ON CONFLICT
 (archetype) DO NOTHING`, so across concurrent queries and instances only one winner proceeds. The
-winner creates `rm_<archetype>` + its covering index, registers the archetype in the in-memory
+winner creates `rm_<archetype>` (every instance reconciles its `bk_` key indexes through the same reconciler as component leaves), registers the archetype in the in-memory
 dependency map with status BACKFILLING (**dual-write goes live *before* the backfill scan**), then
 kicks the advisory-leased backfill.
 
@@ -125,7 +125,7 @@ permanent parity canary. Any divergence blocks promotion, logs `qsp.shadow`, tri
 `ReconcileSweep` for that archetype, and resets the counters so it must re-prove from scratch.
 
 **(4) READY (routing).** Covered + READY queries are served from `rm_<archetype>` with a single
-covering-index scan. Uncovered queries and any runtime error fall through to legacy transparently
+`bk_` key-index scan. Uncovered queries and any runtime error fall through to legacy transparently
 (`qsp_fallback_total`).
 
 **(5) Rollback — instant.** Set `BUNSANE_QSP=off`: `qspActive()` goes false, the planner is not

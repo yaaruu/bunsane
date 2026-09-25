@@ -13,7 +13,7 @@
  * Query.entitySort.test.ts) so ordering is unambiguous across DB engines.
  */
 import { describe, test, expect, beforeAll, beforeEach } from 'bun:test';
-import { Query, FilterOp } from '../../../query/Query';
+import { Query, FilterOp, or } from '../../../query/Query';
 import { BaseComponent } from '../../../core/components/BaseComponent';
 import { Component, CompData } from '../../../core/components/Decorators';
 import { createTestContext, ensureComponentsRegistered } from '../../utils';
@@ -402,15 +402,21 @@ describe('Composite keyset cursor pagination for sorted queries', () => {
         expect(paged).toEqual(expectedIds);
     });
 
-    test('sortedCursor() + OR query + NULLS FIRST throws a clear error', async () => {
-        const { or } = await import('../../../query/Query');
-        const token = Query.encodeSortedCursor(5, 'a1b2c3d4-e5f6-7890-abcd-ef1234567890');
-        const q = base()
-            .with(or([{ component: KCData, filters: [Query.filter('score', FilterOp.LT, 8)] }]))
-            .sortBy(KCData, 'score', 'ASC', /* nullsFirst */ true)
-            .sortedCursor(token)
-            .take(5);
-        await expect(q.exec()).rejects.toThrow('does not support NULLS FIRST');
+    test('sortedCursor() + OR query + NULLS FIRST walks the same ordered set', async () => {
+        const makeQuery = () =>
+            base()
+                .with(or([{ component: KCData, filters: [Query.filter('score', FilterOp.LT, 8)] }]))
+                .sortBy(KCData, 'score', 'ASC', true);
+        const unbounded = await makeQuery().take(N * 2).exec();
+        const expectedIds = unbounded.map((e: { id: string }) => e.id);
+        const paged = await walkSortedPages(makeQuery, PAGE, async (entity) => {
+            const rows = await ctx.db.unsafe<{ data: { score?: number } }[]>(
+                `SELECT data FROM components WHERE entity_id = $1 AND deleted_at IS NULL AND data ? 'score' LIMIT 1`,
+                [entity.id]
+            );
+            return rows[0]?.data?.score ?? null;
+        });
+        expect(paged).toEqual(expectedIds);
     });
 
     test("sortedCursor(token, 'before') returns the previous component-sort page in order", async () => {

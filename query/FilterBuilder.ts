@@ -10,10 +10,7 @@ import type { QueryFilter } from "./QueryContext";
 import type { QueryContext } from "./QueryContext";
 import { FilterBuilderRegistry } from "./FilterBuilderRegistry";
 import { escapeJsonLiteral, KNOWN_FILTER_OPERATORS } from "./SqlIdentifier";
-import {
-    numericJsonCompareSql,
-    numericJsonTextValidPredicate,
-} from "../database/numericJsonField";
+import { numericKeyOf } from "./orderPlan";
 
 /**
  * Result returned by a custom filter builder function
@@ -113,7 +110,7 @@ export function buildJSONBPath(field: string, alias: string): string {
  */
 export function jsonbInListCast(values: any[]): { lhs: (path: string) => string; param: string } {
     const allNumbers = values.length > 0 && values.every(v => typeof v === 'number');
-    if (allNumbers) return { lhs: (p) => `(${p})::numeric`, param: '::numeric' };
+    if (allNumbers) return { lhs: (p) => numericKeyOf(p), param: '::numeric' };
     // Booleans are compared as text ('true'/'false') by buildComponentFilterCondition
     // so the btree on (data->>'f') applies. Do not cast the column to ::boolean.
     return { lhs: (p) => p, param: '' };
@@ -121,9 +118,8 @@ export function jsonbInListCast(values: any[]): { lhs: (path: string) => string;
 
 /**
  * Build a single field predicate against `<alias>.data` for default operators
- * and registered custom FilterBuilder operators. Shared by INTERSECT/CTE
- * membership pushdown, EXISTS coalescing, and sort-driven scan so all paths
- * emit the same SQL shape.
+ * and registered custom FilterBuilder operators. Shared by driving-leaf
+ * membership, EXISTS probes, and sort-driven scan so all paths emit the same SQL.
  */
 export function buildComponentFilterCondition(
     filter: QueryFilter,
@@ -180,14 +176,9 @@ export function buildComponentFilterCondition(
             }
             const cast = jsonbInListCast(filter.value);
             const placeholders = filter.value
-                .map((v: any) => `$${context.addParam(v)}${cast.param}`)
+                .map((v: unknown) => `$${context.addParam(v)}${cast.param}`)
                 .join(', ');
-            const listPred = `${cast.lhs(jsonPath)} ${filter.operator} (${placeholders})`;
-            // Numeric IN lists need the partial-index validity predicate too.
-            if (cast.param === '::numeric') {
-                return `${numericJsonTextValidPredicate(jsonPath)} AND ${listPred}`;
-            }
-            return listPred;
+            return `${cast.lhs(jsonPath)} ${filter.operator} (${placeholders})`;
         }
         if (Array.isArray(filter.value) && filter.value.length === 0) {
             return filter.operator === 'IN' ? 'FALSE' : 'TRUE';
@@ -195,12 +186,8 @@ export function buildComponentFilterCondition(
         throw new Error(`${filter.operator} operator requires an array of values`);
     }
     if (typeof filter.value === 'number') {
-        // Restate partial numeric index predicate (RP-04 / BUG-1).
-        return numericJsonCompareSql(
-            jsonPath,
-            filter.operator,
-            `$${context.addParam(filter.value)}::numeric`
-        );
+        // bunsane_num_v1 never raises; non-numeric text compares as NULL and does not match.
+        return `${numericKeyOf(jsonPath)} ${filter.operator} $${context.addParam(filter.value)}::numeric`;
     }
     if (typeof filter.value === 'boolean' && (filter.operator === '=' || filter.operator === '!=')) {
         // Text compare so the btree on (data->>'f') applies. Bind the canonical

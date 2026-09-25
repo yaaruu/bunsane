@@ -16,9 +16,10 @@ export interface SortOrder {
 
 /**
  * Sort by a native column on the `entities` table (created_at / updated_at).
- * Unlike SortOrder, this needs no component and no `.with()` — the column
- * always exists and is indexed-friendly. Applied as an outer ORDER BY in
- * Query.doExec, invisible to the SQL planner nodes.
+ * The column always exists. List reads are planned in query/entitySort.ts
+ * (index-ordered id select, or an adaptive membership probe) — not an outer
+ * ORDER BY over a resolved id-set. `.cursor(id)` with an entity sort throws;
+ * use `sortedCursor()`.
  */
 export type EntitySortField = "created_at" | "updated_at";
 
@@ -54,9 +55,9 @@ export class QueryContext {
     public excludedComponentIds: Set<string> = new Set();
     public componentFilters: Map<string, QueryFilter[]> = new Map();
     public sortOrders: SortOrder[] = [];
-    // Native entities-table sorts (created_at/updated_at). Separate channel:
-    // the SQL nodes never read it — Query.doExec wraps the id-set with a
-    // JOIN entities ... ORDER BY. Keeps the component sort paths untouched.
+    // Native entities-table sorts (created_at/updated_at). SQL nodes do not
+    // apply them — Query.doExec dispatches to query/entitySort.ts. count()
+    // does not build that statement, so entity sorts do not change cardinality.
     public entitySortOrders: EntitySortOrder[] = [];
     public excludedEntityIds: Set<string> = new Set();
     public withId: string | null = null;
@@ -80,9 +81,9 @@ export class QueryContext {
     public paginationAppliedInCTE: boolean = false;
     /**
      * True when field filters for required components were already applied
-     * inside membership / INTERSECT branches (CTENode or ComponentInclusionNode).
-     * Downstream EXISTS/LATERAL filter application must skip those filters to
-     * avoid double predicates and duplicate params (RP-03).
+     * inside the driving-leaf scan or its EXISTS semi-joins (CTENode or
+     * ComponentInclusionNode). Downstream EXISTS/LATERAL filter application
+     * must skip those filters to avoid double predicates and duplicate params.
      */
     public filtersAppliedInMembership: boolean = false;
     // Set by Query when an OrQuery participates. OrNode embeds its
